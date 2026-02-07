@@ -28,6 +28,16 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Reject ephemeral evidence references
+        run: |
+          set -euo pipefail
+          if grep -n "\.[a]gent/" IMPLEMENTATION_PLAN.md PROMPT.md; then
+            echo "ephemeral evidence references are forbidden in tracked control docs."
+            echo "Use tracked evidence paths under evidence/<loop-id>/..."
+            exit 1
+          fi
+          echo "evidence integrity guard passed"
+
       - name: Check formatting
         run: cargo fmt --all
 
@@ -57,6 +67,7 @@ jobs:
           --health-retries 10
     env:
       YARLI_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      YARLI_REQUIRE_POSTGRES_TESTS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,10 +79,28 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Store Postgres integration tests
-        run: cargo test -p yarli-store --test postgres_integration
+        run: |
+          set -euo pipefail
+          cargo test -p yarli-store --test postgres_integration -- --nocapture | tee /tmp/yarli-store-postgres-integration.log
+          if grep -q "skipping postgres integration test" /tmp/yarli-store-postgres-integration.log; then
+            echo "skip-path detected in yarli-store postgres integration tests"
+            exit 1
+          fi
 
       - name: Queue Postgres integration tests
-        run: cargo test -p yarli-queue --test postgres_integration
+        run: |
+          set -euo pipefail
+          cargo test -p yarli-queue --test postgres_integration -- --nocapture | tee /tmp/yarli-queue-postgres-integration.log
+          if grep -q "skipping postgres integration test" /tmp/yarli-queue-postgres-integration.log; then
+            echo "skip-path detected in yarli-queue postgres integration tests"
+            exit 1
+          fi
 
       - name: CLI Postgres integration tests
-        run: cargo test -p yarli-cli --test postgres_integration
+        run: |
+          set -euo pipefail
+          cargo test -p yarli-cli --test postgres_integration -- --nocapture | tee /tmp/yarli-cli-postgres-integration.log
+          if grep -q "skipping postgres integration test" /tmp/yarli-cli-postgres-integration.log; then
+            echo "skip-path detected in yarli-cli postgres integration tests"
+            exit 1
+          fi

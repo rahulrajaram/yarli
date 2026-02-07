@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-92f440da3c0dd47c)
+
+running 1 test
+
+thread 'append_and_query_roundtrip_against_postgres' panicked at crates/yarli-store/tests/postgres_integration.rs:19:13:
+postgres integration tests require YARLI_TEST_DATABASE_URL when YARLI_REQUIRE_POSTGRES_TESTS=1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test append_and_query_roundtrip_against_postgres ... FAILED
+
+failures:
+
+failures:
+    append_and_query_roundtrip_against_postgres
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p yarli-store --test postgres_integration`

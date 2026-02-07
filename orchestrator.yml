@@ -5,18 +5,19 @@
 # Use `--exclusive` only if you want to wait for a running loop instead of failing.
 
 # --- Codex backend (disabled) ---
-cli:
-   backend: "custom"
-   command: "codex"
-   args: ["--dangerously-bypass-approvals-and-sandbox", "exec", "--json"]
+#cli:
+   #backend: "custom"
+   #command: "codex"
+   #args: ["--dangerously-bypass-approvals-and-sandbox", "exec", "--json"]
 
 # --- Claude backend (active) ---
-#cli:
-  #backend: "claude"
-  #prompt_mode: "arg"
+cli:
+  backend: "claude"
+  prompt_mode: "arg"
+  args: ["--model", "opus-4.5"]
 
 event_loop:
-  completion_promise: "LOOP_COMPLETE"
+  #completion_promise: "LOOP_COMPLETE"
   prompt_file: "PROMPT.md"
   max_iterations: 5
   max_runtime_seconds: 14400  # 4 hours

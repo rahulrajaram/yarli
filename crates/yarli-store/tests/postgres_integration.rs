@@ -10,10 +10,16 @@ use yarli_store::event_store::EventQuery;
 use yarli_store::{EventStore, PostgresEventStore, MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
 
 const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
+const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";
 
 #[tokio::test]
 async fn append_and_query_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) = test_database_url() else {
+        if require_postgres_tests() {
+            panic!(
+                "postgres integration tests require {TEST_DATABASE_URL_ENV} when {REQUIRE_POSTGRES_TESTS_ENV}=1"
+            );
+        }
         eprintln!(
             "skipping postgres integration test: set {TEST_DATABASE_URL_ENV} (example: postgres://postgres:postgres@localhost:5432/postgres)"
         );
@@ -140,4 +146,11 @@ fn test_database_url() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn require_postgres_tests() -> bool {
+    env::var(REQUIRE_POSTGRES_TESTS_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }

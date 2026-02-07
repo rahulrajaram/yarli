@@ -12,11 +12,17 @@ use uuid::Uuid;
 use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
 
 const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
+const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";
 
 #[tokio::test]
 async fn merge_request_and_status_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) = test_database_url() else {
+        if require_postgres_tests() {
+            panic!(
+                "postgres integration tests require {TEST_DATABASE_URL_ENV} when {REQUIRE_POSTGRES_TESTS_ENV}=1"
+            );
+        }
         eprintln!(
             "skipping postgres integration test: set {TEST_DATABASE_URL_ENV} (example: postgres://postgres:postgres@localhost:5432/postgres)"
         );
@@ -139,7 +145,23 @@ database_url = "{escaped_database_url}"
 fn yarli_binary_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     match env::var_os("CARGO_BIN_EXE_yarli") {
         Some(path) => Ok(PathBuf::from(path)),
-        None => Err("CARGO_BIN_EXE_yarli is not set; run with `cargo test -p yarli-cli --test postgres_integration`".into()),
+        None => {
+            let current_exe = env::current_exe()?;
+            let debug_dir = current_exe
+                .parent()
+                .and_then(|path| path.parent())
+                .ok_or("failed to derive target/debug directory from current test executable path")?;
+            let binary_name = format!("yarli{}", std::env::consts::EXE_SUFFIX);
+            let fallback = debug_dir.join(binary_name);
+            if fallback.is_file() {
+                Ok(fallback)
+            } else {
+                Err(
+                    "CARGO_BIN_EXE_yarli is not set and target/debug/yarli fallback was not found"
+                        .into(),
+                )
+            }
+        }
     }
 }
 
@@ -223,4 +245,11 @@ fn test_database_url() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn require_postgres_tests() -> bool {
+    env::var(REQUIRE_POSTGRES_TESTS_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }

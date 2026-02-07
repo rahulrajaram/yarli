@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-13bc915f70d0c06d)
+
+running 1 test
+test merge_request_and_status_roundtrip_against_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
