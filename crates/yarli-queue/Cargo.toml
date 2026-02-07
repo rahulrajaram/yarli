@@ -11,6 +11,8 @@ yarli-core = { workspace = true }
 yarli-store = { workspace = true }
 yarli-exec = { workspace = true }
 yarli-gates = { workspace = true }
+yarli-policy = { workspace = true }
+yarli-observability = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

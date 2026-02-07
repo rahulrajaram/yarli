@@ -3357,6 +3357,8 @@ dependencies = [
  "yarli-core",
  "yarli-exec",
  "yarli-gates",
+ "yarli-observability",
+ "yarli-policy",
  "yarli-store",
 ]
 

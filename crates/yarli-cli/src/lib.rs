@@ -7,5 +7,6 @@
 //! - **Mode detection**: auto-detect rendering mode from terminal capabilities
 
 pub mod dashboard;
+pub mod config;
 pub mod mode;
 pub mod stream;

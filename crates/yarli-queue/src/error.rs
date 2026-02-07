@@ -37,4 +37,20 @@ pub enum QueueError {
     /// Concurrency cap exceeded.
     #[error("concurrency cap exceeded: {0}")]
     ConcurrencyCapExceeded(String),
+
+    /// Database operation failed.
+    #[error("database error: {0}")]
+    Database(String),
+
+    /// Tokio runtime operation failed.
+    #[error("runtime error: {0}")]
+    Runtime(String),
+
+    /// Persisted queue status is invalid.
+    #[error("invalid queue status in store: {0}")]
+    InvalidQueueStatus(String),
+
+    /// Persisted command class is invalid.
+    #[error("invalid command class in store: {0}")]
+    InvalidCommandClass(String),
 }

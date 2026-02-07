@@ -13,20 +13,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use yarli_core::domain::{EntityType, Event, RunId, TaskId};
+use yarli_core::domain::{EntityType, Event, PolicyOutcome, RunId, TaskId};
 use yarli_core::entities::run::Run;
-use yarli_core::entities::task::Task;
+use yarli_core::entities::task::{BlockerCode, Task};
 use yarli_core::explain::GateType;
 use yarli_core::fsm::command::CommandState;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 use yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError};
 use yarli_gates::{evaluate_all, all_passed, collect_failures, GateContext};
+use yarli_observability::{AuditEntry, AuditSink};
+use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use yarli_store::EventStore;
 
 use crate::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry};
@@ -61,6 +63,10 @@ pub struct SchedulerConfig {
     /// Gates to evaluate for run-level verification.
     /// If empty, runs auto-complete after all tasks finish.
     pub run_gates: Vec<GateType>,
+    /// Enforce policy checks before command execution.
+    pub enforce_policies: bool,
+    /// Emit policy/audit records when decisions are made.
+    pub audit_decisions: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -87,6 +93,8 @@ impl Default for SchedulerConfig {
                 GateType::WorktreeConsistent,
                 GateType::PolicyClean,
             ],
+            enforce_policies: true,
+            audit_decisions: true,
         }
     }
 }
@@ -111,6 +119,12 @@ pub enum SchedulerError {
 
     #[error("run not found: {0}")]
     RunNotFound(RunId),
+
+    #[error("policy error: {0}")]
+    Policy(#[from] yarli_policy::PolicyError),
+
+    #[error("audit error: {0}")]
+    Audit(#[from] yarli_observability::AuditError),
 }
 
 /// In-memory registry of tasks and runs for the scheduler.
@@ -221,6 +235,8 @@ pub struct Scheduler<Q: TaskQueue, S: EventStore, R: CommandRunner> {
     store: Arc<S>,
     runner: Arc<R>,
     registry: Arc<RwLock<TaskRegistry>>,
+    policy_engine: Arc<Mutex<PolicyEngine>>,
+    audit_sink: Option<Arc<dyn AuditSink>>,
     config: SchedulerConfig,
 }
 
@@ -236,6 +252,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             store,
             runner,
             registry: Arc::new(RwLock::new(TaskRegistry::new())),
+            policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
+            audit_sink: None,
             config,
         }
     }
@@ -253,8 +271,22 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             store,
             runner,
             registry: Arc::new(RwLock::new(registry)),
+            policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
+            audit_sink: None,
             config,
         }
+    }
+
+    /// Configure an explicit policy engine (useful for testing/custom rules).
+    pub fn with_policy_engine(mut self, policy_engine: PolicyEngine) -> Self {
+        self.policy_engine = Arc::new(Mutex::new(policy_engine));
+        self
+    }
+
+    /// Configure an audit sink for policy/audit record emission.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit_sink = Some(sink);
+        self
     }
 
     /// Get a reference to the registry for inspection.
@@ -474,15 +506,82 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             reg.track_lease(queue_id, task_id);
         }
 
+        let (command, command_class, attempt_no, correlation_id, safe_mode) = {
+            let reg = self.registry.read().await;
+            let task = reg
+                .get_task(&task_id)
+                .ok_or(SchedulerError::TaskNotFound(task_id))?;
+            let run = reg
+                .get_run(&entry.run_id)
+                .ok_or(SchedulerError::RunNotFound(entry.run_id))?;
+            (
+                task.description.clone(),
+                task.command_class,
+                task.attempt_no,
+                task.correlation_id,
+                run.safe_mode,
+            )
+        };
+
+        if self.config.enforce_policies {
+            let action = classify_policy_action(&command);
+            let request = if action == ActionType::CommandExecute {
+                let mut req = PolicyRequest::command(
+                    entry.run_id,
+                    task_id,
+                    command_class,
+                    safe_mode,
+                );
+                req.actor = self.config.worker_id.clone();
+                req
+            } else {
+                PolicyRequest {
+                    actor: self.config.worker_id.clone(),
+                    action,
+                    command_class: Some(command_class),
+                    repo_path: Some(self.config.working_dir.clone()),
+                    branch: None,
+                    run_id: entry.run_id,
+                    task_id: Some(task_id),
+                    safe_mode,
+                }
+            };
+
+            let decision = {
+                let mut engine = self.policy_engine.lock().await;
+                engine.evaluate(&request)?
+            };
+
+            self.persist_policy_decision(
+                &decision,
+                task_id,
+                attempt_no,
+                correlation_id,
+                &command,
+            )?;
+
+            if decision.outcome != PolicyOutcome::Allow {
+                return self
+                    .handle_policy_block(
+                        task_id,
+                        entry.run_id,
+                        queue_id,
+                        attempt_no,
+                        correlation_id,
+                        &decision,
+                        &command,
+                    )
+                    .await;
+            }
+        }
+
         // Transition task: Ready → Executing
-        let correlation_id = {
+        {
             let mut reg = self.registry.write().await;
             let task = reg
                 .get_task_mut(&task_id)
                 .ok_or(SchedulerError::TaskNotFound(task_id))?;
 
-            let correlation_id = task.correlation_id;
-            let attempt_no = task.attempt_no;
             let transition = task.transition(
                 TaskState::TaskExecuting,
                 "claimed by scheduler",
@@ -508,17 +607,6 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 actor: self.config.worker_id.clone(),
                 idempotency_key: Some(format!("{task_id}:executing:{attempt_no}")),
             })?;
-
-            correlation_id
-        };
-
-        // Build command request from the task
-        let (command, command_class, attempt_no) = {
-            let reg = self.registry.read().await;
-            let task = reg
-                .get_task(&task_id)
-                .ok_or(SchedulerError::TaskNotFound(task_id))?;
-            (task.description.clone(), task.command_class, task.attempt_no)
         };
 
         let request = CommandRequest {
@@ -556,6 +644,170 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         }
 
         Ok(outcome)
+    }
+
+    fn persist_policy_decision(
+        &self,
+        decision: &yarli_core::domain::PolicyDecision,
+        task_id: TaskId,
+        attempt_no: u32,
+        correlation_id: Uuid,
+        command: &str,
+    ) -> Result<(), SchedulerError> {
+        self.store.append(Event {
+            event_id: decision.decision_id,
+            occurred_at: decision.decided_at,
+            entity_type: EntityType::Policy,
+            entity_id: decision.decision_id.to_string(),
+            event_type: "policy.decision".to_string(),
+            payload: serde_json::json!({
+                "run_id": decision.run_id,
+                "task_id": task_id,
+                "action": decision.action,
+                "outcome": decision.outcome,
+                "rule_id": decision.rule_id,
+                "reason": decision.reason,
+                "command": command,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: decision.actor.clone(),
+            idempotency_key: Some(format!(
+                "{task_id}:policy:{}:{attempt_no}",
+                decision.action
+            )),
+        })?;
+
+        if self.config.audit_decisions {
+            if let Some(sink) = self.audit_sink.as_ref() {
+                let mut entry = AuditEntry::from_policy_decision(decision);
+                entry.task_id = Some(task_id);
+                entry.details = serde_json::json!({
+                    "decision_id": decision.decision_id,
+                    "decided_at": decision.decided_at,
+                    "command": command,
+                    "attempt_no": attempt_no,
+                });
+                sink.append(&entry)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_policy_block(
+        &self,
+        task_id: TaskId,
+        run_id: RunId,
+        queue_id: Uuid,
+        attempt_no: u32,
+        correlation_id: Uuid,
+        decision: &yarli_core::domain::PolicyDecision,
+        command: &str,
+    ) -> Result<TaskOutcome, SchedulerError> {
+        let mut reg = self.registry.write().await;
+        let task = reg
+            .get_task_mut(&task_id)
+            .ok_or(SchedulerError::TaskNotFound(task_id))?;
+
+        let reason = format!(
+            "policy {}: {}",
+            policy_outcome_label(decision.outcome),
+            decision.reason
+        );
+
+        let transition = task.block(
+            BlockerCode::PolicyDenial,
+            &reason,
+            &self.config.worker_id,
+            None,
+        )?;
+
+        self.store.append(Event {
+            event_id: transition.event_id,
+            occurred_at: transition.occurred_at,
+            entity_type: EntityType::Task,
+            entity_id: task_id.to_string(),
+            event_type: "task.blocked".to_string(),
+            payload: serde_json::json!({
+                "reason": reason,
+                "blocker": "policy_denial",
+                "policy": {
+                    "outcome": decision.outcome,
+                    "rule_id": decision.rule_id,
+                    "action": decision.action,
+                }
+            }),
+            correlation_id,
+            causation_id: Some(decision.decision_id),
+            actor: self.config.worker_id.clone(),
+            idempotency_key: Some(format!("{task_id}:blocked:policy:{attempt_no}")),
+        })?;
+
+        if let Some(run) = reg.get_run_mut(&run_id) {
+            if matches!(run.state, RunState::RunActive | RunState::RunVerifying) {
+                let run_transition = run.transition(
+                    RunState::RunBlocked,
+                    format!("task {task_id} blocked by policy"),
+                    &self.config.worker_id,
+                    Some(transition.event_id),
+                )?;
+
+                self.store.append(Event {
+                    event_id: run_transition.event_id,
+                    occurred_at: run_transition.occurred_at,
+                    entity_type: EntityType::Run,
+                    entity_id: run_id.to_string(),
+                    event_type: "run.blocked".to_string(),
+                    payload: serde_json::json!({
+                        "reason": "policy_block",
+                        "task_id": task_id,
+                        "policy": {
+                            "outcome": decision.outcome,
+                            "rule_id": decision.rule_id,
+                            "action": decision.action,
+                        }
+                    }),
+                    correlation_id,
+                    causation_id: Some(transition.event_id),
+                    actor: self.config.worker_id.clone(),
+                    idempotency_key: Some(format!(
+                        "{run_id}:blocked:policy:{task_id}:{attempt_no}"
+                    )),
+                })?;
+            }
+        }
+
+        drop(reg);
+        self.queue.complete(queue_id, &self.config.worker_id)?;
+
+        if self.config.audit_decisions {
+            if let Some(sink) = self.audit_sink.as_ref() {
+                let blocked_entry = AuditEntry::destructive_attempt(
+                    self.config.worker_id.clone(),
+                    decision.action.clone(),
+                    format!("blocked by policy: {}", decision.reason),
+                    Some(run_id),
+                    Some(task_id),
+                    serde_json::json!({
+                        "outcome": decision.outcome,
+                        "rule_id": decision.rule_id,
+                        "command": command,
+                        "attempt_no": attempt_no,
+                    }),
+                );
+                sink.append(&blocked_entry)?;
+            }
+        }
+
+        warn!(
+            task_id = %task_id,
+            run_id = %run_id,
+            action = %decision.action,
+            outcome = %policy_outcome_label(decision.outcome),
+            "task blocked by policy"
+        );
+        Ok(TaskOutcome::Failed)
     }
 
     /// Handle successful command completion.
@@ -1193,6 +1445,58 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     }
 }
 
+fn classify_policy_action(command: &str) -> ActionType {
+    let normalized = command.trim().to_ascii_lowercase();
+    if normalized.starts_with("git push") {
+        if normalized.contains(" --force")
+            || normalized.contains(" -f")
+            || normalized.contains("--force-with-lease")
+        {
+            return ActionType::GitForcePush;
+        }
+        return ActionType::GitPush;
+    }
+
+    if normalized.starts_with("git tag") {
+        return ActionType::GitTag;
+    }
+
+    if normalized.starts_with("git branch")
+        && (normalized.contains(" -d")
+            || normalized.contains(" -D")
+            || normalized.contains(" --delete"))
+    {
+        return ActionType::BranchDelete;
+    }
+
+    if normalized.starts_with("git merge") {
+        return ActionType::Merge;
+    }
+
+    if normalized.starts_with("git stash clear") {
+        return ActionType::StashClear;
+    }
+
+    if normalized.starts_with("git clean")
+        && (normalized.contains(" -f")
+            || normalized.contains(" --force")
+            || normalized.contains(" -x")
+            || normalized.contains(" -d"))
+    {
+        return ActionType::DestructiveCleanup;
+    }
+
+    ActionType::CommandExecute
+}
+
+fn policy_outcome_label(outcome: PolicyOutcome) -> &'static str {
+    match outcome {
+        PolicyOutcome::Allow => "allow",
+        PolicyOutcome::Deny => "deny",
+        PolicyOutcome::RequireApproval => "require_approval",
+    }
+}
+
 /// Outcome of executing a single task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
@@ -1230,6 +1534,7 @@ mod tests {
     use super::*;
     use yarli_core::domain::{CommandClass, SafeMode};
     use yarli_exec::LocalCommandRunner;
+    use yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
     use yarli_store::InMemoryEventStore;
     use crate::InMemoryTaskQueue;
 
@@ -1248,6 +1553,8 @@ mod tests {
             // Empty gates: auto-complete (backward compat with M1 tests)
             task_gates: vec![],
             run_gates: vec![],
+            enforce_policies: true,
+            audit_decisions: true,
         }
     }
 
@@ -2022,6 +2329,95 @@ mod tests {
         assert!(
             first.contains("evidence"),
             "failure should mention evidence: got {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_policy_decision_event_emitted_for_allowed_task() {
+        let (sched, store) = test_scheduler();
+        let run = make_run("policy allow");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        let task = make_task(run_id, "echo", "echo hello", corr_id);
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.succeeded, 1);
+
+        let events = store.all().unwrap();
+        let policy = events
+            .iter()
+            .find(|e| e.event_type == "policy.decision")
+            .expect("expected policy.decision event");
+        assert_eq!(policy.entity_type, EntityType::Policy);
+        assert_eq!(
+            policy.payload.get("outcome").and_then(|v| v.as_str()),
+            Some("ALLOW")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_policy_denial_blocks_task_and_run() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let sched = Scheduler::new(queue.clone(), store.clone(), runner, test_config());
+
+        // Observe mode denies all actions, including command execution.
+        let run = Run::new("policy block", SafeMode::Observe);
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        let task = make_task(run_id, "echo", "echo blocked", corr_id);
+        let task_id = task.id;
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.failed, 1, "blocked tasks count as failed outcomes");
+
+        let reg = sched.registry().read().await;
+        assert_eq!(reg.get_task(&task_id).unwrap().state, TaskState::TaskBlocked);
+        assert_eq!(reg.get_run(&run_id).unwrap().state, RunState::RunBlocked);
+        drop(reg);
+
+        let stats = queue.stats();
+        assert_eq!(stats.completed, 1, "blocked task should release queue lease");
+
+        let events = store.all().unwrap();
+        assert!(events.iter().any(|e| e.event_type == "policy.decision"));
+        assert!(events.iter().any(|e| e.event_type == "task.blocked"));
+        assert!(events.iter().any(|e| e.event_type == "run.blocked"));
+    }
+
+    #[tokio::test]
+    async fn test_policy_block_emits_audit_records() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let audit_sink = Arc::new(InMemoryAuditSink::new());
+
+        let sched = Scheduler::new(queue, store, runner, test_config())
+            .with_audit_sink(audit_sink.clone());
+
+        let run = Run::new("policy audit", SafeMode::Observe);
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        let task = make_task(run_id, "git-push", "git push origin main", corr_id);
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+        sched.tick().await.unwrap();
+
+        let entries = audit_sink.read_all().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.category == AuditCategory::PolicyDecision),
+            "expected policy decision audit entry"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.category == AuditCategory::DestructiveAttempt),
+            "expected blocked/destructive attempt audit entry"
         );
     }
 }
