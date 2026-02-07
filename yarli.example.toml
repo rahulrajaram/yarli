@@ -1,0 +1,38 @@
+[core]
+# Durable-by-default backend for write commands.
+backend = "postgres"
+safe_mode = "execute"
+
+[postgres]
+# Replace with your deployment DSN.
+database_url = "postgres://postgres:postgres@localhost:5432/yarli"
+
+[queue]
+claim_batch_size = 4
+lease_ttl_seconds = 60
+heartbeat_interval_seconds = 5
+reclaim_interval_seconds = 10
+reclaim_grace_seconds = 15
+per_run_cap = 8
+io_cap = 4
+cpu_cap = 2
+git_cap = 2
+tool_cap = 2
+
+[execution]
+working_dir = "."
+command_timeout_seconds = 900
+tick_interval_ms = 200
+
+[policy]
+enforce_policies = true
+audit_decisions = true
+
+[observability]
+audit_file = ".yarl/audit.jsonl"
+
+# Explicit ephemeral override for local throwaway usage only.
+# Uncomment to allow write commands with core.backend = "in-memory".
+#
+# [core]
+# allow_in_memory_writes = true

@@ -39,3 +39,4 @@ owo-colors = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+sqlx = { workspace = true }

@@ -168,6 +168,8 @@ impl Default for BackendKind {
 pub struct CoreConfig {
     #[serde(default)]
     pub backend: BackendKind,
+    #[serde(default)]
+    pub allow_in_memory_writes: bool,
     #[serde(default = "default_safe_mode")]
     pub safe_mode: SafeMode,
     #[serde(default)]
@@ -178,6 +180,7 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             backend: BackendKind::InMemory,
+            allow_in_memory_writes: false,
             safe_mode: default_safe_mode(),
             worker_id: None,
         }
@@ -443,6 +446,7 @@ mod tests {
         let loaded = LoadedConfig::load(&path).unwrap();
         assert_eq!(loaded.source(), ConfigSource::Defaults);
         assert_eq!(loaded.config().core.backend, BackendKind::InMemory);
+        assert!(!loaded.config().core.allow_in_memory_writes);
         assert_eq!(loaded.config().execution.working_dir, ".");
     }
 
@@ -456,6 +460,7 @@ mod tests {
             r#"
 [core]
 backend = "postgres"
+allow_in_memory_writes = true
 safe_mode = "restricted"
 
 [postgres]
@@ -490,6 +495,7 @@ mode = "stream"
         let loaded = LoadedConfig::load(&path).unwrap();
         assert_eq!(loaded.source(), ConfigSource::File);
         assert_eq!(loaded.config().core.backend, BackendKind::Postgres);
+        assert!(loaded.config().core.allow_in_memory_writes);
         assert_eq!(loaded.config().core.safe_mode, SafeMode::Restricted);
         assert_eq!(loaded.config().memory.backend.enabled, true);
         assert_eq!(loaded.config().ui.mode, UiMode::Stream);

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -18,9 +19,13 @@ use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
 use yarli_cli::stream::{StreamConfig, StreamEvent, StreamRenderer};
 use yarli_core::domain::{CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode};
+use yarli_core::entities::merge_intent::{MergeIntent, MergeStrategy};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::Task;
-use yarli_core::explain::{explain_run, explain_task, GateResult, GateType, RunSnapshot, TaskSnapshot};
+use yarli_core::entities::worktree_binding::{SubmoduleMode, WorktreeBinding};
+use yarli_core::explain::{
+    explain_run, explain_task, GateResult, GateType, RunSnapshot, TaskSnapshot,
+};
 use yarli_core::fsm::merge::MergeState;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
@@ -28,6 +33,8 @@ use yarli_core::fsm::worktree::WorktreeState;
 use yarli_core::shutdown::ShutdownController;
 use yarli_exec::LocalCommandRunner;
 use yarli_gates::{all_passed, default_run_gates, default_task_gates, evaluate_all, GateContext};
+use yarli_git::error::{GitError, RecoveryAction};
+use yarli_git::{LocalMergeOrchestrator, LocalWorktreeManager, MergeOrchestrator, WorktreeManager};
 use yarli_observability::{AuditEntry, AuditSink, JsonlAuditSink};
 use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, Scheduler, SchedulerConfig, TaskQueue};
@@ -264,7 +271,15 @@ async fn run() -> Result<()> {
                 workdir,
                 timeout,
             } => {
-                cmd_run_start(objective, cmd, workdir, timeout, _render_mode, &loaded_config).await
+                cmd_run_start(
+                    objective,
+                    cmd,
+                    workdir,
+                    timeout,
+                    _render_mode,
+                    &loaded_config,
+                )
+                .await
             }
             RunAction::Status { run_id } => cmd_run_status(&run_id),
             RunAction::ExplainExit { run_id } => cmd_run_explain(&run_id),
@@ -316,7 +331,10 @@ async fn cmd_run_start(
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
 ) -> Result<()> {
-    let selected_workdir = workdir.unwrap_or_else(|| loaded_config.config().execution.working_dir.clone());
+    ensure_write_backend_guard(loaded_config, "run start")?;
+
+    let selected_workdir =
+        workdir.unwrap_or_else(|| loaded_config.config().execution.working_dir.clone());
     let selected_timeout_secs =
         timeout_secs.unwrap_or(loaded_config.config().execution.command_timeout_seconds);
 
@@ -339,14 +357,14 @@ async fn cmd_run_start(
         }
         BackendSelection::Postgres { database_url } => {
             println!("Using backend: postgres");
-            let store = Arc::new(
-                PostgresEventStore::new(&database_url)
-                    .map_err(|e| anyhow::anyhow!("failed to initialize postgres event store: {e}"))?,
-            );
-            let queue = Arc::new(
-                PostgresTaskQueue::new(&database_url)
-                    .map_err(|e| anyhow::anyhow!("failed to initialize postgres task queue: {e}"))?,
-            );
+            let store =
+                Arc::new(PostgresEventStore::new(&database_url).map_err(|e| {
+                    anyhow::anyhow!("failed to initialize postgres event store: {e}")
+                })?);
+            let queue =
+                Arc::new(PostgresTaskQueue::new(&database_url).map_err(|e| {
+                    anyhow::anyhow!("failed to initialize postgres task queue: {e}")
+                })?);
             cmd_run_start_with_backend(
                 objective,
                 commands,
@@ -401,8 +419,7 @@ where
         Duration::from_secs(loaded_config.config().queue.reclaim_interval_seconds);
     config.reclaim_grace =
         chrono::Duration::seconds(loaded_config.config().queue.reclaim_grace_seconds);
-    config.tick_interval =
-        Duration::from_millis(loaded_config.config().execution.tick_interval_ms);
+    config.tick_interval = Duration::from_millis(loaded_config.config().execution.tick_interval_ms);
     config.concurrency.per_run_cap = loaded_config.config().queue.per_run_cap;
     config.concurrency.io_cap = loaded_config.config().queue.io_cap;
     config.concurrency.cpu_cap = loaded_config.config().queue.cpu_cap;
@@ -420,10 +437,7 @@ where
         if let Some(parent) = audit_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "failed to create audit directory {}",
-                        parent.display()
-                    )
+                    format!("failed to create audit directory {}", parent.display())
                 })?;
             }
         }
@@ -455,7 +469,8 @@ where
         })
         .collect();
 
-    let task_names: Vec<(Uuid, String)> = tasks.iter().map(|t| (t.id, t.task_key.clone())).collect();
+    let task_names: Vec<(Uuid, String)> =
+        tasks.iter().map(|t| (t.id, t.task_key.clone())).collect();
 
     store.append(Event {
         event_id: Uuid::now_v7(),
@@ -501,9 +516,8 @@ where
 
     // Spawn renderer task.
     let renderer_shutdown = shutdown.clone();
-    let renderer_handle = tokio::task::spawn_blocking(move || {
-        run_renderer(rx, render_mode, renderer_shutdown)
-    });
+    let renderer_handle =
+        tokio::task::spawn_blocking(move || run_renderer(rx, render_mode, renderer_shutdown));
 
     // Drive scheduler loop, emitting events to renderer channel.
     drive_scheduler(&scheduler, &store, cancel, tx, run_id, &task_names).await?;
@@ -677,12 +691,7 @@ where
         }
 
         let attempt_no = task.attempt_no;
-        let transition = task.transition(
-            TaskState::TaskCancelled,
-            reason,
-            "cli",
-            None,
-        )?;
+        let transition = task.transition(TaskState::TaskCancelled, reason, "cli", None)?;
 
         events.push(Event {
             event_id: transition.event_id,
@@ -706,12 +715,7 @@ where
         if run.state.is_terminal() {
             false
         } else {
-            let transition = run.transition(
-                RunState::RunCancelled,
-                reason,
-                "cli",
-                None,
-            )?;
+            let transition = run.transition(RunState::RunCancelled, reason, "cli", None)?;
 
             events.push(Event {
                 event_id: transition.event_id,
@@ -790,7 +794,11 @@ fn event_to_stream_event(
                 to,
                 elapsed: None,
                 exit_code,
-                detail: event.payload.get("reason").and_then(|v| v.as_str()).map(String::from),
+                detail: event
+                    .payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 at: event.occurred_at,
             })
         }
@@ -805,7 +813,11 @@ fn event_to_stream_event(
                 .and_then(|s| parse_run_state(s))
                 .unwrap_or(RunState::RunOpen);
 
-            let reason = event.payload.get("reason").and_then(|v| v.as_str()).map(String::from);
+            let reason = event
+                .payload
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             let run_id = event.entity_id.parse().unwrap_or(Uuid::nil());
 
@@ -897,6 +909,48 @@ fn parse_merge_state(s: &str) -> Option<MergeState> {
     }
 }
 
+fn parse_submodule_mode(s: &str) -> Option<SubmoduleMode> {
+    match s {
+        "locked" | "Locked" => Some(SubmoduleMode::Locked),
+        "allow_fast_forward" | "AllowFastForward" => Some(SubmoduleMode::AllowFastForward),
+        "allow_any" | "AllowAny" => Some(SubmoduleMode::AllowAny),
+        _ => None,
+    }
+}
+
+fn parse_merge_strategy_value(value: &str) -> Option<MergeStrategy> {
+    match value {
+        "merge-no-ff" | "merge_no_ff" | "MergeNoFf" => Some(MergeStrategy::MergeNoFf),
+        "rebase-then-ff" | "rebase_then_ff" | "RebaseThenFf" => Some(MergeStrategy::RebaseThenFf),
+        "squash-merge" | "squash_merge" | "SquashMerge" => Some(MergeStrategy::SquashMerge),
+        _ => None,
+    }
+}
+
+fn parse_recovery_action(action: &str) -> RecoveryAction {
+    match action {
+        "abort" => RecoveryAction::Abort,
+        "resume" => RecoveryAction::Resume,
+        "manual-block" => RecoveryAction::ManualBlock,
+        _ => unreachable!("recovery action validated by caller"),
+    }
+}
+
+fn block_on_current_runtime<F>(future: F) -> Result<F::Output>
+where
+    F: Future,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        Ok(tokio::task::block_in_place(|| handle.block_on(future)))
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build tokio runtime for git orchestration")?;
+        Ok(runtime.block_on(future))
+    }
+}
+
 /// Run the renderer in a blocking context (requires raw terminal access).
 fn run_renderer(
     mut rx: mpsc::UnboundedReceiver<StreamEvent>,
@@ -930,7 +984,9 @@ fn run_renderer(
                 renderer.draw().context("dashboard draw failed")?;
 
                 // Poll for keyboard input (blocks for tick_rate_ms).
-                let quit = renderer.poll_input().context("dashboard input poll failed")?;
+                let quit = renderer
+                    .poll_input()
+                    .context("dashboard input poll failed")?;
                 if quit {
                     break;
                 }
@@ -942,7 +998,10 @@ fn run_renderer(
                         renderer.draw().context("dashboard final draw failed")?;
                         // Wait for user to press q.
                         loop {
-                            if renderer.poll_input().context("dashboard input poll failed")? {
+                            if renderer
+                                .poll_input()
+                                .context("dashboard input poll failed")?
+                            {
                                 break;
                             }
                         }
@@ -1002,6 +1061,13 @@ struct WorktreeProjection {
     last_event_type: String,
     reason: Option<String>,
     run_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+    repo_root: Option<PathBuf>,
+    worktree_path: Option<PathBuf>,
+    branch_name: Option<String>,
+    base_ref: Option<String>,
+    head_ref: Option<String>,
+    submodule_mode: Option<SubmoduleMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -1009,6 +1075,7 @@ struct MergeProjection {
     merge_id: Uuid,
     state: MergeState,
     run_id: Option<Uuid>,
+    worktree_id: Option<Uuid>,
     correlation_id: Uuid,
     updated_at: chrono::DateTime<chrono::Utc>,
     last_event_id: Uuid,
@@ -1023,6 +1090,25 @@ fn load_runtime_config_for_reads() -> Result<LoadedConfig> {
     LoadedConfig::load_default().context("failed to load runtime config")
 }
 
+fn ensure_write_backend_guard(loaded_config: &LoadedConfig, command_name: &str) -> Result<()> {
+    if matches!(
+        loaded_config.backend_selection()?,
+        BackendSelection::InMemory
+    ) && !loaded_config.config().core.allow_in_memory_writes
+    {
+        bail!(
+            "`{command_name}` refuses in-memory write mode. Configure durable storage with [core] backend = \"postgres\" and [postgres] database_url, or explicitly opt in with [core] allow_in_memory_writes = true."
+        );
+    }
+    Ok(())
+}
+
+fn load_runtime_config_for_writes(command_name: &str) -> Result<LoadedConfig> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    ensure_write_backend_guard(&loaded_config, command_name)?;
+    Ok(loaded_config)
+}
+
 fn prepare_audit_sink(loaded_config: &LoadedConfig) -> Result<Option<JsonlAuditSink>> {
     if !loaded_config.config().policy.audit_decisions {
         return Ok(None);
@@ -1032,10 +1118,7 @@ fn prepare_audit_sink(loaded_config: &LoadedConfig) -> Result<Option<JsonlAuditS
     if let Some(parent) = audit_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create audit directory {}",
-                    parent.display()
-                )
+                format!("failed to create audit directory {}", parent.display())
             })?;
         }
     }
@@ -1125,7 +1208,10 @@ fn extract_entity_state(event: &Event) -> String {
 
 fn parse_gate_failure_entry(entry: &str) -> Option<(GateType, String)> {
     let (raw_gate, raw_reason) = entry.split_once(':')?;
-    let gate_name = raw_gate.trim().strip_prefix("gate.").unwrap_or(raw_gate.trim());
+    let gate_name = raw_gate
+        .trim()
+        .strip_prefix("gate.")
+        .unwrap_or(raw_gate.trim());
     let gate_type = parse_gate_type(gate_name)?;
     Some((gate_type, raw_reason.trim().to_string()))
 }
@@ -1219,7 +1305,10 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
 }
 
 fn load_task_projection(store: &dyn EventStore, task_id: Uuid) -> Result<Option<TaskProjection>> {
-    let task_events = query_events(store, &EventQuery::by_entity(EntityType::Task, task_id.to_string()))?;
+    let task_events = query_events(
+        store,
+        &EventQuery::by_entity(EntityType::Task, task_id.to_string()),
+    )?;
     if task_events.is_empty() {
         return Ok(None);
     }
@@ -1229,7 +1318,10 @@ fn load_task_projection(store: &dyn EventStore, task_id: Uuid) -> Result<Option<
 }
 
 fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<RunProjection>> {
-    let run_events = query_events(store, &EventQuery::by_entity(EntityType::Run, run_id.to_string()))?;
+    let run_events = query_events(
+        store,
+        &EventQuery::by_entity(EntityType::Run, run_id.to_string()),
+    )?;
     if run_events.is_empty() {
         return Ok(None);
     }
@@ -1306,6 +1398,13 @@ fn load_worktree_projection(
     let mut last_event_type = events[0].event_type.clone();
     let mut reason = None;
     let mut run_id = None;
+    let mut task_id = None;
+    let mut repo_root = None;
+    let mut worktree_path = None;
+    let mut branch_name = None;
+    let mut base_ref = None;
+    let mut head_ref = None;
+    let mut submodule_mode = None;
 
     for event in &events {
         correlation_id = event.correlation_id;
@@ -1329,6 +1428,52 @@ fn load_worktree_projection(
         {
             run_id = Some(value);
         }
+
+        if let Some(value) = event
+            .payload
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .and_then(|raw| raw.parse::<Uuid>().ok())
+        {
+            task_id = Some(value);
+        }
+
+        if let Some(value) = event.payload.get("repo_root").and_then(|value| value.as_str()) {
+            repo_root = Some(PathBuf::from(value));
+        }
+
+        if let Some(value) = event
+            .payload
+            .get("worktree_path")
+            .and_then(|value| value.as_str())
+        {
+            worktree_path = Some(PathBuf::from(value));
+        }
+
+        if let Some(value) = event
+            .payload
+            .get("branch_name")
+            .and_then(|value| value.as_str())
+        {
+            branch_name = Some(value.to_string());
+        }
+
+        if let Some(value) = event.payload.get("base_ref").and_then(|value| value.as_str()) {
+            base_ref = Some(value.to_string());
+        }
+
+        if let Some(value) = event.payload.get("head_ref").and_then(|value| value.as_str()) {
+            head_ref = Some(value.to_string());
+        }
+
+        if let Some(value) = event
+            .payload
+            .get("submodule_mode")
+            .and_then(|value| value.as_str())
+            .and_then(parse_submodule_mode)
+        {
+            submodule_mode = Some(value);
+        }
     }
 
     Ok(Some(WorktreeProjection {
@@ -1340,10 +1485,20 @@ fn load_worktree_projection(
         last_event_type,
         reason,
         run_id,
+        task_id,
+        repo_root,
+        worktree_path,
+        branch_name,
+        base_ref,
+        head_ref,
+        submodule_mode,
     }))
 }
 
-fn load_merge_projection(store: &dyn EventStore, merge_id: Uuid) -> Result<Option<MergeProjection>> {
+fn load_merge_projection(
+    store: &dyn EventStore,
+    merge_id: Uuid,
+) -> Result<Option<MergeProjection>> {
     let events = query_events(
         store,
         &EventQuery::by_entity(EntityType::Merge, merge_id.to_string()),
@@ -1354,6 +1509,7 @@ fn load_merge_projection(store: &dyn EventStore, merge_id: Uuid) -> Result<Optio
 
     let mut state = MergeState::MergeRequested;
     let mut run_id = None;
+    let mut worktree_id = None;
     let mut correlation_id = events[0].correlation_id;
     let mut updated_at = events[0].occurred_at;
     let mut last_event_id = events[0].event_id;
@@ -1386,6 +1542,15 @@ fn load_merge_projection(store: &dyn EventStore, merge_id: Uuid) -> Result<Optio
             run_id = Some(value);
         }
 
+        if let Some(value) = event
+            .payload
+            .get("worktree_id")
+            .and_then(|value| value.as_str())
+            .and_then(|raw| raw.parse::<Uuid>().ok())
+        {
+            worktree_id = Some(value);
+        }
+
         if let Some(value) = event.payload.get("source").and_then(|value| value.as_str()) {
             source_ref = Some(value.to_string());
         }
@@ -1407,6 +1572,7 @@ fn load_merge_projection(store: &dyn EventStore, merge_id: Uuid) -> Result<Optio
         merge_id,
         state,
         run_id,
+        worktree_id,
         correlation_id,
         updated_at,
         last_event_id,
@@ -1416,6 +1582,138 @@ fn load_merge_projection(store: &dyn EventStore, merge_id: Uuid) -> Result<Optio
         target_ref,
         strategy,
     }))
+}
+
+fn load_latest_worktree_projection_for_run(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+) -> Result<Option<WorktreeProjection>> {
+    let events = query_events(store, &EventQuery::by_correlation(correlation_id))?;
+    let mut worktree_ids: Vec<Uuid> = events
+        .iter()
+        .filter(|event| event.entity_type == EntityType::Worktree)
+        .filter_map(|event| event.entity_id.parse::<Uuid>().ok())
+        .collect();
+    worktree_ids.sort();
+    worktree_ids.dedup();
+
+    let mut projections = Vec::new();
+    for worktree_id in worktree_ids {
+        if let Some(projection) = load_worktree_projection(store, worktree_id)? {
+            if projection.run_id == Some(run_id) {
+                projections.push(projection);
+            }
+        }
+    }
+
+    projections.sort_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.worktree_id.cmp(&b.worktree_id))
+    });
+
+    Ok(projections.pop())
+}
+
+fn build_worktree_binding(projection: &WorktreeProjection) -> Result<WorktreeBinding> {
+    let run_id = projection
+        .run_id
+        .ok_or_else(|| anyhow::anyhow!("worktree {} missing run_id context", projection.worktree_id))?;
+    let repo_root = projection
+        .repo_root
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("worktree {} missing repo_root context", projection.worktree_id))?
+        .clone();
+    let branch_name = projection
+        .branch_name
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("worktree {} missing branch_name context", projection.worktree_id))?
+        .clone();
+    let worktree_path = projection
+        .worktree_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("worktree {} missing worktree_path context", projection.worktree_id))?
+        .clone();
+    let base_ref = projection
+        .base_ref
+        .clone()
+        .or_else(|| projection.head_ref.clone())
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let mut binding = WorktreeBinding::new(
+        run_id,
+        repo_root,
+        branch_name,
+        base_ref,
+        projection.correlation_id,
+    );
+    binding.id = projection.worktree_id;
+    binding.state = projection.state;
+    binding.updated_at = projection.updated_at;
+    binding.set_worktree_path(worktree_path);
+    if let Some(task_id) = projection.task_id {
+        binding = binding.with_task(task_id);
+    }
+    if let Some(head_ref) = projection.head_ref.as_ref() {
+        binding.head_ref = head_ref.clone();
+    }
+    if let Some(mode) = projection.submodule_mode {
+        binding = binding.with_submodule_mode(mode);
+    }
+    Ok(binding)
+}
+
+fn build_merge_intent(merge: &MergeProjection, worktree_id: Uuid) -> Result<MergeIntent> {
+    let run_id = merge
+        .run_id
+        .ok_or_else(|| anyhow::anyhow!("merge intent {} missing run_id context", merge.merge_id))?;
+    let source_ref = merge
+        .source_ref
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("merge intent {} missing source ref", merge.merge_id))?
+        .clone();
+    let target_ref = merge
+        .target_ref
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("merge intent {} missing target ref", merge.merge_id))?
+        .clone();
+
+    let mut intent = MergeIntent::new(run_id, worktree_id, source_ref, target_ref, merge.correlation_id);
+    intent.id = merge.merge_id;
+    intent.state = merge.state;
+    intent.updated_at = merge.updated_at;
+    if let Some(strategy_raw) = merge.strategy.as_deref() {
+        let strategy = parse_merge_strategy_value(strategy_raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "merge intent {} has unsupported strategy {strategy_raw}",
+                merge.merge_id
+            )
+        })?;
+        intent.strategy = strategy;
+    }
+    Ok(intent)
+}
+
+fn resolve_merge_worktree_projection(
+    store: &dyn EventStore,
+    merge: &MergeProjection,
+) -> Result<WorktreeProjection> {
+    if let Some(worktree_id) = merge.worktree_id {
+        return load_worktree_projection(store, worktree_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "worktree {} referenced by merge intent {} not found",
+                worktree_id,
+                merge.merge_id
+            )
+        });
+    }
+
+    let run_id = merge
+        .run_id
+        .ok_or_else(|| anyhow::anyhow!("merge intent {} missing run_id context", merge.merge_id))?;
+    load_latest_worktree_projection_for_run(store, run_id, merge.correlation_id)?
+        .ok_or_else(|| anyhow::anyhow!("no worktree context found for merge intent {}", merge.merge_id))
 }
 
 fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
@@ -1505,7 +1803,14 @@ fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
                 gates: task
                     .failed_gates
                     .iter()
-                    .map(|(gate_type, reason)| (*gate_type, GateResult::Failed { reason: reason.clone() }))
+                    .map(|(gate_type, reason)| {
+                        (
+                            *gate_type,
+                            GateResult::Failed {
+                                reason: reason.clone(),
+                            },
+                        )
+                    })
                     .collect(),
                 last_transition_at: Some(task.updated_at),
             })
@@ -1513,7 +1818,14 @@ fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
         gates: run
             .failed_gates
             .iter()
-            .map(|(gate_type, reason)| (*gate_type, GateResult::Failed { reason: reason.clone() }))
+            .map(|(gate_type, reason)| {
+                (
+                    *gate_type,
+                    GateResult::Failed {
+                        reason: reason.clone(),
+                    },
+                )
+            })
             .collect(),
     };
     let explain = explain_run(&snapshot);
@@ -1575,7 +1887,14 @@ fn render_task_explain(store: &dyn EventStore, task_id: Uuid) -> Result<String> 
         gates: task
             .failed_gates
             .iter()
-            .map(|(gate_type, reason)| (*gate_type, GateResult::Failed { reason: reason.clone() }))
+            .map(|(gate_type, reason)| {
+                (
+                    *gate_type,
+                    GateResult::Failed {
+                        reason: reason.clone(),
+                    },
+                )
+            })
             .collect(),
         last_transition_at: Some(task.updated_at),
     };
@@ -1595,7 +1914,12 @@ fn render_task_explain(store: &dyn EventStore, task_id: Uuid) -> Result<String> 
         writeln!(&mut out)?;
         writeln!(&mut out, "Failed gates:")?;
         for failure in &explain.failed_gates {
-            writeln!(&mut out, "  {} - {}", failure.gate_type.label(), failure.reason)?;
+            writeln!(
+                &mut out,
+                "  {} - {}",
+                failure.gate_type.label(),
+                failure.reason
+            )?;
         }
     }
 
@@ -1688,24 +2012,126 @@ fn append_worktree_transition_event(
     action: &str,
     reason: &str,
     causation_id: Option<Uuid>,
+    binding: Option<&WorktreeBinding>,
+    side_effect: bool,
+    git_error: Option<&str>,
 ) -> Result<Event> {
+    let mut payload = serde_json::json!({
+        "from": format!("{from:?}"),
+        "to": format!("{to:?}"),
+        "action": action,
+        "reason": reason,
+        "run_id": projection.run_id,
+        "side_effect": side_effect,
+    });
+    if let Some(message) = git_error {
+        payload["git_error"] = serde_json::Value::String(message.to_string());
+    }
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(task_id) = projection.task_id {
+            map.insert("task_id".to_string(), serde_json::Value::String(task_id.to_string()));
+        }
+        if let Some(mode) = projection.submodule_mode {
+            map.insert(
+                "submodule_mode".to_string(),
+                serde_json::Value::String(
+                    match mode {
+                        SubmoduleMode::Locked => "locked",
+                        SubmoduleMode::AllowFastForward => "allow_fast_forward",
+                        SubmoduleMode::AllowAny => "allow_any",
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+
+        if let Some(binding) = binding {
+            map.insert(
+                "repo_root".to_string(),
+                serde_json::Value::String(binding.repo_root.display().to_string()),
+            );
+            map.insert(
+                "worktree_path".to_string(),
+                serde_json::Value::String(binding.worktree_path.display().to_string()),
+            );
+            map.insert(
+                "branch_name".to_string(),
+                serde_json::Value::String(binding.branch_name.clone()),
+            );
+            map.insert(
+                "base_ref".to_string(),
+                serde_json::Value::String(binding.base_ref.clone()),
+            );
+            map.insert(
+                "head_ref".to_string(),
+                serde_json::Value::String(binding.head_ref.clone()),
+            );
+            map.insert(
+                "submodule_mode".to_string(),
+                serde_json::Value::String(
+                    match binding.submodule_mode {
+                        SubmoduleMode::Locked => "locked",
+                        SubmoduleMode::AllowFastForward => "allow_fast_forward",
+                        SubmoduleMode::AllowAny => "allow_any",
+                    }
+                    .to_string(),
+                ),
+            );
+            if let Some(task_id) = binding.task_id {
+                map.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id.to_string()),
+                );
+            }
+        } else {
+            if let Some(repo_root) = projection.repo_root.as_ref() {
+                map.insert(
+                    "repo_root".to_string(),
+                    serde_json::Value::String(repo_root.display().to_string()),
+                );
+            }
+            if let Some(worktree_path) = projection.worktree_path.as_ref() {
+                map.insert(
+                    "worktree_path".to_string(),
+                    serde_json::Value::String(worktree_path.display().to_string()),
+                );
+            }
+            if let Some(branch_name) = projection.branch_name.as_ref() {
+                map.insert(
+                    "branch_name".to_string(),
+                    serde_json::Value::String(branch_name.clone()),
+                );
+            }
+            if let Some(base_ref) = projection.base_ref.as_ref() {
+                map.insert(
+                    "base_ref".to_string(),
+                    serde_json::Value::String(base_ref.clone()),
+                );
+            }
+            if let Some(head_ref) = projection.head_ref.as_ref() {
+                map.insert(
+                    "head_ref".to_string(),
+                    serde_json::Value::String(head_ref.clone()),
+                );
+            }
+        }
+    }
+
     let event = Event {
         event_id: Uuid::now_v7(),
         occurred_at: chrono::Utc::now(),
         entity_type: EntityType::Worktree,
         entity_id: projection.worktree_id.to_string(),
         event_type: event_type.to_string(),
-        payload: serde_json::json!({
-            "from": format!("{from:?}"),
-            "to": format!("{to:?}"),
-            "action": action,
-            "reason": reason,
-            "run_id": projection.run_id,
-        }),
+        payload,
         correlation_id: projection.correlation_id,
         causation_id,
         actor: "cli".to_string(),
-        idempotency_key: None,
+        idempotency_key: Some(worktree_recovery_idempotency_key(
+            projection.worktree_id,
+            action,
+            event_type,
+        )),
     };
     append_event(store, event.clone())?;
     Ok(event)
@@ -1746,67 +2172,118 @@ fn execute_worktree_recover(
             action,
             &reason,
             causation_id,
+            None,
+            false,
+            None,
         )?;
         current_state = WorktreeState::WtRecovering;
         causation_id = Some(started.event_id);
         persisted_events += 1;
     }
 
-    match action {
-        "abort" => {
+    let mut side_effect_status = "executed";
+    let mut failure_reason = None::<String>;
+    let mut binding = match build_worktree_binding(&projection) {
+        Ok(binding) => binding,
+        Err(err) => {
+            let reason = format!("recovery orchestration context error: {err}");
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovery_failed",
+                WorktreeState::WtRecovering,
+                WorktreeState::WtRecovering,
+                action,
+                &reason,
+                causation_id,
+                None,
+                false,
+                Some(&reason),
+            )?;
+            persisted_events += 1;
+            let mut output = String::new();
+            writeln!(&mut output, "Worktree recovery for {worktree_id}")?;
+            writeln!(&mut output, "Action: {action}")?;
+            writeln!(&mut output, "Resulting state: {:?}", WorktreeState::WtRecovering)?;
+            writeln!(&mut output, "Persisted events: {persisted_events}")?;
+            writeln!(&mut output, "Side effect: failed")?;
+            writeln!(&mut output, "Failure: {reason}")?;
+            return Ok(output.trim_end().to_string());
+        }
+    };
+    binding.state = current_state;
+    let manager = LocalWorktreeManager::new();
+    let recover_action = parse_recovery_action(action);
+    let recover_result = block_on_current_runtime(manager.recover(
+        &mut binding,
+        recover_action,
+        CancellationToken::new(),
+    ))?;
+
+    match recover_result {
+        Ok(()) => {
+            current_state = binding.state;
+            let recovered_reason = match action {
+                "abort" => "aborted interrupted operation and restored bound home state",
+                "resume" => "resumed interrupted operation and restored bound home state",
+                "manual-block" => "manual intervention required before recovery can continue",
+                _ => unreachable!("action validated by caller"),
+            };
             append_worktree_transition_event(
                 store,
                 &projection,
                 "worktree.recovered",
+                WorktreeState::WtRecovering,
                 current_state,
-                WorktreeState::WtBoundHome,
                 action,
-                "aborted interrupted operation and restored bound home state",
+                recovered_reason,
                 causation_id,
+                Some(&binding),
+                true,
+                None,
             )?;
-            current_state = WorktreeState::WtBoundHome;
             persisted_events += 1;
         }
-        "resume" => {
-            append_worktree_transition_event(
-                store,
-                &projection,
-                "worktree.recovered",
-                current_state,
-                WorktreeState::WtBoundHome,
-                action,
-                "resumed interrupted operation and restored bound home state",
-                causation_id,
-            )?;
-            current_state = WorktreeState::WtBoundHome;
-            persisted_events += 1;
-        }
-        "manual-block" => {
-            append_event(
-                store,
-                Event {
-                    event_id: Uuid::now_v7(),
-                    occurred_at: chrono::Utc::now(),
-                    entity_type: EntityType::Worktree,
-                    entity_id: projection.worktree_id.to_string(),
-                    event_type: "worktree.recovery_blocked".to_string(),
-                    payload: serde_json::json!({
-                        "from": format!("{current_state:?}"),
-                        "to": "WtRecovering",
-                        "action": action,
-                        "reason": "manual intervention required before recovery can continue",
-                        "run_id": projection.run_id,
-                    }),
-                    correlation_id: projection.correlation_id,
-                    causation_id,
-                    actor: "cli".to_string(),
-                    idempotency_key: None,
-                },
-            )?;
+        Err(GitError::InterruptedOperation { operation, .. })
+            if matches!(recover_action, RecoveryAction::ManualBlock) =>
+        {
             current_state = WorktreeState::WtRecovering;
+            side_effect_status = "blocked";
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovery_blocked",
+                WorktreeState::WtRecovering,
+                WorktreeState::WtRecovering,
+                action,
+                &format!("manual intervention required for interrupted {operation}"),
+                causation_id,
+                Some(&binding),
+                true,
+                None,
+            )?;
             persisted_events += 1;
         }
-        _ => unreachable!("action validated by caller"),
+        Err(err) => {
+            current_state = binding.state;
+            side_effect_status = "failed";
+            let reason = format!("recovery orchestration failed: {err}");
+            failure_reason = Some(reason.clone());
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovery_failed",
+                WorktreeState::WtRecovering,
+                current_state,
+                action,
+                &reason,
+                causation_id,
+                Some(&binding),
+                true,
+                Some(&reason),
+            )?;
+            persisted_events += 1;
+        }
     }
 
     let mut output = String::new();
@@ -1814,6 +2291,10 @@ fn execute_worktree_recover(
     writeln!(&mut output, "Action: {action}")?;
     writeln!(&mut output, "Resulting state: {current_state:?}")?;
     writeln!(&mut output, "Persisted events: {persisted_events}")?;
+    writeln!(&mut output, "Side effect: {side_effect_status}")?;
+    if let Some(reason) = failure_reason.as_ref() {
+        writeln!(&mut output, "Failure: {reason}")?;
+    }
     writeln!(
         &mut output,
         "Previous state: {:?} (event: {}, updated: {})",
@@ -1836,15 +2317,17 @@ fn gate_result_status(result: &GateResult) -> &'static str {
 }
 
 fn parse_command_class_value(value: &serde_json::Value) -> Option<CommandClass> {
-    serde_json::from_value::<CommandClass>(value.clone()).ok().or_else(|| {
-        value.as_str().and_then(|raw| match raw {
-            "io" | "Io" => Some(CommandClass::Io),
-            "cpu" | "Cpu" => Some(CommandClass::Cpu),
-            "git" | "Git" => Some(CommandClass::Git),
-            "tool" | "Tool" => Some(CommandClass::Tool),
-            _ => None,
+    serde_json::from_value::<CommandClass>(value.clone())
+        .ok()
+        .or_else(|| {
+            value.as_str().and_then(|raw| match raw {
+                "io" | "Io" => Some(CommandClass::Io),
+                "cpu" | "Cpu" => Some(CommandClass::Cpu),
+                "git" | "Git" => Some(CommandClass::Git),
+                "tool" | "Tool" => Some(CommandClass::Tool),
+                _ => None,
+            })
         })
-    })
 }
 
 fn is_command_event_for_task(event: &Event, task_id: Uuid) -> bool {
@@ -1865,7 +2348,10 @@ fn collect_task_command_evidence(
     let mut started_meta: HashMap<String, (String, Option<CommandClass>)> = HashMap::new();
     let mut terminal_events: Vec<&Event> = Vec::new();
 
-    for event in events.iter().filter(|event| is_command_event_for_task(event, task_id)) {
+    for event in events
+        .iter()
+        .filter(|event| is_command_event_for_task(event, task_id))
+    {
         match event.event_type.as_str() {
             "command.started" => {
                 let command = event
@@ -1956,8 +2442,10 @@ fn build_task_gate_context(
         .iter()
         .map(|task| (task.task_id, task.task_id.to_string(), task.state))
         .collect::<Vec<_>>();
-    let all_tasks_complete =
-        !task_states.is_empty() && task_states.iter().all(|(_, _, state)| *state == TaskState::TaskComplete);
+    let all_tasks_complete = !task_states.is_empty()
+        && task_states
+            .iter()
+            .all(|(_, _, state)| *state == TaskState::TaskComplete);
 
     let worktree_events: Vec<Event> = events
         .iter()
@@ -1975,7 +2463,10 @@ fn build_task_gate_context(
 
     let mut policy_violations = Vec::new();
     let mut has_unapproved_git_ops = false;
-    for event in events.iter().filter(|event| event.entity_type == EntityType::Policy) {
+    for event in events
+        .iter()
+        .filter(|event| event.entity_type == EntityType::Policy)
+    {
         if policy_outcome_is_allowed(&event.payload) {
             continue;
         }
@@ -2018,11 +2509,7 @@ fn render_gate_rerun_output(
     let mut output = String::new();
     writeln!(&mut output, "Gate re-run for task {task_id}")?;
     writeln!(&mut output, "Run: {run_id}")?;
-    writeln!(
-        &mut output,
-        "Evaluated {} gate(s):",
-        selected_count
-    )?;
+    writeln!(&mut output, "Evaluated {} gate(s):", selected_count)?;
 
     for evaluation in evaluations {
         match &evaluation.result {
@@ -2113,7 +2600,10 @@ fn execute_gate_rerun(
                 correlation_id: task.correlation_id,
                 causation_id: Some(task.last_event_id),
                 actor: "cli".to_string(),
-                idempotency_key: None,
+                idempotency_key: Some(gate_rerun_idempotency_key(
+                    task_id,
+                    evaluation.gate_type.label(),
+                )),
             },
         )?;
     }
@@ -2194,6 +2684,27 @@ fn policy_outcome_label(outcome: PolicyOutcome) -> &'static str {
     }
 }
 
+fn gate_rerun_idempotency_key(task_id: Uuid, gate_label: &str) -> String {
+    format!("{task_id}:gate_rerun:{gate_label}")
+}
+
+fn worktree_recovery_idempotency_key(worktree_id: Uuid, action: &str, event_type: &str) -> String {
+    format!("{worktree_id}:worktree_recover:{action}:{event_type}")
+}
+
+fn merge_request_idempotency_key(
+    run_id: Uuid,
+    source: &str,
+    target: &str,
+    strategy: &str,
+) -> String {
+    format!("{run_id}:merge_request:{source}:{target}:{strategy}")
+}
+
+fn merge_operation_idempotency_key(merge_id: Uuid, operation: &str, event_type: &str) -> String {
+    format!("{merge_id}:{operation}:{event_type}")
+}
+
 fn persist_merge_policy_decision(
     store: &dyn EventStore,
     merge: &MergeProjection,
@@ -2220,7 +2731,11 @@ fn persist_merge_policy_decision(
             correlation_id: merge.correlation_id,
             causation_id: Some(merge.last_event_id),
             actor: decision.actor.clone(),
-            idempotency_key: None,
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge.merge_id,
+                operation,
+                "policy.decision",
+            )),
         },
     )
 }
@@ -2273,6 +2788,67 @@ fn evaluate_merge_policy(
         .map_err(|e| anyhow::anyhow!("policy evaluation failed: {e}"))
 }
 
+fn append_merge_execution_event(
+    store: &dyn EventStore,
+    merge: &MergeProjection,
+    operation: &str,
+    event_type: &str,
+    from: MergeState,
+    to: MergeState,
+    reason: &str,
+    causation_id: Option<Uuid>,
+    worktree: Option<&WorktreeBinding>,
+    merge_sha: Option<&str>,
+    conflict_count: Option<usize>,
+) -> Result<()> {
+    let mut payload = serde_json::json!({
+        "operation": operation,
+        "from": format!("{from:?}"),
+        "to": format!("{to:?}"),
+        "state": format!("{to:?}"),
+        "run_id": merge.run_id,
+        "worktree_id": merge.worktree_id.or(worktree.map(|binding| binding.id)),
+        "source": merge.source_ref.clone(),
+        "target": merge.target_ref.clone(),
+        "strategy": merge.strategy.clone(),
+        "reason": reason,
+    });
+    if let Some(sha) = merge_sha {
+        payload["merge_sha"] = serde_json::Value::String(sha.to_string());
+    }
+    if let Some(count) = conflict_count {
+        payload["conflict_count"] = serde_json::json!(count);
+    }
+    if let Some(binding) = worktree {
+        payload["worktree_state"] = serde_json::Value::String(format!("{:?}", binding.state));
+        payload["worktree_head"] = serde_json::Value::String(binding.head_ref.clone());
+        payload["repo_root"] =
+            serde_json::Value::String(binding.repo_root.display().to_string());
+        payload["worktree_path"] =
+            serde_json::Value::String(binding.worktree_path.display().to_string());
+    }
+
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge.merge_id.to_string(),
+            event_type: event_type.to_string(),
+            payload,
+            correlation_id: merge.correlation_id,
+            causation_id,
+            actor: "cli".to_string(),
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge.merge_id,
+                operation,
+                event_type,
+            )),
+        },
+    )
+}
+
 fn execute_merge_request(
     store: &dyn EventStore,
     source: &str,
@@ -2284,6 +2860,8 @@ fn execute_merge_request(
         Some(run) => run,
         None => return Ok(format!("Run {run_id} not found in persisted event log.")),
     };
+    let worktree_id = load_latest_worktree_projection_for_run(store, run_id, run.correlation_id)?
+        .map(|worktree| worktree.worktree_id);
 
     let merge_id = Uuid::now_v7();
     append_event(
@@ -2299,6 +2877,7 @@ fn execute_merge_request(
                 "to": "MergeRequested",
                 "state": "MergeRequested",
                 "run_id": run_id,
+                "worktree_id": worktree_id,
                 "source": source,
                 "target": target,
                 "strategy": strategy,
@@ -2307,7 +2886,9 @@ fn execute_merge_request(
             correlation_id: run.correlation_id,
             causation_id: None,
             actor: "cli".to_string(),
-            idempotency_key: None,
+            idempotency_key: Some(merge_request_idempotency_key(
+                run_id, source, target, strategy,
+            )),
         },
     )?;
 
@@ -2315,6 +2896,9 @@ fn execute_merge_request(
     writeln!(&mut out, "Merge intent requested")?;
     writeln!(&mut out, "Merge ID: {merge_id}")?;
     writeln!(&mut out, "Run: {run_id}")?;
+    if let Some(worktree_id) = worktree_id {
+        writeln!(&mut out, "Worktree: {worktree_id}")?;
+    }
     writeln!(&mut out, "Source: {source}")?;
     writeln!(&mut out, "Target: {target}")?;
     writeln!(&mut out, "Strategy: {strategy}")?;
@@ -2375,7 +2959,11 @@ fn execute_merge_approve(
                     correlation_id: merge.correlation_id,
                     causation_id: Some(decision.decision_id),
                     actor: "cli".to_string(),
-                    idempotency_key: None,
+                    idempotency_key: Some(merge_operation_idempotency_key(
+                        merge_id,
+                        "merge.approve",
+                        "merge.policy_blocked",
+                    )),
                 },
             )?;
             if let Some(sink) = audit_sink {
@@ -2403,10 +2991,11 @@ fn execute_merge_approve(
         causation_id = Some(decision.decision_id);
     }
 
+    let approved_event_id = Uuid::now_v7();
     append_event(
         store,
         Event {
-            event_id: Uuid::now_v7(),
+            event_id: approved_event_id,
             occurred_at: chrono::Utc::now(),
             entity_type: EntityType::Merge,
             entity_id: merge_id.to_string(),
@@ -2416,6 +3005,7 @@ fn execute_merge_approve(
                 "to": "MergePrecheck",
                 "state": "MergePrecheck",
                 "run_id": merge.run_id,
+                "worktree_id": merge.worktree_id,
                 "source": merge.source_ref,
                 "target": merge.target_ref,
                 "strategy": merge.strategy,
@@ -2424,12 +3014,220 @@ fn execute_merge_approve(
             correlation_id: merge.correlation_id,
             causation_id,
             actor: "cli".to_string(),
-            idempotency_key: None,
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge_id,
+                "merge.approve",
+                "merge.approved",
+            )),
         },
     )?;
 
+    let worktree_projection = match resolve_merge_worktree_projection(store, &merge) {
+        Ok(worktree) => worktree,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                MergeState::MergePrecheck,
+                &format!("merge orchestration context error: {err}"),
+                Some(approved_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but execution failed (missing git context): {err}"
+            ));
+        }
+    };
+
+    let mut binding = match build_worktree_binding(&worktree_projection) {
+        Ok(binding) => binding,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                MergeState::MergePrecheck,
+                &format!("merge orchestration context error: {err}"),
+                Some(approved_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but execution failed (invalid worktree context): {err}"
+            ));
+        }
+    };
+    let mut intent = match build_merge_intent(&merge, binding.id) {
+        Ok(intent) => intent,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                MergeState::MergePrecheck,
+                &format!("merge orchestration context error: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but execution failed (invalid merge context): {err}"
+            ));
+        }
+    };
+
+    let orchestrator = LocalMergeOrchestrator::new(LocalWorktreeManager::new());
+    let cancel = CancellationToken::new();
+    let precheck = match block_on_current_runtime(orchestrator.precheck(
+        &mut intent,
+        &binding,
+        cancel.clone(),
+    ))? {
+        Ok(precheck) => precheck,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                intent.state,
+                &format!("merge precheck failed: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but precheck failed: {err}"
+            ));
+        }
+    };
+
+    let dry_run = match block_on_current_runtime(orchestrator.dry_run(
+        &mut intent,
+        &binding,
+        cancel.clone(),
+    ))? {
+        Ok(result) => result,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                intent.state,
+                &format!("merge dry-run failed: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but dry-run failed: {err}"
+            ));
+        }
+    };
+
+    if !dry_run.clean {
+        append_merge_execution_event(
+            store,
+            &merge,
+            "merge.approve",
+            "merge.execution_failed",
+            MergeState::MergePrecheck,
+            MergeState::MergeConflict,
+            "merge dry-run detected conflicts",
+            Some(approved_event_id),
+            Some(&binding),
+            None,
+            Some(dry_run.conflicts.len()),
+        )?;
+        return Ok(format!(
+            "Merge intent {merge_id} approved but dry-run found {} conflict(s).",
+            dry_run.conflicts.len()
+        ));
+    }
+
+    let apply = match block_on_current_runtime(orchestrator.apply(
+        &mut intent,
+        &mut binding,
+        cancel.clone(),
+    ))? {
+        Ok(apply) => apply,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergeApply,
+                intent.state,
+                &format!("merge apply failed: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but apply failed: {err}"
+            ));
+        }
+    };
+
+    if let Err(err) = block_on_current_runtime(orchestrator.verify(
+        &mut intent,
+        &binding,
+        &precheck.submodule_snapshot,
+        cancel,
+    ))? {
+        append_merge_execution_event(
+            store,
+            &merge,
+            "merge.approve",
+            "merge.execution_failed",
+            MergeState::MergeVerify,
+            intent.state,
+            &format!("merge verify failed: {err}"),
+            Some(approved_event_id),
+            Some(&binding),
+            apply.merge_sha.as_str().into(),
+            None,
+        )?;
+        return Ok(format!(
+            "Merge intent {merge_id} approved but verify failed: {err}"
+        ));
+    }
+
+    append_merge_execution_event(
+        store,
+        &merge,
+        "merge.approve",
+        "merge.execution_succeeded",
+        MergeState::MergePrecheck,
+        intent.state,
+        "merge orchestration completed successfully",
+        Some(approved_event_id),
+        Some(&binding),
+        Some(apply.merge_sha.as_str()),
+        None,
+    )?;
+
     Ok(format!(
-        "Merge intent {merge_id} transitioned MergeRequested -> MergePrecheck."
+        "Merge intent {merge_id} approved and executed to {:?} (merge_sha: {}).",
+        intent.state, apply.merge_sha
     ))
 }
 
@@ -2487,7 +3285,11 @@ fn execute_merge_reject(
                     correlation_id: merge.correlation_id,
                     causation_id: Some(decision.decision_id),
                     actor: "cli".to_string(),
-                    idempotency_key: None,
+                    idempotency_key: Some(merge_operation_idempotency_key(
+                        merge_id,
+                        "merge.reject",
+                        "merge.policy_blocked",
+                    )),
                 },
             )?;
             if let Some(sink) = audit_sink {
@@ -2515,10 +3317,11 @@ fn execute_merge_reject(
         causation_id = Some(decision.decision_id);
     }
 
+    let rejected_event_id = Uuid::now_v7();
     append_event(
         store,
         Event {
-            event_id: Uuid::now_v7(),
+            event_id: rejected_event_id,
             occurred_at: chrono::Utc::now(),
             entity_type: EntityType::Merge,
             entity_id: merge_id.to_string(),
@@ -2528,6 +3331,7 @@ fn execute_merge_reject(
                 "to": "MergeAborted",
                 "state": "MergeAborted",
                 "run_id": merge.run_id,
+                "worktree_id": merge.worktree_id,
                 "source": merge.source_ref,
                 "target": merge.target_ref,
                 "strategy": merge.strategy,
@@ -2536,8 +3340,117 @@ fn execute_merge_reject(
             correlation_id: merge.correlation_id,
             causation_id,
             actor: "cli".to_string(),
-            idempotency_key: None,
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge_id,
+                "merge.reject",
+                "merge.rejected",
+            )),
         },
+    )?;
+
+    let worktree_projection = match resolve_merge_worktree_projection(store, &merge) {
+        Ok(worktree) => worktree,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.reject",
+                "merge.execution_failed",
+                MergeState::MergeRequested,
+                MergeState::MergeRequested,
+                &format!("merge abort context error: {err}"),
+                Some(rejected_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} rejected but abort execution failed (missing git context): {err}"
+            ));
+        }
+    };
+
+    let mut binding = match build_worktree_binding(&worktree_projection) {
+        Ok(binding) => binding,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.reject",
+                "merge.execution_failed",
+                MergeState::MergeRequested,
+                MergeState::MergeRequested,
+                &format!("merge abort context error: {err}"),
+                Some(rejected_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} rejected but abort execution failed (invalid worktree context): {err}"
+            ));
+        }
+    };
+    let mut intent = match build_merge_intent(&merge, binding.id) {
+        Ok(intent) => intent,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.reject",
+                "merge.execution_failed",
+                MergeState::MergeRequested,
+                MergeState::MergeRequested,
+                &format!("merge abort context error: {err}"),
+                Some(rejected_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} rejected but abort execution failed (invalid merge context): {err}"
+            ));
+        }
+    };
+
+    let orchestrator = LocalMergeOrchestrator::new(LocalWorktreeManager::new());
+    let cancel = CancellationToken::new();
+    if let Err(err) = block_on_current_runtime(orchestrator.abort(
+        &mut intent,
+        &mut binding,
+        reason,
+        cancel,
+    ))? {
+        append_merge_execution_event(
+            store,
+            &merge,
+            "merge.reject",
+            "merge.execution_failed",
+            MergeState::MergeRequested,
+            intent.state,
+            &format!("merge abort failed: {err}"),
+            Some(rejected_event_id),
+            Some(&binding),
+            None,
+            None,
+        )?;
+        return Ok(format!(
+            "Merge intent {merge_id} rejected but abort execution failed: {err}"
+        ));
+    }
+
+    append_merge_execution_event(
+        store,
+        &merge,
+        "merge.reject",
+        "merge.execution_succeeded",
+        MergeState::MergeRequested,
+        intent.state,
+        "merge abort orchestration completed successfully",
+        Some(rejected_event_id),
+        Some(&binding),
+        intent.result_sha.as_deref(),
+        None,
     )?;
 
     Ok(format!(
@@ -2628,7 +3541,11 @@ fn cmd_task_explain(task_id_str: &str) -> Result<()> {
 }
 
 /// `yarli info` — show version and terminal capabilities.
-fn cmd_info(info: &TerminalInfo, render_mode: RenderMode, loaded_config: &LoadedConfig) -> Result<()> {
+fn cmd_info(
+    info: &TerminalInfo,
+    render_mode: RenderMode,
+    loaded_config: &LoadedConfig,
+) -> Result<()> {
     println!("yarli v{}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("Terminal:");
@@ -2638,7 +3555,11 @@ fn cmd_info(info: &TerminalInfo, render_mode: RenderMode, loaded_config: &Loaded
     println!();
     println!("Render mode: {:?}", render_mode);
     println!("Backend: {}", loaded_config.config().core.backend.as_str());
-    println!("Config:  {} ({})", loaded_config.path().display(), loaded_config.source().label());
+    println!(
+        "Config:  {} ({})",
+        loaded_config.path().display(),
+        loaded_config.source().label()
+    );
     Ok(())
 }
 
@@ -2647,9 +3568,10 @@ fn cmd_task_unblock(task_id_str: &str, reason: &str) -> Result<()> {
     let task_id: Uuid = task_id_str
         .parse()
         .context("invalid task ID (expected UUID)")?;
-    let loaded_config = load_runtime_config_for_reads()?;
-    let output =
-        with_event_store(&loaded_config, |store| execute_task_unblock(store, task_id, reason))?;
+    let loaded_config = load_runtime_config_for_writes("task unblock")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_task_unblock(store, task_id, reason)
+    })?;
     println!("{output}");
     Ok(())
 }
@@ -2688,8 +3610,10 @@ fn cmd_gate_rerun(task_id_str: &str, gate_name: Option<&str>) -> Result<()> {
         }
     }
 
-    let loaded_config = load_runtime_config_for_reads()?;
-    let output = with_event_store(&loaded_config, |store| execute_gate_rerun(store, task_id, gate_name))?;
+    let loaded_config = load_runtime_config_for_writes("gate rerun")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_gate_rerun(store, task_id, gate_name)
+    })?;
     println!("{output}");
     Ok(())
 }
@@ -2700,7 +3624,9 @@ fn cmd_worktree_status(run_id_str: &str) -> Result<()> {
         .parse()
         .context("invalid run ID (expected UUID)")?;
     let loaded_config = load_runtime_config_for_reads()?;
-    let output = with_event_store(&loaded_config, |store| render_worktree_status(store, run_id))?;
+    let output = with_event_store(&loaded_config, |store| {
+        render_worktree_status(store, run_id)
+    })?;
     println!("{output}");
     Ok(())
 }
@@ -2714,8 +3640,10 @@ fn cmd_worktree_recover(worktree_id_str: &str, action: &str) -> Result<()> {
         "abort" | "resume" | "manual-block" => {}
         _ => bail!("invalid recovery action: {action}. Use: abort, resume, or manual-block"),
     }
-    let loaded_config = load_runtime_config_for_reads()?;
-    let output = with_event_store(&loaded_config, |store| execute_worktree_recover(store, worktree_id, action))?;
+    let loaded_config = load_runtime_config_for_writes("worktree recover")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_worktree_recover(store, worktree_id, action)
+    })?;
     println!("{output}");
     Ok(())
 }
@@ -2731,7 +3659,7 @@ fn cmd_merge_request(source: &str, target: &str, run_id_str: &str, strategy: &st
         )
     })?;
 
-    let loaded_config = load_runtime_config_for_reads()?;
+    let loaded_config = load_runtime_config_for_writes("merge request")?;
     let output = with_event_store(&loaded_config, |store| {
         execute_merge_request(store, source, target, run_id, strategy)
     })?;
@@ -2744,7 +3672,7 @@ fn cmd_merge_approve(merge_id_str: &str) -> Result<()> {
     let merge_id: Uuid = merge_id_str
         .parse()
         .context("invalid merge intent ID (expected UUID)")?;
-    let loaded_config = load_runtime_config_for_reads()?;
+    let loaded_config = load_runtime_config_for_writes("merge approve")?;
     let audit_sink = prepare_audit_sink(&loaded_config)?;
     let output = with_event_store(&loaded_config, |store| {
         execute_merge_approve(
@@ -2764,7 +3692,7 @@ fn cmd_merge_reject(merge_id_str: &str, reason: &str) -> Result<()> {
     let merge_id: Uuid = merge_id_str
         .parse()
         .context("invalid merge intent ID (expected UUID)")?;
-    let loaded_config = load_runtime_config_for_reads()?;
+    let loaded_config = load_runtime_config_for_writes("merge reject")?;
     let audit_sink = prepare_audit_sink(&loaded_config)?;
     let output = with_event_store(&loaded_config, |store| {
         execute_merge_reject(
@@ -2918,13 +3846,22 @@ fn parse_merge_strategy(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
     use chrono::Utc;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
     use yarli_observability::{AuditCategory, AuditEntry, InMemoryAuditSink};
     use yarli_store::event_store::EventQuery;
     use yarli_store::InMemoryEventStore;
 
     const VALID_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    fn write_test_config(contents: &str) -> LoadedConfig {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        std::fs::write(&path, contents).unwrap();
+        LoadedConfig::load(path).unwrap()
+    }
 
     fn make_event(
         entity_type: EntityType,
@@ -2945,6 +3882,109 @@ mod tests {
             actor: "test".to_string(),
             idempotency_key: None,
         }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) -> (bool, String, String) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command should run");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    fn run_git_expect_ok(repo: &Path, args: &[&str]) {
+        let (ok, _stdout, stderr) = run_git(repo, args);
+        assert!(ok, "git {:?} failed: {stderr}", args);
+    }
+
+    fn seed_worktree_event_payload(
+        binding: &WorktreeBinding,
+        from: &str,
+        to: &str,
+        reason: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "from": from,
+            "to": to,
+            "run_id": binding.run_id,
+            "task_id": binding.task_id,
+            "repo_root": binding.repo_root.display().to_string(),
+            "worktree_path": binding.worktree_path.display().to_string(),
+            "branch_name": binding.branch_name.clone(),
+            "base_ref": binding.base_ref.clone(),
+            "head_ref": binding.head_ref.clone(),
+            "submodule_mode": "locked",
+            "reason": reason,
+        })
+    }
+
+    fn create_merge_fixture(
+        conflict: bool,
+    ) -> (TempDir, Uuid, Uuid, String, String, WorktreeBinding) {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path();
+        run_git_expect_ok(repo, &["init"]);
+        run_git_expect_ok(repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        run_git_expect_ok(repo, &["add", "."]);
+        run_git_expect_ok(repo, &["commit", "-m", "initial commit"]);
+
+        let source_branch = "feature/test-merge".to_string();
+        let target_branch = "main".to_string();
+        run_git_expect_ok(repo, &["checkout", "-b", &source_branch]);
+        std::fs::write(repo.join("shared.txt"), "feature change\n").unwrap();
+        run_git_expect_ok(repo, &["add", "shared.txt"]);
+        run_git_expect_ok(repo, &["commit", "-m", "feature change"]);
+        run_git_expect_ok(repo, &["checkout", &target_branch]);
+
+        if conflict {
+            std::fs::write(repo.join("shared.txt"), "main conflicting change\n").unwrap();
+            run_git_expect_ok(repo, &["add", "shared.txt"]);
+            run_git_expect_ok(repo, &["commit", "-m", "main conflict change"]);
+        } else {
+            std::fs::write(repo.join("main-only.txt"), "main only\n").unwrap();
+            run_git_expect_ok(repo, &["add", "main-only.txt"]);
+            run_git_expect_ok(repo, &["commit", "-m", "main baseline change"]);
+        }
+
+        let run_id = Uuid::now_v7();
+        let correlation_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let mut binding = WorktreeBinding::new(
+            run_id,
+            repo,
+            format!("yarl/{}/merge-task", &run_id.to_string()[..8]),
+            "main",
+            correlation_id,
+        )
+        .with_task(task_id);
+        let manager = LocalWorktreeManager::new();
+        block_on_current_runtime(manager.create(&mut binding, CancellationToken::new()))
+            .unwrap()
+            .unwrap();
+
+        if conflict {
+            let (ok, _stdout, _stderr) =
+                run_git(&binding.worktree_path, &["merge", &source_branch]);
+            assert!(!ok, "expected merge conflict to produce interrupted state");
+        }
+
+        (
+            temp_dir,
+            run_id,
+            correlation_id,
+            source_branch,
+            target_branch,
+            binding,
+        )
     }
 
     #[test]
@@ -3099,10 +4139,15 @@ mod tests {
         assert!(output.contains("TaskBlocked -> TaskReady"));
 
         let events = store
-            .query(&EventQuery::by_entity(EntityType::Task, task_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Task,
+                task_id.to_string(),
+            ))
             .unwrap();
         assert!(
-            events.iter().any(|event| event.event_type == "task.unblocked"),
+            events
+                .iter()
+                .any(|event| event.event_type == "task.unblocked"),
             "expected task.unblocked event to be persisted"
         );
     }
@@ -3167,14 +4212,8 @@ mod tests {
             parse_gate_type("required_tasks_closed"),
             Some(GateType::RequiredTasksClosed)
         );
-        assert_eq!(
-            parse_gate_type("tests_passed"),
-            Some(GateType::TestsPassed)
-        );
-        assert_eq!(
-            parse_gate_type("policy_clean"),
-            Some(GateType::PolicyClean)
-        );
+        assert_eq!(parse_gate_type("tests_passed"), Some(GateType::TestsPassed));
+        assert_eq!(parse_gate_type("policy_clean"), Some(GateType::PolicyClean));
     }
 
     #[test]
@@ -3204,9 +4243,13 @@ mod tests {
     }
 
     #[test]
-    fn cmd_task_unblock_accepts_valid_uuid() {
+    fn cmd_task_unblock_blocks_in_memory_writes_by_default() {
         let result = cmd_task_unblock(VALID_UUID, "test reason");
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refuses in-memory write mode"));
     }
 
     #[test]
@@ -3286,13 +4329,21 @@ mod tests {
     #[test]
     fn cmd_gate_rerun_accepts_valid_gate() {
         let result = cmd_gate_rerun(VALID_UUID, Some("tests_passed"));
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refuses in-memory write mode"));
     }
 
     #[test]
-    fn cmd_gate_rerun_accepts_no_gate() {
+    fn cmd_gate_rerun_blocks_in_memory_writes_by_default() {
         let result = cmd_gate_rerun(VALID_UUID, None);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refuses in-memory write mode"));
     }
 
     #[test]
@@ -3363,12 +4414,20 @@ mod tests {
         assert!(!output.contains("requires a persistent store"));
 
         let gate_events = store
-            .query(&EventQuery::by_entity(EntityType::Gate, task_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Gate,
+                task_id.to_string(),
+            ))
             .unwrap();
         assert_eq!(gate_events.len(), 1);
         assert_eq!(gate_events[0].event_type, "gate.evaluated");
         assert_eq!(gate_events[0].payload["gate"], "gate.tests_passed");
         assert_eq!(gate_events[0].payload["status"], "passed");
+        let expected_gate_key = format!("{task_id}:gate_rerun:gate.tests_passed");
+        assert_eq!(
+            gate_events[0].idempotency_key.as_deref(),
+            Some(expected_gate_key.as_str())
+        );
     }
 
     #[test]
@@ -3402,23 +4461,35 @@ mod tests {
         assert!(!output.contains("requires a persistent store"));
 
         let gate_events = store
-            .query(&EventQuery::by_entity(EntityType::Gate, task_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Gate,
+                task_id.to_string(),
+            ))
             .unwrap();
         assert_eq!(gate_events.len(), default_task_gates().len());
-        assert!(
-            gate_events
-                .iter()
-                .all(|event| event.event_type == "gate.evaluated")
-        );
+        assert!(gate_events
+            .iter()
+            .all(|event| event.event_type == "gate.evaluated"));
+        assert!(gate_events.iter().all(|event| event
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with(&format!("{task_id}:gate_rerun:gate.")))));
     }
 
     // ── worktree recover validation ──────────────────────────────────
 
     #[test]
-    fn cmd_worktree_recover_accepts_valid_actions() {
-        assert!(cmd_worktree_recover(VALID_UUID, "abort").is_ok());
-        assert!(cmd_worktree_recover(VALID_UUID, "resume").is_ok());
-        assert!(cmd_worktree_recover(VALID_UUID, "manual-block").is_ok());
+    fn cmd_worktree_recover_blocks_in_memory_writes_by_default() {
+        let abort = cmd_worktree_recover(VALID_UUID, "abort");
+        let resume = cmd_worktree_recover(VALID_UUID, "resume");
+        let manual_block = cmd_worktree_recover(VALID_UUID, "manual-block");
+        assert!(abort.is_err());
+        assert!(resume.is_err());
+        assert!(manual_block.is_err());
+        assert!(abort
+            .unwrap_err()
+            .to_string()
+            .contains("refuses in-memory write mode"));
     }
 
     #[test]
@@ -3430,9 +4501,9 @@ mod tests {
     #[test]
     fn execute_worktree_recover_abort_persists_state_and_updates_status_projection() {
         let store = InMemoryEventStore::new();
-        let run_id = Uuid::now_v7();
-        let worktree_id = Uuid::now_v7();
-        let corr = Uuid::now_v7();
+        let (_temp_dir, run_id, corr, source_branch, _target_branch, binding) =
+            create_merge_fixture(true);
+        let worktree_id = binding.id;
 
         store
             .append(make_event(
@@ -3449,17 +4520,18 @@ mod tests {
                 worktree_id.to_string(),
                 "worktree.conflict_detected",
                 corr,
-                serde_json::json!({
-                    "from": "WtMerging",
-                    "to": "WtConflict",
-                    "run_id": run_id,
-                    "reason": "merge conflict requires recovery",
-                }),
+                seed_worktree_event_payload(
+                    &binding,
+                    "WtMerging",
+                    "WtConflict",
+                    "merge conflict requires recovery",
+                ),
             ))
             .unwrap();
 
         let output = execute_worktree_recover(&store, worktree_id, "abort").unwrap();
         assert!(output.contains("Resulting state: WtBoundHome"));
+        assert!(output.contains("Side effect: executed"));
         assert!(!output.contains("requires a persistent store"));
 
         let events = store
@@ -3468,15 +4540,41 @@ mod tests {
                 worktree_id.to_string(),
             ))
             .unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| event.event_type == "worktree.recovery_started")
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "worktree.recovery_started"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "worktree.recovered"));
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "worktree.recovery_started")
+            .expect("expected worktree.recovery_started event");
+        let expected_started_key =
+            format!("{worktree_id}:worktree_recover:abort:worktree.recovery_started");
+        assert_eq!(
+            started.idempotency_key.as_deref(),
+            Some(expected_started_key.as_str())
+        );
+        let recovered = events
+            .iter()
+            .find(|event| event.event_type == "worktree.recovered")
+            .expect("expected worktree.recovered event");
+        let expected_recovered_key =
+            format!("{worktree_id}:worktree_recover:abort:worktree.recovered");
+        assert_eq!(
+            recovered.idempotency_key.as_deref(),
+            Some(expected_recovered_key.as_str())
+        );
+        assert_eq!(recovered.payload["side_effect"].as_bool(), Some(true));
+
+        let (merge_head_ok, _stdout, _stderr) = run_git(
+            &binding.worktree_path,
+            &["rev-parse", "--verify", "MERGE_HEAD"],
         );
         assert!(
-            events
-                .iter()
-                .any(|event| event.event_type == "worktree.recovered")
+            !merge_head_ok,
+            "MERGE_HEAD should be cleared after abort recovery on branch {source_branch}"
         );
 
         let status_output = render_worktree_status(&store, run_id).unwrap();
@@ -3487,9 +4585,9 @@ mod tests {
     #[test]
     fn execute_worktree_recover_manual_block_persists_recovering_state() {
         let store = InMemoryEventStore::new();
-        let run_id = Uuid::now_v7();
-        let worktree_id = Uuid::now_v7();
-        let corr = Uuid::now_v7();
+        let (_temp_dir, run_id, corr, _source_branch, _target_branch, binding) =
+            create_merge_fixture(true);
+        let worktree_id = binding.id;
 
         store
             .append(make_event(
@@ -3506,17 +4604,18 @@ mod tests {
                 worktree_id.to_string(),
                 "worktree.conflict_detected",
                 corr,
-                serde_json::json!({
-                    "from": "WtMerging",
-                    "to": "WtConflict",
-                    "run_id": run_id,
-                    "reason": "manual intervention required",
-                }),
+                seed_worktree_event_payload(
+                    &binding,
+                    "WtMerging",
+                    "WtConflict",
+                    "manual intervention required",
+                ),
             ))
             .unwrap();
 
         let output = execute_worktree_recover(&store, worktree_id, "manual-block").unwrap();
         assert!(output.contains("Resulting state: WtRecovering"));
+        assert!(output.contains("Side effect: blocked"));
         assert!(!output.contains("requires a persistent store"));
 
         let events = store
@@ -3525,11 +4624,20 @@ mod tests {
                 worktree_id.to_string(),
             ))
             .unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| event.event_type == "worktree.recovery_blocked")
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "worktree.recovery_blocked"));
+        let blocked = events
+            .iter()
+            .find(|event| event.event_type == "worktree.recovery_blocked")
+            .expect("expected worktree.recovery_blocked event");
+        let expected_blocked_key =
+            format!("{worktree_id}:worktree_recover:manual-block:worktree.recovery_blocked");
+        assert_eq!(
+            blocked.idempotency_key.as_deref(),
+            Some(expected_blocked_key.as_str())
         );
+        assert_eq!(blocked.payload["side_effect"].as_bool(), Some(true));
 
         let status_output = render_worktree_status(&store, run_id).unwrap();
         assert!(status_output.contains("WtRecovering"));
@@ -3546,10 +4654,45 @@ mod tests {
     }
 
     #[test]
-    fn cmd_merge_request_accepts_valid_strategies() {
-        assert!(cmd_merge_request("feat", "main", VALID_UUID, "merge-no-ff").is_ok());
-        assert!(cmd_merge_request("feat", "main", VALID_UUID, "rebase-then-ff").is_ok());
-        assert!(cmd_merge_request("feat", "main", VALID_UUID, "squash-merge").is_ok());
+    fn cmd_merge_request_blocks_in_memory_writes_by_default() {
+        let merge_no_ff = cmd_merge_request("feat", "main", VALID_UUID, "merge-no-ff");
+        let rebase_then_ff = cmd_merge_request("feat", "main", VALID_UUID, "rebase-then-ff");
+        let squash_merge = cmd_merge_request("feat", "main", VALID_UUID, "squash-merge");
+        assert!(merge_no_ff.is_err());
+        assert!(rebase_then_ff.is_err());
+        assert!(squash_merge.is_err());
+        assert!(merge_no_ff
+            .unwrap_err()
+            .to_string()
+            .contains("refuses in-memory write mode"));
+    }
+
+    #[test]
+    fn ensure_write_backend_guard_blocks_in_memory_writes_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("yarli.toml");
+        let loaded_config = LoadedConfig::load(config_path).unwrap();
+
+        let result = ensure_write_backend_guard(&loaded_config, "task unblock");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refuses in-memory write mode"));
+    }
+
+    #[test]
+    fn ensure_write_backend_guard_allows_explicit_ephemeral_override() {
+        let loaded_config = write_test_config(
+            r#"
+[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+"#,
+        );
+
+        let result = ensure_write_backend_guard(&loaded_config, "task unblock");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -3580,13 +4723,17 @@ mod tests {
             ))
             .unwrap();
 
-        let output = execute_merge_request(&store, "feat/login", "main", run_id, "merge-no-ff").unwrap();
+        let output =
+            execute_merge_request(&store, "feat/login", "main", run_id, "merge-no-ff").unwrap();
         assert!(output.contains("Merge intent requested"));
         assert!(!output.contains("requires a persistent store"));
 
         let merge_id = merge_id_from_output(&output);
         let events = store
-            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Merge,
+                merge_id.to_string(),
+            ))
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "merge.requested");
@@ -3594,15 +4741,20 @@ mod tests {
         assert_eq!(events[0].payload["source"], "feat/login");
         assert_eq!(events[0].payload["target"], "main");
         assert_eq!(events[0].payload["strategy"], "merge-no-ff");
+        let expected_request_key = format!("{run_id}:merge_request:feat/login:main:merge-no-ff");
+        assert_eq!(
+            events[0].idempotency_key.as_deref(),
+            Some(expected_request_key.as_str())
+        );
     }
 
     #[test]
     fn execute_merge_approve_persists_policy_and_transition_events() {
         let store = InMemoryEventStore::new();
-        let run_id = Uuid::now_v7();
         let merge_id = Uuid::now_v7();
-        let corr = Uuid::now_v7();
         let audit = InMemoryAuditSink::new();
+        let (_temp_dir, run_id, corr, source_branch, target_branch, binding) =
+            create_merge_fixture(false);
 
         store
             .append(make_event(
@@ -3615,6 +4767,20 @@ mod tests {
             .unwrap();
         store
             .append(make_event(
+                EntityType::Worktree,
+                binding.id.to_string(),
+                "worktree.bound",
+                corr,
+                seed_worktree_event_payload(
+                    &binding,
+                    "WtCreating",
+                    "WtBoundHome",
+                    "worktree created for merge",
+                ),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
                 EntityType::Merge,
                 merge_id.to_string(),
                 "merge.requested",
@@ -3623,47 +4789,65 @@ mod tests {
                     "to": "MergeRequested",
                     "state": "MergeRequested",
                     "run_id": run_id,
-                    "source": "feat/login",
-                    "target": "main",
+                    "worktree_id": binding.id,
+                    "source": source_branch,
+                    "target": target_branch,
                     "strategy": "merge-no-ff",
                     "reason": "pending approval",
                 }),
             ))
             .unwrap();
 
-        let output = execute_merge_approve(
-            &store,
-            merge_id,
-            SafeMode::Execute,
-            true,
-            Some(&audit),
-        )
-        .unwrap();
-        assert!(output.contains("MergeRequested -> MergePrecheck"));
+        let output =
+            execute_merge_approve(&store, merge_id, SafeMode::Execute, true, Some(&audit)).unwrap();
+        assert!(output.contains("approved and executed to MergeDone"));
         assert!(!output.contains("requires a persistent store"));
 
         let merge_events = store
-            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Merge,
+                merge_id.to_string(),
+            ))
             .unwrap();
-        assert!(
-            merge_events
-                .iter()
-                .any(|event| event.event_type == "merge.approved")
+        assert!(merge_events
+            .iter()
+            .any(|event| event.event_type == "merge.approved"));
+        let approved = merge_events
+            .iter()
+            .find(|event| event.event_type == "merge.approved")
+            .expect("expected merge.approved event");
+        let expected_approved_key = format!("{merge_id}:merge.approve:merge.approved");
+        assert_eq!(
+            approved.idempotency_key.as_deref(),
+            Some(expected_approved_key.as_str())
         );
+        let execution = merge_events
+            .iter()
+            .find(|event| event.event_type == "merge.execution_succeeded")
+            .expect("expected merge.execution_succeeded event");
+        assert_eq!(execution.payload["state"], "MergeDone");
+        let merge_sha = execution
+            .payload
+            .get("merge_sha")
+            .and_then(|value| value.as_str())
+            .expect("expected merge_sha");
+        assert_eq!(merge_sha.len(), 40);
 
         let all_events = store.query(&EventQuery::by_correlation(corr)).unwrap();
-        assert!(
-            all_events
-                .iter()
-                .any(|event| event.event_type == "policy.decision")
+        let policy = all_events
+            .iter()
+            .find(|event| event.event_type == "policy.decision")
+            .expect("expected policy.decision event");
+        let expected_policy_key = format!("{merge_id}:merge.approve:policy.decision");
+        assert_eq!(
+            policy.idempotency_key.as_deref(),
+            Some(expected_policy_key.as_str())
         );
 
         let audit_entries = audit.read_all().unwrap();
-        assert!(
-            audit_entries
-                .iter()
-                .any(|entry| entry.category == AuditCategory::PolicyDecision)
-        );
+        assert!(audit_entries
+            .iter()
+            .any(|entry| entry.category == AuditCategory::PolicyDecision));
     }
 
     #[test]
@@ -3700,30 +4884,23 @@ mod tests {
             ))
             .unwrap();
 
-        let output = execute_merge_approve(
-            &store,
-            merge_id,
-            SafeMode::Observe,
-            true,
-            Some(&audit),
-        )
-        .unwrap();
+        let output =
+            execute_merge_approve(&store, merge_id, SafeMode::Observe, true, Some(&audit)).unwrap();
         assert!(output.contains("blocked by policy"));
         assert!(!output.contains("requires a persistent store"));
 
         let merge_events = store
-            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Merge,
+                merge_id.to_string(),
+            ))
             .unwrap();
-        assert!(
-            !merge_events
-                .iter()
-                .any(|event| event.event_type == "merge.approved")
-        );
-        assert!(
-            merge_events
-                .iter()
-                .any(|event| event.event_type == "merge.policy_blocked")
-        );
+        assert!(!merge_events
+            .iter()
+            .any(|event| event.event_type == "merge.approved"));
+        assert!(merge_events
+            .iter()
+            .any(|event| event.event_type == "merge.policy_blocked"));
 
         let policy_event = store
             .query(&EventQuery::by_correlation(corr))
@@ -3732,21 +4909,33 @@ mod tests {
             .find(|event| event.event_type == "policy.decision")
             .expect("expected policy decision event");
         assert_eq!(policy_event.payload["outcome"].as_str(), Some("DENY"));
+        let expected_policy_key = format!("{merge_id}:merge.approve:policy.decision");
+        assert_eq!(
+            policy_event.idempotency_key.as_deref(),
+            Some(expected_policy_key.as_str())
+        );
+        let blocked_event = merge_events
+            .iter()
+            .find(|event| event.event_type == "merge.policy_blocked")
+            .expect("expected merge.policy_blocked event");
+        let expected_blocked_key = format!("{merge_id}:merge.approve:merge.policy_blocked");
+        assert_eq!(
+            blocked_event.idempotency_key.as_deref(),
+            Some(expected_blocked_key.as_str())
+        );
 
         let audit_entries = audit.read_all().unwrap();
-        assert!(
-            audit_entries
-                .iter()
-                .any(|entry| entry.category == AuditCategory::DestructiveAttempt)
-        );
+        assert!(audit_entries
+            .iter()
+            .any(|entry| entry.category == AuditCategory::DestructiveAttempt));
     }
 
     #[test]
     fn execute_merge_reject_persists_rejected_transition() {
         let store = InMemoryEventStore::new();
-        let run_id = Uuid::now_v7();
         let merge_id = Uuid::now_v7();
-        let corr = Uuid::now_v7();
+        let (_temp_dir, run_id, corr, source_branch, target_branch, binding) =
+            create_merge_fixture(true);
 
         store
             .append(make_event(
@@ -3759,6 +4948,20 @@ mod tests {
             .unwrap();
         store
             .append(make_event(
+                EntityType::Worktree,
+                binding.id.to_string(),
+                "worktree.conflict_detected",
+                corr,
+                seed_worktree_event_payload(
+                    &binding,
+                    "WtMerging",
+                    "WtConflict",
+                    "interrupted merge pending rejection",
+                ),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
                 EntityType::Merge,
                 merge_id.to_string(),
                 "merge.requested",
@@ -3767,8 +4970,9 @@ mod tests {
                     "to": "MergeRequested",
                     "state": "MergeRequested",
                     "run_id": run_id,
-                    "source": "feat/login",
-                    "target": "main",
+                    "worktree_id": binding.id,
+                    "source": source_branch,
+                    "target": target_branch,
                     "strategy": "merge-no-ff",
                     "reason": "pending approval",
                 }),
@@ -3788,7 +4992,10 @@ mod tests {
         assert!(!output.contains("requires a persistent store"));
 
         let merge_events = store
-            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Merge,
+                merge_id.to_string(),
+            ))
             .unwrap();
         let rejected = merge_events
             .iter()
@@ -3796,6 +5003,34 @@ mod tests {
             .expect("expected merge.rejected event");
         assert_eq!(rejected.payload["to"], "MergeAborted");
         assert_eq!(rejected.payload["reason"], "manual rejection");
+        let expected_rejected_key = format!("{merge_id}:merge.reject:merge.rejected");
+        assert_eq!(
+            rejected.idempotency_key.as_deref(),
+            Some(expected_rejected_key.as_str())
+        );
+        let execution = merge_events
+            .iter()
+            .find(|event| event.event_type == "merge.execution_succeeded")
+            .expect("expected merge.execution_succeeded event");
+        assert_eq!(execution.payload["state"], "MergeAborted");
+
+        let (merge_head_ok, _stdout, _stderr) = run_git(
+            &binding.worktree_path,
+            &["rev-parse", "--verify", "MERGE_HEAD"],
+        );
+        assert!(!merge_head_ok, "MERGE_HEAD should be cleared after merge.reject");
+
+        let policy_event = store
+            .query(&EventQuery::by_correlation(corr))
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "policy.decision")
+            .expect("expected policy decision event");
+        let expected_policy_key = format!("{merge_id}:merge.reject:policy.decision");
+        assert_eq!(
+            policy_event.idempotency_key.as_deref(),
+            Some(expected_policy_key.as_str())
+        );
     }
 
     // ── audit tail ───────────────────────────────────────────────────
@@ -3847,13 +5082,8 @@ mod tests {
         let sink = JsonlAuditSink::new(f.path());
 
         for i in 0..5 {
-            let entry = AuditEntry::gate_evaluation(
-                &format!("gate_{i}"),
-                true,
-                "ok",
-                Uuid::nil(),
-                None,
-            );
+            let entry =
+                AuditEntry::gate_evaluation(&format!("gate_{i}"), true, "ok", Uuid::nil(), None);
             sink.append(&entry).unwrap();
         }
 
@@ -3875,13 +5105,7 @@ mod tests {
             None,
             serde_json::json!({}),
         );
-        let entry2 = AuditEntry::gate_evaluation(
-            "tests_passed",
-            true,
-            "ok",
-            Uuid::nil(),
-            None,
-        );
+        let entry2 = AuditEntry::gate_evaluation("tests_passed", true, "ok", Uuid::nil(), None);
         sink.append(&entry1).unwrap();
         sink.append(&entry2).unwrap();
 
@@ -3896,13 +5120,8 @@ mod tests {
         let sink = JsonlAuditSink::new(f.path());
 
         for i in 0..3 {
-            let entry = AuditEntry::gate_evaluation(
-                &format!("gate_{i}"),
-                true,
-                "ok",
-                Uuid::nil(),
-                None,
-            );
+            let entry =
+                AuditEntry::gate_evaluation(&format!("gate_{i}"), true, "ok", Uuid::nil(), None);
             sink.append(&entry).unwrap();
         }
 
@@ -3937,26 +5156,28 @@ mod tests {
         assert!(cancelled);
 
         let reg = scheduler.registry().read().await;
-        assert_eq!(reg.get_task(&task_id).unwrap().state, TaskState::TaskCancelled);
+        assert_eq!(
+            reg.get_task(&task_id).unwrap().state,
+            TaskState::TaskCancelled
+        );
         assert_eq!(reg.get_run(&run_id).unwrap().state, RunState::RunCancelled);
         drop(reg);
 
         let task_events = store
-            .query(&EventQuery::by_entity(EntityType::Task, task_id.to_string()))
+            .query(&EventQuery::by_entity(
+                EntityType::Task,
+                task_id.to_string(),
+            ))
             .unwrap();
-        assert!(
-            task_events
-                .iter()
-                .any(|event| event.event_type == "task.cancelled")
-        );
+        assert!(task_events
+            .iter()
+            .any(|event| event.event_type == "task.cancelled"));
 
         let run_events = store
             .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
             .unwrap();
-        assert!(
-            run_events
-                .iter()
-                .any(|event| event.event_type == "run.cancelled")
-        );
+        assert!(run_events
+            .iter()
+            .any(|event| event.event_type == "run.cancelled"));
     }
 }
