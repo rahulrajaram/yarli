@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
@@ -17,16 +17,19 @@ use yarli_cli::config::{BackendSelection, LoadedConfig};
 use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
 use yarli_cli::stream::{StreamConfig, StreamEvent, StreamRenderer};
-use yarli_core::domain::{CommandClass, EntityType, Event};
+use yarli_core::domain::{CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::Task;
 use yarli_core::explain::{explain_run, explain_task, GateResult, GateType, RunSnapshot, TaskSnapshot};
+use yarli_core::fsm::merge::MergeState;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
+use yarli_core::fsm::worktree::WorktreeState;
 use yarli_core::shutdown::ShutdownController;
 use yarli_exec::LocalCommandRunner;
-use yarli_gates::{default_run_gates, default_task_gates};
-use yarli_observability::{AuditSink, JsonlAuditSink};
+use yarli_gates::{all_passed, default_run_gates, default_task_gates, evaluate_all, GateContext};
+use yarli_observability::{AuditEntry, AuditSink, JsonlAuditSink};
+use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, Scheduler, SchedulerConfig, TaskQueue};
 use yarli_store::event_store::EventQuery;
 use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
@@ -862,6 +865,38 @@ fn parse_run_state(s: &str) -> Option<RunState> {
     }
 }
 
+/// Parse a WorktreeState from its serialized form.
+fn parse_worktree_state(s: &str) -> Option<WorktreeState> {
+    match s {
+        "WtUnbound" => Some(WorktreeState::WtUnbound),
+        "WtCreating" => Some(WorktreeState::WtCreating),
+        "WtBoundHome" => Some(WorktreeState::WtBoundHome),
+        "WtSwitchPending" => Some(WorktreeState::WtSwitchPending),
+        "WtBoundNonHome" => Some(WorktreeState::WtBoundNonHome),
+        "WtMerging" => Some(WorktreeState::WtMerging),
+        "WtConflict" => Some(WorktreeState::WtConflict),
+        "WtRecovering" => Some(WorktreeState::WtRecovering),
+        "WtCleanupPending" => Some(WorktreeState::WtCleanupPending),
+        "WtClosed" => Some(WorktreeState::WtClosed),
+        _ => None,
+    }
+}
+
+/// Parse a MergeState from its serialized form.
+fn parse_merge_state(s: &str) -> Option<MergeState> {
+    match s {
+        "MergeRequested" => Some(MergeState::MergeRequested),
+        "MergePrecheck" => Some(MergeState::MergePrecheck),
+        "MergeDryRun" => Some(MergeState::MergeDryRun),
+        "MergeApply" => Some(MergeState::MergeApply),
+        "MergeVerify" => Some(MergeState::MergeVerify),
+        "MergeDone" => Some(MergeState::MergeDone),
+        "MergeConflict" => Some(MergeState::MergeConflict),
+        "MergeAborted" => Some(MergeState::MergeAborted),
+        _ => None,
+    }
+}
+
 /// Run the renderer in a blocking context (requires raw terminal access).
 fn run_renderer(
     mut rx: mpsc::UnboundedReceiver<StreamEvent>,
@@ -957,8 +992,55 @@ struct EntityProjection {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct WorktreeProjection {
+    worktree_id: Uuid,
+    state: WorktreeState,
+    correlation_id: Uuid,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    last_event_id: Uuid,
+    last_event_type: String,
+    reason: Option<String>,
+    run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct MergeProjection {
+    merge_id: Uuid,
+    state: MergeState,
+    run_id: Option<Uuid>,
+    correlation_id: Uuid,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    last_event_id: Uuid,
+    last_event_type: String,
+    reason: Option<String>,
+    source_ref: Option<String>,
+    target_ref: Option<String>,
+    strategy: Option<String>,
+}
+
 fn load_runtime_config_for_reads() -> Result<LoadedConfig> {
     LoadedConfig::load_default().context("failed to load runtime config")
+}
+
+fn prepare_audit_sink(loaded_config: &LoadedConfig) -> Result<Option<JsonlAuditSink>> {
+    if !loaded_config.config().policy.audit_decisions {
+        return Ok(None);
+    }
+
+    let audit_path = PathBuf::from(&loaded_config.config().observability.audit_file);
+    if let Some(parent) = audit_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create audit directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(Some(JsonlAuditSink::new(audit_path)))
 }
 
 fn with_event_store<T>(
@@ -1202,6 +1284,137 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
         objective,
         tasks,
         failed_gates,
+    }))
+}
+
+fn load_worktree_projection(
+    store: &dyn EventStore,
+    worktree_id: Uuid,
+) -> Result<Option<WorktreeProjection>> {
+    let events = query_events(
+        store,
+        &EventQuery::by_entity(EntityType::Worktree, worktree_id.to_string()),
+    )?;
+    if events.is_empty() {
+        return Ok(None);
+    }
+
+    let mut state = WorktreeState::WtUnbound;
+    let mut correlation_id = events[0].correlation_id;
+    let mut updated_at = events[0].occurred_at;
+    let mut last_event_id = events[0].event_id;
+    let mut last_event_type = events[0].event_type.clone();
+    let mut reason = None;
+    let mut run_id = None;
+
+    for event in &events {
+        correlation_id = event.correlation_id;
+        updated_at = event.occurred_at;
+        last_event_id = event.event_id;
+        last_event_type = event.event_type.clone();
+
+        if let Some(next_state) = parse_worktree_state(&extract_entity_state(event)) {
+            state = next_state;
+        }
+
+        if let Some(next_reason) = event_reason(event) {
+            reason = Some(next_reason);
+        }
+
+        if let Some(value) = event
+            .payload
+            .get("run_id")
+            .and_then(|value| value.as_str())
+            .and_then(|raw| raw.parse::<Uuid>().ok())
+        {
+            run_id = Some(value);
+        }
+    }
+
+    Ok(Some(WorktreeProjection {
+        worktree_id,
+        state,
+        correlation_id,
+        updated_at,
+        last_event_id,
+        last_event_type,
+        reason,
+        run_id,
+    }))
+}
+
+fn load_merge_projection(store: &dyn EventStore, merge_id: Uuid) -> Result<Option<MergeProjection>> {
+    let events = query_events(
+        store,
+        &EventQuery::by_entity(EntityType::Merge, merge_id.to_string()),
+    )?;
+    if events.is_empty() {
+        return Ok(None);
+    }
+
+    let mut state = MergeState::MergeRequested;
+    let mut run_id = None;
+    let mut correlation_id = events[0].correlation_id;
+    let mut updated_at = events[0].occurred_at;
+    let mut last_event_id = events[0].event_id;
+    let mut last_event_type = events[0].event_type.clone();
+    let mut reason = None;
+    let mut source_ref = None;
+    let mut target_ref = None;
+    let mut strategy = None;
+
+    for event in &events {
+        correlation_id = event.correlation_id;
+        updated_at = event.occurred_at;
+        last_event_id = event.event_id;
+        last_event_type = event.event_type.clone();
+
+        if let Some(next_state) = parse_merge_state(&extract_entity_state(event)) {
+            state = next_state;
+        }
+
+        if let Some(next_reason) = event_reason(event) {
+            reason = Some(next_reason);
+        }
+
+        if let Some(value) = event
+            .payload
+            .get("run_id")
+            .and_then(|value| value.as_str())
+            .and_then(|raw| raw.parse::<Uuid>().ok())
+        {
+            run_id = Some(value);
+        }
+
+        if let Some(value) = event.payload.get("source").and_then(|value| value.as_str()) {
+            source_ref = Some(value.to_string());
+        }
+
+        if let Some(value) = event.payload.get("target").and_then(|value| value.as_str()) {
+            target_ref = Some(value.to_string());
+        }
+
+        if let Some(value) = event
+            .payload
+            .get("strategy")
+            .and_then(|value| value.as_str())
+        {
+            strategy = Some(value.to_string());
+        }
+    }
+
+    Ok(Some(MergeProjection {
+        merge_id,
+        state,
+        run_id,
+        correlation_id,
+        updated_at,
+        last_event_id,
+        last_event_type,
+        reason,
+        source_ref,
+        target_ref,
+        strategy,
     }))
 }
 
@@ -1466,6 +1679,448 @@ fn execute_task_unblock(store: &dyn EventStore, task_id: Uuid, reason: &str) -> 
     ))
 }
 
+fn append_worktree_transition_event(
+    store: &dyn EventStore,
+    projection: &WorktreeProjection,
+    event_type: &str,
+    from: WorktreeState,
+    to: WorktreeState,
+    action: &str,
+    reason: &str,
+    causation_id: Option<Uuid>,
+) -> Result<Event> {
+    let event = Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Worktree,
+        entity_id: projection.worktree_id.to_string(),
+        event_type: event_type.to_string(),
+        payload: serde_json::json!({
+            "from": format!("{from:?}"),
+            "to": format!("{to:?}"),
+            "action": action,
+            "reason": reason,
+            "run_id": projection.run_id,
+        }),
+        correlation_id: projection.correlation_id,
+        causation_id,
+        actor: "cli".to_string(),
+        idempotency_key: None,
+    };
+    append_event(store, event.clone())?;
+    Ok(event)
+}
+
+fn execute_worktree_recover(
+    store: &dyn EventStore,
+    worktree_id: Uuid,
+    action: &str,
+) -> Result<String> {
+    let projection = match load_worktree_projection(store, worktree_id)? {
+        Some(worktree) => worktree,
+        None => {
+            return Ok(format!(
+                "Worktree {worktree_id} not found in persisted event log."
+            ))
+        }
+    };
+
+    let mut current_state = projection.state;
+    let mut causation_id = Some(projection.last_event_id);
+    let mut persisted_events = 0usize;
+
+    if current_state != WorktreeState::WtRecovering {
+        if !current_state.can_transition_to(WorktreeState::WtRecovering) {
+            return Ok(format!(
+                "Worktree {worktree_id} is {current_state:?}; cannot enter WtRecovering from this state."
+            ));
+        }
+
+        let reason = format!("recovery action `{action}` requested by operator");
+        let started = append_worktree_transition_event(
+            store,
+            &projection,
+            "worktree.recovery_started",
+            current_state,
+            WorktreeState::WtRecovering,
+            action,
+            &reason,
+            causation_id,
+        )?;
+        current_state = WorktreeState::WtRecovering;
+        causation_id = Some(started.event_id);
+        persisted_events += 1;
+    }
+
+    match action {
+        "abort" => {
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovered",
+                current_state,
+                WorktreeState::WtBoundHome,
+                action,
+                "aborted interrupted operation and restored bound home state",
+                causation_id,
+            )?;
+            current_state = WorktreeState::WtBoundHome;
+            persisted_events += 1;
+        }
+        "resume" => {
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovered",
+                current_state,
+                WorktreeState::WtBoundHome,
+                action,
+                "resumed interrupted operation and restored bound home state",
+                causation_id,
+            )?;
+            current_state = WorktreeState::WtBoundHome;
+            persisted_events += 1;
+        }
+        "manual-block" => {
+            append_event(
+                store,
+                Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: chrono::Utc::now(),
+                    entity_type: EntityType::Worktree,
+                    entity_id: projection.worktree_id.to_string(),
+                    event_type: "worktree.recovery_blocked".to_string(),
+                    payload: serde_json::json!({
+                        "from": format!("{current_state:?}"),
+                        "to": "WtRecovering",
+                        "action": action,
+                        "reason": "manual intervention required before recovery can continue",
+                        "run_id": projection.run_id,
+                    }),
+                    correlation_id: projection.correlation_id,
+                    causation_id,
+                    actor: "cli".to_string(),
+                    idempotency_key: None,
+                },
+            )?;
+            current_state = WorktreeState::WtRecovering;
+            persisted_events += 1;
+        }
+        _ => unreachable!("action validated by caller"),
+    }
+
+    let mut output = String::new();
+    writeln!(&mut output, "Worktree recovery for {worktree_id}")?;
+    writeln!(&mut output, "Action: {action}")?;
+    writeln!(&mut output, "Resulting state: {current_state:?}")?;
+    writeln!(&mut output, "Persisted events: {persisted_events}")?;
+    writeln!(
+        &mut output,
+        "Previous state: {:?} (event: {}, updated: {})",
+        projection.state,
+        projection.last_event_type,
+        projection.updated_at.format("%Y-%m-%d %H:%M:%S")
+    )?;
+    if let Some(reason) = projection.reason.as_ref() {
+        writeln!(&mut output, "Previous reason: {reason}")?;
+    }
+    Ok(output.trim_end().to_string())
+}
+
+fn gate_result_status(result: &GateResult) -> &'static str {
+    match result {
+        GateResult::Passed { .. } => "passed",
+        GateResult::Failed { .. } => "failed",
+        GateResult::Pending => "pending",
+    }
+}
+
+fn parse_command_class_value(value: &serde_json::Value) -> Option<CommandClass> {
+    serde_json::from_value::<CommandClass>(value.clone()).ok().or_else(|| {
+        value.as_str().and_then(|raw| match raw {
+            "io" | "Io" => Some(CommandClass::Io),
+            "cpu" | "Cpu" => Some(CommandClass::Cpu),
+            "git" | "Git" => Some(CommandClass::Git),
+            "tool" | "Tool" => Some(CommandClass::Tool),
+            _ => None,
+        })
+    })
+}
+
+fn is_command_event_for_task(event: &Event, task_id: Uuid) -> bool {
+    if event.entity_type != EntityType::Command {
+        return false;
+    }
+    let Some(idempotency_key) = event.idempotency_key.as_deref() else {
+        return false;
+    };
+    idempotency_key.starts_with(&format!("{task_id}:cmd:"))
+}
+
+fn collect_task_command_evidence(
+    events: &[Event],
+    task_id: Uuid,
+    run_id: Uuid,
+) -> (Vec<Evidence>, Option<CommandClass>) {
+    let mut started_meta: HashMap<String, (String, Option<CommandClass>)> = HashMap::new();
+    let mut terminal_events: Vec<&Event> = Vec::new();
+
+    for event in events.iter().filter(|event| is_command_event_for_task(event, task_id)) {
+        match event.event_type.as_str() {
+            "command.started" => {
+                let command = event
+                    .payload
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let command_class = event
+                    .payload
+                    .get("command_class")
+                    .and_then(parse_command_class_value);
+                started_meta.insert(event.entity_id.clone(), (command, command_class));
+            }
+            "command.exited" | "command.timed_out" | "command.killed" => {
+                terminal_events.push(event);
+            }
+            _ => {}
+        }
+    }
+
+    let Some(terminal) = terminal_events.last() else {
+        return (Vec::new(), None);
+    };
+
+    let (command, command_class) = started_meta
+        .get(&terminal.entity_id)
+        .map(|(command, class)| (command.clone(), *class))
+        .unwrap_or_else(|| ("unknown".to_string(), None));
+    let exit_code = terminal
+        .payload
+        .get("exit_code")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(-1);
+    let duration_ms = terminal
+        .payload
+        .get("duration_ms")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+        .max(0) as u64;
+
+    let evidence = Evidence {
+        evidence_id: terminal.event_id,
+        task_id,
+        run_id,
+        evidence_type: "command_result".to_string(),
+        payload: serde_json::json!({
+            "command": command,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "timed_out": terminal.event_type == "command.timed_out",
+            "killed": terminal.event_type == "command.killed",
+        }),
+        created_at: terminal.occurred_at,
+    };
+
+    (vec![evidence], command_class)
+}
+
+fn policy_outcome_is_allowed(payload: &serde_json::Value) -> bool {
+    payload
+        .get("outcome")
+        .and_then(|value| value.as_str())
+        .map(|outcome| outcome.eq_ignore_ascii_case("ALLOW"))
+        .unwrap_or(false)
+}
+
+fn build_task_gate_context(
+    store: &dyn EventStore,
+    task: &TaskProjection,
+) -> Result<Option<(Uuid, GateContext)>> {
+    let events = query_events(store, &EventQuery::by_correlation(task.correlation_id))?;
+    let run_id = events
+        .iter()
+        .find(|event| event.entity_type == EntityType::Run)
+        .and_then(|event| event.entity_id.parse::<Uuid>().ok());
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+
+    let task_events: Vec<Event> = events
+        .iter()
+        .filter(|event| event.entity_type == EntityType::Task)
+        .cloned()
+        .collect();
+    let task_snapshots = collect_task_projections(&task_events);
+    let task_states = task_snapshots
+        .iter()
+        .map(|task| (task.task_id, task.task_id.to_string(), task.state))
+        .collect::<Vec<_>>();
+    let all_tasks_complete =
+        !task_states.is_empty() && task_states.iter().all(|(_, _, state)| *state == TaskState::TaskComplete);
+
+    let worktree_events: Vec<Event> = events
+        .iter()
+        .filter(|event| event.entity_type == EntityType::Worktree)
+        .cloned()
+        .collect();
+    let worktrees = collect_entity_projections(&worktree_events);
+    let has_unresolved_conflicts = worktrees.iter().any(|worktree| {
+        worktree.state == "WtConflict"
+            || worktree
+                .last_event_type
+                .to_ascii_lowercase()
+                .contains("conflict")
+    });
+
+    let mut policy_violations = Vec::new();
+    let mut has_unapproved_git_ops = false;
+    for event in events.iter().filter(|event| event.entity_type == EntityType::Policy) {
+        if policy_outcome_is_allowed(&event.payload) {
+            continue;
+        }
+        if let Some(reason) = event.payload.get("reason").and_then(|value| value.as_str()) {
+            policy_violations.push(reason.to_string());
+        }
+        if let Some(action) = event.payload.get("action").and_then(|value| value.as_str()) {
+            let action = action.to_ascii_lowercase();
+            if action.contains("git")
+                || action.contains("push")
+                || action.contains("merge")
+                || action.contains("rebase")
+            {
+                has_unapproved_git_ops = true;
+            }
+        }
+    }
+
+    let (evidence, command_class) = collect_task_command_evidence(&events, task.task_id, run_id);
+
+    let mut gate_ctx = GateContext::for_task(run_id, task.task_id, task.task_id.to_string());
+    gate_ctx.evidence = evidence;
+    gate_ctx.task_states = task_states;
+    gate_ctx.all_tasks_complete = all_tasks_complete;
+    gate_ctx.has_unresolved_conflicts = has_unresolved_conflicts;
+    gate_ctx.has_unapproved_git_ops = has_unapproved_git_ops;
+    gate_ctx.worktree_consistent = !has_unresolved_conflicts;
+    gate_ctx.policy_violations = policy_violations;
+    gate_ctx.command_class = command_class;
+
+    Ok(Some((run_id, gate_ctx)))
+}
+
+fn render_gate_rerun_output(
+    task_id: Uuid,
+    run_id: Uuid,
+    selected_count: usize,
+    evaluations: &[yarli_gates::GateEvaluation],
+) -> Result<String> {
+    let mut output = String::new();
+    writeln!(&mut output, "Gate re-run for task {task_id}")?;
+    writeln!(&mut output, "Run: {run_id}")?;
+    writeln!(
+        &mut output,
+        "Evaluated {} gate(s):",
+        selected_count
+    )?;
+
+    for evaluation in evaluations {
+        match &evaluation.result {
+            GateResult::Passed { evidence_ids } => {
+                writeln!(
+                    &mut output,
+                    "  {}: PASS ({} evidence id(s))",
+                    evaluation.gate_type.label(),
+                    evidence_ids.len()
+                )?;
+            }
+            GateResult::Failed { reason } => {
+                writeln!(
+                    &mut output,
+                    "  {}: FAIL ({reason})",
+                    evaluation.gate_type.label()
+                )?;
+            }
+            GateResult::Pending => {
+                writeln!(&mut output, "  {}: PENDING", evaluation.gate_type.label())?;
+            }
+        }
+        if let Some(remediation) = evaluation.remediation.as_ref() {
+            writeln!(&mut output, "    remediation: {remediation}")?;
+        }
+    }
+
+    writeln!(
+        &mut output,
+        "Overall: {}",
+        if all_passed(evaluations) {
+            "all selected gates passed"
+        } else {
+            "one or more selected gates failed"
+        }
+    )?;
+
+    Ok(output.trim_end().to_string())
+}
+
+fn execute_gate_rerun(
+    store: &dyn EventStore,
+    task_id: Uuid,
+    gate_name: Option<&str>,
+) -> Result<String> {
+    let task = match load_task_projection(store, task_id)? {
+        Some(task) => task,
+        None => return Ok(format!("Task {task_id} not found in persisted event log.")),
+    };
+    let selected_gates = if let Some(name) = gate_name {
+        vec![parse_gate_type(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown gate: {name}. Valid gates: {}",
+                all_gate_names().join(", ")
+            )
+        })?]
+    } else {
+        default_task_gates()
+    };
+
+    let Some((run_id, gate_ctx)) = build_task_gate_context(store, &task)? else {
+        return Ok(format!(
+            "Task {task_id} has no associated run context in persisted event log."
+        ));
+    };
+
+    let evaluations = evaluate_all(&selected_gates, &gate_ctx);
+    for evaluation in &evaluations {
+        append_event(
+            store,
+            Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: chrono::Utc::now(),
+                entity_type: EntityType::Gate,
+                entity_id: task_id.to_string(),
+                event_type: "gate.evaluated".to_string(),
+                payload: serde_json::json!({
+                    "scope": "task",
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "gate": evaluation.gate_type.label(),
+                    "status": gate_result_status(&evaluation.result),
+                    "result": evaluation.result,
+                    "inspected_evidence": evaluation.inspected_evidence,
+                    "remediation": evaluation.remediation,
+                    "rerun": true,
+                }),
+                correlation_id: task.correlation_id,
+                causation_id: Some(task.last_event_id),
+                actor: "cli".to_string(),
+                idempotency_key: None,
+            },
+        )?;
+    }
+
+    render_gate_rerun_output(task_id, run_id, selected_gates.len(), &evaluations)
+}
+
 fn collect_entity_projections(events: &[Event]) -> Vec<EntityProjection> {
     let mut entities: BTreeMap<String, EntityProjection> = BTreeMap::new();
 
@@ -1531,17 +2186,368 @@ fn render_worktree_status(store: &dyn EventStore, run_id: Uuid) -> Result<String
     Ok(out.trim_end().to_string())
 }
 
-fn render_merge_status(store: &dyn EventStore, merge_id: Uuid) -> Result<String> {
-    let events = query_events(store, &EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))?;
-    if events.is_empty() {
+fn policy_outcome_label(outcome: PolicyOutcome) -> &'static str {
+    match outcome {
+        PolicyOutcome::Allow => "allow",
+        PolicyOutcome::Deny => "deny",
+        PolicyOutcome::RequireApproval => "require_approval",
+    }
+}
+
+fn persist_merge_policy_decision(
+    store: &dyn EventStore,
+    merge: &MergeProjection,
+    decision: &yarli_core::domain::PolicyDecision,
+    operation: &str,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: decision.decision_id,
+            occurred_at: decision.decided_at,
+            entity_type: EntityType::Policy,
+            entity_id: decision.decision_id.to_string(),
+            event_type: "policy.decision".to_string(),
+            payload: serde_json::json!({
+                "run_id": decision.run_id,
+                "merge_id": merge.merge_id,
+                "operation": operation,
+                "action": decision.action,
+                "outcome": decision.outcome,
+                "rule_id": decision.rule_id,
+                "reason": decision.reason,
+            }),
+            correlation_id: merge.correlation_id,
+            causation_id: Some(merge.last_event_id),
+            actor: decision.actor.clone(),
+            idempotency_key: None,
+        },
+    )
+}
+
+fn append_merge_policy_audit(
+    sink: Option<&dyn AuditSink>,
+    decision: &yarli_core::domain::PolicyDecision,
+    merge: &MergeProjection,
+    operation: &str,
+) -> Result<()> {
+    if let Some(sink) = sink {
+        let mut entry = AuditEntry::from_policy_decision(decision);
+        entry.details = serde_json::json!({
+            "decision_id": decision.decision_id,
+            "decided_at": decision.decided_at,
+            "merge_id": merge.merge_id,
+            "merge_state": format!("{:?}", merge.state),
+            "operation": operation,
+            "source": merge.source_ref.clone(),
+            "target": merge.target_ref.clone(),
+            "strategy": merge.strategy.clone(),
+        });
+        sink.append(&entry)
+            .map_err(|e| anyhow::anyhow!("failed to append policy audit entry: {e}"))?;
+    }
+    Ok(())
+}
+
+fn evaluate_merge_policy(
+    merge: &MergeProjection,
+    safe_mode: SafeMode,
+    actor: &str,
+) -> Result<yarli_core::domain::PolicyDecision> {
+    let run_id = merge
+        .run_id
+        .ok_or_else(|| anyhow::anyhow!("merge intent {} missing run context", merge.merge_id))?;
+    let request = PolicyRequest {
+        actor: actor.to_string(),
+        action: ActionType::Merge,
+        command_class: Some(CommandClass::Git),
+        repo_path: None,
+        branch: merge.target_ref.clone(),
+        run_id,
+        task_id: None,
+        safe_mode,
+    };
+    let mut engine = PolicyEngine::with_defaults();
+    engine
+        .evaluate(&request)
+        .map_err(|e| anyhow::anyhow!("policy evaluation failed: {e}"))
+}
+
+fn execute_merge_request(
+    store: &dyn EventStore,
+    source: &str,
+    target: &str,
+    run_id: Uuid,
+    strategy: &str,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+
+    let merge_id = Uuid::now_v7();
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge_id.to_string(),
+            event_type: "merge.requested".to_string(),
+            payload: serde_json::json!({
+                "from": "MergeRequested",
+                "to": "MergeRequested",
+                "state": "MergeRequested",
+                "run_id": run_id,
+                "source": source,
+                "target": target,
+                "strategy": strategy,
+                "reason": "pending approval",
+            }),
+            correlation_id: run.correlation_id,
+            causation_id: None,
+            actor: "cli".to_string(),
+            idempotency_key: None,
+        },
+    )?;
+
+    let mut out = String::new();
+    writeln!(&mut out, "Merge intent requested")?;
+    writeln!(&mut out, "Merge ID: {merge_id}")?;
+    writeln!(&mut out, "Run: {run_id}")?;
+    writeln!(&mut out, "Source: {source}")?;
+    writeln!(&mut out, "Target: {target}")?;
+    writeln!(&mut out, "Strategy: {strategy}")?;
+    writeln!(&mut out, "State: MergeRequested")?;
+    Ok(out.trim_end().to_string())
+}
+
+fn execute_merge_approve(
+    store: &dyn EventStore,
+    merge_id: Uuid,
+    safe_mode: SafeMode,
+    enforce_policies: bool,
+    audit_sink: Option<&dyn AuditSink>,
+) -> Result<String> {
+    let merge = match load_merge_projection(store, merge_id)? {
+        Some(merge) => merge,
+        None => {
+            return Ok(format!(
+                "Merge intent {merge_id} not found in persisted event log."
+            ))
+        }
+    };
+
+    if merge.state != MergeState::MergeRequested {
         return Ok(format!(
-            "Merge intent {merge_id} not found in persisted event log."
+            "Merge intent {merge_id} is {:?}; approval allowed only from MergeRequested.",
+            merge.state
         ));
     }
 
-    let merged = collect_entity_projections(&events);
-    let merge = match merged.into_iter().next() {
-        Some(value) => value,
+    let mut causation_id = Some(merge.last_event_id);
+    if enforce_policies {
+        let decision = evaluate_merge_policy(&merge, safe_mode, "cli")?;
+        persist_merge_policy_decision(store, &merge, &decision, "merge.approve")?;
+        append_merge_policy_audit(audit_sink, &decision, &merge, "merge.approve")?;
+
+        if decision.outcome != PolicyOutcome::Allow {
+            append_event(
+                store,
+                Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: chrono::Utc::now(),
+                    entity_type: EntityType::Merge,
+                    entity_id: merge_id.to_string(),
+                    event_type: "merge.policy_blocked".to_string(),
+                    payload: serde_json::json!({
+                        "from": format!("{:?}", merge.state),
+                        "to": format!("{:?}", merge.state),
+                        "state": format!("{:?}", merge.state),
+                        "run_id": merge.run_id,
+                        "reason": format!("approval blocked by policy: {}", decision.reason),
+                        "policy": {
+                            "action": decision.action,
+                            "outcome": decision.outcome,
+                            "rule_id": decision.rule_id,
+                        },
+                    }),
+                    correlation_id: merge.correlation_id,
+                    causation_id: Some(decision.decision_id),
+                    actor: "cli".to_string(),
+                    idempotency_key: None,
+                },
+            )?;
+            if let Some(sink) = audit_sink {
+                sink.append(&AuditEntry::destructive_attempt(
+                    "cli",
+                    "merge.approve",
+                    format!("blocked by policy: {}", decision.reason),
+                    merge.run_id,
+                    None,
+                    serde_json::json!({
+                        "merge_id": merge_id,
+                        "outcome": decision.outcome,
+                        "rule_id": decision.rule_id,
+                    }),
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to append policy-block audit entry: {e}"))?;
+            }
+
+            return Ok(format!(
+                "Merge intent {merge_id} approval blocked by policy ({})",
+                policy_outcome_label(decision.outcome)
+            ));
+        }
+
+        causation_id = Some(decision.decision_id);
+    }
+
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge_id.to_string(),
+            event_type: "merge.approved".to_string(),
+            payload: serde_json::json!({
+                "from": "MergeRequested",
+                "to": "MergePrecheck",
+                "state": "MergePrecheck",
+                "run_id": merge.run_id,
+                "source": merge.source_ref,
+                "target": merge.target_ref,
+                "strategy": merge.strategy,
+                "reason": "approved by operator",
+            }),
+            correlation_id: merge.correlation_id,
+            causation_id,
+            actor: "cli".to_string(),
+            idempotency_key: None,
+        },
+    )?;
+
+    Ok(format!(
+        "Merge intent {merge_id} transitioned MergeRequested -> MergePrecheck."
+    ))
+}
+
+fn execute_merge_reject(
+    store: &dyn EventStore,
+    merge_id: Uuid,
+    reason: &str,
+    safe_mode: SafeMode,
+    enforce_policies: bool,
+    audit_sink: Option<&dyn AuditSink>,
+) -> Result<String> {
+    let merge = match load_merge_projection(store, merge_id)? {
+        Some(merge) => merge,
+        None => {
+            return Ok(format!(
+                "Merge intent {merge_id} not found in persisted event log."
+            ))
+        }
+    };
+
+    if merge.state != MergeState::MergeRequested {
+        return Ok(format!(
+            "Merge intent {merge_id} is {:?}; rejection allowed only from MergeRequested.",
+            merge.state
+        ));
+    }
+
+    let mut causation_id = Some(merge.last_event_id);
+    if enforce_policies {
+        let decision = evaluate_merge_policy(&merge, safe_mode, "cli")?;
+        persist_merge_policy_decision(store, &merge, &decision, "merge.reject")?;
+        append_merge_policy_audit(audit_sink, &decision, &merge, "merge.reject")?;
+
+        if decision.outcome != PolicyOutcome::Allow {
+            append_event(
+                store,
+                Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: chrono::Utc::now(),
+                    entity_type: EntityType::Merge,
+                    entity_id: merge_id.to_string(),
+                    event_type: "merge.policy_blocked".to_string(),
+                    payload: serde_json::json!({
+                        "from": format!("{:?}", merge.state),
+                        "to": format!("{:?}", merge.state),
+                        "state": format!("{:?}", merge.state),
+                        "run_id": merge.run_id,
+                        "reason": format!("rejection blocked by policy: {}", decision.reason),
+                        "policy": {
+                            "action": decision.action,
+                            "outcome": decision.outcome,
+                            "rule_id": decision.rule_id,
+                        },
+                    }),
+                    correlation_id: merge.correlation_id,
+                    causation_id: Some(decision.decision_id),
+                    actor: "cli".to_string(),
+                    idempotency_key: None,
+                },
+            )?;
+            if let Some(sink) = audit_sink {
+                sink.append(&AuditEntry::destructive_attempt(
+                    "cli",
+                    "merge.reject",
+                    format!("blocked by policy: {}", decision.reason),
+                    merge.run_id,
+                    None,
+                    serde_json::json!({
+                        "merge_id": merge_id,
+                        "outcome": decision.outcome,
+                        "rule_id": decision.rule_id,
+                    }),
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to append policy-block audit entry: {e}"))?;
+            }
+
+            return Ok(format!(
+                "Merge intent {merge_id} rejection blocked by policy ({})",
+                policy_outcome_label(decision.outcome)
+            ));
+        }
+
+        causation_id = Some(decision.decision_id);
+    }
+
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge_id.to_string(),
+            event_type: "merge.rejected".to_string(),
+            payload: serde_json::json!({
+                "from": "MergeRequested",
+                "to": "MergeAborted",
+                "state": "MergeAborted",
+                "run_id": merge.run_id,
+                "source": merge.source_ref,
+                "target": merge.target_ref,
+                "strategy": merge.strategy,
+                "reason": reason,
+            }),
+            correlation_id: merge.correlation_id,
+            causation_id,
+            actor: "cli".to_string(),
+            idempotency_key: None,
+        },
+    )?;
+
+    Ok(format!(
+        "Merge intent {merge_id} transitioned MergeRequested -> MergeAborted (reason: {reason})."
+    ))
+}
+
+fn render_merge_status(store: &dyn EventStore, merge_id: Uuid) -> Result<String> {
+    let merge = match load_merge_projection(store, merge_id)? {
+        Some(merge) => merge,
         None => {
             return Ok(format!(
                 "Merge intent {merge_id} not found in persisted event log."
@@ -1550,14 +2556,26 @@ fn render_merge_status(store: &dyn EventStore, merge_id: Uuid) -> Result<String>
     };
 
     let mut out = String::new();
-    writeln!(&mut out, "Merge intent {}", merge.entity_id)?;
-    writeln!(&mut out, "State: {}", merge.state)?;
+    writeln!(&mut out, "Merge intent {}", merge.merge_id)?;
+    writeln!(&mut out, "State: {:?}", merge.state)?;
     writeln!(&mut out, "Last event: {}", merge.last_event_type)?;
     writeln!(
         &mut out,
         "Updated: {}",
         merge.updated_at.format("%Y-%m-%d %H:%M:%S")
     )?;
+    if let Some(run_id) = merge.run_id {
+        writeln!(&mut out, "Run: {run_id}")?;
+    }
+    if let Some(source) = merge.source_ref {
+        writeln!(&mut out, "Source: {source}")?;
+    }
+    if let Some(target) = merge.target_ref {
+        writeln!(&mut out, "Target: {target}")?;
+    }
+    if let Some(strategy) = merge.strategy {
+        writeln!(&mut out, "Strategy: {strategy}")?;
+    }
     if let Some(reason) = merge.reason {
         writeln!(&mut out, "Reason: {reason}")?;
     }
@@ -1657,7 +2675,7 @@ fn cmd_gate_list(run_level: bool) -> Result<()> {
 
 /// `yarli gate rerun` — re-run gate evaluation for a task.
 fn cmd_gate_rerun(task_id_str: &str, gate_name: Option<&str>) -> Result<()> {
-    let _task_id: Uuid = task_id_str
+    let task_id: Uuid = task_id_str
         .parse()
         .context("invalid task ID (expected UUID)")?;
     if let Some(name) = gate_name {
@@ -1668,11 +2686,11 @@ fn cmd_gate_rerun(task_id_str: &str, gate_name: Option<&str>) -> Result<()> {
                 all_gate_names().join(", ")
             );
         }
-        println!("Gate re-run for `{name}` requires a persistent store (not yet available).");
-    } else {
-        println!("Gate re-run (all gates) requires a persistent store (not yet available).");
     }
-    println!("During `yarli run start`, gates are evaluated automatically after task execution.");
+
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| execute_gate_rerun(store, task_id, gate_name))?;
+    println!("{output}");
     Ok(())
 }
 
@@ -1689,51 +2707,76 @@ fn cmd_worktree_status(run_id_str: &str) -> Result<()> {
 
 /// `yarli worktree recover` — recover from interrupted git operation.
 fn cmd_worktree_recover(worktree_id_str: &str, action: &str) -> Result<()> {
-    let _worktree_id: Uuid = worktree_id_str
+    let worktree_id: Uuid = worktree_id_str
         .parse()
         .context("invalid worktree ID (expected UUID)")?;
     match action {
         "abort" | "resume" | "manual-block" => {}
         _ => bail!("invalid recovery action: {action}. Use: abort, resume, or manual-block"),
     }
-    println!("Worktree recovery requires a persistent store (not yet available).");
-    println!("Recovery action: {action}");
-    println!("During `yarli run start`, interrupted operations are detected and handled automatically.");
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| execute_worktree_recover(store, worktree_id, action))?;
+    println!("{output}");
     Ok(())
 }
 
 /// `yarli merge request` — create a merge intent.
 fn cmd_merge_request(source: &str, target: &str, run_id_str: &str, strategy: &str) -> Result<()> {
-    let _run_id: Uuid = run_id_str
+    let run_id: Uuid = run_id_str
         .parse()
         .context("invalid run ID (expected UUID)")?;
-    match strategy {
-        "merge-no-ff" | "rebase-then-ff" | "squash-merge" => {}
-        _ => bail!("invalid merge strategy: {strategy}. Use: merge-no-ff, rebase-then-ff, or squash-merge"),
-    }
-    println!("Merge request requires a persistent store (not yet available).");
-    println!("Intent: merge {source} into {target} using strategy `{strategy}`");
-    println!("During `yarli run start`, merges are orchestrated by the merge engine.");
+    let strategy = parse_merge_strategy(strategy).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid merge strategy: {strategy}. Use: merge-no-ff, rebase-then-ff, or squash-merge"
+        )
+    })?;
+
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_merge_request(store, source, target, run_id, strategy)
+    })?;
+    println!("{output}");
     Ok(())
 }
 
 /// `yarli merge approve` — approve a merge intent.
 fn cmd_merge_approve(merge_id_str: &str) -> Result<()> {
-    let _merge_id: Uuid = merge_id_str
+    let merge_id: Uuid = merge_id_str
         .parse()
         .context("invalid merge intent ID (expected UUID)")?;
-    println!("Merge approval requires a persistent store (not yet available).");
-    println!("Approval tokens are validated by the policy engine before merge apply.");
+    let loaded_config = load_runtime_config_for_reads()?;
+    let audit_sink = prepare_audit_sink(&loaded_config)?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_merge_approve(
+            store,
+            merge_id,
+            loaded_config.config().core.safe_mode,
+            loaded_config.config().policy.enforce_policies,
+            audit_sink.as_ref().map(|sink| sink as &dyn AuditSink),
+        )
+    })?;
+    println!("{output}");
     Ok(())
 }
 
 /// `yarli merge reject` — reject a merge intent.
 fn cmd_merge_reject(merge_id_str: &str, reason: &str) -> Result<()> {
-    let _merge_id: Uuid = merge_id_str
+    let merge_id: Uuid = merge_id_str
         .parse()
         .context("invalid merge intent ID (expected UUID)")?;
-    println!("Merge rejection requires a persistent store (not yet available).");
-    println!("Reason: {reason}");
+    let loaded_config = load_runtime_config_for_reads()?;
+    let audit_sink = prepare_audit_sink(&loaded_config)?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_merge_reject(
+            store,
+            merge_id,
+            reason,
+            loaded_config.config().core.safe_mode,
+            loaded_config.config().policy.enforce_policies,
+            audit_sink.as_ref().map(|sink| sink as &dyn AuditSink),
+        )
+    })?;
+    println!("{output}");
     Ok(())
 }
 
@@ -1859,6 +2902,15 @@ fn parse_gate_type(name: &str) -> Option<GateType> {
     }
 }
 
+fn parse_merge_strategy(name: &str) -> Option<&'static str> {
+    match name {
+        "merge-no-ff" => Some("merge-no-ff"),
+        "rebase-then-ff" => Some("rebase-then-ff"),
+        "squash-merge" => Some("squash-merge"),
+        _ => None,
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1868,7 +2920,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tempfile::NamedTempFile;
-    use yarli_observability::AuditEntry;
+    use yarli_observability::{AuditCategory, AuditEntry, InMemoryAuditSink};
     use yarli_store::event_store::EventQuery;
     use yarli_store::InMemoryEventStore;
 
@@ -2243,6 +3295,123 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn execute_gate_rerun_persists_single_gate_evaluation() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let command_id = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.verifying",
+                corr,
+                serde_json::json!({ "from": "TaskExecuting", "to": "TaskVerifying" }),
+            ))
+            .unwrap();
+        store
+            .append(Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: Utc::now(),
+                entity_type: EntityType::Command,
+                entity_id: command_id.to_string(),
+                event_type: "command.started".to_string(),
+                payload: serde_json::json!({
+                    "command": "cargo test",
+                    "working_dir": "/tmp",
+                    "command_class": "io",
+                }),
+                correlation_id: corr,
+                causation_id: None,
+                actor: "test".to_string(),
+                idempotency_key: Some(format!("{task_id}:cmd:1:started")),
+            })
+            .unwrap();
+        store
+            .append(Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: Utc::now(),
+                entity_type: EntityType::Command,
+                entity_id: command_id.to_string(),
+                event_type: "command.exited".to_string(),
+                payload: serde_json::json!({
+                    "exit_code": 0,
+                    "duration_ms": 42,
+                    "state": "CmdExited",
+                }),
+                correlation_id: corr,
+                causation_id: None,
+                actor: "test".to_string(),
+                idempotency_key: Some(format!("{task_id}:cmd:1:terminal")),
+            })
+            .unwrap();
+
+        let output = execute_gate_rerun(&store, task_id, Some("tests_passed")).unwrap();
+        assert!(output.contains("gate.tests_passed: PASS"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let gate_events = store
+            .query(&EventQuery::by_entity(EntityType::Gate, task_id.to_string()))
+            .unwrap();
+        assert_eq!(gate_events.len(), 1);
+        assert_eq!(gate_events[0].event_type, "gate.evaluated");
+        assert_eq!(gate_events[0].payload["gate"], "gate.tests_passed");
+        assert_eq!(gate_events[0].payload["status"], "passed");
+    }
+
+    #[test]
+    fn execute_gate_rerun_persists_all_default_task_gates() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.verifying",
+                corr,
+                serde_json::json!({ "from": "TaskExecuting", "to": "TaskVerifying" }),
+            ))
+            .unwrap();
+
+        let output = execute_gate_rerun(&store, task_id, None).unwrap();
+        assert!(output.contains("Evaluated 5 gate(s):"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let gate_events = store
+            .query(&EventQuery::by_entity(EntityType::Gate, task_id.to_string()))
+            .unwrap();
+        assert_eq!(gate_events.len(), default_task_gates().len());
+        assert!(
+            gate_events
+                .iter()
+                .all(|event| event.event_type == "gate.evaluated")
+        );
+    }
+
     // ── worktree recover validation ──────────────────────────────────
 
     #[test]
@@ -2258,7 +3427,123 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── merge request validation ─────────────────────────────────────
+    #[test]
+    fn execute_worktree_recover_abort_persists_state_and_updates_status_projection() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let worktree_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Worktree,
+                worktree_id.to_string(),
+                "worktree.conflict_detected",
+                corr,
+                serde_json::json!({
+                    "from": "WtMerging",
+                    "to": "WtConflict",
+                    "run_id": run_id,
+                    "reason": "merge conflict requires recovery",
+                }),
+            ))
+            .unwrap();
+
+        let output = execute_worktree_recover(&store, worktree_id, "abort").unwrap();
+        assert!(output.contains("Resulting state: WtBoundHome"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let events = store
+            .query(&EventQuery::by_entity(
+                EntityType::Worktree,
+                worktree_id.to_string(),
+            ))
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worktree.recovery_started")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worktree.recovered")
+        );
+
+        let status_output = render_worktree_status(&store, run_id).unwrap();
+        assert!(status_output.contains(&worktree_id.to_string()));
+        assert!(status_output.contains("WtBoundHome"));
+    }
+
+    #[test]
+    fn execute_worktree_recover_manual_block_persists_recovering_state() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let worktree_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Worktree,
+                worktree_id.to_string(),
+                "worktree.conflict_detected",
+                corr,
+                serde_json::json!({
+                    "from": "WtMerging",
+                    "to": "WtConflict",
+                    "run_id": run_id,
+                    "reason": "manual intervention required",
+                }),
+            ))
+            .unwrap();
+
+        let output = execute_worktree_recover(&store, worktree_id, "manual-block").unwrap();
+        assert!(output.contains("Resulting state: WtRecovering"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let events = store
+            .query(&EventQuery::by_entity(
+                EntityType::Worktree,
+                worktree_id.to_string(),
+            ))
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "worktree.recovery_blocked")
+        );
+
+        let status_output = render_worktree_status(&store, run_id).unwrap();
+        assert!(status_output.contains("WtRecovering"));
+    }
+
+    // ── merge lifecycle commands ─────────────────────────────────────
+
+    fn merge_id_from_output(output: &str) -> Uuid {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("Merge ID: "))
+            .and_then(|raw| raw.trim().parse::<Uuid>().ok())
+            .expect("expected merge ID line in output")
+    }
 
     #[test]
     fn cmd_merge_request_accepts_valid_strategies() {
@@ -2277,6 +3562,240 @@ mod tests {
     fn cmd_merge_request_rejects_invalid_uuid() {
         let result = cmd_merge_request("feat", "main", "bad", "merge-no-ff");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_merge_request_persists_requested_event() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+
+        let output = execute_merge_request(&store, "feat/login", "main", run_id, "merge-no-ff").unwrap();
+        assert!(output.contains("Merge intent requested"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let merge_id = merge_id_from_output(&output);
+        let events = store
+            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "merge.requested");
+        assert_eq!(events[0].payload["state"], "MergeRequested");
+        assert_eq!(events[0].payload["source"], "feat/login");
+        assert_eq!(events[0].payload["target"], "main");
+        assert_eq!(events[0].payload["strategy"], "merge-no-ff");
+    }
+
+    #[test]
+    fn execute_merge_approve_persists_policy_and_transition_events() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let merge_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let audit = InMemoryAuditSink::new();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Merge,
+                merge_id.to_string(),
+                "merge.requested",
+                corr,
+                serde_json::json!({
+                    "to": "MergeRequested",
+                    "state": "MergeRequested",
+                    "run_id": run_id,
+                    "source": "feat/login",
+                    "target": "main",
+                    "strategy": "merge-no-ff",
+                    "reason": "pending approval",
+                }),
+            ))
+            .unwrap();
+
+        let output = execute_merge_approve(
+            &store,
+            merge_id,
+            SafeMode::Execute,
+            true,
+            Some(&audit),
+        )
+        .unwrap();
+        assert!(output.contains("MergeRequested -> MergePrecheck"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let merge_events = store
+            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .unwrap();
+        assert!(
+            merge_events
+                .iter()
+                .any(|event| event.event_type == "merge.approved")
+        );
+
+        let all_events = store.query(&EventQuery::by_correlation(corr)).unwrap();
+        assert!(
+            all_events
+                .iter()
+                .any(|event| event.event_type == "policy.decision")
+        );
+
+        let audit_entries = audit.read_all().unwrap();
+        assert!(
+            audit_entries
+                .iter()
+                .any(|entry| entry.category == AuditCategory::PolicyDecision)
+        );
+    }
+
+    #[test]
+    fn execute_merge_approve_in_observe_mode_blocks_and_audits() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let merge_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let audit = InMemoryAuditSink::new();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Merge,
+                merge_id.to_string(),
+                "merge.requested",
+                corr,
+                serde_json::json!({
+                    "to": "MergeRequested",
+                    "state": "MergeRequested",
+                    "run_id": run_id,
+                    "source": "feat/login",
+                    "target": "main",
+                    "strategy": "merge-no-ff",
+                }),
+            ))
+            .unwrap();
+
+        let output = execute_merge_approve(
+            &store,
+            merge_id,
+            SafeMode::Observe,
+            true,
+            Some(&audit),
+        )
+        .unwrap();
+        assert!(output.contains("blocked by policy"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let merge_events = store
+            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .unwrap();
+        assert!(
+            !merge_events
+                .iter()
+                .any(|event| event.event_type == "merge.approved")
+        );
+        assert!(
+            merge_events
+                .iter()
+                .any(|event| event.event_type == "merge.policy_blocked")
+        );
+
+        let policy_event = store
+            .query(&EventQuery::by_correlation(corr))
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "policy.decision")
+            .expect("expected policy decision event");
+        assert_eq!(policy_event.payload["outcome"].as_str(), Some("DENY"));
+
+        let audit_entries = audit.read_all().unwrap();
+        assert!(
+            audit_entries
+                .iter()
+                .any(|entry| entry.category == AuditCategory::DestructiveAttempt)
+        );
+    }
+
+    #[test]
+    fn execute_merge_reject_persists_rejected_transition() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let merge_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Merge,
+                merge_id.to_string(),
+                "merge.requested",
+                corr,
+                serde_json::json!({
+                    "to": "MergeRequested",
+                    "state": "MergeRequested",
+                    "run_id": run_id,
+                    "source": "feat/login",
+                    "target": "main",
+                    "strategy": "merge-no-ff",
+                    "reason": "pending approval",
+                }),
+            ))
+            .unwrap();
+
+        let output = execute_merge_reject(
+            &store,
+            merge_id,
+            "manual rejection",
+            SafeMode::Execute,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(output.contains("MergeRequested -> MergeAborted"));
+        assert!(!output.contains("requires a persistent store"));
+
+        let merge_events = store
+            .query(&EventQuery::by_entity(EntityType::Merge, merge_id.to_string()))
+            .unwrap();
+        let rejected = merge_events
+            .iter()
+            .find(|event| event.event_type == "merge.rejected")
+            .expect("expected merge.rejected event");
+        assert_eq!(rejected.payload["to"], "MergeAborted");
+        assert_eq!(rejected.payload["reason"], "manual rejection");
     }
 
     // ── audit tail ───────────────────────────────────────────────────
