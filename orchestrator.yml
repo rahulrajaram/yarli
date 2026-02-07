@@ -1,0 +1,41 @@
+# Orchestrator Orchestrator Configuration
+# See: https://mikeyobrien.github.io/orchestrator-orchestrator/guide/configuration/
+#
+# Parallel worktrees are disabled via `features.parallel: false` below.
+# Use `--exclusive` only if you want to wait for a running loop instead of failing.
+
+# --- Codex backend (disabled) ---
+cli:
+   backend: "custom"
+   command: "codex"
+   args: ["--dangerously-bypass-approvals-and-sandbox", "exec", "--json"]
+
+# --- Claude backend (active) ---
+#cli:
+  #backend: "claude"
+  #prompt_mode: "arg"
+
+event_loop:
+  completion_promise: "LOOP_COMPLETE"
+  prompt_file: "PROMPT.md"
+  max_iterations: 5
+  max_runtime_seconds: 14400  # 4 hours
+  idle_timeout_secs: 1800     # 30 min
+
+features:
+  parallel: false             # Disable parallel loop worktrees
+
+core:
+  scratchpad: ".agent/scratchpad.md"
+  state_file: ".agent/loop-state.json"
+  guardrails:
+    - "Fresh context each iteration - scratchpad is memory"
+    - "Backpressure is law - tests must pass before marking DONE"
+
+memories:
+  enabled: true
+  inject: auto
+  budget: 2000
+
+tasks:
+  enabled: true
