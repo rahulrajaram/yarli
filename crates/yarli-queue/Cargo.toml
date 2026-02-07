@@ -1,0 +1,22 @@
+[package]
+name = "yarli-queue"
+description = "Queue leasing and scheduling utilities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yarli-core = { workspace = true }
+yarli-store = { workspace = true }
+yarli-exec = { workspace = true }
+yarli-gates = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

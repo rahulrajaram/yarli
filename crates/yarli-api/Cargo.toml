@@ -1,0 +1,21 @@
+[package]
+name = "yarli-api"
+description = "gRPC services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yarli-core = { workspace = true }
+yarli-store = { workspace = true }
+yarli-queue = { workspace = true }
+yarli-gates = { workspace = true }
+yarli-policy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

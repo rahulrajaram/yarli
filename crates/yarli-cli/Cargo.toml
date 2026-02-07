@@ -1,0 +1,41 @@
+[package]
+name = "yarli-cli"
+description = "CLI, stream mode renderer, and interactive TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yarli"
+path = "src/main.rs"
+
+[dependencies]
+yarli-core = { workspace = true }
+yarli-store = { workspace = true }
+yarli-queue = { workspace = true }
+yarli-exec = { workspace = true }
+yarli-git = { workspace = true }
+yarli-gates = { workspace = true }
+yarli-policy = { workspace = true }
+yarli-memory = { workspace = true }
+yarli-observability = { workspace = true }
+yarli-api = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+owo-colors = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

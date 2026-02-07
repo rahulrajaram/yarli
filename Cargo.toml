@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yarli-core",
+    "crates/yarli-store",
+    "crates/yarli-queue",
+    "crates/yarli-exec",
+    "crates/yarli-git",
+    "crates/yarli-gates",
+    "crates/yarli-policy",
+    "crates/yarli-memory",
+    "crates/yarli-observability",
+    "crates/yarli-api",
+    "crates/yarli-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Core domain
+yarli-core = { path = "crates/yarli-core" }
+yarli-store = { path = "crates/yarli-store" }
+yarli-queue = { path = "crates/yarli-queue" }
+yarli-exec = { path = "crates/yarli-exec" }
+yarli-git = { path = "crates/yarli-git" }
+yarli-gates = { path = "crates/yarli-gates" }
+yarli-policy = { path = "crates/yarli-policy" }
+yarli-memory = { path = "crates/yarli-memory" }
+yarli-observability = { path = "crates/yarli-observability" }
+yarli-api = { path = "crates/yarli-api" }
+yarli-cli = { path = "crates/yarli-cli" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+
+# IDs and time
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Observability
+opentelemetry = "0.27"
+opentelemetry_sdk = "0.27"
+opentelemetry-otlp = "0.27"
+
+# Metrics
+prometheus-client = "0.23"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+owo-colors = "4"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config
+toml = "0.8"
+
+# Testing
+assert_matches = "1.5"
+tempfile = "3"

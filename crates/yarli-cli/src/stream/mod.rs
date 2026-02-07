@@ -1,0 +1,16 @@
+//! Stream mode renderer (Section 30).
+//!
+//! Plain structured ANSI output to stdout with inline viewport for live status.
+//! Completed output enters native terminal scrollback (copy-pasteable).
+//! Active tasks shown via ratatui `Viewport::Inline` with braille spinners.
+//! Used in CI, pipes, small terminals.
+
+pub mod events;
+pub mod renderer;
+pub mod spinner;
+pub mod style;
+
+pub use events::{StreamEvent, TaskView};
+pub use renderer::{StreamConfig, StreamRenderer};
+pub use spinner::Spinner;
+pub use style::Tier;
