@@ -21,4 +21,16 @@ pub enum StoreError {
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// Database operation failed.
+    #[error("database error: {0}")]
+    Database(String),
+
+    /// Tokio runtime operation failed.
+    #[error("runtime error: {0}")]
+    Runtime(String),
+
+    /// Persisted entity type value is invalid.
+    #[error("invalid entity type in store: {0}")]
+    InvalidEntityType(String),
 }
