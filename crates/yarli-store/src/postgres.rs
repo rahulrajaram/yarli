@@ -50,17 +50,15 @@ impl PostgresEventStore {
         match Handle::try_current() {
             Ok(handle) => match handle.runtime_flavor() {
                 RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| handle.block_on(fut)),
-                RuntimeFlavor::CurrentThread => {
-                    thread::spawn(move || {
-                        let runtime = Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|error| StoreError::Runtime(error.to_string()))?;
-                        runtime.block_on(fut)
-                    })
-                    .join()
-                    .map_err(|_| StoreError::Runtime("postgres operation panicked".to_string()))?
-                }
+                RuntimeFlavor::CurrentThread => thread::spawn(move || {
+                    let runtime = Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| StoreError::Runtime(error.to_string()))?;
+                    runtime.block_on(fut)
+                })
+                .join()
+                .map_err(|_| StoreError::Runtime("postgres operation panicked".to_string()))?,
                 _ => {
                     let runtime = Builder::new_current_thread()
                         .enable_all()

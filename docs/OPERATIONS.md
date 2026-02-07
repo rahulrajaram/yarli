@@ -78,6 +78,55 @@ database_url = "postgres://postgres:postgres@localhost:5432/yarli"
 
 `core.backend = "in-memory"` is supported only for explicit ephemeral workflows, and write commands are blocked unless `core.allow_in_memory_writes = true`.
 
+## Runtime Resource and Token Budgets
+
+YARLI can enforce explicit per-task and per-run budgets from `yarli.toml`:
+
+```toml
+[budgets]
+max_task_total_tokens = 25000
+max_run_total_tokens = 250000
+max_task_rss_bytes = 1073741824
+max_run_peak_rss_bytes = 2147483648
+```
+
+Behavior:
+
+- Budget breaches are fail-closed (`task.failed` with `reason = "budget_exceeded"`).
+- Breach events include observed metric values, limits, command resource usage, token usage, and run usage totals.
+- Token usage currently uses deterministic `char_count_div4_estimate_v1` estimation and is recorded in command/task events.
+
+Operator-visible command surfaces for resource_usage and token_usage:
+
+- `yarli run status <run-id>`: shows per-task `budget_exceeded`, `token_usage` (prompt_tokens, completion_tokens, total_tokens), and `resource_usage` (max_rss_bytes).
+- `yarli run explain-exit <run-id>`: shows `Budget breaches:` section with task name and breach detail, plus per-task token and resource usage.
+- `yarli task explain <task-id>`: shows `budget_exceeded` reason, token usage, and resource usage for individual tasks.
+
+## Reproducing Budget Stress Checks Locally
+
+Run these commands to verify budget governance under parallel workload:
+
+```bash
+# Single-task budget breach: task exceeds token limit, fails without retry
+cargo test -p yarli-queue scheduler::tests::test_budget_exceeded_fails_task_without_retry -- --nocapture
+
+# Run-level budget breach: cumulative tokens across tasks exceed run limit
+cargo test -p yarli-queue scheduler::tests::test_run_token_budget_exceeded_across_tasks -- --nocapture
+
+# Parallel-task budget stress: 4 concurrent tasks with tight run budget,
+# proves accounting consistency and no silent continuation after breach
+cargo test -p yarli-queue scheduler::tests::test_parallel_tasks_budget_accounting_consistency -- --nocapture
+
+# Command execution resource capture (exec layer)
+cargo test -p yarli-exec -- --nocapture
+```
+
+Expected behavior:
+
+- All commands exit `0`.
+- Budget failure events include `reason = "budget_exceeded"` with observed/limit metrics.
+- Run does not reach `RunCompleted` after any budget breach.
+
 ## Migration Workflow
 
 YARLI schema SQL lives under `crates/yarli-store/migrations/`.
@@ -151,6 +200,16 @@ cargo fmt --all
 cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
+
+## Consistency and Governance Contract
+
+See `docs/CONSISTENCY_CONTRACT.md` for the canonical strong-consistency and runtime-governance contract, including:
+
+- Per-aggregate transition ordering and linearizable state.
+- Durable-state-before-side-effects invariant.
+- Idempotency key replay behavior.
+- Queue lease single-owner invariant.
+- Resource and token accounting fields and budget breach outcomes.
 
 ## Acceptance Decision
 

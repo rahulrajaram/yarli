@@ -499,8 +499,7 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.lines().count(), 1);
 
-        let decoded: AuditEntry =
-            serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        let decoded: AuditEntry = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
         assert_eq!(decoded.audit_id, entry.audit_id);
     }
 
@@ -671,18 +670,12 @@ mod tests {
         sink.append(&e2).unwrap();
 
         // Token consumed
-        let e3 = AuditEntry::token_consumed(
-            "admin",
-            "git_push",
-            Uuid::new_v4(),
-            Some(run_id),
-            None,
-        );
+        let e3 =
+            AuditEntry::token_consumed("admin", "git_push", Uuid::new_v4(), Some(run_id), None);
         sink.append(&e3).unwrap();
 
         // Gate evaluation
-        let e4 =
-            AuditEntry::gate_evaluation("tests_passed", true, "all pass", run_id, None);
+        let e4 = AuditEntry::gate_evaluation("tests_passed", true, "all pass", run_id, None);
         sink.append(&e4).unwrap();
 
         let entries = sink.read_all().unwrap();

@@ -94,7 +94,14 @@ impl StreamRenderer {
                 at,
             } => {
                 self.handle_task_transition(
-                    task_id, &task_name, from, to, elapsed, exit_code, detail.as_deref(), at,
+                    task_id,
+                    &task_name,
+                    from,
+                    to,
+                    elapsed,
+                    exit_code,
+                    detail.as_deref(),
+                    at,
                 )?;
             }
             StreamEvent::RunTransition {
@@ -121,10 +128,7 @@ impl StreamRenderer {
             StreamEvent::ExplainUpdate { summary } => {
                 self.explain_summary = Some(summary);
             }
-            StreamEvent::TaskWorker {
-                task_id,
-                worker_id,
-            } => {
+            StreamEvent::TaskWorker { task_id, worker_id } => {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     view.worker_id = Some(worker_id);
                 }
@@ -327,10 +331,7 @@ impl StreamRenderer {
                     Span::styled("  ", Style::default()),
                     Span::styled(format!("{glyph} "), tier.style()),
                     Span::styled(format!("task/{:<14}", task.name), tier.style()),
-                    Span::styled(
-                        format!("{:<8}", elapsed_str),
-                        Tier::Contextual.style(),
-                    ),
+                    Span::styled(format!("{:<8}", elapsed_str), Tier::Contextual.style()),
                 ];
 
                 // Show last output line for executing tasks.
@@ -478,9 +479,6 @@ mod tests {
     #[test]
     fn tier_for_completed_run() {
         use yarli_core::fsm::run::RunState;
-        assert_eq!(
-            tier_for_run_state(RunState::RunCompleted),
-            Tier::Contextual
-        );
+        assert_eq!(tier_for_run_state(RunState::RunCompleted), Tier::Contextual);
     }
 }

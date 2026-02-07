@@ -135,10 +135,7 @@ pub fn evaluate_gate(gate_type: GateType, ctx: &GateContext) -> GateEvaluation {
 ///
 /// The `required_gates` list determines which gates are checked.
 /// All must pass for the entity to be considered verified.
-pub fn evaluate_all(
-    required_gates: &[GateType],
-    ctx: &GateContext,
-) -> Vec<GateEvaluation> {
+pub fn evaluate_all(required_gates: &[GateType], ctx: &GateContext) -> Vec<GateEvaluation> {
     required_gates
         .iter()
         .map(|gate| evaluate_gate(*gate, ctx))
@@ -233,7 +230,9 @@ fn eval_required_evidence_present(ctx: &GateContext) -> (GateResult, Option<Stri
             GateResult::Failed {
                 reason: "no evidence records found".to_string(),
             },
-            Some("Ensure the task produces evidence (command result, test report, etc.)".to_string()),
+            Some(
+                "Ensure the task produces evidence (command result, test report, etc.)".to_string(),
+            ),
         );
     }
 
@@ -258,7 +257,10 @@ fn eval_required_evidence_present(ctx: &GateContext) -> (GateResult, Option<Stri
                         invalid.join("; ")
                     ),
                 },
-                Some("Check evidence payload matches expected schema for this task class.".to_string()),
+                Some(
+                    "Check evidence payload matches expected schema for this task class."
+                        .to_string(),
+                ),
             );
         }
 
@@ -279,16 +281,13 @@ fn eval_required_evidence_present(ctx: &GateContext) -> (GateResult, Option<Stri
 fn eval_tests_passed(ctx: &GateContext) -> (GateResult, Option<String>) {
     // Look for test report evidence first
     for ev in &ctx.evidence {
-        if let Ok(report) = serde_json::from_value::<crate::evidence::TestReportEvidence>(
-            ev.payload.clone(),
-        ) {
+        if let Ok(report) =
+            serde_json::from_value::<crate::evidence::TestReportEvidence>(ev.payload.clone())
+        {
             if report.failed > 0 {
                 return (
                     GateResult::Failed {
-                        reason: format!(
-                            "{}/{} tests failed",
-                            report.failed, report.total
-                        ),
+                        reason: format!("{}/{} tests failed", report.failed, report.total),
                     },
                     Some(format!(
                         "Fix {} failing test(s): {}",
@@ -710,9 +709,7 @@ mod tests {
     fn evaluate_all_some_fail() {
         let mut ctx = make_context();
         ctx.all_tasks_complete = false;
-        ctx.task_states = vec![
-            (Uuid::new_v4(), "test".into(), TaskState::TaskFailed),
-        ];
+        ctx.task_states = vec![(Uuid::new_v4(), "test".into(), TaskState::TaskFailed)];
         ctx.has_unresolved_conflicts = true;
 
         let gates = vec![

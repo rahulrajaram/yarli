@@ -10,9 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use yarli_core::domain::{
-    CommandClass, PolicyDecision, PolicyOutcome, RunId, SafeMode, TaskId,
-};
+use yarli_core::domain::{CommandClass, PolicyDecision, PolicyOutcome, RunId, SafeMode, TaskId};
 
 use crate::error::PolicyError;
 use crate::token::ApprovalToken;
@@ -457,12 +455,7 @@ impl PolicyEngine {
         decisions
             .iter()
             .filter(|d| d.outcome != PolicyOutcome::Allow)
-            .map(|d| {
-                format!(
-                    "{}: {} (rule: {})",
-                    d.action, d.reason, d.rule_id
-                )
-            })
+            .map(|d| format!("{}: {} (rule: {})", d.action, d.reason, d.rule_id))
             .collect()
     }
 }
@@ -565,7 +558,9 @@ mod tests {
     fn breakglass_mode_allows_all() {
         assert!(SafeModePolicy::check(SafeMode::Breakglass, ActionType::CommandExecute).is_ok());
         assert!(SafeModePolicy::check(SafeMode::Breakglass, ActionType::GitPush).is_ok());
-        assert!(SafeModePolicy::check(SafeMode::Breakglass, ActionType::DestructiveCleanup).is_ok());
+        assert!(
+            SafeModePolicy::check(SafeMode::Breakglass, ActionType::DestructiveCleanup).is_ok()
+        );
     }
 
     // ---- Rule matching ----
@@ -617,7 +612,10 @@ mod tests {
             reason: "test".to_string(),
         };
         assert!(rule.matches(&make_request(ActionType::CommandExecute, SafeMode::Execute)));
-        assert!(!rule.matches(&make_request(ActionType::CommandExecute, SafeMode::Breakglass)));
+        assert!(!rule.matches(&make_request(
+            ActionType::CommandExecute,
+            SafeMode::Breakglass
+        )));
     }
 
     #[test]
@@ -750,7 +748,9 @@ mod tests {
         // Restricted passes safe mode for command, but needs a matching rule
         // Our default rules match execute|breakglass, so restricted won't match
         // → default deny
-        assert!(decision.outcome == PolicyOutcome::Allow || decision.outcome == PolicyOutcome::Deny);
+        assert!(
+            decision.outcome == PolicyOutcome::Allow || decision.outcome == PolicyOutcome::Deny
+        );
 
         let push_req = make_request(ActionType::GitPush, SafeMode::Restricted);
         let decision = engine.evaluate(&push_req).unwrap();
@@ -846,12 +846,7 @@ mod tests {
             run_id: Some(run_id),
             task_id: None,
         };
-        let token = ApprovalToken::new(
-            "admin",
-            scope,
-            Utc::now() + Duration::hours(1),
-            "one-time",
-        );
+        let token = ApprovalToken::new("admin", scope, Utc::now() + Duration::hours(1), "one-time");
         engine.add_token(token);
 
         let req = PolicyRequest {

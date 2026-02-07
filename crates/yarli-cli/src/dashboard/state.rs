@@ -210,8 +210,7 @@ impl PanelManager {
     /// Move task list cursor down.
     pub fn select_next_task(&mut self) {
         if !self.task_order.is_empty() {
-            self.selected_task_idx =
-                (self.selected_task_idx + 1).min(self.task_order.len() - 1);
+            self.selected_task_idx = (self.selected_task_idx + 1).min(self.task_order.len() - 1);
             self.update_output_for_selected_task();
         }
     }
@@ -271,7 +270,13 @@ impl PanelManager {
     }
 
     /// Update a task's state from a stream event.
-    pub fn update_task(&mut self, task_id: TaskId, name: &str, state: TaskState, elapsed: Option<Duration>) {
+    pub fn update_task(
+        &mut self,
+        task_id: TaskId,
+        name: &str,
+        state: TaskState,
+        elapsed: Option<Duration>,
+    ) {
         if !self.task_order.contains(&task_id) {
             self.task_order.push(task_id);
         }
@@ -428,8 +433,10 @@ mod tests {
     #[test]
     fn restore_all_resets_panels() {
         let mut mgr = PanelManager::new();
-        mgr.panel_states.insert(PanelId::TaskList, PanelState::Hidden);
-        mgr.panel_states.insert(PanelId::Output, PanelState::Collapsed);
+        mgr.panel_states
+            .insert(PanelId::TaskList, PanelState::Hidden);
+        mgr.panel_states
+            .insert(PanelId::Output, PanelState::Collapsed);
         mgr.restore_all();
         assert_eq!(mgr.panel_state(PanelId::TaskList), PanelState::Expanded);
         assert_eq!(mgr.panel_state(PanelId::Output), PanelState::Expanded);

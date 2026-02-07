@@ -201,9 +201,7 @@ fn query_by_correlation() {
         .append(make_event(EntityType::Task, "t2", "created"))
         .unwrap();
 
-    let results = store
-        .query(&EventQuery::by_correlation(corr))
-        .unwrap();
+    let results = store.query(&EventQuery::by_correlation(corr)).unwrap();
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|e| e.correlation_id == corr));
 }

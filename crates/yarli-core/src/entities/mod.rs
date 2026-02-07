@@ -12,7 +12,9 @@ pub mod task;
 pub mod transition;
 pub mod worktree_binding;
 
-pub use command_execution::{CommandExecution, StreamChunk, StreamType};
+pub use command_execution::{
+    CommandExecution, CommandResourceUsage, StreamChunk, StreamType, TokenUsage,
+};
 pub use merge_intent::{ConflictRecord, ConflictType, MergeIntent, MergeStrategy};
 pub use run::Run;
 pub use task::{BlockerCode, Task};

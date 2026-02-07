@@ -62,9 +62,8 @@ impl TracingConfig {
 ///
 /// Returns an error if the subscriber has already been set (double init).
 pub fn init_tracing(config: &TracingConfig) -> Result<(), TracingInitError> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(config.default_level.as_str())
-    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(config.default_level.as_str()));
 
     if config.json {
         let fmt_layer = fmt::layer()

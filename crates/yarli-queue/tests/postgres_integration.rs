@@ -1,13 +1,14 @@
+use std::collections::HashSet;
 use std::env;
 use std::str::FromStr;
 
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::ConnectOptions;
 use uuid::Uuid;
-use yarli_core::domain::CommandClass;
+use yarli_core::domain::{CommandClass, EntityType, Event};
 use yarli_queue::{ClaimRequest, ConcurrencyConfig, PostgresTaskQueue, TaskQueue};
-use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
+use yarli_store::{EventStore, PostgresEventStore, MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
 
 const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
 const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";
@@ -94,6 +95,238 @@ async fn enqueue_and_claim_lease_roundtrip_against_postgres(
     assert_eq!(queue.pending_count(), 0);
     assert_eq!(queue.leased_count_for_run(run_id), 1);
     assert_eq!(queue.leased_count_for_class(CommandClass::Git), 1);
+
+    database.drop().await?;
+    Ok(())
+}
+
+/// Prove that >=2 concurrent workers cannot double-claim the same queue entry.
+///
+/// This validates SC-2 from the consistency matrix: single-active-lease invariant
+/// under Postgres FOR UPDATE SKIP LOCKED.
+#[tokio::test]
+async fn concurrent_claim_no_duplicate_lease_postgres() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) = test_database_url() else {
+        if require_postgres_tests() {
+            panic!(
+                "postgres integration tests require {TEST_DATABASE_URL_ENV} when {REQUIRE_POSTGRES_TESTS_ENV}=1"
+            );
+        }
+        eprintln!(
+            "skipping postgres integration test: set {TEST_DATABASE_URL_ENV} (example: postgres://postgres:postgres@localhost:5432/postgres)"
+        );
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    // Insert 5 tasks into a single run
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database.database_url)
+        .await?;
+
+    let run_id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+
+    sqlx::query(
+        r#"
+        INSERT INTO runs (run_id, objective, state, safe_mode, correlation_id, config_snapshot)
+        VALUES ($1, $2, 'RUN_ACTIVE', 'execute', $3, '{}'::jsonb)
+        "#,
+    )
+    .bind(run_id)
+    .bind("concurrent claim test run")
+    .bind(correlation_id)
+    .execute(&pool)
+    .await?;
+
+    let task_ids: Vec<Uuid> = (0..5).map(|_| Uuid::now_v7()).collect();
+
+    for (i, task_id) in task_ids.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO tasks (
+                task_id, run_id, task_key, description, state, command_class,
+                attempt_no, max_attempts, blocker_code, correlation_id, priority
+            )
+            VALUES ($1, $2, $3, $4, 'TASK_READY', 'io', 1, 3, NULL, $5, 1)
+            "#,
+        )
+        .bind(task_id)
+        .bind(run_id)
+        .bind(format!("concurrent-task-{i}"))
+        .bind(format!("concurrent task {i}"))
+        .bind(correlation_id)
+        .execute(&pool)
+        .await?;
+    }
+
+    let queue = PostgresTaskQueue::new(&database.database_url)?;
+    for &task_id in &task_ids {
+        queue.enqueue(task_id, run_id, 1, CommandClass::Io, None)?;
+    }
+
+    // Have 3 workers each claim up to 5 tasks concurrently
+    let mut handles = Vec::new();
+    for worker_idx in 0..3 {
+        let q = queue.clone();
+        handles.push(std::thread::spawn(move || {
+            let worker_id = format!("worker-{worker_idx}");
+            let claim_request = ClaimRequest::new(&worker_id, 5, Duration::seconds(60));
+            q.claim(&claim_request, &ConcurrencyConfig::default())
+                .expect("claim should not error")
+        }));
+    }
+
+    let mut all_claimed_task_ids = Vec::new();
+    for handle in handles {
+        let entries = handle.join().expect("thread should not panic");
+        for entry in &entries {
+            all_claimed_task_ids.push(entry.task_id);
+        }
+    }
+
+    // Exactly 5 tasks should be claimed in total (no duplicates)
+    assert_eq!(
+        all_claimed_task_ids.len(),
+        5,
+        "total claims must equal total tasks"
+    );
+
+    let unique: HashSet<Uuid> = all_claimed_task_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        5,
+        "all claimed task IDs must be unique (no duplicate lease)"
+    );
+
+    // All 5 original task_ids must be present
+    for task_id in &task_ids {
+        assert!(
+            unique.contains(task_id),
+            "task {task_id} must be claimed by exactly one worker"
+        );
+    }
+
+    assert_eq!(queue.pending_count(), 0, "no tasks should remain pending");
+
+    database.drop().await?;
+    Ok(())
+}
+
+/// Prove that replaying events via idempotency keys produces no duplicate records.
+///
+/// This validates the replay/restart safety invariant: after a crash, re-appending
+/// the same events with the same idempotency keys does not create duplicates, and
+/// querying the store returns exactly one event per key.
+#[tokio::test]
+async fn replay_idempotency_no_duplicate_terminal_transition_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) = test_database_url() else {
+        if require_postgres_tests() {
+            panic!(
+                "postgres integration tests require {TEST_DATABASE_URL_ENV} when {REQUIRE_POSTGRES_TESTS_ENV}=1"
+            );
+        }
+        eprintln!(
+            "skipping postgres integration test: set {TEST_DATABASE_URL_ENV} (example: postgres://postgres:postgres@localhost:5432/postgres)"
+        );
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let store = PostgresEventStore::new(&database.database_url)?;
+    let task_id = Uuid::now_v7();
+    let correlation_id = Uuid::now_v7();
+
+    // Simulate a task lifecycle: started → completed (terminal transition)
+    let started_event = Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: Utc::now(),
+        entity_type: EntityType::Task,
+        entity_id: task_id.to_string(),
+        event_type: "task.started".to_string(),
+        payload: serde_json::json!({
+            "from": "TaskReady",
+            "to": "TaskRunning",
+        }),
+        correlation_id,
+        causation_id: None,
+        actor: "replay-test".to_string(),
+        idempotency_key: Some(format!("{task_id}:1:started")),
+    };
+
+    let completed_event = Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: Utc::now(),
+        entity_type: EntityType::Task,
+        entity_id: task_id.to_string(),
+        event_type: "task.completed".to_string(),
+        payload: serde_json::json!({
+            "from": "TaskRunning",
+            "to": "TaskComplete",
+        }),
+        correlation_id,
+        causation_id: None,
+        actor: "replay-test".to_string(),
+        idempotency_key: Some(format!("{task_id}:1:completed")),
+    };
+
+    // First append (normal execution)
+    store.append(started_event.clone())?;
+    store.append(completed_event.clone())?;
+    assert_eq!(store.len(), 2, "initial append should produce 2 events");
+
+    // Simulate restart: re-append with same idempotency keys but new event IDs
+    // (as would happen if the scheduler replayed after a crash)
+    let replay_started = Event {
+        event_id: Uuid::now_v7(), // new event_id, same idempotency_key
+        ..started_event.clone()
+    };
+    let replay_completed = Event {
+        event_id: Uuid::now_v7(), // new event_id, same idempotency_key
+        ..completed_event.clone()
+    };
+
+    // Idempotency key dedup should reject these
+    let result_started = store.append(replay_started);
+    assert!(
+        result_started.is_err(),
+        "replay of started event must be rejected by idempotency key"
+    );
+
+    let result_completed = store.append(replay_completed);
+    assert!(
+        result_completed.is_err(),
+        "replay of completed event must be rejected by idempotency key"
+    );
+
+    // Store still contains exactly 2 events (no duplicates)
+    assert_eq!(
+        store.len(),
+        2,
+        "store must contain exactly 2 events after replay attempt"
+    );
+
+    // Query by entity confirms only one terminal transition exists
+    use yarli_store::event_store::EventQuery;
+    let task_events = store.query(&EventQuery {
+        entity_type: Some(EntityType::Task),
+        entity_id: Some(task_id.to_string()),
+        correlation_id: None,
+        event_type: Some("task.completed".to_string()),
+        limit: None,
+        after_event_id: None,
+    })?;
+    assert_eq!(
+        task_events.len(),
+        1,
+        "exactly one terminal transition must exist for task"
+    );
 
     database.drop().await?;
     Ok(())

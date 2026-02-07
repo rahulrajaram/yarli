@@ -44,10 +44,7 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
         // Persist the started event.
         let started_event = Event {
             event_id: Uuid::now_v7(),
-            occurred_at: result
-                .execution
-                .started_at
-                .unwrap_or_else(Utc::now),
+            occurred_at: result.execution.started_at.unwrap_or_else(Utc::now),
             entity_type: EntityType::Command,
             entity_id: result.execution.id.to_string(),
             event_type: "command.started".to_string(),
@@ -116,6 +113,8 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
                 "state": format!("{:?}", result.execution.state),
                 "duration_ms": result.execution.duration().map(|d| d.num_milliseconds()),
                 "chunk_count": result.execution.chunk_count,
+                "resource_usage": result.execution.resource_usage,
+                "token_usage": result.execution.token_usage,
             }),
             correlation_id,
             causation_id: None,
@@ -282,9 +281,7 @@ mod tests {
 
         journal.execute(req, cancel).await.unwrap();
 
-        let events = store
-            .query(&EventQuery::by_correlation(corr_id))
-            .unwrap();
+        let events = store.query(&EventQuery::by_correlation(corr_id)).unwrap();
         assert!(events.len() >= 2);
         for e in &events {
             assert_eq!(e.correlation_id, corr_id);
@@ -341,15 +338,9 @@ mod tests {
         journal.execute(req, cancel).await.unwrap();
 
         let events = store.all().unwrap();
-        assert_eq!(
-            events[0].idempotency_key.as_deref(),
-            Some("my-key:started")
-        );
+        assert_eq!(events[0].idempotency_key.as_deref(), Some("my-key:started"));
         // output event
-        assert_eq!(
-            events[1].idempotency_key.as_deref(),
-            Some("my-key:output")
-        );
+        assert_eq!(events[1].idempotency_key.as_deref(), Some("my-key:output"));
         assert_eq!(
             events[2].idempotency_key.as_deref(),
             Some("my-key:terminal")

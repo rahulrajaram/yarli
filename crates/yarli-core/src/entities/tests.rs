@@ -195,8 +195,13 @@ mod task_tests {
         assert_eq!(task.state, TaskState::TaskExecuting);
 
         // Executing -> Verifying
-        task.transition(TaskState::TaskVerifying, "command exited 0", "worker-1", None)
-            .unwrap();
+        task.transition(
+            TaskState::TaskVerifying,
+            "command exited 0",
+            "worker-1",
+            None,
+        )
+        .unwrap();
         assert_eq!(task.state, TaskState::TaskVerifying);
 
         // Verifying -> Complete
@@ -227,17 +232,17 @@ mod task_tests {
         let mut task = make_task();
         task.transition(TaskState::TaskReady, "deps met", "scheduler", None)
             .unwrap();
-        task.block(
-            BlockerCode::DependencyPending,
-            "waiting",
+        task.block(BlockerCode::DependencyPending, "waiting", "scheduler", None)
+            .unwrap();
+
+        // Blocked -> Ready (unblocked)
+        task.transition(
+            TaskState::TaskReady,
+            "dependency resolved",
             "scheduler",
             None,
         )
         .unwrap();
-
-        // Blocked -> Ready (unblocked)
-        task.transition(TaskState::TaskReady, "dependency resolved", "scheduler", None)
-            .unwrap();
         assert_eq!(task.state, TaskState::TaskReady);
         assert!(task.blocker.is_none());
     }
@@ -403,8 +408,13 @@ mod command_execution_tests {
         assert!(cmd.started_at.is_some());
 
         // Started -> Streaming
-        cmd.transition(CommandState::CmdStreaming, "output flowing", "worker-1", None)
-            .unwrap();
+        cmd.transition(
+            CommandState::CmdStreaming,
+            "output flowing",
+            "worker-1",
+            None,
+        )
+        .unwrap();
         assert_eq!(cmd.state, CommandState::CmdStreaming);
 
         // Streaming -> Exited
@@ -586,13 +596,23 @@ mod worktree_binding_tests {
         let mut wt = make_worktree();
 
         // Unbound -> Creating
-        wt.transition(WorktreeState::WtCreating, "creating worktree", "system", None)
-            .unwrap();
+        wt.transition(
+            WorktreeState::WtCreating,
+            "creating worktree",
+            "system",
+            None,
+        )
+        .unwrap();
         assert_eq!(wt.state, WorktreeState::WtCreating);
 
         // Creating -> BoundHome
-        wt.transition(WorktreeState::WtBoundHome, "worktree created", "system", None)
-            .unwrap();
+        wt.transition(
+            WorktreeState::WtBoundHome,
+            "worktree created",
+            "system",
+            None,
+        )
+        .unwrap();
         assert_eq!(wt.state, WorktreeState::WtBoundHome);
 
         // BoundHome -> CleanupPending
@@ -620,8 +640,13 @@ mod worktree_binding_tests {
             .unwrap();
 
         // BoundHome -> SwitchPending
-        wt.transition(WorktreeState::WtSwitchPending, "switching branch", "system", None)
-            .unwrap();
+        wt.transition(
+            WorktreeState::WtSwitchPending,
+            "switching branch",
+            "system",
+            None,
+        )
+        .unwrap();
         assert_eq!(wt.state, WorktreeState::WtSwitchPending);
 
         // SwitchPending -> BoundNonHome
@@ -670,8 +695,13 @@ mod worktree_binding_tests {
         assert_eq!(wt.state, WorktreeState::WtConflict);
 
         // Conflict -> Recovering
-        wt.transition(WorktreeState::WtRecovering, "aborting merge", "system", None)
-            .unwrap();
+        wt.transition(
+            WorktreeState::WtRecovering,
+            "aborting merge",
+            "system",
+            None,
+        )
+        .unwrap();
         assert_eq!(wt.state, WorktreeState::WtRecovering);
 
         // Recovering -> BoundHome
@@ -813,9 +843,7 @@ mod worktree_binding_tests {
 
 #[cfg(test)]
 mod merge_intent_tests {
-    use crate::entities::merge_intent::{
-        ConflictRecord, ConflictType, MergeIntent, MergeStrategy,
-    };
+    use crate::entities::merge_intent::{ConflictRecord, ConflictType, MergeIntent, MergeStrategy};
     use crate::fsm::merge::MergeState;
     use uuid::Uuid;
 
@@ -860,8 +888,13 @@ mod merge_intent_tests {
         let mut mi = make_merge();
 
         // Requested -> Precheck
-        mi.transition(MergeState::MergePrecheck, "starting precheck", "system", None)
-            .unwrap();
+        mi.transition(
+            MergeState::MergePrecheck,
+            "starting precheck",
+            "system",
+            None,
+        )
+        .unwrap();
         assert_eq!(mi.state, MergeState::MergePrecheck);
 
         // Set precheck SHAs
@@ -919,8 +952,13 @@ mod merge_intent_tests {
         assert_eq!(mi.conflicts.len(), 2);
 
         // DryRun -> Conflict
-        mi.transition(MergeState::MergeConflict, "2 conflicts found", "system", None)
-            .unwrap();
+        mi.transition(
+            MergeState::MergeConflict,
+            "2 conflicts found",
+            "system",
+            None,
+        )
+        .unwrap();
         assert_eq!(mi.state, MergeState::MergeConflict);
     }
 

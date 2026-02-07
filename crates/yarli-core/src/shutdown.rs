@@ -108,18 +108,17 @@ impl ShutdownController {
     /// Returns `true` if this call transitioned from Running → Graceful.
     /// Returns `false` if already shutting down (caller should escalate to force).
     pub fn request_graceful(&self) -> bool {
-        let prev = self
-            .inner
-            .phase
-            .compare_exchange(
-                ShutdownPhase::Running as u8,
-                ShutdownPhase::Graceful as u8,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+        let prev = self.inner.phase.compare_exchange(
+            ShutdownPhase::Running as u8,
+            ShutdownPhase::Graceful as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
 
         if prev.is_ok() {
-            self.inner.first_signal_received.store(true, Ordering::SeqCst);
+            self.inner
+                .first_signal_received
+                .store(true, Ordering::SeqCst);
             self.inner.token.cancel();
             self.inner.graceful_notify.notify_waiters();
             info!("graceful shutdown initiated");
@@ -133,7 +132,10 @@ impl ShutdownController {
     ///
     /// Returns `true` if this call transitioned to Force phase.
     pub fn request_force(&self) -> bool {
-        let prev = self.inner.phase.swap(ShutdownPhase::Force as u8, Ordering::SeqCst);
+        let prev = self
+            .inner
+            .phase
+            .swap(ShutdownPhase::Force as u8, Ordering::SeqCst);
         if prev != ShutdownPhase::Force as u8 {
             // Ensure token is cancelled (might already be from graceful).
             self.inner.token.cancel();
@@ -197,7 +199,11 @@ impl ShutdownController {
         use tokio::time::sleep;
 
         let pids: Vec<u32> = {
-            let children = self.inner.children.lock().unwrap_or_else(|e| e.into_inner());
+            let children = self
+                .inner
+                .children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             children.clone()
         };
 
@@ -217,7 +223,11 @@ impl ShutdownController {
         sleep(SIGKILL_ESCALATION).await;
 
         let remaining: Vec<u32> = {
-            let children = self.inner.children.lock().unwrap_or_else(|e| e.into_inner());
+            let children = self
+                .inner
+                .children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             children.clone()
         };
 

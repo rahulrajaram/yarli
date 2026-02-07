@@ -270,12 +270,10 @@ mod tests {
             failed: 2,
             skipped: 1,
             duration_ms: 45000,
-            failures: vec![
-                TestFailure {
-                    test_name: "test_auth".to_string(),
-                    message: "timeout".to_string(),
-                },
-            ],
+            failures: vec![TestFailure {
+                test_name: "test_auth".to_string(),
+                message: "timeout".to_string(),
+            }],
         };
         let json = serde_json::to_value(&report).unwrap();
         let decoded: TestReportEvidence = serde_json::from_value(json).unwrap();

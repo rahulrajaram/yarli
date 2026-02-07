@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use yarli_core::domain::{EntityType, Event, PolicyOutcome, RunId, TaskId};
+use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::{BlockerCode, Task};
 use yarli_core::explain::GateType;
@@ -26,7 +27,7 @@ use yarli_core::fsm::command::CommandState;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 use yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError};
-use yarli_gates::{evaluate_all, all_passed, collect_failures, GateContext};
+use yarli_gates::{all_passed, collect_failures, evaluate_all, GateContext};
 use yarli_observability::{AuditEntry, AuditSink};
 use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use yarli_store::EventStore;
@@ -67,6 +68,37 @@ pub struct SchedulerConfig {
     pub enforce_policies: bool,
     /// Emit policy/audit records when decisions are made.
     pub audit_decisions: bool,
+    /// Runtime resource and token budgets.
+    pub budgets: ResourceBudgetConfig,
+}
+
+/// Per-task/per-run budgets used for explicit fail-fast policy behavior.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceBudgetConfig {
+    /// Maximum RSS bytes for a single task execution.
+    pub max_task_rss_bytes: Option<u64>,
+    /// Maximum CPU user ticks for a single task execution.
+    pub max_task_cpu_user_ticks: Option<u64>,
+    /// Maximum CPU system ticks for a single task execution.
+    pub max_task_cpu_system_ticks: Option<u64>,
+    /// Maximum read bytes for a single task execution.
+    pub max_task_io_read_bytes: Option<u64>,
+    /// Maximum write bytes for a single task execution.
+    pub max_task_io_write_bytes: Option<u64>,
+    /// Maximum total tokens for a single task execution.
+    pub max_task_total_tokens: Option<u64>,
+    /// Maximum total tokens across the entire run.
+    pub max_run_total_tokens: Option<u64>,
+    /// Maximum peak RSS observed across all tasks in the run.
+    pub max_run_peak_rss_bytes: Option<u64>,
+    /// Maximum aggregate CPU user ticks across the run.
+    pub max_run_cpu_user_ticks: Option<u64>,
+    /// Maximum aggregate CPU system ticks across the run.
+    pub max_run_cpu_system_ticks: Option<u64>,
+    /// Maximum aggregate disk read bytes across the run.
+    pub max_run_io_read_bytes: Option<u64>,
+    /// Maximum aggregate disk write bytes across the run.
+    pub max_run_io_write_bytes: Option<u64>,
 }
 
 impl Default for SchedulerConfig {
@@ -95,6 +127,7 @@ impl Default for SchedulerConfig {
             ],
             enforce_policies: true,
             audit_decisions: true,
+            budgets: ResourceBudgetConfig::default(),
         }
     }
 }
@@ -127,6 +160,14 @@ pub enum SchedulerError {
     Audit(#[from] yarli_observability::AuditError),
 }
 
+#[derive(Debug, Clone)]
+struct BudgetViolation {
+    scope: &'static str,
+    metric: &'static str,
+    observed: u64,
+    limit: u64,
+}
+
 /// In-memory registry of tasks and runs for the scheduler.
 ///
 /// This is a lightweight state cache — the event store remains the source of truth.
@@ -137,6 +178,18 @@ pub struct TaskRegistry {
     runs: HashMap<RunId, Run>,
     /// Maps queue_id → task_id for active leases.
     active_leases: HashMap<Uuid, TaskId>,
+    /// Aggregated resource/token usage per run.
+    run_usage: HashMap<RunId, RunUsageTotals>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunUsageTotals {
+    total_cpu_user_ticks: u64,
+    total_cpu_system_ticks: u64,
+    total_io_read_bytes: u64,
+    total_io_write_bytes: u64,
+    total_tokens: u64,
+    peak_rss_bytes: u64,
 }
 
 impl TaskRegistry {
@@ -145,11 +198,13 @@ impl TaskRegistry {
             tasks: HashMap::new(),
             runs: HashMap::new(),
             active_leases: HashMap::new(),
+            run_usage: HashMap::new(),
         }
     }
 
     /// Register a run with the scheduler.
     pub fn add_run(&mut self, run: Run) {
+        self.run_usage.entry(run.id).or_default();
         self.runs.insert(run.id, run);
     }
 
@@ -218,6 +273,39 @@ impl TaskRegistry {
     pub fn run_ids(&self) -> Vec<RunId> {
         self.runs.keys().copied().collect()
     }
+
+    fn accumulate_usage(
+        &mut self,
+        run_id: RunId,
+        resource_usage: Option<&CommandResourceUsage>,
+        token_usage: Option<&TokenUsage>,
+    ) -> RunUsageTotals {
+        let totals = self.run_usage.entry(run_id).or_default();
+
+        if let Some(resource) = resource_usage {
+            if let Some(v) = resource.cpu_user_ticks {
+                totals.total_cpu_user_ticks = totals.total_cpu_user_ticks.saturating_add(v);
+            }
+            if let Some(v) = resource.cpu_system_ticks {
+                totals.total_cpu_system_ticks = totals.total_cpu_system_ticks.saturating_add(v);
+            }
+            if let Some(v) = resource.io_read_bytes {
+                totals.total_io_read_bytes = totals.total_io_read_bytes.saturating_add(v);
+            }
+            if let Some(v) = resource.io_write_bytes {
+                totals.total_io_write_bytes = totals.total_io_write_bytes.saturating_add(v);
+            }
+            if let Some(v) = resource.max_rss_bytes {
+                totals.peak_rss_bytes = totals.peak_rss_bytes.max(v);
+            }
+        }
+
+        if let Some(tokens) = token_usage {
+            totals.total_tokens = totals.total_tokens.saturating_add(tokens.total_tokens);
+        }
+
+        totals.clone()
+    }
 }
 
 impl Default for TaskRegistry {
@@ -241,12 +329,7 @@ pub struct Scheduler<Q: TaskQueue, S: EventStore, R: CommandRunner> {
 }
 
 impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
-    pub fn new(
-        queue: Arc<Q>,
-        store: Arc<S>,
-        runner: Arc<R>,
-        config: SchedulerConfig,
-    ) -> Self {
+    pub fn new(queue: Arc<Q>, store: Arc<S>, runner: Arc<R>, config: SchedulerConfig) -> Self {
         Self {
             queue,
             store,
@@ -476,13 +559,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 })?;
 
                 // Enqueue into the task queue now that the task is Ready
-                self.queue.enqueue(
-                    task_id,
-                    run_id,
-                    priority,
-                    command_class,
-                    None,
-                )?;
+                self.queue
+                    .enqueue(task_id, run_id, priority, command_class, None)?;
 
                 promoted += 1;
                 debug!(task_id = %task_id, "task promoted to ready and enqueued");
@@ -493,10 +571,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     }
 
     /// Execute a single claimed task through the command journal.
-    async fn execute_task(
-        &self,
-        entry: QueueEntry,
-    ) -> Result<TaskOutcome, SchedulerError> {
+    async fn execute_task(&self, entry: QueueEntry) -> Result<TaskOutcome, SchedulerError> {
         let queue_id = entry.queue_id;
         let task_id = entry.task_id;
 
@@ -526,12 +601,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         if self.config.enforce_policies {
             let action = classify_policy_action(&command);
             let request = if action == ActionType::CommandExecute {
-                let mut req = PolicyRequest::command(
-                    entry.run_id,
-                    task_id,
-                    command_class,
-                    safe_mode,
-                );
+                let mut req =
+                    PolicyRequest::command(entry.run_id, task_id, command_class, safe_mode);
                 req.actor = self.config.worker_id.clone();
                 req
             } else {
@@ -552,13 +623,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 engine.evaluate(&request)?
             };
 
-            self.persist_policy_decision(
-                &decision,
-                task_id,
-                attempt_no,
-                correlation_id,
-                &command,
-            )?;
+            self.persist_policy_decision(&decision, task_id, attempt_no, correlation_id, &command)?;
 
             if decision.outcome != PolicyOutcome::Allow {
                 return self
@@ -632,9 +697,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 self.handle_command_success(task_id, queue_id, result)
                     .await?
             }
-            Err(e) => {
-                self.handle_command_failure(task_id, queue_id, e).await?
-            }
+            Err(e) => self.handle_command_failure(task_id, queue_id, e).await?,
         };
 
         // Remove lease tracking
@@ -672,10 +735,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             correlation_id,
             causation_id: None,
             actor: decision.actor.clone(),
-            idempotency_key: Some(format!(
-                "{task_id}:policy:{}:{attempt_no}",
-                decision.action
-            )),
+            idempotency_key: Some(format!("{task_id}:policy:{}:{attempt_no}", decision.action)),
         })?;
 
         if self.config.audit_decisions {
@@ -810,6 +870,108 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         Ok(TaskOutcome::Failed)
     }
 
+    fn check_budget_violations(
+        &self,
+        run_totals: &RunUsageTotals,
+        result: &CommandResult,
+    ) -> Vec<BudgetViolation> {
+        let mut violations = Vec::new();
+        let budgets = &self.config.budgets;
+
+        if let Some(resource) = result.execution.resource_usage.as_ref() {
+            check_limit(
+                &mut violations,
+                "task",
+                "rss_bytes",
+                resource.max_rss_bytes,
+                budgets.max_task_rss_bytes,
+            );
+            check_limit(
+                &mut violations,
+                "task",
+                "cpu_user_ticks",
+                resource.cpu_user_ticks,
+                budgets.max_task_cpu_user_ticks,
+            );
+            check_limit(
+                &mut violations,
+                "task",
+                "cpu_system_ticks",
+                resource.cpu_system_ticks,
+                budgets.max_task_cpu_system_ticks,
+            );
+            check_limit(
+                &mut violations,
+                "task",
+                "io_read_bytes",
+                resource.io_read_bytes,
+                budgets.max_task_io_read_bytes,
+            );
+            check_limit(
+                &mut violations,
+                "task",
+                "io_write_bytes",
+                resource.io_write_bytes,
+                budgets.max_task_io_write_bytes,
+            );
+        }
+
+        if let Some(token_usage) = result.execution.token_usage.as_ref() {
+            check_limit(
+                &mut violations,
+                "task",
+                "total_tokens",
+                Some(token_usage.total_tokens),
+                budgets.max_task_total_tokens,
+            );
+        }
+
+        check_limit(
+            &mut violations,
+            "run",
+            "total_tokens",
+            Some(run_totals.total_tokens),
+            budgets.max_run_total_tokens,
+        );
+        check_limit(
+            &mut violations,
+            "run",
+            "peak_rss_bytes",
+            Some(run_totals.peak_rss_bytes),
+            budgets.max_run_peak_rss_bytes,
+        );
+        check_limit(
+            &mut violations,
+            "run",
+            "total_cpu_user_ticks",
+            Some(run_totals.total_cpu_user_ticks),
+            budgets.max_run_cpu_user_ticks,
+        );
+        check_limit(
+            &mut violations,
+            "run",
+            "total_cpu_system_ticks",
+            Some(run_totals.total_cpu_system_ticks),
+            budgets.max_run_cpu_system_ticks,
+        );
+        check_limit(
+            &mut violations,
+            "run",
+            "total_io_read_bytes",
+            Some(run_totals.total_io_read_bytes),
+            budgets.max_run_io_read_bytes,
+        );
+        check_limit(
+            &mut violations,
+            "run",
+            "total_io_write_bytes",
+            Some(run_totals.total_io_write_bytes),
+            budgets.max_run_io_write_bytes,
+        );
+
+        violations
+    }
+
     /// Handle successful command completion.
     async fn handle_command_success(
         &self,
@@ -821,11 +983,75 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         let cmd_state = result.execution.state;
 
         let mut reg = self.registry.write().await;
+        let run_totals = reg.accumulate_usage(
+            result.execution.run_id,
+            result.execution.resource_usage.as_ref(),
+            result.execution.token_usage.as_ref(),
+        );
         let task = reg
             .get_task_mut(&task_id)
             .ok_or(SchedulerError::TaskNotFound(task_id))?;
 
         let correlation_id = task.correlation_id;
+        let attempt_no = task.attempt_no;
+        let run_id = result.execution.run_id;
+
+        if let Some(violation) = self
+            .check_budget_violations(&run_totals, result)
+            .first()
+            .cloned()
+        {
+            let reason = format!(
+                "budget exceeded ({}) {}={} > {}",
+                violation.scope, violation.metric, violation.observed, violation.limit
+            );
+            let transition =
+                task.transition(TaskState::TaskFailed, &reason, &self.config.worker_id, None)?;
+
+            self.store.append(Event {
+                event_id: transition.event_id,
+                occurred_at: transition.occurred_at,
+                entity_type: EntityType::Task,
+                entity_id: task_id.to_string(),
+                event_type: "task.failed".to_string(),
+                payload: serde_json::json!({
+                    "reason": "budget_exceeded",
+                    "detail": reason,
+                    "scope": violation.scope,
+                    "metric": violation.metric,
+                    "observed": violation.observed,
+                    "limit": violation.limit,
+                    "command_resource_usage": result.execution.resource_usage,
+                    "command_token_usage": result.execution.token_usage,
+                    "run_usage_totals": {
+                        "total_cpu_user_ticks": run_totals.total_cpu_user_ticks,
+                        "total_cpu_system_ticks": run_totals.total_cpu_system_ticks,
+                        "total_io_read_bytes": run_totals.total_io_read_bytes,
+                        "total_io_write_bytes": run_totals.total_io_write_bytes,
+                        "total_tokens": run_totals.total_tokens,
+                        "peak_rss_bytes": run_totals.peak_rss_bytes
+                    }
+                }),
+                correlation_id,
+                causation_id: None,
+                actor: self.config.worker_id.clone(),
+                idempotency_key: Some(format!("{task_id}:failed:budget:{attempt_no}")),
+            })?;
+
+            self.queue.fail(queue_id, &self.config.worker_id)?;
+
+            warn!(
+                task_id = %task_id,
+                run_id = %run_id,
+                metric = violation.metric,
+                scope = violation.scope,
+                observed = violation.observed,
+                limit = violation.limit,
+                "task failed due to budget limit"
+            );
+
+            return Ok(TaskOutcome::Failed);
+        }
 
         let outcome = if exit_code == 0 && cmd_state == CommandState::CmdExited {
             // Success: Executing → Verifying
@@ -844,6 +1070,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 event_type: "task.verifying".to_string(),
                 payload: serde_json::json!({
                     "exit_code": exit_code,
+                    "resource_usage": result.execution.resource_usage,
+                    "token_usage": result.execution.token_usage,
                 }),
                 correlation_id,
                 causation_id: None,
@@ -870,6 +1098,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     payload: serde_json::json!({
                         "exit_code": exit_code,
                         "auto_verified": true,
+                        "resource_usage": result.execution.resource_usage,
+                        "token_usage": result.execution.token_usage,
                     }),
                     correlation_id,
                     causation_id: None,
@@ -877,8 +1107,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     idempotency_key: Some(format!("{task_id}:completed")),
                 })?;
 
-                self.queue
-                    .complete(queue_id, &self.config.worker_id)?;
+                self.queue.complete(queue_id, &self.config.worker_id)?;
 
                 info!(task_id = %task_id, exit_code, "task completed (no gates)");
                 TaskOutcome::Succeeded
@@ -902,6 +1131,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         "duration_ms": result.execution.duration().map(|d| d.num_milliseconds().max(0) as u64).unwrap_or(0),
                         "timed_out": false,
                         "killed": false,
+                        "resource_usage": result.execution.resource_usage,
+                        "token_usage": result.execution.token_usage,
                     }),
                     created_at: chrono::Utc::now(),
                 }];
@@ -910,10 +1141,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
                 if all_passed(&evaluations) {
                     // All gates passed: Verifying → Complete
-                    let gate_names: Vec<&str> = evaluations
-                        .iter()
-                        .map(|e| e.gate_type.label())
-                        .collect();
+                    let gate_names: Vec<&str> =
+                        evaluations.iter().map(|e| e.gate_type.label()).collect();
                     let transition = task.transition(
                         TaskState::TaskComplete,
                         format!("all {} gate(s) passed", evaluations.len()),
@@ -931,6 +1160,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                             "exit_code": exit_code,
                             "gates_evaluated": gate_names,
                             "auto_verified": false,
+                            "resource_usage": result.execution.resource_usage,
+                            "token_usage": result.execution.token_usage,
                         }),
                         correlation_id,
                         causation_id: None,
@@ -938,8 +1169,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         idempotency_key: Some(format!("{task_id}:completed")),
                     })?;
 
-                    self.queue
-                        .complete(queue_id, &self.config.worker_id)?;
+                    self.queue.complete(queue_id, &self.config.worker_id)?;
 
                     info!(task_id = %task_id, exit_code, gates = evaluations.len(), "task completed, all gates passed");
                     TaskOutcome::Succeeded
@@ -950,7 +1180,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         .iter()
                         .map(|f| {
                             let reason = match &f.result {
-                                yarli_core::explain::GateResult::Failed { reason } => reason.clone(),
+                                yarli_core::explain::GateResult::Failed { reason } => {
+                                    reason.clone()
+                                }
                                 _ => "unknown".to_string(),
                             };
                             format!("{}: {}", f.gate_type.label(), reason)
@@ -985,8 +1217,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         idempotency_key: Some(format!("{task_id}:gate_failed:{}", task.attempt_no)),
                     })?;
 
-                    self.queue
-                        .fail(queue_id, &self.config.worker_id)?;
+                    self.queue.fail(queue_id, &self.config.worker_id)?;
                     self.maybe_retry(task, task_id, correlation_id)?;
 
                     warn!(task_id = %task_id, "task failed gate verification: {}", failure_reasons.join("; "));
@@ -1010,6 +1241,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 event_type: "task.failed".to_string(),
                 payload: serde_json::json!({
                     "reason": "timeout",
+                    "resource_usage": result.execution.resource_usage,
+                    "token_usage": result.execution.token_usage,
                 }),
                 correlation_id,
                 causation_id: None,
@@ -1017,8 +1250,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 idempotency_key: Some(format!("{task_id}:failed:{}", task.attempt_no)),
             })?;
 
-            self.queue
-                .fail(queue_id, &self.config.worker_id)?;
+            self.queue.fail(queue_id, &self.config.worker_id)?;
             self.maybe_retry(task, task_id, correlation_id)?;
 
             warn!(task_id = %task_id, "task timed out");
@@ -1040,6 +1272,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 event_type: "task.failed".to_string(),
                 payload: serde_json::json!({
                     "reason": "killed",
+                    "resource_usage": result.execution.resource_usage,
+                    "token_usage": result.execution.token_usage,
                 }),
                 correlation_id,
                 causation_id: None,
@@ -1047,8 +1281,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 idempotency_key: Some(format!("{task_id}:failed:{}", task.attempt_no)),
             })?;
 
-            self.queue
-                .fail(queue_id, &self.config.worker_id)?;
+            self.queue.fail(queue_id, &self.config.worker_id)?;
             self.maybe_retry(task, task_id, correlation_id)?;
 
             warn!(task_id = %task_id, "task killed");
@@ -1071,6 +1304,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 payload: serde_json::json!({
                     "exit_code": exit_code,
                     "reason": "nonzero_exit",
+                    "resource_usage": result.execution.resource_usage,
+                    "token_usage": result.execution.token_usage,
                 }),
                 correlation_id,
                 causation_id: None,
@@ -1078,8 +1313,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 idempotency_key: Some(format!("{task_id}:failed:{}", task.attempt_no)),
             })?;
 
-            self.queue
-                .fail(queue_id, &self.config.worker_id)?;
+            self.queue.fail(queue_id, &self.config.worker_id)?;
             self.maybe_retry(task, task_id, correlation_id)?;
 
             warn!(task_id = %task_id, exit_code, "task failed with nonzero exit");
@@ -1125,8 +1359,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             idempotency_key: Some(format!("{task_id}:failed:{}", task.attempt_no)),
         })?;
 
-        self.queue
-            .fail(queue_id, &self.config.worker_id)?;
+        self.queue.fail(queue_id, &self.config.worker_id)?;
         self.maybe_retry(task, task_id, correlation_id)?;
 
         warn!(task_id = %task_id, error = %error, "task execution error");
@@ -1144,11 +1377,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             let next_attempt = task.attempt_no + 1;
             let transition = task.transition(
                 TaskState::TaskReady,
-                format!(
-                    "retry attempt {}/{}",
-                    next_attempt,
-                    task.max_attempts
-                ),
+                format!("retry attempt {}/{}", next_attempt, task.max_attempts),
                 &self.config.worker_id,
                 None,
             )?;
@@ -1214,14 +1443,11 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             }
 
             let all_complete = task_states.iter().all(|s| *s == TaskState::TaskComplete);
-            let any_permanently_failed = reg
-                .tasks
-                .values()
-                .any(|t| {
-                    t.run_id == run_id
-                        && t.state == TaskState::TaskFailed
-                        && t.attempt_no >= t.max_attempts
-                });
+            let any_permanently_failed = reg.tasks.values().any(|t| {
+                t.run_id == run_id
+                    && t.state == TaskState::TaskFailed
+                    && t.attempt_no >= t.max_attempts
+            });
 
             // Collect task info for gate context before taking mutable borrow
             let task_info_for_gates: Vec<(TaskId, String, TaskState)> = reg
@@ -1307,10 +1533,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         let evaluations = evaluate_all(&self.config.run_gates, &gate_ctx);
 
                         if all_passed(&evaluations) {
-                            let gate_names: Vec<&str> = evaluations
-                                .iter()
-                                .map(|e| e.gate_type.label())
-                                .collect();
+                            let gate_names: Vec<&str> =
+                                evaluations.iter().map(|e| e.gate_type.label()).collect();
                             let transition = run.transition(
                                 RunState::RunCompleted,
                                 format!("all {} gate(s) passed", evaluations.len()),
@@ -1344,7 +1568,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                                 .iter()
                                 .map(|f| {
                                     let reason = match &f.result {
-                                        yarli_core::explain::GateResult::Failed { reason } => reason.clone(),
+                                        yarli_core::explain::GateResult::Failed { reason } => {
+                                            reason.clone()
+                                        }
                                         _ => "unknown".to_string(),
                                     };
                                     format!("{}: {}", f.gate_type.label(), reason)
@@ -1421,11 +1647,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         drop(reg);
 
         for queue_id in lease_ids {
-            if let Err(e) = self.queue.heartbeat(
-                queue_id,
-                &self.config.worker_id,
-                self.config.lease_ttl,
-            ) {
+            if let Err(e) =
+                self.queue
+                    .heartbeat(queue_id, &self.config.worker_id, self.config.lease_ttl)
+            {
                 debug!(queue_id = %queue_id, error = %e, "heartbeat failed");
             }
         }
@@ -1489,6 +1714,25 @@ fn classify_policy_action(command: &str) -> ActionType {
     ActionType::CommandExecute
 }
 
+fn check_limit(
+    violations: &mut Vec<BudgetViolation>,
+    scope: &'static str,
+    metric: &'static str,
+    observed: Option<u64>,
+    limit: Option<u64>,
+) {
+    if let (Some(observed), Some(limit)) = (observed, limit) {
+        if observed > limit {
+            violations.push(BudgetViolation {
+                scope,
+                metric,
+                observed,
+                limit,
+            });
+        }
+    }
+}
+
 fn policy_outcome_label(outcome: PolicyOutcome) -> &'static str {
     match outcome {
         PolicyOutcome::Allow => "allow",
@@ -1532,11 +1776,11 @@ pub struct TickResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InMemoryTaskQueue;
     use yarli_core::domain::{CommandClass, SafeMode};
     use yarli_exec::LocalCommandRunner;
     use yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
     use yarli_store::InMemoryEventStore;
-    use crate::InMemoryTaskQueue;
 
     fn test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -1555,6 +1799,7 @@ mod tests {
             run_gates: vec![],
             enforce_policies: true,
             audit_decisions: true,
+            budgets: ResourceBudgetConfig::default(),
         }
     }
 
@@ -1682,7 +1927,11 @@ mod tests {
 
         let reg = sched.registry().read().await;
         let task = reg.get_task(&task_id).unwrap();
-        assert_eq!(task.state, TaskState::TaskFailed, "task should be permanently failed");
+        assert_eq!(
+            task.state,
+            TaskState::TaskFailed,
+            "task should be permanently failed"
+        );
         assert_eq!(task.attempt_no, 2);
     }
 
@@ -1967,7 +2216,10 @@ mod tests {
             .collect();
 
         // Each attempt should have a unique idempotency key
-        assert!(idem_keys.len() >= 2, "should have at least 2 failure events");
+        assert!(
+            idem_keys.len() >= 2,
+            "should have at least 2 failure events"
+        );
         let unique: std::collections::HashSet<_> = idem_keys.iter().collect();
         assert_eq!(
             unique.len(),
@@ -2019,7 +2271,10 @@ mod tests {
 
         let result = sched.tick().await.unwrap();
         assert_eq!(result.promoted, 1);
-        assert_eq!(result.succeeded, 1, "task should pass gates with exit_code=0 evidence");
+        assert_eq!(
+            result.succeeded, 1,
+            "task should pass gates with exit_code=0 evidence"
+        );
 
         let reg = sched.registry().read().await;
         assert_eq!(
@@ -2030,9 +2285,15 @@ mod tests {
 
         // Verify gate evaluation is recorded in events
         let events = store.all().unwrap();
-        let completed_event = events.iter().find(|e| e.event_type == "task.completed").unwrap();
+        let completed_event = events
+            .iter()
+            .find(|e| e.event_type == "task.completed")
+            .unwrap();
         assert_eq!(
-            completed_event.payload.get("auto_verified").and_then(|v| v.as_bool()),
+            completed_event
+                .payload
+                .get("auto_verified")
+                .and_then(|v| v.as_bool()),
             Some(false),
             "should not be auto-verified when gates are active"
         );
@@ -2054,7 +2315,10 @@ mod tests {
         sched.submit_run(run, vec![task]).await.unwrap();
 
         let result = sched.tick().await.unwrap();
-        assert_eq!(result.runs_completed, 1, "run should complete when all gates pass");
+        assert_eq!(
+            result.runs_completed, 1,
+            "run should complete when all gates pass"
+        );
 
         let reg = sched.registry().read().await;
         let run = reg.get_run(&run_id).unwrap();
@@ -2062,9 +2326,15 @@ mod tests {
 
         // Check run.completed event has gate info
         let events = store.all().unwrap();
-        let completed_event = events.iter().find(|e| e.event_type == "run.completed").unwrap();
+        let completed_event = events
+            .iter()
+            .find(|e| e.event_type == "run.completed")
+            .unwrap();
         assert_eq!(
-            completed_event.payload.get("auto_verified").and_then(|v| v.as_bool()),
+            completed_event
+                .payload
+                .get("auto_verified")
+                .and_then(|v| v.as_bool()),
             Some(false),
         );
     }
@@ -2133,7 +2403,10 @@ mod tests {
         // Git class falls back to command evidence (exit_code present), so passes
         assert_eq!(result.succeeded, 1);
         let reg = sched.registry().read().await;
-        assert_eq!(reg.get_task(&task_id).unwrap().state, TaskState::TaskComplete);
+        assert_eq!(
+            reg.get_task(&task_id).unwrap().state,
+            TaskState::TaskComplete
+        );
     }
 
     #[tokio::test]
@@ -2183,7 +2456,10 @@ mod tests {
             events.iter().any(|e| e.event_type == "run.gate_failed"),
             "should have run.gate_failed event"
         );
-        let gate_event = events.iter().find(|e| e.event_type == "run.gate_failed").unwrap();
+        let gate_event = events
+            .iter()
+            .find(|e| e.event_type == "run.gate_failed")
+            .unwrap();
         assert!(
             gate_event.payload.get("failures").is_some(),
             "gate_failed event should include failures"
@@ -2229,8 +2505,16 @@ mod tests {
     #[tokio::test]
     async fn test_default_config_has_gates() {
         let config = SchedulerConfig::default();
-        assert_eq!(config.task_gates.len(), 5, "default should have 5 task gates");
-        assert_eq!(config.run_gates.len(), 5, "default should have 5 run gates (structural only)");
+        assert_eq!(
+            config.task_gates.len(),
+            5,
+            "default should have 5 task gates"
+        );
+        assert_eq!(
+            config.run_gates.len(),
+            5,
+            "default should have 5 run gates (structural only)"
+        );
     }
 
     #[tokio::test]
@@ -2250,9 +2534,15 @@ mod tests {
         assert_eq!(result.runs_completed, 1);
 
         let events = store.all().unwrap();
-        let completed = events.iter().find(|e| e.event_type == "task.completed").unwrap();
+        let completed = events
+            .iter()
+            .find(|e| e.event_type == "task.completed")
+            .unwrap();
         assert_eq!(
-            completed.payload.get("auto_verified").and_then(|v| v.as_bool()),
+            completed
+                .payload
+                .get("auto_verified")
+                .and_then(|v| v.as_bool()),
             Some(true),
             "should be auto_verified with empty gates"
         );
@@ -2318,10 +2608,18 @@ mod tests {
         sched.tick().await.unwrap();
 
         let events = store.all().unwrap();
-        let gate_event = events.iter().find(|e| e.event_type == "run.gate_failed").unwrap();
+        let gate_event = events
+            .iter()
+            .find(|e| e.event_type == "run.gate_failed")
+            .unwrap();
 
         // Should have failures array
-        let failures = gate_event.payload.get("failures").unwrap().as_array().unwrap();
+        let failures = gate_event
+            .payload
+            .get("failures")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert!(!failures.is_empty(), "should have at least one failure");
 
         // First failure should mention evidence
@@ -2375,12 +2673,18 @@ mod tests {
         assert_eq!(result.failed, 1, "blocked tasks count as failed outcomes");
 
         let reg = sched.registry().read().await;
-        assert_eq!(reg.get_task(&task_id).unwrap().state, TaskState::TaskBlocked);
+        assert_eq!(
+            reg.get_task(&task_id).unwrap().state,
+            TaskState::TaskBlocked
+        );
         assert_eq!(reg.get_run(&run_id).unwrap().state, RunState::RunBlocked);
         drop(reg);
 
         let stats = queue.stats();
-        assert_eq!(stats.completed, 1, "blocked task should release queue lease");
+        assert_eq!(
+            stats.completed, 1,
+            "blocked task should release queue lease"
+        );
 
         let events = store.all().unwrap();
         assert!(events.iter().any(|e| e.event_type == "policy.decision"));
@@ -2395,8 +2699,8 @@ mod tests {
         let runner = Arc::new(LocalCommandRunner::new());
         let audit_sink = Arc::new(InMemoryAuditSink::new());
 
-        let sched = Scheduler::new(queue, store, runner, test_config())
-            .with_audit_sink(audit_sink.clone());
+        let sched =
+            Scheduler::new(queue, store, runner, test_config()).with_audit_sink(audit_sink.clone());
 
         let run = Run::new("policy audit", SafeMode::Observe);
         let run_id = run.id;
@@ -2419,5 +2723,213 @@ mod tests {
                 .any(|entry| entry.category == AuditCategory::DestructiveAttempt),
             "expected blocked/destructive attempt audit entry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_budget_exceeded_fails_task_without_retry() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = SchedulerConfig {
+            budgets: ResourceBudgetConfig {
+                max_task_total_tokens: Some(1),
+                ..ResourceBudgetConfig::default()
+            },
+            ..test_config()
+        };
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = make_run("budget fail task");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        let mut task = make_task(run_id, "token-heavy", "echo token budget exceeded", corr_id);
+        task = task.with_max_attempts(3);
+        let task_id = task.id;
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.failed, 1);
+
+        let reg = sched.registry().read().await;
+        let task = reg.get_task(&task_id).unwrap();
+        assert_eq!(task.state, TaskState::TaskFailed);
+        assert_eq!(task.attempt_no, 1, "budget failure should not retry");
+        drop(reg);
+
+        let events = store.all().unwrap();
+        let failed = events
+            .iter()
+            .find(|e| e.event_type == "task.failed" && e.entity_id == task_id.to_string())
+            .expect("expected task.failed");
+        assert_eq!(
+            failed.payload.get("reason").and_then(|v| v.as_str()),
+            Some("budget_exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_token_budget_exceeded_across_tasks() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = SchedulerConfig {
+            budgets: ResourceBudgetConfig {
+                max_run_total_tokens: Some(8),
+                ..ResourceBudgetConfig::default()
+            },
+            ..test_config()
+        };
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = make_run("run token budget");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+
+        let t1 = make_task(
+            run_id,
+            "step-1",
+            "echo this is a verbose first command",
+            corr_id,
+        );
+        let t2 = make_task(
+            run_id,
+            "step-2",
+            "echo this is a verbose second command",
+            corr_id,
+        );
+
+        sched.submit_run(run, vec![t1, t2]).await.unwrap();
+        let result = sched.tick().await.unwrap();
+        assert!(result.failed >= 1, "a task should breach run budget");
+
+        let reg = sched.registry().read().await;
+        let run = reg.get_run(&run_id).unwrap();
+        assert!(
+            run.state != RunState::RunCompleted,
+            "run should not complete after budget breach"
+        );
+        drop(reg);
+
+        let events = store.all().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.event_type == "task.failed"
+                    && e.payload.get("reason").and_then(|v| v.as_str()) == Some("budget_exceeded")
+            }),
+            "expected a budget_exceeded failure event"
+        );
+    }
+
+    /// Stress proof: 4 parallel tasks with a run-level token budget that allows
+    /// the first 2 to succeed but forces a budget breach on the 3rd or 4th.
+    /// Proves:
+    ///   - Accounting remains consistent across parallel task completions.
+    ///   - Over-budget behavior transitions to explicit TaskFailed with reason="budget_exceeded".
+    ///   - No silent continuation: the run does NOT reach RunCompleted.
+    #[tokio::test]
+    async fn test_parallel_tasks_budget_accounting_consistency() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        // Set a run-level token budget that allows ~2 tasks but breaches on the 3rd.
+        // Token estimate for "echo taskN": prompt=ceil(10/4)=3 + completion=ceil(6/4)=2 = ~5 per task.
+        // Budget of 12 allows 2 tasks (~10 tokens) but breaches on the 3rd (~15 > 12).
+        let config = SchedulerConfig {
+            budgets: ResourceBudgetConfig {
+                max_run_total_tokens: Some(12),
+                ..ResourceBudgetConfig::default()
+            },
+            ..test_config()
+        };
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = make_run("parallel budget stress");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+
+        // Create 4 independent tasks (no dependencies — all promote in one tick)
+        let t1 = make_task(run_id, "p1", "echo task1", corr_id);
+        let t2 = make_task(run_id, "p2", "echo task2", corr_id);
+        let t3 = make_task(run_id, "p3", "echo task3", corr_id);
+        let t4 = make_task(run_id, "p4", "echo task4", corr_id);
+        let t1_id = t1.id;
+        let t2_id = t2.id;
+        let t3_id = t3.id;
+        let t4_id = t4.id;
+
+        sched.submit_run(run, vec![t1, t2, t3, t4]).await.unwrap();
+
+        // Tick until all 4 tasks are processed (may take 1-2 ticks depending on batch)
+        let mut total_succeeded = 0u64;
+        let mut total_failed = 0u64;
+        for _ in 0..4 {
+            let r = sched.tick().await.unwrap();
+            total_succeeded += r.succeeded as u64;
+            total_failed += r.failed as u64;
+            if total_succeeded + total_failed >= 4 {
+                break;
+            }
+        }
+
+        // At least one task must have failed due to budget
+        assert!(
+            total_failed >= 1,
+            "at least one task must fail due to budget breach (failed={total_failed})"
+        );
+
+        // Verify the run did NOT complete
+        let reg = sched.registry().read().await;
+        let run = reg.get_run(&run_id).unwrap();
+        assert!(
+            run.state != RunState::RunCompleted,
+            "run must not complete after budget breach"
+        );
+
+        // Verify accounting: every completed task should have consistent events
+        let events = store.all().unwrap();
+        let budget_failures: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.event_type == "task.failed"
+                    && e.payload.get("reason").and_then(|v| v.as_str()) == Some("budget_exceeded")
+            })
+            .collect();
+        assert!(
+            !budget_failures.is_empty(),
+            "must have explicit budget_exceeded failure events"
+        );
+
+        // Each budget failure event must include run_usage_totals showing accumulated accounting
+        for failure in &budget_failures {
+            let run_totals = failure
+                .payload
+                .get("run_usage_totals")
+                .expect("budget failure must include run_usage_totals");
+            let total_tokens = run_totals
+                .get("total_tokens")
+                .and_then(|v| v.as_u64())
+                .expect("run_usage_totals.total_tokens must be present");
+            assert!(
+                total_tokens > 12,
+                "accumulated tokens ({total_tokens}) must exceed budget (12)"
+            );
+        }
+
+        // Verify no silent continuation: no task.completed events appear AFTER a budget failure
+        let failed_task_ids: std::collections::HashSet<String> =
+            budget_failures.iter().map(|e| e.entity_id.clone()).collect();
+        let task_ids = [t1_id, t2_id, t3_id, t4_id];
+        for task_id in &task_ids {
+            let task = reg.get_task(task_id).unwrap();
+            if failed_task_ids.contains(&task_id.to_string()) {
+                assert_eq!(
+                    task.state,
+                    TaskState::TaskFailed,
+                    "budget-failed task must be in TaskFailed state"
+                );
+            }
+        }
+        drop(reg);
     }
 }

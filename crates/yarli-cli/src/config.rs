@@ -115,6 +115,8 @@ pub struct YarliConfig {
     #[serde(default)]
     pub execution: ExecutionConfig,
     #[serde(default)]
+    pub budgets: BudgetsConfig,
+    #[serde(default)]
     pub git: GitConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -133,6 +135,7 @@ impl Default for YarliConfig {
             postgres: PostgresConfig::default(),
             queue: QueueConfig::default(),
             execution: ExecutionConfig::default(),
+            budgets: BudgetsConfig::default(),
             git: GitConfig::default(),
             policy: PolicyConfig::default(),
             memory: MemoryConfig::default(),
@@ -316,6 +319,34 @@ fn default_tick_interval_ms() -> u64 {
     100
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BudgetsConfig {
+    #[serde(default)]
+    pub max_task_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_task_cpu_user_ticks: Option<u64>,
+    #[serde(default)]
+    pub max_task_cpu_system_ticks: Option<u64>,
+    #[serde(default)]
+    pub max_task_io_read_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_task_io_write_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_task_total_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_run_total_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_run_peak_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_run_cpu_user_ticks: Option<u64>,
+    #[serde(default)]
+    pub max_run_cpu_system_ticks: Option<u64>,
+    #[serde(default)]
+    pub max_run_io_read_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_run_io_write_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitConfig {
     #[serde(default = "default_main_branch")]
@@ -473,6 +504,10 @@ claim_batch_size = 2
 working_dir = "/work"
 command_timeout_seconds = 600
 
+[budgets]
+max_task_total_tokens = 1000
+max_run_total_tokens = 5000
+
 [git]
 default_target_branch = "develop"
 
@@ -499,6 +534,7 @@ mode = "stream"
         assert_eq!(loaded.config().core.safe_mode, SafeMode::Restricted);
         assert_eq!(loaded.config().memory.backend.enabled, true);
         assert_eq!(loaded.config().ui.mode, UiMode::Stream);
+        assert_eq!(loaded.config().budgets.max_task_total_tokens, Some(1000));
     }
 
     #[test]
@@ -532,6 +568,7 @@ mode = "stream"
             "postgres",
             "queue",
             "execution",
+            "budgets",
             "git",
             "policy",
             "memory",
@@ -549,7 +586,10 @@ mode = "stream"
             source: ConfigSource::Defaults,
             config: YarliConfig::default(),
         };
-        assert_eq!(loaded.backend_selection().unwrap(), BackendSelection::InMemory);
+        assert_eq!(
+            loaded.backend_selection().unwrap(),
+            BackendSelection::InMemory
+        );
     }
 
     #[test]

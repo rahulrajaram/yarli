@@ -1,0 +1,28 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/yarli_cli-bc6cedaea093fa8b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/yarli-206c24a2be7a67ee)
+
+running 3 tests
+test tests::render_task_explain_surfaces_budget_breach_and_token_usage ... ok
+test tests::render_run_explain_surfaces_budget_breach ... ok
+test tests::render_run_status_surfaces_budget_exceeded_and_token_usage ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.00s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-13bc915f70d0c06d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+   Doc-tests yarli_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

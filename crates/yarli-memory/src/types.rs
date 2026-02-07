@@ -182,10 +182,10 @@ const SECRET_PATTERNS: &[&str] = &[
     "api_key=",
     "apikey=",
     "AWS_SECRET",
-    "AKIA",       // AWS access key prefix
-    "ghp_",       // GitHub personal access token
-    "ghs_",       // GitHub server-to-server token
-    "sk-",        // OpenAI / Stripe key prefix
+    "AKIA", // AWS access key prefix
+    "ghp_", // GitHub personal access token
+    "ghs_", // GitHub server-to-server token
+    "sk-",  // OpenAI / Stripe key prefix
     "Bearer ",
 ];
 
@@ -194,5 +194,7 @@ const SECRET_PATTERNS: &[&str] = &[
 /// Returns `true` if the content likely contains secret material.
 pub fn content_may_contain_secrets(content: &str) -> bool {
     let lower = content.to_lowercase();
-    SECRET_PATTERNS.iter().any(|pat| lower.contains(&pat.to_lowercase()))
+    SECRET_PATTERNS
+        .iter()
+        .any(|pat| lower.contains(&pat.to_lowercase()))
 }

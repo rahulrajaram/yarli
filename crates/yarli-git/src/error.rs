@@ -14,7 +14,6 @@ use yarli_core::fsm::worktree::WorktreeState;
 #[derive(Debug, Error)]
 pub enum GitError {
     // ── Worktree errors (Section 12.1–12.3, 12.11) ────────────────
-
     /// Failed to create a worktree (Section 12.2).
     #[error("worktree creation failed: {reason}")]
     WorktreeCreation { reason: String },
@@ -53,7 +52,6 @@ pub enum GitError {
     CleanupBlocked { reason: String },
 
     // ── Merge errors (Section 12.5–12.9) ───────────────────────────
-
     /// Merge precheck failed (Section 12.6).
     #[error("merge precheck failed: {reason}")]
     MergePrecheckFailed { reason: String },
@@ -79,7 +77,6 @@ pub enum GitError {
     InvalidMergeState { state: MergeState },
 
     // ── Submodule errors (Section 12.4) ────────────────────────────
-
     /// Uninitialized submodule detected before task start.
     #[error("uninitialized submodule: {path}")]
     UninitializedSubmodule { path: String },
@@ -93,23 +90,23 @@ pub enum GitError {
     SubmodulePolicyViolation { path: String, reason: String },
 
     // ── Forbidden operations (Section 12.12) ───────────────────────
-
     /// A forbidden git operation was attempted without policy approval.
     #[error("forbidden git operation: {operation}")]
     ForbiddenOperation { operation: ForbiddenOp },
 
     // ── Recovery errors (Section 12.10) ────────────────────────────
-
     /// An interrupted git operation was detected on recovery.
     #[error("interrupted {operation} detected in {path}")]
-    InterruptedOperation { operation: InterruptedOp, path: PathBuf },
+    InterruptedOperation {
+        operation: InterruptedOp,
+        path: PathBuf,
+    },
 
     /// Recovery action failed.
     #[error("recovery failed: {reason}")]
     RecoveryFailed { reason: String },
 
     // ── Ref resolution ─────────────────────────────────────────────
-
     /// A ref (branch/tag/sha) could not be resolved.
     #[error("ref not found: {refspec}")]
     RefNotFound { refspec: String },
@@ -119,7 +116,6 @@ pub enum GitError {
     BranchAlreadyExists { branch: String },
 
     // ── Underlying errors ──────────────────────────────────────────
-
     /// Git command returned a non-zero exit code.
     #[error("git command failed (exit {exit_code}): {stderr}")]
     CommandFailed { exit_code: i32, stderr: String },

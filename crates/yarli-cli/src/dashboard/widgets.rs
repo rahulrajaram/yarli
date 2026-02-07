@@ -91,10 +91,7 @@ impl<'a> CollapsiblePanel<'a> {
             PanelState::Hidden => "",
         };
 
-        let shortcut_str = self
-            .shortcut
-            .map(|c| format!(" {c}:"))
-            .unwrap_or_default();
+        let shortcut_str = self.shortcut.map(|c| format!(" {c}:")).unwrap_or_default();
 
         let title = format!("{shortcut_str}{} {state_indicator}", self.title);
 
@@ -129,16 +126,10 @@ impl Widget for CollapsiblePanel<'_> {
                 } else {
                     Tier::Background.style()
                 };
-                let shortcut_str = self
-                    .shortcut
-                    .map(|c| format!("{c}:"))
-                    .unwrap_or_default();
+                let shortcut_str = self.shortcut.map(|c| format!("{c}:")).unwrap_or_default();
                 let line = Line::from(vec![
                     Span::styled("▶ ", border_style),
-                    Span::styled(
-                        format!("{shortcut_str}{} [+]", self.title),
-                        border_style,
-                    ),
+                    Span::styled(format!("{shortcut_str}{} [+]", self.title), border_style),
                 ]);
                 let _ = block; // not used in collapsed mode
                 Paragraph::new(line).render(header_area, buf);
@@ -197,7 +188,16 @@ mod tests {
         panel.render(area, &mut buf);
 
         // Should have rendered something in the first line.
-        let line: String = (0..40).map(|x| buf.cell((x, 0)).unwrap().symbol().chars().next().unwrap_or(' ')).collect();
+        let line: String = (0..40)
+            .map(|x| {
+                buf.cell((x, 0))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect();
         assert!(line.contains("Tasks"));
     }
 
@@ -232,7 +232,16 @@ mod tests {
         panel.render(area, &mut buf);
 
         // Check that content appears (inside the borders).
-        let line: String = (0..40).map(|x| buf.cell((x, 1)).unwrap().symbol().chars().next().unwrap_or(' ')).collect();
+        let line: String = (0..40)
+            .map(|x| {
+                buf.cell((x, 1))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect();
         assert!(line.contains("Hello"));
     }
 
@@ -253,7 +262,16 @@ mod tests {
         panel.render(area, &mut buf);
 
         // First line should contain content directly (no border).
-        let line: String = (0..40).map(|x| buf.cell((x, 0)).unwrap().symbol().chars().next().unwrap_or(' ')).collect();
+        let line: String = (0..40)
+            .map(|x| {
+                buf.cell((x, 0))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect();
         assert!(line.contains("Hello"));
     }
 
@@ -272,7 +290,16 @@ mod tests {
         panel.render(area, &mut buf);
 
         // First visible line should be "Line 1" (skipped "Line 0").
-        let line: String = (0..40).map(|x| buf.cell((x, 1)).unwrap().symbol().chars().next().unwrap_or(' ')).collect();
+        let line: String = (0..40)
+            .map(|x| {
+                buf.cell((x, 1))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect();
         assert!(line.contains("Line 1"));
     }
 }

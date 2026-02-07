@@ -25,9 +25,7 @@ impl Tier {
     /// Primary style for this tier.
     pub fn style(self) -> Style {
         match self {
-            Tier::Urgent => Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Tier::Urgent => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             Tier::Active => Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{RunId, TaskId};
+use crate::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use crate::fsm::run::RunState;
 use crate::fsm::task::TaskState;
 
@@ -80,6 +81,15 @@ pub struct TaskSnapshot {
     pub gates: Vec<(GateType, GateResult)>,
     /// When the task last changed state.
     pub last_transition_at: Option<DateTime<Utc>>,
+    /// Resource usage from the last command execution (if available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_usage: Option<CommandResourceUsage>,
+    /// Token usage from the last command execution (if available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsage>,
+    /// If the task failed due to budget breach, the failure reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_breach_reason: Option<String>,
 }
 
 /// Snapshot of a run's state for explain computation.
@@ -164,6 +174,13 @@ pub struct SuggestedAction {
     pub command: Option<String>,
 }
 
+/// Summary of a budget breach for operator display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetBreachSummary {
+    pub task_name: String,
+    pub reason: String,
+}
+
 /// The full explain result — answer to "Why Not Done?"
 ///
 /// Computed purely from run/task/gate state snapshots.
@@ -175,6 +192,8 @@ pub struct ExplainResult {
     pub failed_gates: Vec<GateFailure>,
     pub blocker_chain: Vec<BlockerChainLink>,
     pub suggested_actions: Vec<SuggestedAction>,
+    /// Budget breaches detected across tasks.
+    pub budget_breaches: Vec<BudgetBreachSummary>,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +210,7 @@ pub fn explain_run(snapshot: &RunSnapshot) -> ExplainResult {
     let blocking_tasks = find_blocking_tasks(&snapshot.tasks);
     let failed_gates = find_failed_gates(snapshot);
     let blocker_chain = compute_blocker_chain(&snapshot.tasks);
+    let budget_breaches = find_budget_breaches(&snapshot.tasks);
     let suggested_actions = suggest_actions(&blocking_tasks, &failed_gates);
 
     ExplainResult {
@@ -199,6 +219,7 @@ pub fn explain_run(snapshot: &RunSnapshot) -> ExplainResult {
         failed_gates,
         blocker_chain,
         suggested_actions,
+        budget_breaches,
     }
 }
 
@@ -248,12 +269,22 @@ pub fn explain_task(task: &TaskSnapshot) -> ExplainResult {
         });
     }
 
+    let budget_breaches = if let Some(ref reason) = task.budget_breach_reason {
+        vec![BudgetBreachSummary {
+            task_name: task.name.clone(),
+            reason: reason.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+
     ExplainResult {
         status,
         blocking_tasks: Vec::new(),
         failed_gates,
         blocker_chain: Vec::new(),
         suggested_actions,
+        budget_breaches,
     }
 }
 
@@ -308,10 +339,9 @@ fn find_blocking_tasks(tasks: &[TaskSnapshot]) -> Vec<BlockerInfo> {
                 | TaskState::TaskReady
                 | TaskState::TaskExecuting
                 | TaskState::TaskWaiting
-                | TaskState::TaskVerifying => Some(format!(
-                    "task/{} not yet complete ({:?})",
-                    t.name, t.state
-                )),
+                | TaskState::TaskVerifying => {
+                    Some(format!("task/{} not yet complete ({:?})", t.name, t.state))
+                }
                 TaskState::TaskComplete | TaskState::TaskCancelled => None,
             };
 
@@ -435,6 +465,20 @@ fn compute_blocker_chain(tasks: &[TaskSnapshot]) -> Vec<BlockerChainLink> {
     Vec::new()
 }
 
+fn find_budget_breaches(tasks: &[TaskSnapshot]) -> Vec<BudgetBreachSummary> {
+    tasks
+        .iter()
+        .filter_map(|t| {
+            t.budget_breach_reason
+                .as_ref()
+                .map(|reason| BudgetBreachSummary {
+                    task_name: t.name.clone(),
+                    reason: reason.clone(),
+                })
+        })
+        .collect()
+}
+
 fn suggest_actions(
     blocking_tasks: &[BlockerInfo],
     failed_gates: &[GateFailure],
@@ -489,6 +533,9 @@ mod tests {
             blocked_by: Vec::new(),
             gates: Vec::new(),
             last_transition_at: None,
+            resource_usage: None,
+            token_usage: None,
+            budget_breach_reason: None,
         }
     }
 
@@ -728,6 +775,88 @@ mod tests {
         assert_eq!(
             result.blocker_chain[1].relation,
             BlockerRelation::GateFailed
+        );
+    }
+
+    #[test]
+    fn budget_exceeded_task_surfaces_breach_in_run_explain() {
+        let mut task = make_task("compute", TaskState::TaskFailed);
+        task.budget_breach_reason =
+            Some("budget_exceeded: task max_task_total_tokens observed=5000 limit=1".to_string());
+        task.token_usage = Some(TokenUsage {
+            prompt_tokens: 2500,
+            completion_tokens: 2500,
+            total_tokens: 5000,
+            source: "char_count_div4_estimate_v1".to_string(),
+        });
+
+        let snapshot = RunSnapshot {
+            run_id: Uuid::new_v4(),
+            state: RunState::RunBlocked,
+            tasks: vec![task],
+            gates: vec![],
+        };
+
+        let result = explain_run(&snapshot);
+        assert_eq!(result.status, RunStatus::Failed);
+        assert_eq!(result.budget_breaches.len(), 1);
+        assert_eq!(result.budget_breaches[0].task_name, "compute");
+        assert!(result.budget_breaches[0].reason.contains("budget_exceeded"));
+    }
+
+    #[test]
+    fn budget_exceeded_task_explain_surfaces_breach() {
+        let mut task = make_task("compute", TaskState::TaskFailed);
+        task.budget_breach_reason =
+            Some("budget_exceeded: task max_task_total_tokens observed=5000 limit=1".to_string());
+        task.resource_usage = Some(CommandResourceUsage {
+            max_rss_bytes: Some(1024 * 1024),
+            cpu_user_ticks: Some(100),
+            cpu_system_ticks: Some(50),
+            io_read_bytes: Some(4096),
+            io_write_bytes: Some(2048),
+        });
+
+        let result = explain_task(&task);
+        assert_eq!(result.status, RunStatus::Failed);
+        assert_eq!(result.budget_breaches.len(), 1);
+        assert!(result.budget_breaches[0].reason.contains("budget_exceeded"));
+    }
+
+    #[test]
+    fn no_breach_when_task_succeeds() {
+        let task = make_task("build", TaskState::TaskComplete);
+        let result = explain_task(&task);
+        assert!(result.budget_breaches.is_empty());
+    }
+
+    #[test]
+    fn token_usage_accessible_on_task_snapshot() {
+        let mut task = make_task("llm-call", TaskState::TaskComplete);
+        task.token_usage = Some(TokenUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            total_tokens: 1500,
+            source: "char_count_div4_estimate_v1".to_string(),
+        });
+        assert_eq!(task.token_usage.as_ref().unwrap().prompt_tokens, 1000);
+        assert_eq!(task.token_usage.as_ref().unwrap().completion_tokens, 500);
+        assert_eq!(task.token_usage.as_ref().unwrap().total_tokens, 1500);
+    }
+
+    #[test]
+    fn resource_usage_accessible_on_task_snapshot() {
+        let mut task = make_task("heavy-compute", TaskState::TaskComplete);
+        task.resource_usage = Some(CommandResourceUsage {
+            max_rss_bytes: Some(2 * 1024 * 1024 * 1024),
+            cpu_user_ticks: Some(500),
+            cpu_system_ticks: Some(200),
+            io_read_bytes: Some(1024 * 1024),
+            io_write_bytes: Some(512 * 1024),
+        });
+        assert_eq!(
+            task.resource_usage.as_ref().unwrap().max_rss_bytes,
+            Some(2 * 1024 * 1024 * 1024)
         );
     }
 }

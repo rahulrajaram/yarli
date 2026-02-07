@@ -76,9 +76,7 @@ impl DashboardRenderer {
     /// Restore terminal state on exit.
     pub fn restore(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
-        self.terminal
-            .backend_mut()
-            .execute(LeaveAlternateScreen)?;
+        self.terminal.backend_mut().execute(LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
         Ok(())
     }
@@ -124,10 +122,7 @@ impl DashboardRenderer {
             StreamEvent::ExplainUpdate { summary } => {
                 self.state.explain_summary = Some(summary);
             }
-            StreamEvent::TaskWorker {
-                task_id,
-                worker_id,
-            } => {
+            StreamEvent::TaskWorker { task_id, worker_id } => {
                 if let Some(view) = self.state.tasks.get_mut(&task_id) {
                     view.worker_id = Some(worker_id);
                 }
@@ -210,7 +205,9 @@ impl DashboardRenderer {
         let explain_line = build_explain_line(state);
         let key_hints_line = build_key_hints_line(state);
         let title_line = if borderless {
-            self.copy_mode.banner_line().unwrap_or_else(|| build_title_line(state))
+            self.copy_mode
+                .banner_line()
+                .unwrap_or_else(|| build_title_line(state))
         } else {
             build_title_line(state)
         };
@@ -219,9 +216,21 @@ impl DashboardRenderer {
         let output_panel_state = state.panel_state(PanelId::Output);
         let gates_panel_state = state.panel_state(PanelId::Gates);
         let focused = state.focused;
-        let task_scroll = state.scroll_offsets.get(&PanelId::TaskList).copied().unwrap_or(0);
-        let output_scroll = state.scroll_offsets.get(&PanelId::Output).copied().unwrap_or(0);
-        let gate_scroll = state.scroll_offsets.get(&PanelId::Gates).copied().unwrap_or(0);
+        let task_scroll = state
+            .scroll_offsets
+            .get(&PanelId::TaskList)
+            .copied()
+            .unwrap_or(0);
+        let output_scroll = state
+            .scroll_offsets
+            .get(&PanelId::Output)
+            .copied()
+            .unwrap_or(0);
+        let gate_scroll = state
+            .scroll_offsets
+            .get(&PanelId::Gates)
+            .copied()
+            .unwrap_or(0);
         let auto_scroll = state.output_auto_scroll;
 
         // Capture overlay stack reference for use inside the closure.
@@ -234,18 +243,15 @@ impl DashboardRenderer {
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),      // Title bar
-                    Constraint::Min(4),         // Body panels
-                    Constraint::Length(1),       // WHY NOT DONE bar
-                    Constraint::Length(1),       // Key hints bar
+                    Constraint::Length(1), // Title bar
+                    Constraint::Min(4),    // Body panels
+                    Constraint::Length(1), // WHY NOT DONE bar
+                    Constraint::Length(1), // Key hints bar
                 ])
                 .split(full_area);
 
             // Title bar.
-            frame.render_widget(
-                Paragraph::new(title_line),
-                main_chunks[0],
-            );
+            frame.render_widget(Paragraph::new(title_line), main_chunks[0]);
 
             // Body: horizontal split [TaskList | Output+Gates]
             let body_area = main_chunks[1];
@@ -322,16 +328,10 @@ impl DashboardRenderer {
             }
 
             // WHY NOT DONE bar.
-            frame.render_widget(
-                Paragraph::new(explain_line),
-                main_chunks[2],
-            );
+            frame.render_widget(Paragraph::new(explain_line), main_chunks[2]);
 
             // Key hints bar.
-            frame.render_widget(
-                Paragraph::new(key_hints_line),
-                main_chunks[3],
-            );
+            frame.render_widget(Paragraph::new(key_hints_line), main_chunks[3]);
 
             // Overlays (rendered on top of everything).
             if !overlays.is_empty() {
@@ -381,10 +381,7 @@ pub fn build_task_list_lines<'a>(
 
         let (glyph, tier) = match task.state {
             TaskState::TaskExecuting => {
-                let sp = spinners
-                    .get(task_id)
-                    .map(|s| s.frame())
-                    .unwrap_or('⠋');
+                let sp = spinners.get(task_id).map(|s| s.frame()).unwrap_or('⠋');
                 (sp, Tier::Active)
             }
             TaskState::TaskWaiting => ('⠿', Tier::Active),
@@ -491,15 +488,13 @@ pub fn build_explain_line<'a>(state: &PanelManager) -> Line<'a> {
             .map(|s| format!("{s:?}"))
             .unwrap_or_else(|| "pending".to_string());
         let summary = state.task_summary();
-        Line::from(vec![
-            Span::styled(
-                format!(
-                    " {run_state_str} | {}/{} complete, {} active, {} failed",
-                    summary.complete, summary.total, summary.active, summary.failed
-                ),
-                Tier::Contextual.style(),
+        Line::from(vec![Span::styled(
+            format!(
+                " {run_state_str} | {}/{} complete, {} active, {} failed",
+                summary.complete, summary.total, summary.active, summary.failed
             ),
-        ])
+            Tier::Contextual.style(),
+        )])
     }
 }
 
@@ -620,9 +615,24 @@ mod tests {
     #[test]
     fn build_task_list_with_tasks() {
         let mut state = PanelManager::new();
-        state.update_task(Uuid::new_v4(), "lint", TaskState::TaskComplete, Some(Duration::from_secs(3)));
-        state.update_task(Uuid::new_v4(), "build", TaskState::TaskExecuting, Some(Duration::from_secs(34)));
-        state.update_task(Uuid::new_v4(), "test", TaskState::TaskFailed, Some(Duration::from_secs(14)));
+        state.update_task(
+            Uuid::new_v4(),
+            "lint",
+            TaskState::TaskComplete,
+            Some(Duration::from_secs(3)),
+        );
+        state.update_task(
+            Uuid::new_v4(),
+            "build",
+            TaskState::TaskExecuting,
+            Some(Duration::from_secs(34)),
+        );
+        state.update_task(
+            Uuid::new_v4(),
+            "test",
+            TaskState::TaskFailed,
+            Some(Duration::from_secs(14)),
+        );
 
         let spinners = std::collections::HashMap::new();
         let lines = build_task_list_lines(&state, &spinners);
@@ -659,7 +669,9 @@ mod tests {
     fn build_gate_lines_with_results() {
         let mut state = PanelManager::new();
         state.gate_results.push(("tests_passed".into(), true, None));
-        state.gate_results.push(("policy_clean".into(), false, Some("denied".into())));
+        state
+            .gate_results
+            .push(("policy_clean".into(), false, Some("denied".into())));
 
         let lines = build_gate_lines(&state);
         assert_eq!(lines.len(), 2);

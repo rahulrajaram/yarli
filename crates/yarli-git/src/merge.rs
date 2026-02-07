@@ -10,7 +10,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use yarli_core::entities::merge_intent::{ConflictRecord, ConflictType, MergeIntent, MergeStrategy};
+use yarli_core::entities::merge_intent::{
+    ConflictRecord, ConflictType, MergeIntent, MergeStrategy,
+};
 use yarli_core::entities::worktree_binding::WorktreeBinding;
 use yarli_core::fsm::merge::MergeState;
 use yarli_core::fsm::worktree::WorktreeState;
@@ -276,45 +278,27 @@ impl LocalMergeOrchestrator {
             MergeStrategy::SquashMerge => {
                 // Squash merge: stage then commit separately.
                 let squash = self
-                    .run_git(
-                        &wt_path,
-                        &["merge", "--squash", &source_sha],
-                        cancel,
-                    )
+                    .run_git(&wt_path, &["merge", "--squash", &source_sha], cancel)
                     .await?;
                 if squash.exit_code != 0 {
                     squash
                 } else {
-                    self.run_git(
-                        &wt_path,
-                        &["commit", "-m", &commit_msg],
-                        cancel,
-                    )
-                    .await?
+                    self.run_git(&wt_path, &["commit", "-m", &commit_msg], cancel)
+                        .await?
                 }
             }
             MergeStrategy::RebaseThenFf => {
                 // Rebase source onto target, then fast-forward merge.
                 let rebase = self
-                    .run_git(
-                        &wt_path,
-                        &["rebase", &intent.target_ref],
-                        cancel,
-                    )
+                    .run_git(&wt_path, &["rebase", &intent.target_ref], cancel)
                     .await?;
                 if rebase.exit_code != 0 {
                     // Abort the rebase.
-                    let _ = self
-                        .run_git(&wt_path, &["rebase", "--abort"], cancel)
-                        .await;
+                    let _ = self.run_git(&wt_path, &["rebase", "--abort"], cancel).await;
                     rebase
                 } else {
-                    self.run_git(
-                        &wt_path,
-                        &["merge", "--ff-only", &source_sha],
-                        cancel,
-                    )
-                    .await?
+                    self.run_git(&wt_path, &["merge", "--ff-only", &source_sha], cancel)
+                        .await?
                 }
             }
         };
@@ -332,9 +316,7 @@ impl LocalMergeOrchestrator {
             let conflicts = Self::parse_conflicts(&conflict_output.stdout);
 
             // Abort the merge.
-            let _ = self
-                .run_git(&wt_path, &["merge", "--abort"], cancel)
-                .await;
+            let _ = self.run_git(&wt_path, &["merge", "--abort"], cancel).await;
 
             let count = conflicts.len();
             intent.set_conflicts(conflicts);
@@ -359,10 +341,7 @@ impl LocalMergeOrchestrator {
                 )
                 .map_err(GitError::Transition)?;
 
-            warn!(
-                conflicts = count,
-                "merge apply detected conflicts"
-            );
+            warn!(conflicts = count, "merge apply detected conflicts");
 
             return Err(GitError::MergeConflict { count });
         }
@@ -409,10 +388,7 @@ impl LocalMergeOrchestrator {
             .replace("{source}", &intent.source_ref)
             .replace("{target}", &intent.target_ref)
             .replace("{run_id}", &intent.run_id.to_string())
-            .replace(
-                "{task_id}",
-                &intent.worktree_id.to_string(),
-            )
+            .replace("{task_id}", &intent.worktree_id.to_string())
     }
 }
 
@@ -587,9 +563,7 @@ impl MergeOrchestrator for LocalMergeOrchestrator {
             let conflicts = Self::parse_conflicts(&conflict_output.stdout);
 
             // Abort the failed merge to return to clean state.
-            let _ = self
-                .run_git(wt_path, &["merge", "--abort"], &cancel)
-                .await;
+            let _ = self.run_git(wt_path, &["merge", "--abort"], &cancel).await;
 
             let count = conflicts.len();
             intent.set_conflicts(conflicts.clone());
@@ -619,9 +593,7 @@ impl MergeOrchestrator for LocalMergeOrchestrator {
         }
 
         // Dry-run succeeded — abort the uncommitted merge to return to clean state.
-        let _ = self
-            .run_git(wt_path, &["merge", "--abort"], &cancel)
-            .await;
+        let _ = self.run_git(wt_path, &["merge", "--abort"], &cancel).await;
 
         info!(
             changed_files = changed_files.len(),
@@ -707,11 +679,7 @@ impl MergeOrchestrator for LocalMergeOrchestrator {
         // Section 12.4: Verify submodule policy.
         let after_submodules = self.wt_manager.submodule_status(wt_path).await?;
         self.wt_manager
-            .verify_submodule_policy(
-                binding.submodule_mode,
-                before_submodules,
-                &after_submodules,
-            )
+            .verify_submodule_policy(binding.submodule_mode, before_submodules, &after_submodules)
             .map_err(|e| GitError::MergeVerifyFailed {
                 reason: format!("submodule policy: {e}"),
             })?;
@@ -755,12 +723,8 @@ impl MergeOrchestrator for LocalMergeOrchestrator {
         let wt_path = &binding.worktree_path;
 
         // If worktree is in WtMerging or WtConflict, try to abort the git merge.
-        if binding.state == WorktreeState::WtMerging
-            || binding.state == WorktreeState::WtConflict
-        {
-            let _ = self
-                .run_git(wt_path, &["merge", "--abort"], &cancel)
-                .await;
+        if binding.state == WorktreeState::WtMerging || binding.state == WorktreeState::WtConflict {
+            let _ = self.run_git(wt_path, &["merge", "--abort"], &cancel).await;
 
             // Transition worktree through WtRecovering to WtBoundHome.
             binding
@@ -784,12 +748,7 @@ impl MergeOrchestrator for LocalMergeOrchestrator {
 
         // Transition merge to MergeAborted.
         intent
-            .transition(
-                MergeState::MergeAborted,
-                reason,
-                "merge_orchestrator",
-                None,
-            )
+            .transition(MergeState::MergeAborted, reason, "merge_orchestrator", None)
             .map_err(GitError::Transition)?;
 
         // Release any merge lock.

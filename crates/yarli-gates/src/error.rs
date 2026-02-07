@@ -9,17 +9,11 @@ use yarli_core::explain::GateType;
 pub enum GateError {
     /// Evidence required for gate evaluation is missing.
     #[error("missing evidence for gate {gate:?}: {details}")]
-    MissingEvidence {
-        gate: GateType,
-        details: String,
-    },
+    MissingEvidence { gate: GateType, details: String },
 
     /// Evidence validation failed (malformed payload, wrong schema).
     #[error("invalid evidence {evidence_id}: {details}")]
-    InvalidEvidence {
-        evidence_id: Uuid,
-        details: String,
-    },
+    InvalidEvidence { evidence_id: Uuid, details: String },
 
     /// Gate evaluation encountered an internal error.
     #[error("gate evaluation error for {gate:?}: {source}")]

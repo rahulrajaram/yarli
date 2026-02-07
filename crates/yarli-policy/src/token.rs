@@ -26,8 +26,14 @@ pub struct TokenScope {
 
 impl TokenScope {
     /// Check if this scope covers the given request parameters.
-    pub fn covers(&self, action: &str, repo: Option<&str>, branch: Option<&str>,
-                  run_id: Option<RunId>, task_id: Option<TaskId>) -> bool {
+    pub fn covers(
+        &self,
+        action: &str,
+        repo: Option<&str>,
+        branch: Option<&str>,
+        run_id: Option<RunId>,
+        task_id: Option<TaskId>,
+    ) -> bool {
         if self.action != action {
             return false;
         }
@@ -107,8 +113,14 @@ impl ApprovalToken {
     }
 
     /// Check if the token covers the given action parameters.
-    pub fn covers(&self, action: &str, repo: Option<&str>, branch: Option<&str>,
-                  run_id: Option<RunId>, task_id: Option<TaskId>) -> bool {
+    pub fn covers(
+        &self,
+        action: &str,
+        repo: Option<&str>,
+        branch: Option<&str>,
+        run_id: Option<RunId>,
+        task_id: Option<TaskId>,
+    ) -> bool {
         self.is_valid() && self.scope.covers(action, repo, branch, run_id, task_id)
     }
 
@@ -155,7 +167,8 @@ mod tests {
 
     #[test]
     fn token_invalid_when_consumed() {
-        let mut token = ApprovalToken::new("admin", make_scope("git_push"), future_time(), "testing");
+        let mut token =
+            ApprovalToken::new("admin", make_scope("git_push"), future_time(), "testing");
         token.consume();
         assert!(!token.is_valid());
     }
@@ -239,7 +252,12 @@ mod tests {
 
     #[test]
     fn token_serializes_roundtrip() {
-        let token = ApprovalToken::new("admin", make_scope("merge"), future_time(), "approved by lead");
+        let token = ApprovalToken::new(
+            "admin",
+            make_scope("merge"),
+            future_time(),
+            "approved by lead",
+        );
         let json = serde_json::to_string(&token).unwrap();
         let decoded: ApprovalToken = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.token_id, token.token_id);
@@ -259,9 +277,27 @@ mod tests {
             run_id: Some(run_id),
             task_id: Some(task_id),
         };
-        assert!(scope.covers("merge", Some("/repo/x"), Some("main"), Some(run_id), Some(task_id)));
+        assert!(scope.covers(
+            "merge",
+            Some("/repo/x"),
+            Some("main"),
+            Some(run_id),
+            Some(task_id)
+        ));
         // Fail on any mismatch
-        assert!(!scope.covers("merge", Some("/repo/y"), Some("main"), Some(run_id), Some(task_id)));
-        assert!(!scope.covers("merge", Some("/repo/x"), Some("dev"), Some(run_id), Some(task_id)));
+        assert!(!scope.covers(
+            "merge",
+            Some("/repo/y"),
+            Some("main"),
+            Some(run_id),
+            Some(task_id)
+        ));
+        assert!(!scope.covers(
+            "merge",
+            Some("/repo/x"),
+            Some("dev"),
+            Some(run_id),
+            Some(task_id)
+        ));
     }
 }

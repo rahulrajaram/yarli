@@ -56,7 +56,9 @@ pub fn parse_submodule_status(stdout: &str) -> Vec<SubmoduleEntry> {
 
             let first = trimmed.chars().next()?;
             let (status, rest) = match first {
-                c if c == SUBMODULE_UNINIT_PREFIX => (SubmoduleStatus::Uninitialized, &trimmed[1..]),
+                c if c == SUBMODULE_UNINIT_PREFIX => {
+                    (SubmoduleStatus::Uninitialized, &trimmed[1..])
+                }
                 c if c == SUBMODULE_MODIFIED_PREFIX => (SubmoduleStatus::Modified, &trimmed[1..]),
                 c if c == SUBMODULE_CONFLICT_PREFIX => (SubmoduleStatus::Conflict, &trimmed[1..]),
                 c if c.is_ascii_hexdigit() => (SubmoduleStatus::Current, trimmed),
@@ -247,10 +249,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, SubmoduleStatus::Modified);
         assert_eq!(entries[0].path, "vendor/dirty");
-        assert_eq!(
-            entries[0].descriptor.as_deref(),
-            Some("v1.0-1-gabcdef")
-        );
+        assert_eq!(entries[0].descriptor.as_deref(), Some("v1.0-1-gabcdef"));
     }
 
     #[test]

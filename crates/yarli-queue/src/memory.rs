@@ -141,7 +141,10 @@ impl TaskQueue for InMemoryTaskQueue {
             }
 
             // Check per-class cap.
-            let class_count = leased_by_class.get(&entry.command_class).copied().unwrap_or(0);
+            let class_count = leased_by_class
+                .get(&entry.command_class)
+                .copied()
+                .unwrap_or(0);
             if class_count >= config.cap_for(entry.command_class) {
                 continue;
             }
@@ -185,10 +188,7 @@ impl TaskQueue for InMemoryTaskQueue {
             });
         }
 
-        let owner = entry
-            .lease_owner
-            .as_deref()
-            .unwrap_or("");
+        let owner = entry.lease_owner.as_deref().unwrap_or("");
         if owner != worker_id {
             return Err(QueueError::LeaseOwnerMismatch {
                 entry_id: queue_id,

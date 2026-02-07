@@ -147,10 +147,9 @@ fn yarli_binary_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         Some(path) => Ok(PathBuf::from(path)),
         None => {
             let current_exe = env::current_exe()?;
-            let debug_dir = current_exe
-                .parent()
-                .and_then(|path| path.parent())
-                .ok_or("failed to derive target/debug directory from current test executable path")?;
+            let debug_dir = current_exe.parent().and_then(|path| path.parent()).ok_or(
+                "failed to derive target/debug directory from current test executable path",
+            )?;
             let binary_name = format!("yarli{}", std::env::consts::EXE_SUFFIX);
             let fallback = debug_dir.join(binary_name);
             if fallback.is_file() {

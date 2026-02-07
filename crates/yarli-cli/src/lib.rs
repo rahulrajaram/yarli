@@ -6,7 +6,7 @@
 //! - **CLI commands**: `yarli run`, `yarli task`, etc.
 //! - **Mode detection**: auto-detect rendering mode from terminal capabilities
 
-pub mod dashboard;
 pub mod config;
+pub mod dashboard;
 pub mod mode;
 pub mod stream;

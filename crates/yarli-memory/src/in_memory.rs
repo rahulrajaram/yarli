@@ -216,9 +216,7 @@ impl MemoryAdapter for InMemoryAdapter {
         if removed.is_some() {
             // Also remove any links involving this memory
             if let Some(links) = state.links.get_mut(project) {
-                links.retain(|l| {
-                    l.from_memory_id != memory_id && l.to_memory_id != memory_id
-                });
+                links.retain(|l| l.from_memory_id != memory_id && l.to_memory_id != memory_id);
             }
             Ok(())
         } else {
@@ -291,26 +289,18 @@ impl MemoryAdapter for InMemoryAdapter {
     ) -> Result<(), MemoryError> {
         let mut state = self.state.write().unwrap();
 
-        state
-            .scopes
-            .entry(project.to_string())
-            .or_default()
-            .insert(
-                scope_id.as_str().to_string(),
-                ScopeState {
-                    parent: parent.cloned(),
-                    closed: false,
-                },
-            );
+        state.scopes.entry(project.to_string()).or_default().insert(
+            scope_id.as_str().to_string(),
+            ScopeState {
+                parent: parent.cloned(),
+                closed: false,
+            },
+        );
 
         Ok(())
     }
 
-    async fn close_scope(
-        &self,
-        project: &str,
-        scope_id: &ScopeId,
-    ) -> Result<(), MemoryError> {
+    async fn close_scope(&self, project: &str, scope_id: &ScopeId) -> Result<(), MemoryError> {
         let mut state = self.state.write().unwrap();
 
         let scope = state
@@ -343,11 +333,7 @@ mod tests {
     #[tokio::test]
     async fn store_and_get() {
         let adapter = InMemoryAdapter::new();
-        let req = InsertMemory::new(
-            test_scope(),
-            MemoryClass::Working,
-            "test content",
-        );
+        let req = InsertMemory::new(test_scope(), MemoryClass::Working, "test content");
         let record = adapter.store("proj", req).await.unwrap();
         assert_eq!(record.content, "test content");
         assert_eq!(record.memory_class, MemoryClass::Working);
@@ -359,11 +345,7 @@ mod tests {
     #[tokio::test]
     async fn store_rejects_secrets() {
         let adapter = InMemoryAdapter::new();
-        let req = InsertMemory::new(
-            test_scope(),
-            MemoryClass::Working,
-            "my password=hunter2",
-        );
+        let req = InsertMemory::new(test_scope(), MemoryClass::Working, "my password=hunter2");
         let err = adapter.store("proj", req).await.unwrap_err();
         assert!(matches!(err, MemoryError::RedactionRequired));
     }
@@ -688,7 +670,11 @@ mod tests {
         adapter
             .store(
                 "proj",
-                InsertMemory::new(scope.clone(), MemoryClass::Semantic, "rust cargo build test"),
+                InsertMemory::new(
+                    scope.clone(),
+                    MemoryClass::Semantic,
+                    "rust cargo build test",
+                ),
             )
             .await
             .unwrap();
@@ -730,10 +716,7 @@ mod tests {
         let parent = ScopeId::for_run(uuid::Uuid::nil());
         let child = ScopeId::for_task(uuid::Uuid::nil());
 
-        adapter
-            .create_scope("proj", &parent, None)
-            .await
-            .unwrap();
+        adapter.create_scope("proj", &parent, None).await.unwrap();
         adapter
             .create_scope("proj", &child, Some(&parent))
             .await
@@ -761,11 +744,19 @@ mod tests {
     #[tokio::test]
     async fn content_secret_detection() {
         assert!(content_may_contain_secrets("password=hunter2"));
-        assert!(content_may_contain_secrets("ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
-        assert!(content_may_contain_secrets("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(content_may_contain_secrets(
+            "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        ));
+        assert!(content_may_contain_secrets(
+            "-----BEGIN RSA PRIVATE KEY-----"
+        ));
         assert!(content_may_contain_secrets("token=abc123"));
-        assert!(content_may_contain_secrets("export AWS_SECRET_ACCESS_KEY=xxx"));
-        assert!(content_may_contain_secrets("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+        assert!(content_may_contain_secrets(
+            "export AWS_SECRET_ACCESS_KEY=xxx"
+        ));
+        assert!(content_may_contain_secrets(
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ));
         assert!(content_may_contain_secrets("sk-proj-abc123"));
 
         assert!(!content_may_contain_secrets("normal text about code"));

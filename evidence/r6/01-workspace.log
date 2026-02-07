@@ -1,0 +1,854 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/yarli_api-66acb92cd7bbce2e)
+
+running 3 tests
+test server::tests::health_endpoint_returns_ok ... ok
+test server::tests::run_status_endpoint_returns_not_found_for_unknown_run ... ok
+test server::tests::run_status_endpoint_replays_persisted_events ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_cli-bc6cedaea093fa8b)
+
+running 121 tests
+test config::tests::backend_kind_as_str ... ok
+test config::tests::backend_selection_for_in_memory ... ok
+test config::tests::postgres_backend_requires_database_url ... ok
+test dashboard::copy_mode::tests::activate_sets_active ... ok
+test dashboard::copy_mode::tests::banner_when_active ... ok
+test dashboard::copy_mode::tests::banner_when_inactive ... ok
+test config::tests::snapshot_serializes_all_sections ... ok
+test config::tests::missing_file_uses_defaults ... ok
+test dashboard::copy_mode::tests::deactivate_clears_active ... ok
+test dashboard::copy_mode::tests::default_is_inactive ... ok
+test dashboard::copy_mode::tests::new_is_inactive ... ok
+test dashboard::copy_mode::tests::status_indicator_when_inactive ... ok
+test dashboard::copy_mode::tests::status_indicator_when_active ... ok
+test dashboard::copy_mode::tests::strip_borders_follows_active ... ok
+test dashboard::input::tests::collapse_expand_keys ... ok
+test dashboard::input::tests::ctrl_c_always_quits ... ok
+test dashboard::input::tests::ctrl_d_u_half_page ... ok
+test dashboard::input::tests::esc_dismisses_overlay ... ok
+test dashboard::input::tests::g_and_shift_g_scroll_extremes ... ok
+test dashboard::input::tests::jk_scroll_in_output_panel ... ok
+test dashboard::input::tests::jk_select_in_task_list ... ok
+test dashboard::input::tests::number_keys_jump_to_panel ... ok
+test dashboard::input::tests::q_quits ... ok
+test dashboard::input::tests::shift_tab_cycles_backward ... ok
+test dashboard::input::tests::tab_cycles_focus ... ok
+test dashboard::input::tests::toggle_copy_mode ... ok
+test dashboard::input::tests::toggle_help ... ok
+test dashboard::input::tests::unknown_key_returns_none ... ok
+test dashboard::overlay::tests::clear_removes_all ... ok
+test dashboard::overlay::tests::compute_rect_small_terminal ... ok
+test dashboard::overlay::tests::confirm_entry_content ... ok
+test dashboard::overlay::tests::default_stack_is_empty ... ok
+test dashboard::overlay::tests::compute_rect_centered ... ok
+test dashboard::overlay::tests::iter_returns_bottom_to_top ... ok
+test dashboard::overlay::tests::new_stack_is_empty ... ok
+test dashboard::overlay::tests::overlay_kind_titles ... ok
+test dashboard::overlay::tests::dismiss_by_kind ... ok
+test dashboard::overlay::tests::pop_removes_topmost ... ok
+test dashboard::overlay::tests::push_replaces_same_kind ... ok
+test dashboard::overlay::tests::push_and_top ... ok
+test dashboard::overlay::tests::toggle_dismisses_when_present ... ok
+test dashboard::overlay::tests::toggle_pushes_when_absent ... ok
+test dashboard::overlay::tests::gate_detail_entry_content ... ok
+test dashboard::renderer::tests::build_explain_line_with_summary ... ok
+test dashboard::renderer::tests::build_explain_line_without_summary ... ok
+test dashboard::overlay::tests::push_stacks_different_kinds ... ok
+test dashboard::renderer::tests::build_help_text_contains_shortcuts ... ok
+test dashboard::renderer::tests::build_help_text_not_empty ... ok
+test dashboard::renderer::tests::build_gate_lines_empty ... ok
+test dashboard::renderer::tests::build_key_hints_contains_shortcuts ... ok
+test dashboard::renderer::tests::build_gate_lines_with_results ... ok
+test dashboard::renderer::tests::build_key_hints_copy_mode ... ok
+test dashboard::renderer::tests::build_output_lines_empty ... ok
+test config::tests::parses_required_sections ... ok
+test dashboard::renderer::tests::build_output_lines_with_content ... ok
+test dashboard::renderer::tests::build_task_list_empty ... ok
+test dashboard::renderer::tests::build_task_list_with_tasks ... ok
+test dashboard::renderer::tests::build_title_line_no_run ... ok
+test dashboard::renderer::tests::format_compact_duration_hours ... ok
+test dashboard::renderer::tests::build_title_line_with_run ... ok
+test dashboard::renderer::tests::format_compact_duration_minutes ... ok
+test dashboard::renderer::tests::format_compact_duration_seconds ... ok
+test dashboard::state::tests::append_output_for_selected_task ... ok
+test dashboard::state::tests::collapse_focused_moves_focus_when_hidden ... ok
+test dashboard::state::tests::focus_cycling ... ok
+test dashboard::state::tests::focus_panel_by_shortcut ... ok
+test dashboard::state::tests::focus_panel_ignores_hidden ... ok
+test dashboard::state::tests::focus_prev_cycling ... ok
+test dashboard::state::tests::focus_skips_hidden_panels ... ok
+test dashboard::state::tests::output_auto_scroll_disengages_on_scroll_up ... ok
+test dashboard::state::tests::panel_id_titles_and_shortcuts ... ok
+test dashboard::state::tests::panel_state_collapse_cycle ... ok
+test dashboard::state::tests::panel_state_expand_cycle ... ok
+test dashboard::state::tests::restore_all_resets_panels ... ok
+test dashboard::state::tests::scroll_up_down ... ok
+test dashboard::state::tests::task_selection ... ok
+test dashboard::widgets::tests::borderless_min_height ... ok
+test dashboard::state::tests::task_summary_counts ... ok
+test dashboard::widgets::tests::min_height_by_state ... ok
+test dashboard::widgets::tests::collapsed_renders_in_one_line ... ok
+test dashboard::widgets::tests::borderless_renders_without_borders ... ok
+test dashboard::widgets::tests::hidden_renders_nothing ... ok
+test mode::tests::auto_detect_large_tty_returns_dashboard ... ok
+test mode::tests::auto_detect_narrow_returns_stream ... ok
+test dashboard::widgets::tests::expanded_renders_block_with_content ... ok
+test mode::tests::auto_detect_pipe_returns_stream ... ok
+test mode::tests::auto_detect_short_returns_stream ... ok
+test mode::tests::auto_detect_small_tty_returns_stream ... ok
+test dashboard::widgets::tests::scroll_offset_skips_lines ... ok
+test mode::tests::exact_minimum_supports_dashboard ... ok
+test mode::tests::force_stream_always_stream ... ok
+test mode::tests::force_stream_wins_over_tui ... ok
+test mode::tests::force_tui_returns_dashboard_on_large_tty ... ok
+test mode::tests::force_tui_errors_on_small_terminal ... ok
+test mode::tests::large_tty_supports_dashboard ... ok
+test mode::tests::narrow_tty_does_not_support_dashboard ... ok
+test mode::tests::pipe_does_not_support_dashboard ... ok
+test mode::tests::short_tty_does_not_support_dashboard ... ok
+test mode::tests::small_tty_does_not_support_dashboard ... ok
+test stream::events::tests::task_view_active_states ... ok
+test stream::events::tests::task_view_terminal_states ... ok
+test stream::renderer::tests::format_duration_long ... ok
+test stream::renderer::tests::format_duration_medium ... ok
+test stream::renderer::tests::format_duration_short ... ok
+test stream::renderer::tests::format_duration_zero ... ok
+test stream::renderer::tests::tier_for_active_run ... ok
+test stream::renderer::tests::tier_for_blocked_run ... ok
+test stream::renderer::tests::tier_for_complete_task ... ok
+test stream::renderer::tests::tier_for_completed_run ... ok
+test stream::renderer::tests::tier_for_executing_task ... ok
+test stream::renderer::tests::tier_for_failed_task ... ok
+test stream::spinner::tests::spinner_cycles_through_frames ... ok
+test stream::spinner::tests::all_frames_are_unique ... ok
+test stream::spinner::tests::spinner_wraps_around ... ok
+test stream::style::tests::active_accent_is_cyan ... ok
+test stream::style::tests::active_is_bold_white ... ok
+test stream::style::tests::background_is_dim_dark_gray ... ok
+test stream::style::tests::contextual_is_dark_gray ... ok
+test stream::style::tests::urgent_accent_is_yellow ... ok
+test stream::style::tests::urgent_is_bold_red ... ok
+test mode::tests::terminal_info_detect_does_not_panic ... ok
+
+test result: ok. 121 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/yarli-206c24a2be7a67ee)
+
+running 50 tests
+test tests::all_gate_names_covers_all_gate_types ... ok
+test tests::cmd_audit_tail_nonexistent_file ... ok
+test tests::cmd_audit_tail_empty_file ... ok
+test tests::cmd_gate_list_run_level ... ok
+test tests::cmd_gate_list_task_level ... ok
+test tests::cmd_gate_rerun_accepts_valid_gate ... ok
+test tests::cmd_gate_rerun_blocks_in_memory_writes_by_default ... ok
+test tests::cmd_gate_rerun_rejects_invalid_uuid ... ok
+test tests::cmd_audit_tail_filters_by_category ... ok
+test tests::cmd_gate_rerun_rejects_unknown_gate ... ok
+test tests::cmd_audit_tail_all_entries_with_zero_limit ... ok
+test tests::cmd_audit_tail_reads_entries ... ok
+test tests::cmd_merge_approve_rejects_invalid_uuid ... ok
+test tests::cmd_merge_reject_rejects_invalid_uuid ... ok
+test tests::cmd_audit_tail_limits_output ... ok
+test tests::cancel_active_run_persists_cancelled_transitions ... ok
+test tests::cmd_merge_request_rejects_invalid_strategy ... ok
+test tests::cmd_merge_request_blocks_in_memory_writes_by_default ... ok
+test tests::cmd_merge_request_rejects_invalid_uuid ... ok
+test tests::cmd_merge_status_rejects_invalid_uuid ... ok
+test tests::cmd_run_explain_rejects_invalid_uuid ... ok
+test tests::cmd_run_status_rejects_invalid_uuid ... ok
+test tests::cmd_task_explain_rejects_invalid_uuid ... ok
+test tests::cmd_task_list_rejects_invalid_uuid ... ok
+test tests::cmd_task_unblock_blocks_in_memory_writes_by_default ... ok
+test tests::cmd_task_unblock_rejects_invalid_uuid ... ok
+test tests::cmd_worktree_recover_blocks_in_memory_writes_by_default ... ok
+test tests::cmd_worktree_recover_rejects_invalid_action ... ok
+test tests::cmd_worktree_status_rejects_invalid_uuid ... ok
+test tests::ensure_write_backend_guard_blocks_in_memory_writes_by_default ... ok
+test tests::ensure_write_backend_guard_allows_explicit_ephemeral_override ... ok
+test tests::execute_task_unblock_appends_unblocked_event ... ok
+test tests::execute_gate_rerun_persists_single_gate_evaluation ... ok
+test tests::execute_merge_request_persists_requested_event ... ok
+test tests::execute_merge_approve_in_observe_mode_blocks_and_audits ... ok
+test tests::execute_gate_rerun_persists_all_default_task_gates ... ok
+test tests::parse_gate_type_unknown_returns_none ... ok
+test tests::render_run_explain_surfaces_budget_breach ... ok
+test tests::parse_gate_type_valid_names ... ok
+test tests::render_merge_status_reads_persisted_events ... ok
+test tests::render_worktree_status_reads_persisted_events ... ok
+test tests::render_run_status_reconstructs_persisted_state ... ok
+test tests::render_task_explain_reads_persisted_gate_failures ... ok
+test tests::render_run_explain_reads_persisted_gate_failures ... ok
+test tests::render_run_status_surfaces_budget_exceeded_and_token_usage ... ok
+test tests::render_task_explain_surfaces_budget_breach_and_token_usage ... ok
+test tests::execute_merge_reject_persists_rejected_transition ... ok
+test tests::execute_worktree_recover_manual_block_persists_recovering_state ... ok
+test tests::execute_worktree_recover_abort_persists_state_and_updates_status_projection ... ok
+test tests::execute_merge_approve_persists_policy_and_transition_events ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-13bc915f70d0c06d)
+
+running 1 test
+test merge_request_and_status_roundtrip_against_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_core-a914a0f3a726cf92)
+
+running 105 tests
+test entities::tests::command_execution_tests::command_duration ... ok
+test entities::tests::command_execution_tests::command_full_lifecycle ... ok
+test entities::tests::command_execution_tests::command_invalid_transition_rejected ... ok
+test entities::tests::command_execution_tests::command_idempotency_key ... ok
+test entities::tests::command_execution_tests::command_killed_from_queued ... ok
+test entities::tests::command_execution_tests::command_timeout ... ok
+test entities::tests::command_execution_tests::command_killed ... ok
+test entities::tests::command_execution_tests::command_terminal_state_rejects_transition ... ok
+test entities::tests::command_execution_tests::new_command_starts_queued ... ok
+test entities::tests::merge_intent_tests::merge_abort_from_apply ... ok
+test entities::tests::merge_intent_tests::merge_abort_from_precheck ... ok
+test entities::tests::merge_intent_tests::merge_abort_from_requested ... ok
+test entities::tests::merge_intent_tests::merge_conflict_restart_from_precheck ... ok
+test entities::tests::merge_intent_tests::merge_conflict_during_dry_run ... ok
+test entities::tests::merge_intent_tests::merge_conflict_types_serde_roundtrip ... ok
+test entities::tests::merge_intent_tests::merge_full_happy_path ... ok
+test entities::tests::merge_intent_tests::merge_has_no_conflicts_initially ... ok
+test entities::tests::merge_intent_tests::merge_done_is_terminal ... ok
+test entities::tests::merge_intent_tests::merge_target_ref_stale ... ok
+test entities::tests::merge_intent_tests::merge_terminal_state_rejects_transition ... ok
+test entities::tests::merge_intent_tests::merge_no_direct_requested_to_apply ... ok
+test entities::tests::merge_intent_tests::merge_strategy_serde_roundtrip ... ok
+test entities::tests::run_tests::new_run_starts_in_open_state ... ok
+test entities::tests::merge_intent_tests::new_merge_starts_requested ... ok
+test entities::tests::merge_intent_tests::merge_transition_has_correlation_id ... ok
+test entities::tests::merge_intent_tests::merge_transition_with_causation_id ... ok
+test entities::tests::merge_intent_tests::merge_with_approval ... ok
+test entities::tests::run_tests::run_add_task_deduplicates ... ok
+test entities::tests::merge_intent_tests::merge_with_strategy ... ok
+test entities::tests::run_tests::run_cancellation ... ok
+test entities::tests::run_tests::run_failure_with_policy_reason ... ok
+test entities::tests::run_tests::run_blocked_and_recovery ... ok
+test entities::tests::run_tests::run_invalid_transition_rejected ... ok
+test entities::tests::run_tests::run_open_to_active ... ok
+test entities::tests::run_tests::run_full_happy_path ... ok
+test entities::tests::run_tests::run_terminal_state_rejects_transition ... ok
+test entities::tests::run_tests::run_transition_has_correlation_id ... ok
+test entities::tests::run_tests::run_transition_with_causation_id ... ok
+test entities::tests::run_tests::run_with_config_snapshot ... ok
+test entities::tests::task_tests::new_task_starts_in_open_state ... ok
+test entities::tests::task_tests::task_block_with_blocker_code ... ok
+test entities::tests::task_tests::task_dependencies_satisfied ... ok
+test entities::tests::task_tests::task_dependency_deduplication ... ok
+test entities::tests::task_tests::task_evidence_attachment ... ok
+test entities::tests::task_tests::task_full_happy_path ... ok
+test entities::tests::task_tests::task_invalid_transition_rejected ... ok
+test entities::tests::task_tests::task_priority_and_max_attempts_builder ... ok
+test entities::tests::task_tests::task_retry_fails_at_max_attempts ... ok
+test entities::tests::task_tests::task_retry_increments_attempt ... ok
+test entities::tests::task_tests::task_terminal_state_rejects_non_retry ... ok
+test entities::tests::task_tests::task_transition_carries_correlation_id ... ok
+test entities::tests::task_tests::task_unblock_clears_blocker ... ok
+test entities::tests::transition_tests::transition_new_populates_fields ... ok
+test entities::tests::transition_tests::transition_without_causation ... ok
+test entities::tests::worktree_binding_tests::new_worktree_starts_unbound ... ok
+test entities::tests::worktree_binding_tests::worktree_allows_mutations ... ok
+test entities::tests::worktree_binding_tests::worktree_cleanup_pending_denies_mutations ... ok
+test entities::tests::worktree_binding_tests::worktree_dirty_flag ... ok
+test entities::tests::worktree_binding_tests::worktree_full_happy_path ... ok
+test entities::tests::worktree_binding_tests::worktree_invalid_transition_rejected ... ok
+test entities::tests::worktree_binding_tests::worktree_lease_owner ... ok
+test entities::tests::worktree_binding_tests::worktree_merge_conflict_and_recovery ... ok
+test entities::tests::worktree_binding_tests::worktree_set_path ... ok
+test entities::tests::worktree_binding_tests::worktree_merge_flow ... ok
+test entities::tests::worktree_binding_tests::worktree_submodule_hash ... ok
+test entities::tests::worktree_binding_tests::worktree_switch_branch ... ok
+test entities::tests::worktree_binding_tests::worktree_terminal_state_rejects_transition ... ok
+test entities::tests::worktree_binding_tests::worktree_transition_has_correlation_id ... ok
+test entities::tests::worktree_binding_tests::worktree_transition_with_causation_id ... ok
+test entities::tests::worktree_binding_tests::worktree_update_head_ref ... ok
+test entities::tests::worktree_binding_tests::worktree_with_submodule_mode ... ok
+test entities::tests::worktree_binding_tests::worktree_with_task_binding ... ok
+test explain::tests::active_run_with_executing_tasks ... ok
+test explain::tests::blocked_task_chain ... ok
+test explain::tests::blocker_chain_with_gate_failure_root ... ok
+test explain::tests::budget_exceeded_task_explain_surfaces_breach ... ok
+test explain::tests::budget_exceeded_task_surfaces_breach_in_run_explain ... ok
+test explain::tests::cancelled_run ... ok
+test explain::tests::completed_run_reports_done ... ok
+test explain::tests::explain_task_complete ... ok
+test explain::tests::explain_task_failed ... ok[?25h
+test explain::tests::failed_task_shows_as_blocker ... [?1006l[?1015l[?1003l[?1002l[?1000lok[?1049l[?25h
+test explain::tests::gate_failure_surfaced ... ok
+test explain::tests::gate_type_labels ... ok
+test explain::tests::no_breach_when_task_succeeds ... ok
+test explain::tests::pending_run ... ok
+test explain::tests::resource_usage_accessible_on_task_snapshot ... ok
+test explain::tests::run_level_gate_failure ... ok
+test explain::tests::token_usage_accessible_on_task_snapshot ... ok
+test shutdown::tests::cloned_controller_shares_state ... ok
+test shutdown::tests::new_controller_is_running ... ok
+test shutdown::tests::direct_force_from_running ... ok
+test shutdown::tests::on_signal_first_goes_graceful ... ok
+test shutdown::tests::on_signal_second_goes_force ... ok
+test shutdown::tests::phase_from_u8_covers_all_values ... ok
+test shutdown::tests::request_force_idempotent ... ok
+test shutdown::tests::request_force_transitions_to_force ... ok
+test shutdown::tests::request_graceful_idempotent ... ok
+test shutdown::tests::request_graceful_transitions_to_graceful ... ok
+test shutdown::tests::terminal_guard_default ... ok
+test shutdown::tests::terminal_guard_with_modes ... ok
+test shutdown::tests::token_is_cancelled_on_graceful ... ok
+test shutdown::tests::track_and_untrack_children ... ok
+test shutdown::tests::wait_for_force_returns_immediately_if_already_forced ... ok
+test shutdown::tests::wait_for_graceful_returns_immediately_if_already_shutting_down ... ok
+
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_exec-0ead2eaaa50cf85c)
+
+running 26 tests
+test journal::tests::test_journal_query_by_entity ... ok
+test journal::tests::test_journal_idempotency_keys ... ok
+test journal::tests::test_journal_correlation_id_propagated ... ok
+test runner::tests::test_duration_populated ... ok
+test journal::tests::test_journal_nonzero_exit_persisted ... ok
+test journal::tests::test_journal_persists_events_for_successful_command ... ok
+test runner::tests::test_spawn_failure ... ok
+test runner::tests::test_simple_echo ... ok
+test runner::tests::test_working_directory ... ok
+test runner::tests::test_token_usage_is_attached ... ok
+test runner::tests::test_stderr_capture ... ok
+test runner::tests::test_chunk_count_matches ... ok
+test journal::tests::test_journal_no_output_event_for_empty_output ... ok
+test runner::tests::test_nonzero_exit_code ... ok
+test runner::tests::test_empty_output ... ok
+test runner::tests::test_idempotency_key_preserved ... ok
+test runner::tests::test_multiline_output ... ok
+test runner::tests::test_env_vars ... ok
+test runner::tests::test_mixed_stdout_stderr ... ok
+test runner::tests::test_cancellation ... ok
+test journal::tests::test_journal_persists_killed_event ... ok
+test journal::tests::test_journal_persists_timeout_event ... ok
+test runner::tests::test_timeout ... ok
+test runner::tests::test_per_command_timeout_overrides_default ... ok
+test runner::tests::test_default_timeout ... ok
+test runner::tests::test_resource_usage_is_captured_for_long_running_command ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_gates-ea493efa237875e4)
+
+running 43 tests
+test engine::tests::default_task_gates_count ... ok
+test engine::tests::default_run_gates_count ... ok
+test engine::tests::evaluate_all_gates_pass ... ok
+test engine::tests::evaluate_all_some_fail ... ok
+test engine::tests::evidence_inspected_ids_collected ... ok
+test engine::tests::evidence_present_invalid_schema ... ok
+test engine::tests::evidence_present_no_evidence ... ok
+test engine::tests::evidence_present_without_command_class ... ok
+test engine::tests::gate_context_for_run_builder ... ok
+test engine::tests::evidence_present_with_valid_evidence ... ok
+test engine::tests::gate_context_for_task_builder ... ok
+test engine::tests::gate_evaluation_has_timestamp ... ok
+test engine::tests::no_conflicts_clean ... ok
+test engine::tests::no_conflicts_with_conflicts ... ok
+test engine::tests::gate_evaluation_serializes ... ok
+test engine::tests::no_unapproved_git_ops_dirty ... ok
+test engine::tests::no_unapproved_git_ops_clean ... ok
+test engine::tests::policy_clean_ok ... ok
+test engine::tests::policy_violations_present ... ok
+test engine::tests::required_tasks_closed_all_complete ... ok
+test engine::tests::required_tasks_closed_empty_tasks ... ok
+test engine::tests::required_tasks_closed_some_incomplete ... ok
+test engine::tests::tests_passed_no_evidence ... ok
+test engine::tests::tests_passed_nonzero_exit ... ok
+test engine::tests::tests_passed_prefers_test_report_over_exit_code ... ok
+test engine::tests::tests_passed_via_exit_code ... ok
+test engine::tests::tests_passed_with_failures ... ok
+test engine::tests::worktree_consistent_ok ... ok
+test engine::tests::tests_passed_with_report ... ok
+test engine::tests::worktree_inconsistent ... ok
+test evidence::tests::command_evidence_roundtrip ... ok
+test evidence::tests::evidence_kind_serialize ... ok
+test evidence::tests::reject_empty_payload ... ok
+test evidence::tests::git_mutation_roundtrip ... ok
+test evidence::tests::reject_invalid_command_evidence ... ok
+test evidence::tests::reject_invalid_git_evidence ... ok
+test evidence::tests::reject_invalid_test_report ... ok
+test evidence::tests::test_report_roundtrip ... ok
+test evidence::tests::validate_command_evidence_schema ... ok
+test evidence::tests::validate_git_command_evidence_fallback ... ok
+test evidence::tests::validate_git_mutation_evidence_schema ... ok
+test evidence::tests::validate_test_report_evidence_schema ... ok
+test evidence::tests::validated_evidence_serialize ... ok
+
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_git-5501aaea3f6f0e30)
+
+running 140 tests
+test submodule::tests::find_dirty_returns_modified_and_conflict ... ok
+test submodule::tests::allow_any_accepts_all_changes ... ok
+test submodule::tests::allow_ff_accepts_sha_change_without_regression ... ok
+test submodule::tests::allow_ff_rejects_conflict ... ok
+test submodule::tests::allow_ff_rejects_regression_to_uninit ... ok
+test submodule::tests::find_uninitialized_returns_only_uninit ... ok
+test submodule::tests::locked_policy_allows_no_changes ... ok
+test submodule::tests::locked_policy_rejects_new_submodule ... ok
+test submodule::tests::locked_policy_rejects_removed_submodule ... ok
+test submodule::tests::locked_policy_rejects_sha_change ... ok
+test submodule::tests::parse_conflict_submodule ... ok
+test submodule::tests::parse_current_submodule ... ok
+test submodule::tests::parse_empty_output ... ok
+test submodule::tests::parse_modified_submodule ... ok
+test submodule::tests::parse_multiple_submodules ... ok
+test submodule::tests::parse_submodule_without_descriptor ... ok
+test submodule::tests::parse_uninitialized_submodule ... ok
+test tests::branch_already_exists_display ... ok
+test tests::branch_prefix_is_yarl ... ok
+test tests::cleanup_blocked_display ... ok
+test tests::command_failed_display ... ok
+test tests::detached_head_error_display ... ok
+test tests::forbidden_op_destructive_cleanup_display ... ok
+test tests::forbidden_op_equality ... ok
+test tests::dirty_submodule_display ... ok
+test tests::dirty_worktree_error_display ... ok
+test tests::dot_git_file_constant ... ok
+test tests::forbidden_op_stash_clear_display ... ok
+test tests::forbidden_op_in_git_error_display ... ok
+test tests::forbidden_op_force_push_display ... ok
+test tests::forbidden_op_branch_delete_display ... ok
+test tests::forbidden_op_push_display ... ok
+test tests::forbidden_args_includes_force ... ok
+test tests::git_command_timeout_is_reasonable ... ok
+test tests::forbidden_subcommands_includes_push ... ok
+test tests::forbidden_op_tag_display ... ok
+test tests::interrupted_op_cherry_pick_display ... ok
+test tests::interrupted_op_merge_display ... ok
+test tests::interrupted_op_rebase_display ... ok
+test tests::interrupted_op_revert_display ... ok
+test tests::interrupted_operation_error_display ... ok
+test tests::invalid_git_indirection_display ... ok
+test tests::invalid_merge_state_display ... ok
+test tests::io_error_conversion ... ok
+test tests::local_worktree_manager_custom_timeout ... ok
+test tests::local_worktree_manager_default_is_same_as_new ... ok
+test tests::local_worktree_manager_default_timeout ... ok
+test tests::git_kill_grace_matches_core ... ok
+test tests::create_worktree_path_already_exists ... ok
+test tests::merge_build_commit_message ... ok
+test tests::cleanup_blocked_with_active_lease ... ok
+test tests::merge_commit_template_has_placeholders ... ok
+test tests::merge_conflict_display ... ok
+test tests::cleanup_without_branch_deletion ... ok
+test tests::create_worktree_creates_branch ... ok
+test tests::detect_interrupted_cherry_pick ... ok
+test tests::create_worktree_sets_head_to_actual_sha ... ok
+test tests::detect_no_interrupted_operation ... ok
+test tests::check_dirty_submodules_empty_for_no_submodules ... ok
+test tests::merge_lock_map_acquire_release ... ok
+test tests::merge_lock_map_independent_branches ... ok
+test tests::check_uninitialized_submodules_empty_for_no_submodules ... ok
+test tests::merge_lock_timeout_is_reasonable ... ok
+test tests::merge_lock_unavailable_display ... ok
+test tests::merge_parse_changed_files ... ok
+test tests::merge_parse_changed_files_empty ... ok
+test tests::merge_parse_conflicts ... ok
+test tests::detect_interrupted_merge ... ok
+test tests::merge_precheck_failed_display ... ok
+test tests::detect_interrupted_revert ... ok
+test tests::create_worktree_full_lifecycle ... ok
+test tests::merge_abort_from_requested ... ok
+test tests::merge_abort_from_terminal_fails ... ok
+test tests::is_dirty_detects_changes ... ok
+test tests::merge_verify_failed_display ... ok
+test tests::detect_interrupted_rebase ... ok
+test tests::merge_dry_run_rejects_wrong_state ... ok
+test tests::detect_then_recover_restart_flow ... ok
+test tests::mutation_denied_error_display ... ok
+test tests::path_confinement_accepts_child_path ... ok
+test tests::path_confinement_accepts_exact_root ... ok
+test tests::path_confinement_rejects_absolute_escape ... ok
+test tests::path_confinement_rejects_parent_traversal ... ok
+test tests::path_confinement_violation_display ... ok
+test tests::merge_precheck_fails_on_invalid_source_ref ... ok
+test tests::merge_precheck_fails_on_dirty_worktree ... ok
+test tests::merge_precheck_rejects_wrong_state ... ok
+test tests::merge_verify_rejects_wrong_state ... ok
+test tests::merge_dry_run_clean ... ok
+test tests::merge_commit_message_has_attribution ... ok
+test tests::merge_lock_prevents_concurrent_apply ... ok
+test tests::merge_apply_rejects_wrong_state ... ok
+test tests::recovery_action_variants ... ok
+test tests::recovery_failed_display ... ok
+test tests::merge_abort_from_precheck ... ok
+test tests::merge_dry_run_detects_conflict ... ok
+test tests::ref_not_found_display ... ok
+test tests::merge_precheck_captures_submodule_snapshot ... ok
+test tests::recover_abort_from_wt_conflict_state ... ok
+test tests::recovery_manual_block_returns_error ... ok
+test tests::merge_apply_releases_lock_on_success ... ok
+test tests::short_id_len_is_8 ... ok
+test tests::submodule_policy_violation_display ... ok
+test tests::submodule_prefixes ... ok
+test tests::recover_abort_real_interrupted_merge ... ok
+test tests::merge_precheck_resolves_shas ... ok
+test tests::target_ref_stale_display ... ok
+test tests::transition_error_conversion ... ok
+test tests::uninitialized_submodule_display ... ok
+test tests::sentinel_files_are_correct ... ok
+test tests::merge_conflict_from_precheck_allows_restart ... ok
+test tests::verify_submodule_policy_allow_any_allows_everything ... ok
+test tests::verify_submodule_policy_allow_ff_rejects_conflict ... ok
+test tests::verify_submodule_policy_locked_allows_same ... ok
+test tests::verify_submodule_policy_locked_rejects_change ... ok
+test tests::worktree_create_timeout_is_reasonable ... ok
+test tests::worktree_creation_error_display ... ok
+test tests::worktree_dir_is_under_yarl ... ok
+test tests::worktree_not_found_error_display ... ok
+test tests::resolve_ref_not_found ... ok
+test tests::worktree_path_exists_error_display ... ok
+test tests::recover_abort_real_interrupted_cherry_pick ... ok
+test tests::validate_git_indirection_fails_on_main_repo ... ok
+test tests::resolve_ref_returns_sha ... ok
+test tests::merge_full_lifecycle_merge_no_ff ... ok
+test tests::recover_abort_updates_head_ref ... ok
+test tests::recover_abort_real_interrupted_revert ... ok
+test tests::merge_worktree_transitions_through_merging ... ok
+test tests::merge_result_sha_is_valid ... ok
+test tests::recover_manual_block_preserves_interrupted_state ... ok
+test tests::recovery_no_interrupted_op_returns_error ... ok
+test tests::resolve_head_in_worktree ... ok
+test tests::recover_resume_updates_head_to_merge_commit ... ok
+test tests::validate_git_indirection_on_worktree ... ok
+test tests::worktree_path_computed_correctly ... ok
+test tests::merge_full_lifecycle_squash ... ok
+test tests::recover_resume_real_interrupted_merge ... ok
+test tests::merge_verify_passes_with_no_submodules ... ok
+test tests::submodule_status_returns_empty_for_no_submodules ... ok
+test tests::submodule_status_hash_is_deterministic ... ok
+
+test result: ok. 140 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_memory-f6f2743df13f5857)
+
+running 25 tests
+test in_memory::tests::health_check_ok ... ok
+test in_memory::tests::close_nonexistent_scope ... ok
+test in_memory::tests::delete_not_found ... ok
+test in_memory::tests::memory_class_roundtrip ... ok
+test in_memory::tests::link_not_found ... ok
+test in_memory::tests::delete_memory ... ok
+test in_memory::tests::insert_with_metadata ... ok
+test in_memory::tests::link_and_unlink ... ok
+test in_memory::tests::content_secret_detection ... ok
+test in_memory::tests::delete_removes_associated_links ... ok
+test in_memory::tests::memory_count ... ok
+test in_memory::tests::query_relevance_scoring ... ok
+test in_memory::tests::query_filters_by_class ... ok
+test in_memory::tests::query_empty_project ... ok
+test in_memory::tests::query_different_scopes_isolated ... ok
+test in_memory::tests::query_returns_matching ... ok
+test in_memory::tests::scope_with_parent ... ok
+test in_memory::tests::relationship_kind_roundtrip ... ok
+test in_memory::tests::query_respects_limit ... ok
+test in_memory::tests::store_rejects_private_key ... ok
+test in_memory::tests::store_rejects_secrets ... ok
+test in_memory::tests::scope_id_constructors ... ok
+test in_memory::tests::store_rejects_api_key ... ok
+test in_memory::tests::store_and_get ... ok
+test in_memory::tests::scope_lifecycle ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_observability-326eda5f7205854f)
+
+running 40 tests
+test audit::tests::all_audit_categories_serialize ... ok
+test audit::tests::audit_category_serializes ... ok
+test audit::tests::audit_entry_roundtrip ... ok
+test audit::tests::from_policy_decision_creates_entry ... ok
+test audit::tests::destructive_attempt_creates_entry ... ok
+test audit::tests::gate_evaluation_creates_entry ... ok
+test audit::tests::audit_entry_serializes_to_json ... ok
+test audit::tests::gate_evaluation_failed ... ok
+test audit::tests::in_memory_sink_append_and_read ... ok
+test audit::tests::in_memory_sink_count ... ok
+test audit::tests::in_memory_sink_empty_read ... ok
+test audit::tests::jsonl_sink_path_accessor ... ok
+test audit::tests::jsonl_sink_count ... ok
+test audit::tests::token_consumed_creates_entry ... ok
+test audit::tests::jsonl_sink_appends_multiple_entries ... ok
+test audit::tests::jsonl_sink_creates_file_and_appends ... ok
+test audit::tests::jsonl_sink_read_nonexistent_file ... ok
+test audit::tests::jsonl_sink_each_line_is_valid_json ... ok
+test metrics::tests::encode_empty_registry ... ok
+test metrics::tests::commands_total_counter ... ok
+test audit::tests::jsonl_sink_immutability_append_only ... ok
+test metrics::tests::metrics_are_cloneable_and_share_state ... ok
+test metrics::tests::merge_attempts_counter ... ok
+test metrics::tests::merge_conflicts_counter ... ok
+test metrics::tests::queue_depth_gauge ... ok
+test metrics::tests::gate_failures_counter ... ok
+test metrics::tests::queue_depth_inc_dec ... ok
+test metrics::tests::command_duration_histogram ... ok
+test metrics::tests::runs_total_counter ... ok
+test metrics::tests::queue_lease_timeouts_counter ... ok
+test audit::tests::jsonl_sink_details_preserved ... ok
+test metrics::tests::tasks_total_counter ... ok
+test tracing_init::tests::json_config_values ... ok
+test tracing_init::tests::tracing_init_error_display ... ok
+test metrics::tests::full_encode_includes_all_metric_names ... ok
+test tracing_init::tests::default_config_values ... ok
+test metrics::tests::metrics_register_without_panic ... ok
+test audit::tests::jsonl_sink_mixed_categories ... ok
+test metrics::tests::worktree_state_counter ... ok
+test tracing_init::tests::config_clone_and_debug ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_policy-32b933f3ac335fca)
+
+running 46 tests
+test rules::tests::action_type_serializes ... ok
+test rules::tests::breakglass_mode_allows_all ... ok
+test rules::tests::approval_token_upgrades_require_approval_to_allow ... ok
+test rules::tests::breakglass_with_custom_rules_allows ... ok
+test rules::tests::collect_violations_filters_non_allow ... ok
+test rules::tests::breakglass_mode_allows_destructive_ops_via_rules ... ok
+test rules::tests::consumed_token_not_reusable ... ok
+test rules::tests::decision_includes_all_audit_fields ... ok
+test rules::tests::default_deny_for_unknown_action ... ok
+test rules::tests::default_rules_has_expected_count ... ok
+test rules::tests::engine_allows_command_execute ... ok
+test rules::tests::engine_allows_merge_in_execute ... ok
+test rules::tests::engine_denies_destructive_cleanup ... ok
+test rules::tests::engine_denies_force_push ... ok
+test rules::tests::engine_denies_stash_clear ... ok
+test rules::tests::engine_denies_in_observe_mode ... ok
+test rules::tests::engine_requires_approval_for_branch_delete ... ok
+test rules::tests::engine_requires_approval_for_push ... ok
+test rules::tests::engine_requires_approval_for_tag ... ok
+test rules::tests::execute_mode_allows_all_actions ... ok
+test rules::tests::engine_restricted_mode_allows_command_denies_git ... ok
+test rules::tests::expired_token_does_not_upgrade ... ok
+test rules::tests::observe_mode_denies_all_actions ... ok
+test rules::tests::is_allowed_returns_bool ... ok
+test rules::tests::policy_request_command_builder ... ok
+test rules::tests::policy_request_git_op_builder ... ok
+test rules::tests::rule_empty_actions_matches_all ... ok
+test rules::tests::rule_matches_branch ... ok
+test rules::tests::policy_rule_serializes ... ok
+test rules::tests::rule_matches_command_class ... ok
+test rules::tests::rule_matches_safe_mode ... ok
+test rules::tests::rule_matches_specific_action ... ok
+test rules::tests::rule_outcome_serializes ... ok
+test token::tests::scope_all_constraints_combined ... ok
+test token::tests::scope_covers_matching_action ... ok
+test token::tests::scope_rejects_different_action ... ok
+test token::tests::scope_with_branch_constraint ... ok
+test token::tests::scope_with_repo_constraint ... ok
+test token::tests::scope_with_run_id_constraint ... ok
+test token::tests::scope_with_task_id_constraint ... ok
+test token::tests::token_covers_checks_validity_and_scope ... ok
+test token::tests::token_invalid_when_consumed ... ok
+test token::tests::token_invalid_when_expired ... ok
+test token::tests::token_is_valid_when_not_expired_and_not_consumed ... ok
+test token::tests::token_serializes_roundtrip ... ok
+test rules::tests::restricted_mode_only_allows_command_execute ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_queue-4aabf583a64ee582)
+
+running 67 tests
+test memory::tests::claim_empty_queue_returns_empty ... ok
+test memory::tests::cancel_pending_entry ... ok
+test memory::tests::cancel_leased_entry ... ok
+test memory::tests::cancel_completed_entry_rejected ... ok
+test memory::tests::claim_mixed_classes_respect_individual_caps ... ok
+test memory::tests::claim_respects_per_class_cap ... ok
+test memory::tests::claim_respects_limit ... ok
+test memory::tests::claim_respects_available_at ... ok
+test memory::tests::claim_respects_priority_ordering ... ok
+test memory::tests::claim_respects_per_run_cap ... ok
+test memory::tests::claim_skips_already_leased ... ok
+test memory::tests::complete_pending_entry_rejected ... ok
+test memory::tests::claim_returns_pending_entries ... ok
+test memory::tests::complete_transitions_to_completed ... ok
+test memory::tests::complete_wrong_worker_rejected ... ok
+test memory::tests::enqueue_duplicate_active_task_rejected ... ok
+test memory::tests::enqueue_multiple_tasks ... ok
+test memory::tests::enqueue_returns_queue_id ... ok
+test memory::tests::enqueue_same_task_after_complete_allowed ... ok
+test memory::tests::fail_transitions_to_failed ... ok
+test memory::tests::fail_wrong_worker_rejected ... ok
+test memory::tests::concurrent_claims_no_double_leasing ... ok
+test memory::tests::full_lifecycle_enqueue_claim_heartbeat_complete ... ok
+test memory::tests::heartbeat_not_found ... ok
+test memory::tests::heartbeat_extends_lease ... ok
+test memory::tests::heartbeat_on_pending_entry_rejected ... ok
+test memory::tests::heartbeat_wrong_worker_rejected ... ok
+test memory::tests::leased_count_for_class ... ok
+test memory::tests::leased_count_for_run ... ok
+test memory::tests::lifecycle_fail_and_reenqueue ... ok
+test memory::tests::pending_count_tracks_pending_only ... ok
+test memory::tests::reclaim_stale_returns_zero_when_no_stale ... ok
+test memory::tests::stats_reflect_all_statuses ... ok
+test postgres::tests::claim_sql_uses_skip_locked ... ok
+test postgres::tests::classify_unique_violation_maps_active_task_constraint ... ok
+test postgres::tests::command_class_codec_round_trips ... ok
+test postgres::tests::status_codec_round_trips ... ok
+test scheduler::tests::test_default_config_has_gates ... ok
+test scheduler::tests::test_empty_tick ... ok
+test scheduler::tests::test_correlation_id_propagated_through_events ... ok
+test scheduler::tests::test_run_fails_on_permanent_task_failure ... ok
+test scheduler::tests::test_run_token_budget_exceeded_across_tasks ... ok
+test memory::tests::reclaim_stale_does_not_reclaim_within_grace ... ok
+test memory::tests::reclaim_stale_increments_attempt ... ok
+test memory::tests::reclaim_stale_reclaims_expired_leases ... ok
+test scheduler::tests::test_submit_run_activates_and_enqueues ... ok
+test scheduler::tests::test_policy_denial_blocks_task_and_run ... ok
+test scheduler::tests::test_policy_block_emits_audit_records ... ok
+test scheduler::tests::test_single_task_full_lifecycle ... ok
+test scheduler::tests::test_gate_failed_event_has_details ... ok
+test scheduler::tests::test_gated_run_completes_with_all_tasks_done ... ok
+test scheduler::tests::test_gated_run_fails_with_unapproved_git_ops ... ok
+test scheduler::tests::test_idempotency_keys_unique_per_attempt ... ok
+test scheduler::tests::test_dependency_ordering ... ok
+test scheduler::tests::test_gated_multi_task_lifecycle ... ok
+test scheduler::tests::test_multiple_tasks_parallel_execution ... ok
+test scheduler::tests::test_diamond_dependency ... ok
+test scheduler::tests::test_budget_exceeded_fails_task_without_retry ... ok
+test scheduler::tests::test_empty_gates_auto_complete ... ok
+test scheduler::tests::test_gated_task_failure_triggers_retry ... ok
+test scheduler::tests::test_gated_task_fails_when_policy_violations_exist ... ok
+test scheduler::tests::test_gated_task_passes_with_valid_evidence ... ok
+test scheduler::tests::test_policy_decision_event_emitted_for_allowed_task ... ok
+test scheduler::tests::test_task_failure_and_retry ... ok
+test scheduler::tests::test_tick_result_counts ... ok
+test scheduler::tests::test_task_timeout ... ok
+test scheduler::tests::test_scheduler_loop_with_cancellation ... ok
+
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-8d8caf1a58f97a42)
+
+running 1 test
+test enqueue_and_claim_lease_roundtrip_against_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_store-bf9e04b3a3f0ca01)
+
+running 28 tests
+test memory::tests::append_allows_different_idempotency_keys ... ok
+test memory::tests::all_returns_events_in_order ... ok
+test memory::tests::append_allows_none_idempotency_keys ... ok
+test memory::tests::append_rejects_duplicate_idempotency_key ... ok
+test memory::tests::append_single_event ... ok
+test memory::tests::append_rejects_duplicate_event_id ... ok
+test memory::tests::causation_chain_queryable ... ok
+test memory::tests::append_multiple_events ... ok
+test memory::tests::empty_store ... ok
+test memory::tests::get_existing_event ... ok
+test memory::tests::get_missing_event ... ok
+test memory::tests::is_empty_false_after_append ... ok
+test memory::tests::event_payload_preserved ... ok
+test memory::tests::query_after_nonexistent_event_returns_error ... ok
+test memory::tests::query_by_entity ... ok
+test memory::tests::query_combined_filters ... ok
+test memory::tests::query_returns_empty_for_no_matches ... ok
+test memory::tests::query_by_correlation ... ok
+test memory::tests::query_with_limit ... ok
+test memory::tests::query_by_entity_type ... ok
+test memory::tests::query_with_pagination ... ok
+test memory::tests::query_by_event_type ... ok
+test migration_tests::index_migration_contains_idempotency_and_queue_indexes ... ok
+test memory::tests::concurrent_appends ... ok
+test postgres::tests::classify_unique_violation_maps_known_constraints ... ok
+test postgres::tests::entity_type_codec_round_trips ... ok
+test migration_tests::init_migration_contains_required_tables ... ok
+test memory::tests::concurrent_reads_during_writes ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-85c7be8f4989ef3c)
+
+running 1 test
+test append_and_query_roundtrip_against_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+   Doc-tests yarli_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_exec
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_gates
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_git
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_memory
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_observability
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_policy
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_queue
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests yarli_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

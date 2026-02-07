@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
-use std::future::Future;
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
 use yarli_cli::stream::{StreamConfig, StreamEvent, StreamRenderer};
 use yarli_core::domain::{CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode};
+use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use yarli_core::entities::merge_intent::{MergeIntent, MergeStrategy};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::Task;
@@ -37,7 +38,10 @@ use yarli_git::error::{GitError, RecoveryAction};
 use yarli_git::{LocalMergeOrchestrator, LocalWorktreeManager, MergeOrchestrator, WorktreeManager};
 use yarli_observability::{AuditEntry, AuditSink, JsonlAuditSink};
 use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
-use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, Scheduler, SchedulerConfig, TaskQueue};
+use yarli_queue::{
+    InMemoryTaskQueue, PostgresTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
+    TaskQueue,
+};
 use yarli_store::event_store::EventQuery;
 use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
 
@@ -430,6 +434,20 @@ where
     }
     config.enforce_policies = loaded_config.config().policy.enforce_policies;
     config.audit_decisions = loaded_config.config().policy.audit_decisions;
+    config.budgets = ResourceBudgetConfig {
+        max_task_rss_bytes: loaded_config.config().budgets.max_task_rss_bytes,
+        max_task_cpu_user_ticks: loaded_config.config().budgets.max_task_cpu_user_ticks,
+        max_task_cpu_system_ticks: loaded_config.config().budgets.max_task_cpu_system_ticks,
+        max_task_io_read_bytes: loaded_config.config().budgets.max_task_io_read_bytes,
+        max_task_io_write_bytes: loaded_config.config().budgets.max_task_io_write_bytes,
+        max_task_total_tokens: loaded_config.config().budgets.max_task_total_tokens,
+        max_run_total_tokens: loaded_config.config().budgets.max_run_total_tokens,
+        max_run_peak_rss_bytes: loaded_config.config().budgets.max_run_peak_rss_bytes,
+        max_run_cpu_user_ticks: loaded_config.config().budgets.max_run_cpu_user_ticks,
+        max_run_cpu_system_ticks: loaded_config.config().budgets.max_run_cpu_system_ticks,
+        max_run_io_read_bytes: loaded_config.config().budgets.max_run_io_read_bytes,
+        max_run_io_write_bytes: loaded_config.config().budgets.max_run_io_write_bytes,
+    };
 
     let mut scheduler = Scheduler::new(queue, store.clone(), runner, config);
     if loaded_config.config().policy.audit_decisions {
@@ -1028,6 +1046,9 @@ struct TaskProjection {
     reason: Option<String>,
     attempt_no: Option<u32>,
     failed_gates: Vec<(GateType, String)>,
+    resource_usage: Option<CommandResourceUsage>,
+    token_usage: Option<TokenUsage>,
+    budget_breach_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1257,6 +1278,9 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
             reason: None,
             attempt_no: None,
             failed_gates: Vec::new(),
+            resource_usage: None,
+            token_usage: None,
+            budget_breach_reason: None,
         });
 
         entry.correlation_id = event.correlation_id;
@@ -1292,6 +1316,24 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
                 | TaskState::TaskCancelled
         ) {
             entry.failed_gates.clear();
+        }
+
+        // Extract resource and token usage from command/task events.
+        if let Some(ru) = event.payload.get("resource_usage").or_else(|| event.payload.get("command_resource_usage")) {
+            if let Ok(usage) = serde_json::from_value::<CommandResourceUsage>(ru.clone()) {
+                entry.resource_usage = Some(usage);
+            }
+        }
+        if let Some(tu) = event.payload.get("token_usage").or_else(|| event.payload.get("command_token_usage")) {
+            if let Ok(usage) = serde_json::from_value::<TokenUsage>(tu.clone()) {
+                entry.token_usage = Some(usage);
+            }
+        }
+
+        // Detect budget breach reason.
+        if event.payload.get("reason").and_then(|v| v.as_str()) == Some("budget_exceeded") {
+            let detail = event.payload.get("detail").and_then(|v| v.as_str()).unwrap_or("budget_exceeded");
+            entry.budget_breach_reason = Some(detail.to_string());
         }
     }
 
@@ -1438,7 +1480,11 @@ fn load_worktree_projection(
             task_id = Some(value);
         }
 
-        if let Some(value) = event.payload.get("repo_root").and_then(|value| value.as_str()) {
+        if let Some(value) = event
+            .payload
+            .get("repo_root")
+            .and_then(|value| value.as_str())
+        {
             repo_root = Some(PathBuf::from(value));
         }
 
@@ -1458,11 +1504,19 @@ fn load_worktree_projection(
             branch_name = Some(value.to_string());
         }
 
-        if let Some(value) = event.payload.get("base_ref").and_then(|value| value.as_str()) {
+        if let Some(value) = event
+            .payload
+            .get("base_ref")
+            .and_then(|value| value.as_str())
+        {
             base_ref = Some(value.to_string());
         }
 
-        if let Some(value) = event.payload.get("head_ref").and_then(|value| value.as_str()) {
+        if let Some(value) = event
+            .payload
+            .get("head_ref")
+            .and_then(|value| value.as_str())
+        {
             head_ref = Some(value.to_string());
         }
 
@@ -1617,23 +1671,38 @@ fn load_latest_worktree_projection_for_run(
 }
 
 fn build_worktree_binding(projection: &WorktreeProjection) -> Result<WorktreeBinding> {
-    let run_id = projection
-        .run_id
-        .ok_or_else(|| anyhow::anyhow!("worktree {} missing run_id context", projection.worktree_id))?;
+    let run_id = projection.run_id.ok_or_else(|| {
+        anyhow::anyhow!("worktree {} missing run_id context", projection.worktree_id)
+    })?;
     let repo_root = projection
         .repo_root
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("worktree {} missing repo_root context", projection.worktree_id))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "worktree {} missing repo_root context",
+                projection.worktree_id
+            )
+        })?
         .clone();
     let branch_name = projection
         .branch_name
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("worktree {} missing branch_name context", projection.worktree_id))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "worktree {} missing branch_name context",
+                projection.worktree_id
+            )
+        })?
         .clone();
     let worktree_path = projection
         .worktree_path
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("worktree {} missing worktree_path context", projection.worktree_id))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "worktree {} missing worktree_path context",
+                projection.worktree_id
+            )
+        })?
         .clone();
     let base_ref = projection
         .base_ref
@@ -1679,7 +1748,13 @@ fn build_merge_intent(merge: &MergeProjection, worktree_id: Uuid) -> Result<Merg
         .ok_or_else(|| anyhow::anyhow!("merge intent {} missing target ref", merge.merge_id))?
         .clone();
 
-    let mut intent = MergeIntent::new(run_id, worktree_id, source_ref, target_ref, merge.correlation_id);
+    let mut intent = MergeIntent::new(
+        run_id,
+        worktree_id,
+        source_ref,
+        target_ref,
+        merge.correlation_id,
+    );
     intent.id = merge.merge_id;
     intent.state = merge.state;
     intent.updated_at = merge.updated_at;
@@ -1712,8 +1787,12 @@ fn resolve_merge_worktree_projection(
     let run_id = merge
         .run_id
         .ok_or_else(|| anyhow::anyhow!("merge intent {} missing run_id context", merge.merge_id))?;
-    load_latest_worktree_projection_for_run(store, run_id, merge.correlation_id)?
-        .ok_or_else(|| anyhow::anyhow!("no worktree context found for merge intent {}", merge.merge_id))
+    load_latest_worktree_projection_for_run(store, run_id, merge.correlation_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no worktree context found for merge intent {}",
+            merge.merge_id
+        )
+    })
 }
 
 fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
@@ -1777,6 +1856,20 @@ fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
                 "  {}  {:?}  ({})",
                 task.task_id, task.state, task.last_event_type
             )?;
+            if let Some(ref breach) = task.budget_breach_reason {
+                writeln!(&mut out, "    budget_exceeded: {breach}")?;
+            }
+            if let Some(ref tu) = task.token_usage {
+                writeln!(
+                    &mut out,
+                    "    token_usage: prompt_tokens={} completion_tokens={} total_tokens={}",
+                    tu.prompt_tokens, tu.completion_tokens, tu.total_tokens
+                )?;
+            }
+            if let Some(ref ru) = task.resource_usage {
+                let rss = ru.max_rss_bytes.map(|v| format!("{v}")).unwrap_or_else(|| "-".into());
+                writeln!(&mut out, "    resource_usage: max_rss_bytes={rss}")?;
+            }
         }
     }
 
@@ -1813,6 +1906,9 @@ fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
                     })
                     .collect(),
                 last_transition_at: Some(task.updated_at),
+                resource_usage: task.resource_usage.clone(),
+                token_usage: task.token_usage.clone(),
+                budget_breach_reason: task.budget_breach_reason.clone(),
             })
             .collect(),
         gates: run
@@ -1862,6 +1958,18 @@ fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
         }
     }
 
+    if !explain.budget_breaches.is_empty() {
+        writeln!(&mut out)?;
+        writeln!(&mut out, "Budget breaches:")?;
+        for breach in &explain.budget_breaches {
+            writeln!(
+                &mut out,
+                "  {} - {}",
+                breach.task_name, breach.reason
+            )?;
+        }
+    }
+
     if !explain.suggested_actions.is_empty() {
         writeln!(&mut out)?;
         writeln!(&mut out, "Suggested actions:")?;
@@ -1897,6 +2005,9 @@ fn render_task_explain(store: &dyn EventStore, task_id: Uuid) -> Result<String> 
             })
             .collect(),
         last_transition_at: Some(task.updated_at),
+        resource_usage: task.resource_usage.clone(),
+        token_usage: task.token_usage.clone(),
+        budget_breach_reason: task.budget_breach_reason.clone(),
     };
     let explain = explain_task(&snapshot);
 
@@ -1908,6 +2019,28 @@ fn render_task_explain(store: &dyn EventStore, task_id: Uuid) -> Result<String> 
 
     if let Some(reason) = task.reason.as_ref() {
         writeln!(&mut out, "Last reason: {reason}")?;
+    }
+
+    if !explain.budget_breaches.is_empty() {
+        writeln!(&mut out)?;
+        writeln!(&mut out, "Budget breaches:")?;
+        for breach in &explain.budget_breaches {
+            writeln!(&mut out, "  budget_exceeded: {}", breach.reason)?;
+        }
+    }
+
+    if let Some(ref tu) = task.token_usage {
+        writeln!(&mut out)?;
+        writeln!(
+            &mut out,
+            "Token usage: prompt_tokens={} completion_tokens={} total_tokens={}",
+            tu.prompt_tokens, tu.completion_tokens, tu.total_tokens
+        )?;
+    }
+
+    if let Some(ref ru) = task.resource_usage {
+        let rss = ru.max_rss_bytes.map(|v| format!("{v}")).unwrap_or_else(|| "-".into());
+        writeln!(&mut out, "Resource usage: max_rss_bytes={rss}")?;
     }
 
     if !explain.failed_gates.is_empty() {
@@ -2029,7 +2162,10 @@ fn append_worktree_transition_event(
     }
     if let Some(map) = payload.as_object_mut() {
         if let Some(task_id) = projection.task_id {
-            map.insert("task_id".to_string(), serde_json::Value::String(task_id.to_string()));
+            map.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(task_id.to_string()),
+            );
         }
         if let Some(mode) = projection.submodule_mode {
             map.insert(
@@ -2204,7 +2340,11 @@ fn execute_worktree_recover(
             let mut output = String::new();
             writeln!(&mut output, "Worktree recovery for {worktree_id}")?;
             writeln!(&mut output, "Action: {action}")?;
-            writeln!(&mut output, "Resulting state: {:?}", WorktreeState::WtRecovering)?;
+            writeln!(
+                &mut output,
+                "Resulting state: {:?}",
+                WorktreeState::WtRecovering
+            )?;
             writeln!(&mut output, "Persisted events: {persisted_events}")?;
             writeln!(&mut output, "Side effect: failed")?;
             writeln!(&mut output, "Failure: {reason}")?;
@@ -2822,8 +2962,7 @@ fn append_merge_execution_event(
     if let Some(binding) = worktree {
         payload["worktree_state"] = serde_json::Value::String(format!("{:?}", binding.state));
         payload["worktree_head"] = serde_json::Value::String(binding.head_ref.clone());
-        payload["repo_root"] =
-            serde_json::Value::String(binding.repo_root.display().to_string());
+        payload["repo_root"] = serde_json::Value::String(binding.repo_root.display().to_string());
         payload["worktree_path"] =
             serde_json::Value::String(binding.worktree_path.display().to_string());
     }
@@ -3415,12 +3554,9 @@ fn execute_merge_reject(
 
     let orchestrator = LocalMergeOrchestrator::new(LocalWorktreeManager::new());
     let cancel = CancellationToken::new();
-    if let Err(err) = block_on_current_runtime(orchestrator.abort(
-        &mut intent,
-        &mut binding,
-        reason,
-        cancel,
-    ))? {
+    if let Err(err) =
+        block_on_current_runtime(orchestrator.abort(&mut intent, &mut binding, reason, cancel))?
+    {
         append_merge_execution_event(
             store,
             &merge,
@@ -3846,9 +3982,9 @@ fn parse_merge_strategy(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use std::path::Path;
     use std::process::Command;
-    use chrono::Utc;
     use tempfile::{NamedTempFile, TempDir};
     use yarli_observability::{AuditCategory, AuditEntry, InMemoryAuditSink};
     use yarli_store::event_store::EventQuery;
@@ -5018,7 +5154,10 @@ allow_in_memory_writes = true
             &binding.worktree_path,
             &["rev-parse", "--verify", "MERGE_HEAD"],
         );
-        assert!(!merge_head_ok, "MERGE_HEAD should be cleared after merge.reject");
+        assert!(
+            !merge_head_ok,
+            "MERGE_HEAD should be cleared after merge.reject"
+        );
 
         let policy_event = store
             .query(&EventQuery::by_correlation(corr))
@@ -5179,5 +5318,173 @@ allow_in_memory_writes = true
         assert!(run_events
             .iter()
             .any(|event| event.event_type == "run.cancelled"));
+    }
+
+    #[test]
+    fn render_run_status_surfaces_budget_exceeded_and_token_usage() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskExecuting",
+                    "to": "TaskFailed",
+                    "reason": "budget_exceeded",
+                    "detail": "task max_task_total_tokens observed=5000 limit=1",
+                    "command_token_usage": {
+                        "prompt_tokens": 2500,
+                        "completion_tokens": 2500,
+                        "total_tokens": 5000,
+                        "source": "char_count_div4_estimate_v1"
+                    },
+                    "command_resource_usage": {
+                        "max_rss_bytes": 1048576,
+                        "cpu_user_ticks": 100,
+                        "cpu_system_ticks": 50,
+                        "io_read_bytes": 4096,
+                        "io_write_bytes": 2048
+                    }
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(
+            output.contains("budget_exceeded"),
+            "status output must surface budget_exceeded: {output}"
+        );
+        assert!(
+            output.contains("prompt_tokens=2500"),
+            "status output must surface prompt_tokens: {output}"
+        );
+        assert!(
+            output.contains("completion_tokens=2500"),
+            "status output must surface completion_tokens: {output}"
+        );
+        assert!(
+            output.contains("total_tokens=5000"),
+            "status output must surface total_tokens: {output}"
+        );
+        assert!(
+            output.contains("max_rss_bytes=1048576"),
+            "status output must surface resource_usage: {output}"
+        );
+    }
+
+    #[test]
+    fn render_run_explain_surfaces_budget_breach() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskExecuting",
+                    "to": "TaskFailed",
+                    "reason": "budget_exceeded",
+                    "detail": "task max_task_total_tokens observed=5000 limit=1",
+                    "command_token_usage": {
+                        "prompt_tokens": 2500,
+                        "completion_tokens": 2500,
+                        "total_tokens": 5000,
+                        "source": "char_count_div4_estimate_v1"
+                    }
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_explain(&store, run_id).unwrap();
+        assert!(
+            output.contains("Budget breaches:"),
+            "explain output must show budget breaches section: {output}"
+        );
+        assert!(
+            output.contains("budget_exceeded") || output.contains("max_task_total_tokens"),
+            "explain output must reference budget breach detail: {output}"
+        );
+    }
+
+    #[test]
+    fn render_task_explain_surfaces_budget_breach_and_token_usage() {
+        let store = InMemoryEventStore::new();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskExecuting",
+                    "to": "TaskFailed",
+                    "reason": "budget_exceeded",
+                    "detail": "task max_task_total_tokens observed=5000 limit=1",
+                    "command_token_usage": {
+                        "prompt_tokens": 2500,
+                        "completion_tokens": 2500,
+                        "total_tokens": 5000,
+                        "source": "char_count_div4_estimate_v1"
+                    },
+                    "command_resource_usage": {
+                        "max_rss_bytes": 1048576
+                    }
+                }),
+            ))
+            .unwrap();
+
+        let output = render_task_explain(&store, task_id).unwrap();
+        assert!(
+            output.contains("budget_exceeded"),
+            "task explain must surface budget_exceeded: {output}"
+        );
+        assert!(
+            output.contains("prompt_tokens=2500"),
+            "task explain must surface prompt_tokens: {output}"
+        );
+        assert!(
+            output.contains("completion_tokens=2500"),
+            "task explain must surface completion_tokens: {output}"
+        );
+        assert!(
+            output.contains("total_tokens=5000"),
+            "task explain must surface total_tokens: {output}"
+        );
+        assert!(
+            output.contains("max_rss_bytes=1048576"),
+            "task explain must surface resource_usage: {output}"
+        );
     }
 }

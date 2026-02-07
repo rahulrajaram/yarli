@@ -322,9 +322,7 @@ fn heartbeat_wrong_worker_rejected() {
     let claimed = q.claim(&req, &cfg).unwrap();
     let qid = claimed[0].queue_id;
 
-    let err = q
-        .heartbeat(qid, "w2", Duration::seconds(30))
-        .unwrap_err();
+    let err = q.heartbeat(qid, "w2", Duration::seconds(30)).unwrap_err();
     assert!(matches!(err, QueueError::LeaseOwnerMismatch { .. }));
 }
 
@@ -346,9 +344,7 @@ fn heartbeat_on_pending_entry_rejected() {
         .enqueue(Uuid::now_v7(), run_id, 1, CommandClass::Io, None)
         .unwrap();
 
-    let err = q
-        .heartbeat(qid, "w1", Duration::seconds(30))
-        .unwrap_err();
+    let err = q.heartbeat(qid, "w1", Duration::seconds(30)).unwrap_err();
     assert!(matches!(err, QueueError::InvalidStatus { .. }));
 }
 
@@ -761,8 +757,7 @@ fn full_lifecycle_enqueue_claim_heartbeat_complete() {
     assert_eq!(q.pending_count(), 0);
 
     // 3. Heartbeat.
-    q.heartbeat(qid, "worker-A", Duration::seconds(30))
-        .unwrap();
+    q.heartbeat(qid, "worker-A", Duration::seconds(30)).unwrap();
 
     // 4. Complete.
     q.complete(qid, "worker-A").unwrap();

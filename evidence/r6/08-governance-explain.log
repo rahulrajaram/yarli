@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/yarli_core-436b0b1917127f25)
+
+running 2 tests
+test explain::tests::budget_exceeded_task_explain_surfaces_breach ... ok
+test explain::tests::budget_exceeded_task_surfaces_breach_in_run_explain ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.00s
+
+   Doc-tests yarli_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

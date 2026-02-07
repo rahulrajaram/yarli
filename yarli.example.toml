@@ -24,6 +24,15 @@ working_dir = "."
 command_timeout_seconds = 900
 tick_interval_ms = 200
 
+[budgets]
+# Optional hard limits; unset values are unlimited.
+# Values are per-task unless prefixed with max_run_.
+# Token accounting currently uses deterministic char-count estimates.
+max_task_total_tokens = 25000
+max_run_total_tokens = 250000
+max_task_rss_bytes = 1073741824      # 1 GiB
+max_run_peak_rss_bytes = 2147483648  # 2 GiB
+
 [policy]
 enforce_policies = true
 audit_decisions = true

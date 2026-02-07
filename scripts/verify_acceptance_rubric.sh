@@ -164,7 +164,34 @@ else
   fi
 fi
 
-no_agent_log="${evidence_dir}/07-no-agent-ref-check.log"
+governance_budget_log="${evidence_dir}/07-governance-budget.log"
+governance_budget_cmd='cargo test -p yarli-queue -- test_budget_exceeded --nocapture'
+run_check "$governance_budget_log" "$governance_budget_cmd"
+governance_budget_ec=$?
+append_summary_entry "$governance_budget_cmd" "$governance_budget_ec" "$governance_budget_log"
+if [[ "$governance_budget_ec" -ne 0 ]]; then
+  failures=$((failures + 1))
+fi
+
+governance_explain_log="${evidence_dir}/08-governance-explain.log"
+governance_explain_cmd='cargo test -p yarli-core -- budget_exceeded_task --nocapture'
+run_check "$governance_explain_log" "$governance_explain_cmd"
+governance_explain_ec=$?
+append_summary_entry "$governance_explain_cmd" "$governance_explain_ec" "$governance_explain_log"
+if [[ "$governance_explain_ec" -ne 0 ]]; then
+  failures=$((failures + 1))
+fi
+
+governance_cli_log="${evidence_dir}/09-governance-cli.log"
+governance_cli_cmd='cargo test -p yarli-cli -- budget --nocapture'
+run_check "$governance_cli_log" "$governance_cli_cmd"
+governance_cli_ec=$?
+append_summary_entry "$governance_cli_cmd" "$governance_cli_ec" "$governance_cli_log"
+if [[ "$governance_cli_ec" -ne 0 ]]; then
+  failures=$((failures + 1))
+fi
+
+no_agent_log="${evidence_dir}/10-no-agent-ref-check.log"
 no_agent_cmd='rg -n "\.[aA]gent/" IMPLEMENTATION_PLAN.md PROMPT.md'
 run_check "$no_agent_log" "$no_agent_cmd"
 no_agent_ec=$?
@@ -173,12 +200,44 @@ if [[ "$no_agent_ec" -ne 1 ]]; then
   failures=$((failures + 1))
 fi
 
-no_tmp_log="${evidence_dir}/08-no-tmp-ref-check.log"
+no_tmp_log="${evidence_dir}/11-no-tmp-ref-check.log"
 no_tmp_cmd="rg -n \"/tmp/\" \"${evidence_dir}\" --glob '*.md'"
 run_check "$no_tmp_log" "$no_tmp_cmd"
 no_tmp_ec=$?
 append_summary_entry "$no_tmp_cmd" "$no_tmp_ec" "$no_tmp_log"
 if [[ "$no_tmp_ec" -ne 1 ]]; then
+  failures=$((failures + 1))
+fi
+
+# Loop-7: Scale-consistency verification matrix keyword coverage
+matrix_log="${evidence_dir}/12-matrix-keywords.log"
+matrix_cmd='rg -n "single-active-lease|duplicate terminal|restart|replay|budget" docs/CONSISTENCY_CONTRACT.md docs/ACCEPTANCE_RUBRIC.md'
+run_check "$matrix_log" "$matrix_cmd"
+matrix_ec=$?
+append_summary_entry "$matrix_cmd" "$matrix_ec" "$matrix_log"
+if [[ "$matrix_ec" -ne 0 ]]; then
+  failures=$((failures + 1))
+fi
+
+# Loop-7: Postgres concurrency/replay invariant tests
+if [[ -n "${YARLI_TEST_DATABASE_URL:-}" ]]; then
+  concurrency_log="${evidence_dir}/13-concurrency-replay.log"
+  concurrency_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-queue --test postgres_integration -- --nocapture'
+  run_check "$concurrency_log" "$concurrency_cmd"
+  concurrency_ec=$?
+  append_summary_entry "$concurrency_cmd" "$concurrency_ec" "$concurrency_log"
+  if [[ "$concurrency_ec" -ne 0 ]]; then
+    failures=$((failures + 1))
+  fi
+fi
+
+# Loop-7: Capacity/budget stress proofs (parallel budget accounting)
+budget_stress_log="${evidence_dir}/14-budget-stress.log"
+budget_stress_cmd='cargo test -p yarli-queue -- test_parallel_tasks_budget_accounting --nocapture'
+run_check "$budget_stress_log" "$budget_stress_cmd"
+budget_stress_ec=$?
+append_summary_entry "$budget_stress_cmd" "$budget_stress_ec" "$budget_stress_log"
+if [[ "$budget_stress_ec" -ne 0 ]]; then
   failures=$((failures + 1))
 fi
 

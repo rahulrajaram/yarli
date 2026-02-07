@@ -80,7 +80,5 @@ pub trait MemoryAdapter: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), MemoryError>> + Send;
 
     /// Check if the backend is healthy.
-    fn health_check(
-        &self,
-    ) -> impl std::future::Future<Output = Result<bool, MemoryError>> + Send;
+    fn health_check(&self) -> impl std::future::Future<Output = Result<bool, MemoryError>> + Send;
 }

@@ -9,7 +9,5 @@ pub mod rules;
 pub mod token;
 
 pub use error::PolicyError;
-pub use rules::{
-    ActionType, PolicyEngine, PolicyRequest, PolicyRule, RuleOutcome, SafeModePolicy,
-};
+pub use rules::{ActionType, PolicyEngine, PolicyRequest, PolicyRule, RuleOutcome, SafeModePolicy};
 pub use token::{ApprovalToken, TokenScope};

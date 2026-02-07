@@ -46,20 +46,13 @@ pub enum StreamEvent {
 
     /// A transient status message (e.g. "connecting to postgres...").
     /// Shows only in inline viewport, never pushed to scrollback.
-    TransientStatus {
-        message: String,
-    },
+    TransientStatus { message: String },
 
     /// A "Why Not Done?" summary update.
-    ExplainUpdate {
-        summary: String,
-    },
+    ExplainUpdate { summary: String },
 
     /// A task's worker assignment for display.
-    TaskWorker {
-        task_id: TaskId,
-        worker_id: String,
-    },
+    TaskWorker { task_id: TaskId, worker_id: String },
 
     /// Tick event — advance spinners and refresh viewport.
     Tick,

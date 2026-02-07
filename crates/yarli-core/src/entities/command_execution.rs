@@ -14,6 +14,34 @@ use crate::fsm::command::CommandState;
 
 use super::transition::Transition;
 
+/// Resource usage captured for a command process.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommandResourceUsage {
+    /// Peak resident memory observed while the command was running (bytes).
+    pub max_rss_bytes: Option<u64>,
+    /// CPU user time observed for the process (clock ticks).
+    pub cpu_user_ticks: Option<u64>,
+    /// CPU system time observed for the process (clock ticks).
+    pub cpu_system_ticks: Option<u64>,
+    /// Bytes read from disk (Linux `/proc/<pid>/io` `read_bytes`).
+    pub io_read_bytes: Option<u64>,
+    /// Bytes written to disk (Linux `/proc/<pid>/io` `write_bytes`).
+    pub io_write_bytes: Option<u64>,
+}
+
+/// Token usage attached to a command execution.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenUsage {
+    /// Prompt/input tokens consumed.
+    pub prompt_tokens: u64,
+    /// Completion/output tokens consumed.
+    pub completion_tokens: u64,
+    /// Total tokens consumed.
+    pub total_tokens: u64,
+    /// How token counts were produced.
+    pub source: String,
+}
+
 /// An immutable record of a command execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandExecution {
@@ -45,6 +73,10 @@ pub struct CommandExecution {
     pub correlation_id: CorrelationId,
     /// Number of stdout/stderr chunks collected.
     pub chunk_count: u64,
+    /// Captured process resource usage for this command.
+    pub resource_usage: Option<CommandResourceUsage>,
+    /// Token usage associated with this command execution.
+    pub token_usage: Option<TokenUsage>,
 }
 
 /// A chunk of command output (stdout or stderr).
@@ -95,6 +127,8 @@ impl CommandExecution {
             idempotency_key: None,
             correlation_id,
             chunk_count: 0,
+            resource_usage: None,
+            token_usage: None,
         }
     }
 

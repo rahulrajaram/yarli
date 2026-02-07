@@ -10,6 +10,7 @@
 //! - Respects `CancellationToken` from shutdown infrastructure.
 //! - Supports configurable timeouts.
 
+use std::fs;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -21,7 +22,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use yarli_core::domain::{CommandClass, CorrelationId, RunId, TaskId};
-use yarli_core::entities::command_execution::{CommandExecution, StreamChunk, StreamType};
+use yarli_core::entities::command_execution::{
+    CommandExecution, CommandResourceUsage, StreamChunk, StreamType, TokenUsage,
+};
 use yarli_core::fsm::command::CommandState;
 
 use crate::error::ExecError;
@@ -141,6 +144,8 @@ impl CommandRunner for LocalCommandRunner {
             .spawn()
             .map_err(ExecError::SpawnFailed)?;
 
+        let monitor = child.id().map(spawn_resource_monitor);
+
         // Transition: CmdQueued → CmdStarted
         execution
             .transition(
@@ -236,6 +241,18 @@ impl CommandRunner for LocalCommandRunner {
             }
         };
 
+        let resource_usage = if let Some((stop_tx, monitor_handle)) = monitor {
+            let _ = stop_tx.send(());
+            match monitor_handle.await {
+                Ok(usage) => usage,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        execution.resource_usage = resource_usage;
+        execution.token_usage = Some(estimate_token_usage(&execution.command, &chunks));
+
         // Apply terminal transition based on outcome.
         match wait_result {
             Ok(exit_code) => {
@@ -273,6 +290,153 @@ impl CommandRunner for LocalCommandRunner {
             Err(e) => Err(e),
         }
     }
+}
+
+fn estimate_token_usage(command: &str, chunks: &[StreamChunk]) -> TokenUsage {
+    let prompt_tokens = estimate_tokens(command);
+    let completion_chars: u64 = chunks.iter().map(|c| c.data.chars().count() as u64).sum();
+    let completion_tokens = if completion_chars == 0 {
+        0
+    } else {
+        completion_chars.div_ceil(4)
+    };
+    let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+    TokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        source: "char_count_div4_estimate_v1".to_string(),
+    }
+}
+
+fn estimate_tokens(input: &str) -> u64 {
+    let chars = input.chars().count() as u64;
+    if chars == 0 {
+        0
+    } else {
+        chars.div_ceil(4)
+    }
+}
+
+fn spawn_resource_monitor(
+    pid: u32,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Option<CommandResourceUsage>>,
+) {
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let mut usage = CommandResourceUsage::default();
+        let mut saw_sample = false;
+
+        if let Some(sample) = read_process_sample(pid) {
+            saw_sample = true;
+            apply_sample(&mut usage, sample);
+        }
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    if let Some(sample) = read_process_sample(pid) {
+                        saw_sample = true;
+                        apply_sample(&mut usage, sample);
+                    }
+                }
+                _ = &mut stop_rx => {
+                    break;
+                }
+            }
+        }
+
+        if let Some(sample) = read_process_sample(pid) {
+            saw_sample = true;
+            apply_sample(&mut usage, sample);
+        }
+
+        if saw_sample {
+            Some(usage)
+        } else {
+            None
+        }
+    });
+    (stop_tx, handle)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcessSample {
+    rss_bytes: Option<u64>,
+    cpu_user_ticks: Option<u64>,
+    cpu_system_ticks: Option<u64>,
+    io_read_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
+}
+
+fn apply_sample(usage: &mut CommandResourceUsage, sample: ProcessSample) {
+    if let Some(rss_bytes) = sample.rss_bytes {
+        usage.max_rss_bytes = Some(usage.max_rss_bytes.unwrap_or(0).max(rss_bytes));
+    }
+    if sample.cpu_user_ticks.is_some() {
+        usage.cpu_user_ticks = sample.cpu_user_ticks;
+    }
+    if sample.cpu_system_ticks.is_some() {
+        usage.cpu_system_ticks = sample.cpu_system_ticks;
+    }
+    if sample.io_read_bytes.is_some() {
+        usage.io_read_bytes = sample.io_read_bytes;
+    }
+    if sample.io_write_bytes.is_some() {
+        usage.io_write_bytes = sample.io_write_bytes;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_sample(pid: u32) -> Option<ProcessSample> {
+    let mut sample = ProcessSample::default();
+
+    // /proc/<pid>/status -> VmRSS (kB)
+    let status_path = format!("/proc/{pid}/status");
+    let status = fs::read_to_string(&status_path).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok());
+            sample.rss_bytes = kb.map(|v| v.saturating_mul(1024));
+            break;
+        }
+    }
+
+    // /proc/<pid>/stat -> utime/stime ticks.
+    let stat_path = format!("/proc/{pid}/stat");
+    if let Ok(stat_text) = fs::read_to_string(&stat_path) {
+        if let Some(end_comm) = stat_text.rfind(')') {
+            let after = stat_text.get(end_comm + 2..).unwrap_or("");
+            let fields: Vec<&str> = after.split_whitespace().collect();
+            // after starts at field #3, so utime (#14) => idx 11, stime (#15) => idx 12.
+            sample.cpu_user_ticks = fields.get(11).and_then(|v| v.parse::<u64>().ok());
+            sample.cpu_system_ticks = fields.get(12).and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+
+    // /proc/<pid>/io -> read_bytes/write_bytes.
+    let io_path = format!("/proc/{pid}/io");
+    if let Ok(io_text) = fs::read_to_string(&io_path) {
+        for line in io_text.lines() {
+            if let Some(v) = line.strip_prefix("read_bytes:") {
+                sample.io_read_bytes = v.trim().parse::<u64>().ok();
+            } else if let Some(v) = line.strip_prefix("write_bytes:") {
+                sample.io_write_bytes = v.trim().parse::<u64>().ok();
+            }
+        }
+    }
+
+    Some(sample)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_sample(_pid: u32) -> Option<ProcessSample> {
+    None
 }
 
 /// Collect output from the channel and wait for the process to exit.
@@ -530,8 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_timeout() {
-        let runner = LocalCommandRunner::new()
-            .with_default_timeout(Duration::from_millis(100));
+        let runner = LocalCommandRunner::new().with_default_timeout(Duration::from_millis(100));
         let cancel = CancellationToken::new();
         let req = make_request("sleep 60");
         let result = runner.run(req, cancel).await.unwrap();
@@ -541,8 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_per_command_timeout_overrides_default() {
-        let runner = LocalCommandRunner::new()
-            .with_default_timeout(Duration::from_secs(60));
+        let runner = LocalCommandRunner::new().with_default_timeout(Duration::from_secs(60));
         let cancel = CancellationToken::new();
         let mut req = make_request("sleep 60");
         req.timeout = Some(Duration::from_millis(100));
@@ -575,5 +737,41 @@ mod tests {
         assert_eq!(result.execution.exit_code, Some(0));
         assert!(result.chunks.is_empty());
         assert_eq!(result.execution.chunk_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_token_usage_is_attached() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let req = make_request("echo token-test");
+        let result = runner.run(req, cancel).await.unwrap();
+
+        let usage = result
+            .execution
+            .token_usage
+            .expect("token usage should exist");
+        assert_eq!(usage.source, "char_count_div4_estimate_v1");
+        assert!(usage.total_tokens >= usage.prompt_tokens);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_resource_usage_is_captured_for_long_running_command() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let req = make_request("sleep 0.2");
+        let result = runner.run(req, cancel).await.unwrap();
+
+        let usage = result
+            .execution
+            .resource_usage
+            .expect("resource usage should exist on linux for running command");
+
+        let has_signal = usage.max_rss_bytes.is_some()
+            || usage.cpu_user_ticks.is_some()
+            || usage.cpu_system_ticks.is_some()
+            || usage.io_read_bytes.is_some()
+            || usage.io_write_bytes.is_some();
+        assert!(has_signal, "expected at least one resource usage metric");
     }
 }

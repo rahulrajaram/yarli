@@ -24,10 +24,7 @@ pub enum MergeState {
 impl MergeState {
     /// Terminal states cannot transition further.
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            MergeState::MergeDone | MergeState::MergeAborted
-        )
+        matches!(self, MergeState::MergeDone | MergeState::MergeAborted)
     }
 
     /// Returns the set of states reachable from this state.

@@ -231,10 +231,7 @@ impl OverlayStack {
                 .iter()
                 .map(|s| Line::from(s.as_str()))
                 .collect();
-            frame.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: false }),
-                inner,
-            );
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
     }
 

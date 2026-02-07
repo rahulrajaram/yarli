@@ -328,12 +328,8 @@ fn forbidden_op_equality() {
     assert_eq!(ForbiddenOp::Push, ForbiddenOp::Push);
     assert_ne!(ForbiddenOp::Push, ForbiddenOp::ForcePush);
     assert_eq!(
-        ForbiddenOp::BranchDelete {
-            branch: "x".into()
-        },
-        ForbiddenOp::BranchDelete {
-            branch: "x".into()
-        }
+        ForbiddenOp::BranchDelete { branch: "x".into() },
+        ForbiddenOp::BranchDelete { branch: "x".into() }
     );
 }
 
@@ -658,7 +654,10 @@ async fn detect_no_interrupted_operation() {
 
     mgr.create(&mut binding, cancel.clone()).await.unwrap();
 
-    let result = mgr.detect_interrupted(&binding.worktree_path).await.unwrap();
+    let result = mgr
+        .detect_interrupted(&binding.worktree_path)
+        .await
+        .unwrap();
     assert!(result.is_none());
 
     mgr.cleanup(&mut binding, true, cancel).await.unwrap();
@@ -685,7 +684,10 @@ async fn detect_interrupted_merge() {
     };
     std::fs::write(git_dir.join(MERGE_HEAD_FILE), "abc123\n").unwrap();
 
-    let result = mgr.detect_interrupted(&binding.worktree_path).await.unwrap();
+    let result = mgr
+        .detect_interrupted(&binding.worktree_path)
+        .await
+        .unwrap();
     assert_eq!(result, Some(InterruptedOp::Merge));
 
     // Clean up sentinel so worktree remove works.
@@ -712,7 +714,10 @@ async fn detect_interrupted_rebase() {
     };
     std::fs::create_dir_all(git_dir.join(REBASE_MERGE_DIR)).unwrap();
 
-    let result = mgr.detect_interrupted(&binding.worktree_path).await.unwrap();
+    let result = mgr
+        .detect_interrupted(&binding.worktree_path)
+        .await
+        .unwrap();
     assert_eq!(result, Some(InterruptedOp::Rebase));
 
     std::fs::remove_dir_all(git_dir.join(REBASE_MERGE_DIR)).unwrap();
@@ -738,7 +743,10 @@ async fn detect_interrupted_cherry_pick() {
     };
     std::fs::write(git_dir.join(CHERRY_PICK_HEAD_FILE), "abc123\n").unwrap();
 
-    let result = mgr.detect_interrupted(&binding.worktree_path).await.unwrap();
+    let result = mgr
+        .detect_interrupted(&binding.worktree_path)
+        .await
+        .unwrap();
     assert_eq!(result, Some(InterruptedOp::CherryPick));
 
     std::fs::remove_file(git_dir.join(CHERRY_PICK_HEAD_FILE)).unwrap();
@@ -764,7 +772,10 @@ async fn detect_interrupted_revert() {
     };
     std::fs::write(git_dir.join(REVERT_HEAD_FILE), "abc123\n").unwrap();
 
-    let result = mgr.detect_interrupted(&binding.worktree_path).await.unwrap();
+    let result = mgr
+        .detect_interrupted(&binding.worktree_path)
+        .await
+        .unwrap();
     assert_eq!(result, Some(InterruptedOp::Revert));
 
     std::fs::remove_file(git_dir.join(REVERT_HEAD_FILE)).unwrap();
@@ -841,8 +852,14 @@ async fn submodule_status_hash_is_deterministic() {
     mgr.create(&mut binding, cancel.clone()).await.unwrap();
 
     // Hash should be deterministic (no submodules = empty output = same hash).
-    let hash1 = mgr.submodule_status_hash(&binding.worktree_path).await.unwrap();
-    let hash2 = mgr.submodule_status_hash(&binding.worktree_path).await.unwrap();
+    let hash1 = mgr
+        .submodule_status_hash(&binding.worktree_path)
+        .await
+        .unwrap();
+    let hash2 = mgr
+        .submodule_status_hash(&binding.worktree_path)
+        .await
+        .unwrap();
     assert_eq!(hash1, hash2);
     assert_eq!(hash1.len(), 64); // SHA-256 hex is 64 chars.
 
@@ -933,7 +950,10 @@ async fn create_worktree_creates_branch() {
         .output()
         .unwrap();
     let branches = String::from_utf8_lossy(&output.stdout);
-    assert!(branches.contains(&branch_name), "branch should exist: {branches}");
+    assert!(
+        branches.contains(&branch_name),
+        "branch should exist: {branches}"
+    );
 
     mgr.cleanup(&mut binding, true, cancel).await.unwrap();
 }
@@ -1062,7 +1082,10 @@ async fn worktree_path_computed_correctly() {
     assert!(wt_path.starts_with(&repo));
     let relative = wt_path.strip_prefix(&repo).unwrap();
     let rel_str = relative.to_string_lossy();
-    assert!(rel_str.starts_with(WORKTREE_DIR), "path should start with {WORKTREE_DIR}, got {rel_str}");
+    assert!(
+        rel_str.starts_with(WORKTREE_DIR),
+        "path should start with {WORKTREE_DIR}, got {rel_str}"
+    );
 
     mgr.cleanup(&mut binding, true, cancel).await.unwrap();
 }
@@ -1166,13 +1189,7 @@ async fn setup_merge_test() -> (
 
     wt_mgr.create(&mut binding, cancel).await.unwrap();
 
-    let intent = MergeIntent::new(
-        run_id,
-        wt_id,
-        &feature_branch,
-        &main_branch,
-        corr_id,
-    );
+    let intent = MergeIntent::new(run_id, wt_id, &feature_branch, &main_branch, corr_id);
 
     let orchestrator = LocalMergeOrchestrator::new(wt_mgr);
 
@@ -1203,9 +1220,7 @@ async fn merge_precheck_fails_on_invalid_source_ref() {
 
     intent.source_ref = "nonexistent-branch".into();
 
-    let result = orchestrator
-        .precheck(&mut intent, &binding, cancel)
-        .await;
+    let result = orchestrator.precheck(&mut intent, &binding, cancel).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -1223,9 +1238,7 @@ async fn merge_precheck_fails_on_dirty_worktree() {
 
     std::fs::write(binding.worktree_path.join("dirty.txt"), "dirty").unwrap();
 
-    let result = orchestrator
-        .precheck(&mut intent, &binding, cancel)
-        .await;
+    let result = orchestrator.precheck(&mut intent, &binding, cancel).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -1243,9 +1256,7 @@ async fn merge_precheck_rejects_wrong_state() {
 
     intent.state = MergeState::MergeDryRun;
 
-    let result = orchestrator
-        .precheck(&mut intent, &binding, cancel)
-        .await;
+    let result = orchestrator.precheck(&mut intent, &binding, cancel).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -1314,13 +1325,7 @@ async fn merge_dry_run_detects_conflict() {
 
     wt_mgr.create(&mut binding, cancel.clone()).await.unwrap();
 
-    let mut intent = MergeIntent::new(
-        run_id,
-        wt_id,
-        "feature/test-merge",
-        "main",
-        corr_id,
-    );
+    let mut intent = MergeIntent::new(run_id, wt_id, "feature/test-merge", "main", corr_id);
 
     let orchestrator = LocalMergeOrchestrator::new(wt_mgr);
 
@@ -1479,9 +1484,7 @@ async fn merge_lock_prevents_concurrent_apply() {
     // Pre-acquire the lock for the target branch.
     orchestrator.lock_map.try_acquire(&intent.target_ref).await;
 
-    let result = orchestrator
-        .apply(&mut intent, &mut binding, cancel)
-        .await;
+    let result = orchestrator.apply(&mut intent, &mut binding, cancel).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -1547,9 +1550,7 @@ async fn merge_dry_run_rejects_wrong_state() {
     let (_tmp, orchestrator, binding, mut intent) = setup_merge_test().await;
     let cancel = CancellationToken::new();
 
-    let result = orchestrator
-        .dry_run(&mut intent, &binding, cancel)
-        .await;
+    let result = orchestrator.dry_run(&mut intent, &binding, cancel).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -1570,9 +1571,7 @@ async fn merge_apply_rejects_wrong_state() {
         .await
         .unwrap();
 
-    let result = orchestrator
-        .apply(&mut intent, &mut binding, cancel)
-        .await;
+    let result = orchestrator.apply(&mut intent, &mut binding, cancel).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -1625,8 +1624,14 @@ async fn merge_commit_message_has_attribution() {
         .output()
         .unwrap();
     let msg = String::from_utf8_lossy(&output.stdout);
-    assert!(msg.contains("yarli-run:"), "commit should contain yarli-run attribution");
-    assert!(msg.contains("yarli-task:"), "commit should contain yarli-task attribution");
+    assert!(
+        msg.contains("yarli-run:"),
+        "commit should contain yarli-run attribution"
+    );
+    assert!(
+        msg.contains("yarli-task:"),
+        "commit should contain yarli-task attribution"
+    );
     assert!(msg.contains("Merge"), "commit should start with Merge");
 }
 
@@ -1651,7 +1656,10 @@ async fn merge_worktree_transitions_through_merging() {
         .unwrap();
 
     assert_eq!(binding.state, WorktreeState::WtBoundHome);
-    assert_eq!(binding.head_ref, intent.result_sha.as_ref().unwrap().as_str());
+    assert_eq!(
+        binding.head_ref,
+        intent.result_sha.as_ref().unwrap().as_str()
+    );
 }
 
 #[tokio::test]
@@ -1756,7 +1764,8 @@ async fn merge_conflict_from_precheck_allows_restart() {
 
 #[test]
 fn merge_parse_changed_files() {
-    let files = LocalMergeOrchestrator::parse_changed_files("file1.txt\nfile2.rs\n\ndir/file3.md\n");
+    let files =
+        LocalMergeOrchestrator::parse_changed_files("file1.txt\nfile2.rs\n\ndir/file3.md\n");
     assert_eq!(files, vec!["file1.txt", "file2.rs", "dir/file3.md"]);
 }
 
@@ -1799,7 +1808,10 @@ async fn submodule_status_returns_empty_for_no_submodules() {
     mgr.create(&mut binding, cancel.clone()).await.unwrap();
 
     let entries = mgr.submodule_status(&binding.worktree_path).await.unwrap();
-    assert!(entries.is_empty(), "no submodules should produce empty list");
+    assert!(
+        entries.is_empty(),
+        "no submodules should produce empty list"
+    );
 
     mgr.cleanup(&mut binding, true, cancel).await.unwrap();
 }
@@ -2083,8 +2095,7 @@ async fn recover_abort_real_interrupted_merge() {
     let mut binding = make_binding(&repo);
     let cancel = CancellationToken::new();
 
-    let git_dir =
-        create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
+    let git_dir = create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
 
     // Verify MERGE_HEAD exists (real interrupted merge).
     assert!(git_dir.join(MERGE_HEAD_FILE).exists());
@@ -2131,8 +2142,7 @@ async fn recover_resume_real_interrupted_merge() {
     let mut binding = make_binding(&repo);
     let cancel = CancellationToken::new();
 
-    let git_dir =
-        create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
+    let git_dir = create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
 
     // Verify MERGE_HEAD exists.
     assert!(git_dir.join(MERGE_HEAD_FILE).exists());
@@ -2190,15 +2200,19 @@ async fn recover_abort_from_wt_conflict_state() {
     let mut binding = make_binding(&repo);
     let cancel = CancellationToken::new();
 
-    let git_dir =
-        create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
+    let git_dir = create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
 
     // Transition to WtMerging then WtConflict (as the merge orchestrator would).
     binding
         .transition(WorktreeState::WtMerging, "merge started", "test", None)
         .unwrap();
     binding
-        .transition(WorktreeState::WtConflict, "conflicts detected", "test", None)
+        .transition(
+            WorktreeState::WtConflict,
+            "conflicts detected",
+            "test",
+            None,
+        )
         .unwrap();
 
     let mgr = LocalWorktreeManager::new();
@@ -2333,7 +2347,12 @@ async fn recover_abort_real_interrupted_cherry_pick() {
 
     // Transition to a state that allows WtRecovering.
     binding
-        .transition(WorktreeState::WtMerging, "cherry-pick started", "test", None)
+        .transition(
+            WorktreeState::WtMerging,
+            "cherry-pick started",
+            "test",
+            None,
+        )
         .unwrap();
 
     // Abort the cherry-pick.
@@ -2464,7 +2483,12 @@ async fn detect_then_recover_restart_flow() {
     //    The worktree was in WtBoundHome (pre-merge) — but the orchestrator would
     //    transition through WtMerging to allow WtRecovering.
     binding
-        .transition(WorktreeState::WtMerging, "detected merge on restart", "test", None)
+        .transition(
+            WorktreeState::WtMerging,
+            "detected merge on restart",
+            "test",
+            None,
+        )
         .unwrap();
 
     // 3. Choose recovery action based on policy (here: abort).
@@ -2531,11 +2555,7 @@ async fn recover_resume_updates_head_to_merge_commit() {
     let pre_merge_head = binding.head_ref.clone();
 
     // Resolve conflicts.
-    std::fs::write(
-        binding.worktree_path.join("shared.txt"),
-        "resolved\n",
-    )
-    .unwrap();
+    std::fs::write(binding.worktree_path.join("shared.txt"), "resolved\n").unwrap();
     let output = std::process::Command::new("git")
         .args(["add", "shared.txt"])
         .current_dir(&binding.worktree_path)
@@ -2554,7 +2574,10 @@ async fn recover_resume_updates_head_to_merge_commit() {
 
     // After resume (commit), HEAD should advance to a new merge commit.
     assert_eq!(binding.head_ref.len(), 40);
-    assert_ne!(binding.head_ref, pre_merge_head, "HEAD should advance after merge commit");
+    assert_ne!(
+        binding.head_ref, pre_merge_head,
+        "HEAD should advance after merge commit"
+    );
 
     // The merge commit should have 2 parents.
     let output = std::process::Command::new("git")
@@ -2563,7 +2586,10 @@ async fn recover_resume_updates_head_to_merge_commit() {
         .output()
         .expect("git cat-file");
     let commit_info = String::from_utf8_lossy(&output.stdout);
-    let parent_count = commit_info.lines().filter(|l| l.starts_with("parent ")).count();
+    let parent_count = commit_info
+        .lines()
+        .filter(|l| l.starts_with("parent "))
+        .count();
     assert_eq!(parent_count, 2, "merge commit should have 2 parents");
 
     mgr.cleanup(&mut binding, true, cancel).await.unwrap();
@@ -2580,8 +2606,7 @@ async fn recover_manual_block_preserves_interrupted_state() {
     let mut binding = make_binding(&repo);
     let cancel = CancellationToken::new();
 
-    let git_dir =
-        create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
+    let git_dir = create_interrupted_merge_in_worktree(&repo, &mut binding, &feature_branch).await;
 
     binding
         .transition(WorktreeState::WtMerging, "merge started", "test", None)

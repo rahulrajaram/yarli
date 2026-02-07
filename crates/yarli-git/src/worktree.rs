@@ -66,11 +66,7 @@ pub trait WorktreeManager: Send + Sync {
     ) -> Result<(), GitError>;
 
     /// Validate that a path is confined within the worktree root (Section 12.3).
-    fn validate_path_confinement(
-        &self,
-        path: &Path,
-        worktree_root: &Path,
-    ) -> Result<(), GitError>;
+    fn validate_path_confinement(&self, path: &Path, worktree_root: &Path) -> Result<(), GitError>;
 
     /// Validate the .git indirection file in a worktree (Section 12.2 step 5).
     async fn validate_git_indirection(&self, worktree_path: &Path) -> Result<(), GitError>;
@@ -79,10 +75,8 @@ pub trait WorktreeManager: Send + Sync {
     async fn submodule_status_hash(&self, worktree_path: &Path) -> Result<String, GitError>;
 
     /// Parse `git submodule status` into structured entries (Section 12.4).
-    async fn submodule_status(
-        &self,
-        worktree_path: &Path,
-    ) -> Result<Vec<SubmoduleEntry>, GitError>;
+    async fn submodule_status(&self, worktree_path: &Path)
+        -> Result<Vec<SubmoduleEntry>, GitError>;
 
     /// Check for uninitialized submodules. Returns paths of uninitialized submodules.
     async fn check_uninitialized_submodules(
@@ -91,10 +85,7 @@ pub trait WorktreeManager: Send + Sync {
     ) -> Result<Vec<String>, GitError>;
 
     /// Check for dirty (modified/conflicted) submodules. Returns paths of dirty submodules.
-    async fn check_dirty_submodules(
-        &self,
-        worktree_path: &Path,
-    ) -> Result<Vec<String>, GitError>;
+    async fn check_dirty_submodules(&self, worktree_path: &Path) -> Result<Vec<String>, GitError>;
 
     /// Verify submodule policy between before/after states (Section 12.4).
     ///
@@ -241,12 +232,11 @@ impl LocalWorktreeManager {
         })?;
 
         // .git file in worktrees contains "gitdir: <path>"
-        let gitdir = content
-            .trim()
-            .strip_prefix("gitdir: ")
-            .ok_or_else(|| GitError::InvalidGitIndirection {
+        let gitdir = content.trim().strip_prefix("gitdir: ").ok_or_else(|| {
+            GitError::InvalidGitIndirection {
                 path: worktree_path.to_path_buf(),
-            })?;
+            }
+        })?;
 
         Ok(PathBuf::from(gitdir))
     }
@@ -294,7 +284,11 @@ impl WorktreeManager for LocalWorktreeManager {
         let branch_check = self
             .run_git(
                 &repo_root,
-                &["rev-parse", "--verify", &format!("refs/heads/{}", binding.branch_name)],
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/heads/{}", binding.branch_name),
+                ],
                 &cancel,
             )
             .await?;
@@ -317,9 +311,11 @@ impl WorktreeManager for LocalWorktreeManager {
         let worktree_path = Self::compute_worktree_path(binding);
 
         // Ensure parent directory exists.
-        let parent = worktree_path.parent().ok_or_else(|| GitError::WorktreeCreation {
-            reason: "invalid worktree path".into(),
-        })?;
+        let parent = worktree_path
+            .parent()
+            .ok_or_else(|| GitError::WorktreeCreation {
+                reason: "invalid worktree path".into(),
+            })?;
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(GitError::Io)?;
@@ -550,15 +546,9 @@ impl WorktreeManager for LocalWorktreeManager {
         Ok(())
     }
 
-    fn validate_path_confinement(
-        &self,
-        path: &Path,
-        worktree_root: &Path,
-    ) -> Result<(), GitError> {
+    fn validate_path_confinement(&self, path: &Path, worktree_root: &Path) -> Result<(), GitError> {
         // Canonicalize if possible, otherwise use starts_with on the raw paths.
-        let canonical_path = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let canonical_root = worktree_root
             .canonicalize()
             .unwrap_or_else(|_| worktree_root.to_path_buf());
@@ -576,11 +566,12 @@ impl WorktreeManager for LocalWorktreeManager {
         let dot_git = worktree_path.join(DOT_GIT_FILE);
 
         // In a worktree, .git is a file (not a directory) containing "gitdir: ..."
-        let metadata = tokio::fs::metadata(&dot_git).await.map_err(|_| {
-            GitError::InvalidGitIndirection {
-                path: worktree_path.to_path_buf(),
-            }
-        })?;
+        let metadata =
+            tokio::fs::metadata(&dot_git)
+                .await
+                .map_err(|_| GitError::InvalidGitIndirection {
+                    path: worktree_path.to_path_buf(),
+                })?;
 
         if metadata.is_dir() {
             // This is a full repo, not a worktree.
@@ -641,10 +632,7 @@ impl WorktreeManager for LocalWorktreeManager {
             .collect())
     }
 
-    async fn check_dirty_submodules(
-        &self,
-        worktree_path: &Path,
-    ) -> Result<Vec<String>, GitError> {
+    async fn check_dirty_submodules(&self, worktree_path: &Path) -> Result<Vec<String>, GitError> {
         let entries = self.submodule_status(worktree_path).await?;
         Ok(submodule::find_dirty(&entries)
             .into_iter()
