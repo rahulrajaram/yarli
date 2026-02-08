@@ -289,20 +289,26 @@ fn default_tool_cap() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionConfig {
+    #[serde(default)]
+    pub runner: ExecutionRunner,
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
     #[serde(default = "default_command_timeout_seconds")]
     pub command_timeout_seconds: u64,
     #[serde(default = "default_tick_interval_ms")]
     pub tick_interval_ms: u64,
+    #[serde(default)]
+    pub overwatch: OverwatchConfig,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
+            runner: ExecutionRunner::default(),
             working_dir: default_working_dir(),
             command_timeout_seconds: default_command_timeout_seconds(),
             tick_interval_ms: default_tick_interval_ms(),
+            overwatch: OverwatchConfig::default(),
         }
     }
 }
@@ -317,6 +323,44 @@ fn default_command_timeout_seconds() -> u64 {
 
 fn default_tick_interval_ms() -> u64 {
     100
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionRunner {
+    #[default]
+    Native,
+    Overwatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverwatchConfig {
+    #[serde(default = "default_overwatch_service_url")]
+    pub service_url: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub soft_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub silent_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_log_bytes: Option<u64>,
+}
+
+impl Default for OverwatchConfig {
+    fn default() -> Self {
+        Self {
+            service_url: default_overwatch_service_url(),
+            profile: None,
+            soft_timeout_seconds: None,
+            silent_timeout_seconds: None,
+            max_log_bytes: None,
+        }
+    }
+}
+
+fn default_overwatch_service_url() -> String {
+    "http://127.0.0.1:8089".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -478,6 +522,7 @@ mod tests {
         assert_eq!(loaded.source(), ConfigSource::Defaults);
         assert_eq!(loaded.config().core.backend, BackendKind::InMemory);
         assert!(!loaded.config().core.allow_in_memory_writes);
+        assert_eq!(loaded.config().execution.runner, ExecutionRunner::Native);
         assert_eq!(loaded.config().execution.working_dir, ".");
     }
 
@@ -501,8 +546,15 @@ database_url = "postgres://localhost/yarli"
 claim_batch_size = 2
 
 [execution]
+runner = "overwatch"
 working_dir = "/work"
 command_timeout_seconds = 600
+[execution.overwatch]
+service_url = "http://127.0.0.1:9999"
+profile = "ci"
+soft_timeout_seconds = 120
+silent_timeout_seconds = 60
+max_log_bytes = 2048
 
 [budgets]
 max_task_total_tokens = 1000
@@ -532,6 +584,19 @@ mode = "stream"
         assert_eq!(loaded.config().core.backend, BackendKind::Postgres);
         assert!(loaded.config().core.allow_in_memory_writes);
         assert_eq!(loaded.config().core.safe_mode, SafeMode::Restricted);
+        assert_eq!(loaded.config().execution.runner, ExecutionRunner::Overwatch);
+        assert_eq!(
+            loaded.config().execution.overwatch.service_url,
+            "http://127.0.0.1:9999"
+        );
+        assert_eq!(
+            loaded.config().execution.overwatch.soft_timeout_seconds,
+            Some(120)
+        );
+        assert_eq!(
+            loaded.config().execution.overwatch.max_log_bytes,
+            Some(2048)
+        );
         assert_eq!(loaded.config().memory.backend.enabled, true);
         assert_eq!(loaded.config().ui.mode, UiMode::Stream);
         assert_eq!(loaded.config().budgets.max_task_total_tokens, Some(1000));

@@ -9,8 +9,10 @@
 
 pub mod error;
 pub mod journal;
+pub mod overwatch;
 pub mod runner;
 
 pub use error::ExecError;
 pub use journal::CommandJournal;
+pub use overwatch::{OverwatchCommandRunner, OverwatchRunnerConfig};
 pub use runner::{CommandRequest, CommandResult, CommandRunner, LocalCommandRunner};

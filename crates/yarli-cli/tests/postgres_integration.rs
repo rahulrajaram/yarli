@@ -80,9 +80,78 @@ async fn merge_request_and_status_roundtrip_against_postgres(
     Ok(())
 }
 
+#[tokio::test]
+async fn run_start_and_status_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(admin_database_url) = test_database_url() else {
+        if require_postgres_tests() {
+            panic!(
+                "postgres integration tests require {TEST_DATABASE_URL_ENV} when {REQUIRE_POSTGRES_TESTS_ENV}=1"
+            );
+        }
+        eprintln!(
+            "skipping postgres integration test: set {TEST_DATABASE_URL_ENV} (example: postgres://postgres:postgres@localhost:5432/postgres)"
+        );
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let temp_dir = TempDir::new()?;
+    write_test_config(temp_dir.path(), &database.database_url)?;
+    let binary = yarli_binary_path()?;
+
+    let run_output = Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args([
+            "run",
+            "start",
+            "postgres roundtrip",
+            "--stream",
+            "--cmd",
+            "echo integration-ok",
+        ])
+        .output()?;
+
+    assert!(
+        run_output.status.success(),
+        "run start command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    let run_stdout = String::from_utf8(run_output.stdout)?;
+    let run_id = parse_run_id(&run_stdout).ok_or("missing run id in CLI output")?;
+
+    let status_output = Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["run", "status", &run_id.to_string()])
+        .output()?;
+    assert!(
+        status_output.status.success(),
+        "run status command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status_output.stdout),
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_stdout = String::from_utf8(status_output.stdout)?;
+    assert!(status_stdout.contains("State: RunCompleted"));
+    assert!(status_stdout.contains("TaskComplete"));
+
+    database.drop().await?;
+    Ok(())
+}
+
 fn parse_merge_id(output: &str) -> Option<Uuid> {
     output.lines().find_map(|line| {
         line.strip_prefix("Merge ID: ")
+            .and_then(|value| value.trim().parse::<Uuid>().ok())
+    })
+}
+
+fn parse_run_id(output: &str) -> Option<Uuid> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("Run ")
+            .and_then(|rest| rest.split_whitespace().next())
             .and_then(|value| value.trim().parse::<Uuid>().ok())
     })
 }

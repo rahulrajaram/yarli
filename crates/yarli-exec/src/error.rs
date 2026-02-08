@@ -28,4 +28,12 @@ pub enum ExecError {
     /// Journal persistence error.
     #[error("journal error: {0}")]
     Journal(String),
+
+    /// HTTP transport error (Overwatch backend).
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    /// Backend protocol or payload mismatch.
+    #[error("backend protocol error: {0}")]
+    Protocol(String),
 }

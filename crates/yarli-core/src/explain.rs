@@ -181,6 +181,32 @@ pub struct BudgetBreachSummary {
     pub reason: String,
 }
 
+/// Direction of sequence deterioration in a rolling window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeteriorationTrend {
+    Improving,
+    Stable,
+    Deteriorating,
+}
+
+/// Top contributing factor to a deterioration score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeteriorationFactor {
+    pub name: String,
+    pub impact: f64,
+    pub detail: String,
+}
+
+/// Structured observer output for sequence deterioration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeteriorationReport {
+    pub score: f64,
+    pub window_size: usize,
+    pub factors: Vec<DeteriorationFactor>,
+    pub trend: DeteriorationTrend,
+}
+
 /// The full explain result — answer to "Why Not Done?"
 ///
 /// Computed purely from run/task/gate state snapshots.

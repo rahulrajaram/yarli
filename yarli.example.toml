@@ -20,9 +20,19 @@ git_cap = 2
 tool_cap = 2
 
 [execution]
+# native | overwatch
+runner = "native"
 working_dir = "."
 command_timeout_seconds = 900
 tick_interval_ms = 200
+
+[execution.overwatch]
+# Used only when execution.runner = "overwatch"
+service_url = "http://127.0.0.1:8089"
+# profile = "default"
+# soft_timeout_seconds = 900
+# silent_timeout_seconds = 300
+# max_log_bytes = 131072
 
 [budgets]
 # Optional hard limits; unset values are unlimited.

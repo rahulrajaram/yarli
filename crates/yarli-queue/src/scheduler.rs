@@ -435,6 +435,14 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     /// 4. Handle results and state transitions
     /// 5. Evaluate run-level state changes
     pub async fn tick(&self) -> Result<TickResult, SchedulerError> {
+        self.tick_with_cancel(CancellationToken::new()).await
+    }
+
+    /// Run a single scheduler tick with an external cancellation token.
+    pub async fn tick_with_cancel(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<TickResult, SchedulerError> {
         let mut result = TickResult::default();
 
         // Step 1: Promote tasks whose dependencies are satisfied
@@ -451,7 +459,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
         // Step 3: Execute claimed tasks
         for entry in claimed {
-            match self.execute_task(entry).await {
+            match self.execute_task(entry, cancel.child_token()).await {
                 Ok(outcome) => {
                     result.executed += 1;
                     match outcome {
@@ -490,7 +498,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     return Ok(());
                 }
                 _ = tick_interval.tick() => {
-                    if let Err(e) = self.tick().await {
+                    if let Err(e) = self.tick_with_cancel(cancel.child_token()).await {
                         warn!(error = %e, "scheduler tick error");
                     }
                 }
@@ -571,7 +579,11 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     }
 
     /// Execute a single claimed task through the command journal.
-    async fn execute_task(&self, entry: QueueEntry) -> Result<TaskOutcome, SchedulerError> {
+    async fn execute_task(
+        &self,
+        entry: QueueEntry,
+        cancel: CancellationToken,
+    ) -> Result<TaskOutcome, SchedulerError> {
         let queue_id = entry.queue_id;
         let task_id = entry.task_id;
 
@@ -687,7 +699,6 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         };
 
         // Execute via journal
-        let cancel = CancellationToken::new();
         let journal = CommandJournal::new((*self.runner).clone(), &*self.store);
         let cmd_result = journal.execute(request, cancel).await;
 
@@ -2917,8 +2928,10 @@ mod tests {
         }
 
         // Verify no silent continuation: no task.completed events appear AFTER a budget failure
-        let failed_task_ids: std::collections::HashSet<String> =
-            budget_failures.iter().map(|e| e.entity_id.clone()).collect();
+        let failed_task_ids: std::collections::HashSet<String> = budget_failures
+            .iter()
+            .map(|e| e.entity_id.clone())
+            .collect();
         let task_ids = [t1_id, t2_id, t3_id, t4_id];
         for task_id in &task_ids {
             let task = reg.get_task(task_id).unwrap();

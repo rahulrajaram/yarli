@@ -17,3 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+axum = "0.8"

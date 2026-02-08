@@ -10,7 +10,6 @@ members = [
     "crates/yarli-policy",
     "crates/yarli-memory",
     "crates/yarli-observability",
-    "crates/yarli-api",
     "crates/yarli-cli",
 ]
 
@@ -31,7 +30,6 @@ yarli-gates = { path = "crates/yarli-gates" }
 yarli-policy = { path = "crates/yarli-policy" }
 yarli-memory = { path = "crates/yarli-memory" }
 yarli-observability = { path = "crates/yarli-observability" }
-yarli-api = { path = "crates/yarli-api" }
 yarli-cli = { path = "crates/yarli-cli" }
 
 # Async runtime
@@ -75,6 +73,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Config
 toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Testing
 assert_matches = "1.5"

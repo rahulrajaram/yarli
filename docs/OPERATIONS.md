@@ -26,14 +26,14 @@ From repository root:
 ```bash
 export YARLI_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55432/postgres
 export YARLI_REQUIRE_POSTGRES_TESTS=1
-bash scripts/verify_acceptance_rubric.sh r5
+bash scripts/verify_acceptance_rubric.sh r8
 ```
 
 Expected behavior:
 
 - Exit `0` and print `PASS` only when every rubric check is proven.
 - Print `UNVERIFIED` and exit non-zero for any missing or failing proof.
-- Write evidence to `evidence/r5/` (or generally `evidence/<loop-id>/`) with command logs and `README.md`.
+- Write evidence to `evidence/r8/` (or generally `evidence/<loop-id>/`) with command logs and `README.md`.
 
 ## Fresh-Clone and Clean-Shell Repro Path
 
@@ -42,8 +42,8 @@ Use this sequence to prove reproducibility from a fresh clone and a clean shell.
 ```bash
 git clone <repo-url> yarli
 cd yarli
-docker rm -f yarli-r5-postgres >/dev/null 2>&1 || true
-docker run -d --name yarli-r5-postgres \
+docker rm -f yarli-r8-postgres >/dev/null 2>&1 || true
+docker run -d --name yarli-r8-postgres \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB=postgres \
@@ -53,16 +53,16 @@ until pg_isready -h 127.0.0.1 -p 55432 -U postgres -d postgres >/dev/null 2>&1; 
 env -i HOME="$HOME" PATH="$PATH" bash --noprofile --norc -lc '
   export YARLI_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55432/postgres
   export YARLI_REQUIRE_POSTGRES_TESTS=1
-  bash scripts/verify_acceptance_rubric.sh r5
+  bash scripts/verify_acceptance_rubric.sh r8
 '
-docker rm -f yarli-r5-postgres
+docker rm -f yarli-r8-postgres
 ```
 
 Expected verification signals:
 
 - Command output prints `PASS`.
 - Exit code is `0`.
-- `evidence/r5/README.md` records command blocks with `Exit Code:` and `Key Output:`.
+- `evidence/r8/README.md` records command blocks with `Exit Code:` and `Key Output:`.
 
 ## Durable Local Configuration
 
@@ -77,6 +77,35 @@ database_url = "postgres://postgres:postgres@localhost:5432/yarli"
 ```
 
 `core.backend = "in-memory"` is supported only for explicit ephemeral workflows, and write commands are blocked unless `core.allow_in_memory_writes = true`.
+
+## Execution Backend Selection
+
+Native process execution remains default:
+
+```toml
+[execution]
+runner = "native"
+```
+
+Optional Overwatch-backed execution is opt-in:
+
+```toml
+[execution]
+runner = "overwatch"
+
+[execution.overwatch]
+service_url = "http://127.0.0.1:8089"
+profile = "default"
+soft_timeout_seconds = 900
+silent_timeout_seconds = 300
+max_log_bytes = 131072
+```
+
+Behavior notes:
+
+- `runner = "native"` keeps current local process behavior unchanged.
+- `runner = "overwatch"` submits commands to Overwatch (`/run`), polls `/status/{task_id}`, reads final logs from `/output/{task_id}`, and maps terminal state into YARLI command transitions.
+- Scheduler shutdown cancellation propagates to command execution; Overwatch runner calls `/cancel/{task_id}` for in-flight tasks.
 
 ## Runtime Resource and Token Budgets
 
@@ -101,6 +130,23 @@ Operator-visible command surfaces for resource_usage and token_usage:
 - `yarli run status <run-id>`: shows per-task `budget_exceeded`, `token_usage` (prompt_tokens, completion_tokens, total_tokens), and `resource_usage` (max_rss_bytes).
 - `yarli run explain-exit <run-id>`: shows `Budget breaches:` section with task name and breach detail, plus per-task token and resource usage.
 - `yarli task explain <task-id>`: shows `budget_exceeded` reason, token usage, and resource usage for individual tasks.
+
+## Sequence Deterioration Observer
+
+YARLI emits rolling deterioration analysis events (`run.observer.deterioration`) during run execution.
+The observer consumes event deltas incrementally using event-store cursor reads (`after_event_id`), not full-history rescans.
+
+Signals included in the score:
+
+- Runtime drift for repeated command keys.
+- Retry inflation and blocker churn.
+- Failure-rate drift by reason bucket.
+- Budget headroom erosion (when observed/limit values are present).
+
+Operator surfaces:
+
+- `yarli run status <run-id>` includes latest deterioration score/trend/factors when available.
+- `yarli run explain-exit <run-id>` includes a sequence deterioration section.
 
 ## Reproducing Budget Stress Checks Locally
 

@@ -59,6 +59,10 @@ pub struct CommandResult {
     pub execution: CommandExecution,
     /// All captured output chunks.
     pub chunks: Vec<StreamChunk>,
+    /// Actor label for persisted journal events.
+    pub runner_actor: String,
+    /// Optional backend-specific metadata for audit/debug.
+    pub backend_metadata: Option<serde_json::Value>,
 }
 
 /// Trait for running commands. Implementations must be Send + Sync for
@@ -261,7 +265,12 @@ impl CommandRunner for LocalCommandRunner {
                     .exit(exit_code, "local_runner", None)
                     .map_err(ExecError::Transition)?;
                 info!(cmd_id = %cmd_id, exit_code, "command exited");
-                Ok(CommandResult { execution, chunks })
+                Ok(CommandResult {
+                    execution,
+                    chunks,
+                    runner_actor: "local_runner".to_string(),
+                    backend_metadata: None,
+                })
             }
             Err(ExecError::Timeout(dur)) => {
                 execution.chunk_count = seq;
@@ -273,7 +282,12 @@ impl CommandRunner for LocalCommandRunner {
                         None,
                     )
                     .map_err(ExecError::Transition)?;
-                Ok(CommandResult { execution, chunks })
+                Ok(CommandResult {
+                    execution,
+                    chunks,
+                    runner_actor: "local_runner".to_string(),
+                    backend_metadata: None,
+                })
             }
             Err(ExecError::Killed { ref reason }) => {
                 execution.chunk_count = seq;
@@ -285,14 +299,19 @@ impl CommandRunner for LocalCommandRunner {
                         None,
                     )
                     .map_err(ExecError::Transition)?;
-                Ok(CommandResult { execution, chunks })
+                Ok(CommandResult {
+                    execution,
+                    chunks,
+                    runner_actor: "local_runner".to_string(),
+                    backend_metadata: None,
+                })
             }
             Err(e) => Err(e),
         }
     }
 }
 
-fn estimate_token_usage(command: &str, chunks: &[StreamChunk]) -> TokenUsage {
+pub(crate) fn estimate_token_usage(command: &str, chunks: &[StreamChunk]) -> TokenUsage {
     let prompt_tokens = estimate_tokens(command);
     let completion_chars: u64 = chunks.iter().map(|c| c.data.chars().count() as u64).sum();
     let completion_tokens = if completion_chars == 0 {

@@ -52,10 +52,11 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
                 "command": result.execution.command,
                 "working_dir": result.execution.working_dir,
                 "command_class": result.execution.command_class,
+                "backend_metadata": result.backend_metadata,
             }),
             correlation_id,
             causation_id: None,
-            actor: "local_runner".to_string(),
+            actor: result.runner_actor.clone(),
             idempotency_key: result
                 .execution
                 .idempotency_key
@@ -81,7 +82,7 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
                 }),
                 correlation_id,
                 causation_id: None,
-                actor: "local_runner".to_string(),
+                actor: result.runner_actor.clone(),
                 idempotency_key: result
                     .execution
                     .idempotency_key
@@ -115,10 +116,11 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
                 "chunk_count": result.execution.chunk_count,
                 "resource_usage": result.execution.resource_usage,
                 "token_usage": result.execution.token_usage,
+                "backend_metadata": result.backend_metadata,
             }),
             correlation_id,
             causation_id: None,
-            actor: "local_runner".to_string(),
+            actor: result.runner_actor.clone(),
             idempotency_key: result
                 .execution
                 .idempotency_key
@@ -401,5 +403,29 @@ mod tests {
         assert_eq!(terminal.event_type, "command.exited");
         let exit_code = terminal.payload["exit_code"].as_i64();
         assert_eq!(exit_code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn test_journal_native_runner_actor_unchanged() {
+        let store = InMemoryEventStore::new();
+        let runner = LocalCommandRunner::new();
+        let journal = CommandJournal::new(runner, &store);
+        let cancel = CancellationToken::new();
+
+        let req = CommandRequest {
+            task_id: Uuid::now_v7(),
+            run_id: Uuid::now_v7(),
+            command: "echo actor".to_string(),
+            working_dir: "/tmp".to_string(),
+            command_class: CommandClass::Io,
+            correlation_id: Uuid::now_v7(),
+            idempotency_key: None,
+            timeout: None,
+            env: vec![],
+        };
+
+        journal.execute(req, cancel).await.unwrap();
+        let events = store.all().unwrap();
+        assert!(events.iter().all(|event| event.actor == "local_runner"));
     }
 }

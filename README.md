@@ -1,6 +1,11 @@
 # YARLI
 
-YARLI is a Rust workspace for durable run/task orchestration with event sourcing, queue scheduling, git workflow controls, and a minimal API surface.
+YARLI is a Rust workspace for durable run/task orchestration with event sourcing, queue scheduling, and git workflow controls.
+
+Execution backends:
+
+- `execution.runner = "native"` (default)
+- `execution.runner = "overwatch"` (opt-in; Overwatch service API integration)
 
 ## Quick Verification
 
