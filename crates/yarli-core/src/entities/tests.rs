@@ -367,6 +367,69 @@ mod task_tests {
         assert_eq!(t.correlation_id, task.correlation_id);
         assert_eq!(t.entity_kind, "task");
     }
+
+    #[test]
+    fn last_error_set_on_first_call_only() {
+        let mut task = make_task();
+        assert!(task.last_error.is_none());
+
+        task.set_last_error("command exited with code 1");
+        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+
+        // Second call should not overwrite.
+        task.set_last_error("command killed");
+        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+    }
+
+    #[test]
+    fn blocker_detail_set_and_clear() {
+        let mut task = make_task();
+        assert!(task.blocker_detail.is_none());
+
+        task.set_blocker_detail("see blocker-001.md");
+        assert_eq!(task.blocker_detail.as_deref(), Some("see blocker-001.md"));
+
+        // Overwrite is allowed for blocker_detail.
+        task.set_blocker_detail("see blocker-002.md");
+        assert_eq!(task.blocker_detail.as_deref(), Some("see blocker-002.md"));
+
+        task.clear_blocker_detail();
+        assert!(task.blocker_detail.is_none());
+    }
+
+    #[test]
+    fn new_task_has_no_last_error_or_blocker_detail() {
+        let task = make_task();
+        assert!(task.last_error.is_none());
+        assert!(task.blocker_detail.is_none());
+    }
+
+    #[test]
+    fn last_error_preserved_across_transitions() {
+        let mut task = make_task();
+
+        // Move to executing.
+        task.transition(TaskState::TaskReady, "deps met", "scheduler", None)
+            .unwrap();
+        task.transition(TaskState::TaskExecuting, "claimed", "worker", None)
+            .unwrap();
+
+        // First failure sets last_error.
+        task.set_last_error("command exited with code 1");
+        task.transition(TaskState::TaskFailed, "nonzero exit", "worker", None)
+            .unwrap();
+        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+
+        // Retry and kill — last_error preserved.
+        task.transition(TaskState::TaskReady, "retry", "scheduler", None)
+            .unwrap();
+        task.transition(TaskState::TaskExecuting, "claimed", "worker", None)
+            .unwrap();
+        task.set_last_error("command killed"); // Should NOT overwrite.
+        task.transition(TaskState::TaskFailed, "killed", "worker", None)
+            .unwrap();
+        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+    }
 }
 
 #[cfg(test)]

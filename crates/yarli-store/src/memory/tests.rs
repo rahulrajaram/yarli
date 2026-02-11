@@ -274,8 +274,10 @@ fn query_by_event_type() {
         .append(make_event(EntityType::Task, "t2", "state_transition"))
         .unwrap();
 
-    let mut q = EventQuery::default();
-    q.event_type = Some("state_transition".to_string());
+    let q = EventQuery {
+        event_type: Some("state_transition".to_string()),
+        ..EventQuery::default()
+    };
     let results = store.query(&q).unwrap();
     assert_eq!(results.len(), 2);
 }

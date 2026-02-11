@@ -57,6 +57,12 @@ pub struct Task {
     pub max_attempts: u32,
     /// Blocker code when in `TaskBlocked` state.
     pub blocker: Option<BlockerCode>,
+    /// Root-cause error message preserved across state changes.
+    /// Set on first failure; not overwritten by subsequent kills or timeouts.
+    pub last_error: Option<String>,
+    /// Free-form annotation for blocker context (e.g. "see blocker-001.md").
+    /// Set by external agents or the `task annotate` CLI command.
+    pub blocker_detail: Option<String>,
     /// Correlation ID (inherited from parent run).
     pub correlation_id: CorrelationId,
     /// When the task was created.
@@ -89,6 +95,8 @@ impl Task {
             attempt_no: 1,
             max_attempts: 3,
             blocker: None,
+            last_error: None,
+            blocker_detail: None,
             correlation_id,
             created_at: now,
             updated_at: now,
@@ -113,6 +121,24 @@ impl Task {
     pub fn with_max_attempts(mut self, max: u32) -> Self {
         self.max_attempts = max;
         self
+    }
+
+    /// Set the root-cause error message. Only sets if not already populated,
+    /// preserving the original failure reason across subsequent state changes.
+    pub fn set_last_error(&mut self, error: impl Into<String>) {
+        if self.last_error.is_none() {
+            self.last_error = Some(error.into());
+        }
+    }
+
+    /// Set the blocker detail annotation.
+    pub fn set_blocker_detail(&mut self, detail: impl Into<String>) {
+        self.blocker_detail = Some(detail.into());
+    }
+
+    /// Clear the blocker detail annotation.
+    pub fn clear_blocker_detail(&mut self) {
+        self.blocker_detail = None;
     }
 
     /// Attach evidence to this task.
@@ -198,6 +224,6 @@ impl Task {
     where
         F: Fn(&TaskId) -> bool,
     {
-        self.depends_on.iter().all(|dep| is_complete(dep))
+        self.depends_on.iter().all(is_complete)
     }
 }

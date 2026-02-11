@@ -251,10 +251,7 @@ impl CommandRunner for LocalCommandRunner {
 
         let resource_usage = if let Some((stop_tx, monitor_handle)) = monitor {
             let _ = stop_tx.send(());
-            match monitor_handle.await {
-                Ok(usage) => usage,
-                Err(_) => None,
-            }
+            monitor_handle.await.unwrap_or_default()
         } else {
             None
         };

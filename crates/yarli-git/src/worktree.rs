@@ -157,7 +157,7 @@ impl LocalWorktreeManager {
 
         debug!(cwd = %cwd.display(), args = ?args, "running git command");
 
-        let child = cmd.spawn().map_err(|e| GitError::Io(e))?;
+        let child = cmd.spawn().map_err(GitError::Io)?;
 
         tokio::select! {
             biased;

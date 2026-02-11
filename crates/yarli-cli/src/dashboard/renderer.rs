@@ -96,7 +96,7 @@ impl DashboardRenderer {
             } => {
                 self.state.update_task(task_id, &task_name, to, elapsed);
                 if to == TaskState::TaskExecuting {
-                    self.spinners.entry(task_id).or_insert_with(Spinner::new);
+                    self.spinners.entry(task_id).or_default();
                 }
                 if to.is_terminal() {
                     self.spinners.remove(&task_id);
@@ -395,7 +395,7 @@ pub fn build_task_list_lines<'a>(
 
         let elapsed_str = task
             .elapsed
-            .map(|d| format_compact_duration(d))
+            .map(format_compact_duration)
             .unwrap_or_default();
 
         let cursor = if is_selected { ">" } else { " " };
@@ -533,7 +533,7 @@ pub fn build_title_line<'a>(state: &PanelManager) -> Line<'a> {
 
     Line::from(vec![
         Span::styled(
-            format!(" YARLI Dashboard "),
+            " YARLI Dashboard ".to_string(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

@@ -104,7 +104,7 @@ pub enum BackendSelection {
     Postgres { database_url: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct YarliConfig {
     #[serde(default)]
     pub core: CoreConfig,
@@ -134,27 +134,10 @@ pub struct YarliConfig {
     pub observability: ObservabilityConfig,
     #[serde(default)]
     pub ui: UiConfig,
-}
-
-impl Default for YarliConfig {
-    fn default() -> Self {
-        Self {
-            core: CoreConfig::default(),
-            postgres: PostgresConfig::default(),
-            cli: CliConfig::default(),
-            event_loop: EventLoopConfig::default(),
-            features: FeaturesConfig::default(),
-            queue: QueueConfig::default(),
-            execution: ExecutionConfig::default(),
-            run: RunConfig::default(),
-            budgets: BudgetsConfig::default(),
-            git: GitConfig::default(),
-            policy: PolicyConfig::default(),
-            memory: MemoryConfig::default(),
-            observability: ObservabilityConfig::default(),
-            ui: UiConfig::default(),
-        }
-    }
+    /// sw4rm agent integration (only compiled with `sw4rm` feature).
+    #[cfg(feature = "sw4rm")]
+    #[serde(default)]
+    pub sw4rm: yarli_sw4rm::Sw4rmConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,19 +189,13 @@ fn default_safe_mode() -> SafeMode {
     SafeMode::Execute
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PostgresConfig {
     #[serde(default)]
     pub database_url: Option<String>,
 }
 
-impl Default for PostgresConfig {
-    fn default() -> Self {
-        Self { database_url: None }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CliConfig {
     /// Named backend for operator readability (codex|claude|gemini|custom).
     #[serde(default)]
@@ -232,17 +209,6 @@ pub struct CliConfig {
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
-}
-
-impl Default for CliConfig {
-    fn default() -> Self {
-        Self {
-            backend: None,
-            prompt_mode: PromptMode::default(),
-            command: None,
-            args: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -292,16 +258,10 @@ fn default_checkpoint_interval() -> u32 {
     5
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct FeaturesConfig {
     #[serde(default)]
     pub parallel: bool,
-}
-
-impl Default for FeaturesConfig {
-    fn default() -> Self {
-        Self { parallel: false }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -554,7 +514,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MemoryConfig {
     /// Master switch. When unset, defaults to `memory.backend.enabled`.
     ///
@@ -567,16 +527,6 @@ pub struct MemoryConfig {
     pub project_id: Option<String>,
     #[serde(default)]
     pub backend: MemoryBackendConfig,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: None,
-            project_id: None,
-            haake: MemoryBackendConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -645,18 +595,10 @@ fn default_audit_file() -> String {
     ".yarl/audit.jsonl".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct UiConfig {
     #[serde(default)]
     pub mode: UiMode,
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            mode: UiMode::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -683,7 +625,7 @@ mod tests {
         assert_eq!(loaded.config().core.backend, BackendKind::InMemory);
         assert!(!loaded.config().core.allow_in_memory_writes);
         assert_eq!(loaded.config().event_loop.max_iterations, 5);
-        assert_eq!(loaded.config().features.parallel, false);
+        assert!(!loaded.config().features.parallel);
         assert_eq!(loaded.config().execution.runner, ExecutionRunner::Native);
         assert_eq!(loaded.config().execution.working_dir, ".");
     }
@@ -776,7 +718,7 @@ mode = "stream"
         assert_eq!(loaded.config().cli.backend.as_deref(), Some("codex"));
         assert_eq!(loaded.config().cli.command.as_deref(), Some("codex"));
         assert_eq!(loaded.config().event_loop.max_iterations, 3);
-        assert_eq!(loaded.config().features.parallel, true);
+        assert!(loaded.config().features.parallel);
         assert_eq!(loaded.config().execution.runner, ExecutionRunner::Overwatch);
         assert_eq!(
             loaded.config().execution.overwatch.service_url,
@@ -790,7 +732,7 @@ mode = "stream"
             loaded.config().execution.overwatch.max_log_bytes,
             Some(2048)
         );
-        assert_eq!(loaded.config().memory.backend.enabled, true);
+        assert!(loaded.config().memory.backend.enabled);
         assert_eq!(loaded.config().memory.backend.command, "memory-backend");
         assert_eq!(
             loaded.config().memory.backend.project_dir.as_deref(),

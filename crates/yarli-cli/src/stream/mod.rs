@@ -6,11 +6,13 @@
 //! Used in CI, pipes, small terminals.
 
 pub mod events;
+pub mod headless;
 pub mod renderer;
 pub mod spinner;
 pub mod style;
 
 pub use events::{StreamEvent, TaskView};
+pub use headless::HeadlessRenderer;
 pub use renderer::{StreamConfig, StreamRenderer};
 pub use spinner::Spinner;
 pub use style::Tier;

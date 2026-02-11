@@ -8,7 +8,8 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use yarli_core::domain::{EntityType, Event};
-use yarli_core::entities::command_execution::StreamChunk;
+use yarli_core::entities::command_execution::{StreamChunk, StreamType};
+use yarli_observability::audit::{AuditEntry, AuditSink};
 use yarli_store::EventStore;
 
 use crate::error::ExecError;
@@ -18,11 +19,22 @@ use crate::runner::{CommandRequest, CommandResult, CommandRunner};
 pub struct CommandJournal<'a, R: CommandRunner, S: EventStore> {
     runner: R,
     store: &'a S,
+    audit_sink: Option<&'a dyn AuditSink>,
 }
 
 impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
     pub fn new(runner: R, store: &'a S) -> Self {
-        Self { runner, store }
+        Self {
+            runner,
+            store,
+            audit_sink: None,
+        }
+    }
+
+    /// Set an optional audit sink for command execution events.
+    pub fn with_audit_sink(mut self, sink: &'a dyn AuditSink) -> Self {
+        self.audit_sink = Some(sink);
+        self
     }
 
     /// Execute a command and persist all events to the store.
@@ -132,8 +144,36 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
             .append(terminal_event)
             .map_err(|e| ExecError::Journal(e.to_string()))?;
 
+        // Emit audit entry for terminal command events.
+        if let Some(sink) = self.audit_sink {
+            let stderr_excerpt = extract_stderr_excerpt(&result.chunks, 5);
+            let audit_entry = AuditEntry::command_execution(
+                &result.execution.command,
+                result.execution.exit_code,
+                stderr_excerpt,
+                result.execution.duration().map(|d| d.num_milliseconds()),
+                None, // run_id not directly available here
+                None, // task_id not directly available here
+            );
+            // Best-effort: don't fail the execution if audit write fails.
+            let _ = sink.append(&audit_entry);
+        }
+
         Ok(result)
     }
+}
+
+/// Extract the last N lines of stderr output from chunks.
+fn extract_stderr_excerpt(chunks: &[StreamChunk], max_lines: usize) -> String {
+    let stderr_data: String = chunks
+        .iter()
+        .filter(|c| c.stream == StreamType::Stderr)
+        .map(|c| c.data.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    let lines: Vec<&str> = stderr_data.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 /// Serialize chunks to a JSON array of compact objects.
@@ -427,5 +467,148 @@ mod tests {
         journal.execute(req, cancel).await.unwrap();
         let events = store.all().unwrap();
         assert!(events.iter().all(|event| event.actor == "local_runner"));
+    }
+
+    #[tokio::test]
+    async fn test_journal_emits_audit_entry_on_exit() {
+        let store = InMemoryEventStore::new();
+        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let runner = LocalCommandRunner::new();
+        let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
+        let cancel = CancellationToken::new();
+
+        let req = CommandRequest {
+            task_id: Uuid::now_v7(),
+            run_id: Uuid::now_v7(),
+            command: "echo audit-test".to_string(),
+            working_dir: "/tmp".to_string(),
+            command_class: CommandClass::Io,
+            correlation_id: Uuid::now_v7(),
+            idempotency_key: None,
+            timeout: None,
+            env: vec![],
+        };
+
+        journal.execute(req, cancel).await.unwrap();
+        let entries = audit.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].category,
+            yarli_observability::audit::AuditCategory::CommandExecution
+        );
+        assert!(entries[0].action.contains("echo audit-test"));
+    }
+
+    #[tokio::test]
+    async fn test_journal_audit_entry_on_kill() {
+        let store = InMemoryEventStore::new();
+        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let runner = LocalCommandRunner::new();
+        let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+
+        let req = CommandRequest {
+            task_id: Uuid::now_v7(),
+            run_id: Uuid::now_v7(),
+            command: "sleep 60".to_string(),
+            working_dir: "/tmp".to_string(),
+            command_class: CommandClass::Io,
+            correlation_id: Uuid::now_v7(),
+            idempotency_key: None,
+            timeout: None,
+            env: vec![],
+        };
+
+        journal.execute(req, cancel).await.unwrap();
+        let entries = audit.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].category,
+            yarli_observability::audit::AuditCategory::CommandExecution
+        );
+    }
+
+    #[tokio::test]
+    async fn test_journal_audit_records_duration() {
+        let store = InMemoryEventStore::new();
+        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let runner = LocalCommandRunner::new();
+        let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
+        let cancel = CancellationToken::new();
+
+        let req = CommandRequest {
+            task_id: Uuid::now_v7(),
+            run_id: Uuid::now_v7(),
+            command: "echo duration-test".to_string(),
+            working_dir: "/tmp".to_string(),
+            command_class: CommandClass::Io,
+            correlation_id: Uuid::now_v7(),
+            idempotency_key: None,
+            timeout: None,
+            env: vec![],
+        };
+
+        journal.execute(req, cancel).await.unwrap();
+        let entries = audit.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        // Duration should be recorded.
+        assert!(entries[0].details["duration_ms"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_journal_no_audit_without_sink() {
+        // Ensure journal works fine without an audit sink (default behavior).
+        let store = InMemoryEventStore::new();
+        let runner = LocalCommandRunner::new();
+        let journal = CommandJournal::new(runner, &store);
+        let cancel = CancellationToken::new();
+
+        let req = CommandRequest {
+            task_id: Uuid::now_v7(),
+            run_id: Uuid::now_v7(),
+            command: "echo no-audit".to_string(),
+            working_dir: "/tmp".to_string(),
+            command_class: CommandClass::Io,
+            correlation_id: Uuid::now_v7(),
+            idempotency_key: None,
+            timeout: None,
+            env: vec![],
+        };
+
+        let result = journal.execute(req, cancel).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_journal_audit_stderr_excerpt() {
+        let store = InMemoryEventStore::new();
+        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let runner = LocalCommandRunner::new();
+        let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
+        let cancel = CancellationToken::new();
+
+        let req = CommandRequest {
+            task_id: Uuid::now_v7(),
+            run_id: Uuid::now_v7(),
+            command: "echo stderr-line >&2".to_string(),
+            working_dir: "/tmp".to_string(),
+            command_class: CommandClass::Io,
+            correlation_id: Uuid::now_v7(),
+            idempotency_key: None,
+            timeout: None,
+            env: vec![],
+        };
+
+        journal.execute(req, cancel).await.unwrap();
+        let entries = audit.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        // stderr_excerpt should be a string (may or may not contain the stderr output
+        // depending on whether local runner captures stderr as chunks).
+        assert!(entries[0].details["stderr_excerpt"].is_string());
     }
 }

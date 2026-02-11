@@ -45,6 +45,8 @@ pub enum AuditCategory {
     TokenConsumed,
     /// A gate evaluation completed.
     GateEvaluation,
+    /// A command execution terminal event (exited, killed, timed out).
+    CommandExecution,
 }
 
 /// A single audit record, serialized as one JSON line.
@@ -139,6 +141,41 @@ impl AuditEntry {
             run_id,
             task_id,
             details: serde_json::json!({ "token_id": token_id }),
+        }
+    }
+
+    /// Create a command execution audit entry for terminal events.
+    pub fn command_execution(
+        command_key: impl Into<String>,
+        exit_code: Option<i32>,
+        stderr_excerpt: impl Into<String>,
+        duration_ms: Option<i64>,
+        run_id: Option<RunId>,
+        task_id: Option<TaskId>,
+    ) -> Self {
+        let cmd = command_key.into();
+        let action = format!("command.execution:{cmd}");
+        Self {
+            audit_id: Uuid::now_v7(),
+            timestamp: Utc::now(),
+            category: AuditCategory::CommandExecution,
+            actor: "command_journal".to_string(),
+            action,
+            outcome: None,
+            rule_id: None,
+            reason: format!(
+                "exit_code={} duration_ms={}",
+                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                duration_ms.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+            ),
+            run_id,
+            task_id,
+            details: serde_json::json!({
+                "command": cmd,
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+                "stderr_excerpt": stderr_excerpt.into(),
+            }),
         }
     }
 
@@ -629,6 +666,7 @@ mod tests {
             AuditCategory::DestructiveAttempt,
             AuditCategory::TokenConsumed,
             AuditCategory::GateEvaluation,
+            AuditCategory::CommandExecution,
         ];
         for cat in &categories {
             let json = serde_json::to_string(cat).unwrap();
@@ -709,5 +747,64 @@ mod tests {
 
         let entries = sink.read_all().unwrap();
         assert_eq!(entries[0].details, details);
+    }
+
+    // ---- CommandExecution audit entries ----
+
+    #[test]
+    fn command_execution_creates_entry() {
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let entry = AuditEntry::command_execution(
+            "cargo test",
+            Some(1),
+            "error: test failed",
+            Some(3400),
+            Some(run_id),
+            Some(task_id),
+        );
+
+        assert_eq!(entry.category, AuditCategory::CommandExecution);
+        assert_eq!(entry.actor, "command_journal");
+        assert!(entry.action.contains("cargo test"));
+        assert_eq!(entry.run_id, Some(run_id));
+        assert_eq!(entry.task_id, Some(task_id));
+        assert_eq!(entry.details["exit_code"], 1);
+        assert_eq!(entry.details["duration_ms"], 3400);
+        assert_eq!(entry.details["stderr_excerpt"], "error: test failed");
+    }
+
+    #[test]
+    fn command_execution_with_no_exit_code() {
+        let entry = AuditEntry::command_execution("sleep 60", None, "", None, None, None);
+        assert_eq!(entry.category, AuditCategory::CommandExecution);
+        assert!(entry.details["exit_code"].is_null());
+        assert!(entry.details["duration_ms"].is_null());
+    }
+
+    #[test]
+    fn command_execution_category_serializes() {
+        let cat = AuditCategory::CommandExecution;
+        let json = serde_json::to_string(&cat).unwrap();
+        assert_eq!(json, "\"command_execution\"");
+        let decoded: AuditCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, AuditCategory::CommandExecution);
+    }
+
+    #[test]
+    fn command_execution_roundtrip() {
+        let entry = AuditEntry::command_execution(
+            "echo hello",
+            Some(0),
+            "",
+            Some(100),
+            None,
+            None,
+        );
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.audit_id, entry.audit_id);
+        assert_eq!(decoded.category, AuditCategory::CommandExecution);
+        assert_eq!(decoded.details["command"], "echo hello");
     }
 }

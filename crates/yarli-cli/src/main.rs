@@ -20,7 +20,7 @@ use yarli_cli::config::{BackendSelection, ExecutionRunner, LoadedConfig, DEFAULT
 use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
 use yarli_cli::prompt;
-use yarli_cli::stream::{StreamConfig, StreamEvent, StreamRenderer};
+use yarli_cli::stream::{HeadlessRenderer, StreamConfig, StreamEvent, StreamRenderer};
 use yarli_core::domain::{CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode};
 use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use yarli_core::entities::merge_intent::{MergeIntent, MergeStrategy};
@@ -189,6 +189,15 @@ commands unless `core.allow_in_memory_writes = true`.
 
 [ui]
 - ui.mode (default: "auto"; values: auto|stream|tui)
+
+[sw4rm] (requires `--features sw4rm` at build time)
+- sw4rm.agent_name (default: "yarli-orchestrator")
+- sw4rm.capabilities (default: ["orchestrate", "verify", "git"])
+- sw4rm.registry_url (default: "http://127.0.0.1:50051")
+- sw4rm.router_url (default: "http://127.0.0.1:50052")
+- sw4rm.scheduler_url (default: "http://127.0.0.1:50053")
+- sw4rm.max_fix_iterations (default: 5)
+- sw4rm.llm_response_timeout_secs (default: 300)
 
 Examples:
 - yarli init
@@ -518,7 +527,10 @@ enum InitBackend {
 
 #[derive(Subcommand)]
 enum RunAction {
-    /// Start a new orchestration run.
+    #[command(
+        about = "Start a new orchestration run",
+        long_about = "Start a new orchestration run with an explicit objective and commands.\n\nProvide commands via `--cmd` (repeatable) or reference a named pace from\nyarli.toml via `--pace`. The two are mutually exclusive.\n\nExamples:\n  yarli run start \"fix linting\" --cmd \"cargo clippy -- -D warnings\"\n  yarli run start \"full check\" -c \"cargo fmt --check\" -c \"cargo test\"\n  yarli run start \"deploy\" --pace deploy -w /opt/app\n  yarli run start \"build\" --cmd \"make\" --timeout 600"
+    )]
     Start {
         /// The objective describing what this run should accomplish.
         objective: String,
@@ -535,7 +547,10 @@ enum RunAction {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// Start the default verification loop (config-backed) for this workspace.
+    #[command(
+        about = "Start the default verification loop (config-backed) for this workspace",
+        long_about = "Start the default verification loop using a named pace from yarli.toml.\n\nResolves the pace in this order:\n1. Explicit `--pace` argument\n2. A pace named \"batch\" if it exists in [run.paces]\n3. The value of `run.default_pace`\n\nThis is a legacy/back-compat entry point; prefer `yarli run` (PROMPT.md-based) for\nnew projects.\n\nExamples:\n  yarli run batch\n  yarli run batch --pace ci\n  yarli run batch --objective \"nightly check\" -w /repo --timeout 900"
+    )]
     Batch {
         /// Optional objective label (defaults to "batch").
         #[arg(long)]
@@ -550,53 +565,91 @@ enum RunAction {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// Show the current status of a run.
+    #[command(
+        about = "Show the current status of a run",
+        long_about = "Show the current status of a run.\n\nDisplays the run state, objective, task summary, and gate evaluation results.\nIf Memory backend is enabled, includes relevant memory hints.\n\nExamples:\n  yarli run status 019577a2-...\n  yarli run status <run-id>"
+    )]
     Status {
-        /// Run ID to query.
+        /// Run ID to query (UUID).
         run_id: String,
     },
-    /// Explain why a run is not done (Why Not Done? engine).
+    #[command(
+        about = "Explain why a run is not done (Why Not Done? engine)",
+        long_about = "Explain why a run is not done (Why Not Done? engine).\n\nRuns the explain engine to diagnose why a run hasn't completed. Reports:\n- Open/blocked tasks and their blockers\n- Failed gate evaluations\n- Policy denials\n- Deterioration trends (repeated failures)\n\nExamples:\n  yarli run explain-exit 019577a2-...\n  yarli run explain-exit <run-id>"
+    )]
     ExplainExit {
-        /// Run ID to explain.
+        /// Run ID to explain (UUID).
         run_id: String,
     },
+    #[cfg(feature = "sw4rm")]
+    #[command(
+        about = "Run as a sw4rm orchestrator agent (requires `sw4rm` feature)",
+        long_about = "Run as a sw4rm orchestrator agent.\n\nBoots yarli as an agent in the sw4rm multi-agent protocol. The agent:\n1. Registers with the sw4rm registry\n2. Receives objectives from the sw4rm scheduler\n3. Dispatches implementation work to LLM agents via the router\n4. Verifies results using yarli's scheduler and gate engine\n5. Iterates (dispatch -> verify -> fix) until success or max iterations\n\nConfiguration is read from the `[sw4rm]` section of yarli.toml:\n- sw4rm.agent_name (default: \"yarli-orchestrator\")\n- sw4rm.capabilities (default: [\"orchestrate\", \"verify\", \"git\"])\n- sw4rm.registry_url (default: \"http://127.0.0.1:50051\")\n- sw4rm.router_url (default: \"http://127.0.0.1:50052\")\n- sw4rm.scheduler_url (default: \"http://127.0.0.1:50053\")\n- sw4rm.max_fix_iterations (default: 5)\n- sw4rm.llm_response_timeout_secs (default: 300)\n\nVerification commands are loaded from PROMPT.md if available, otherwise\ndefaults to `cargo build`.\n\nNote: requires `--features sw4rm` at build time.\n\nExamples:\n  yarli run sw4rm\n  YARLI_LOG=debug yarli run sw4rm"
+    )]
+    Sw4rm,
 }
 
 #[derive(Subcommand)]
 enum TaskAction {
-    /// List tasks for a run.
+    #[command(
+        about = "List tasks for a run",
+        long_about = "List tasks for a run.\n\nShows each task's ID, key, state, command class, and blocker (if any).\n\nExamples:\n  yarli task list 019577a2-...\n  yarli task list <run-id>"
+    )]
     List {
-        /// Run ID to list tasks for.
+        /// Run ID to list tasks for (UUID).
         run_id: String,
     },
-    /// Explain why a task is not done (Why Not Done? engine).
+    #[command(
+        about = "Explain why a task is not done (Why Not Done? engine)",
+        long_about = "Explain why a task is not done (Why Not Done? engine).\n\nRuns the explain engine on a single task to diagnose why it hasn't completed.\nReports blockers, dependency status, gate failures, and attempt history.\n\nExamples:\n  yarli task explain 019577a3-...\n  yarli task explain <task-id>"
+    )]
     Explain {
-        /// Task ID to explain.
+        /// Task ID to explain (UUID).
         task_id: String,
     },
-    /// Unblock a task (clear its blocker and transition to ready).
+    #[command(
+        about = "Unblock a task (clear its blocker and transition to ready)",
+        long_about = "Unblock a task (clear its blocker and transition to ready).\n\nClears the task's blocker and transitions it from Blocked to Ready so the\nscheduler can pick it up again. This is a write operation that requires\nPostgres durability or explicit in-memory opt-in.\n\nExamples:\n  yarli task unblock 019577a3-... --reason \"dependency resolved manually\"\n  yarli task unblock <task-id>\n  yarli task unblock <task-id> -r \"approved by operator\""
+    )]
     Unblock {
-        /// Task ID to unblock.
+        /// Task ID to unblock (UUID).
         task_id: String,
-        /// Reason for unblocking.
+        /// Reason for unblocking (recorded in audit log).
         #[arg(short, long, default_value = "manually unblocked")]
         reason: String,
+    },
+    #[command(
+        about = "Annotate a task with blocker detail (e.g. link to blocker file)",
+        long_about = "Annotate a task with blocker detail.\n\nSets a free-form annotation on the task that is displayed in `task explain`\nand `run status` output. Useful for linking to external blocker files\nor adding context about why a task is blocked.\n\nExamples:\n  yarli task annotate 019577a3-... --detail \"see blocker-001.md\"\n  yarli task annotate <task-id> -d \"waiting on upstream fix\""
+    )]
+    Annotate {
+        /// Task ID to annotate (UUID).
+        task_id: String,
+        /// Blocker detail text to attach to the task.
+        #[arg(short, long)]
+        detail: String,
     },
 }
 
 #[derive(Subcommand)]
 enum GateAction {
-    /// List configured gates for a run or task.
+    #[command(
+        about = "List configured gates for a run or task",
+        long_about = "List configured gates for a run or task.\n\nBy default lists task-level gates. Use `--run` to show run-level gates instead.\n\nTask gates: required_evidence_present, tests_passed, no_unresolved_conflicts,\n            worktree_consistent, policy_clean\nRun gates:  required_tasks_closed, required_evidence_present, no_unapproved_git_ops,\n            no_unresolved_conflicts, worktree_consistent, policy_clean\n\nExamples:\n  yarli gate list\n  yarli gate list --run"
+    )]
     List {
-        /// Show task-level gates (default), or --run for run-level gates.
+        /// Show run-level gates instead of the default task-level gates.
         #[arg(long)]
         run: bool,
     },
-    /// Re-run a specific gate evaluation.
+    #[command(
+        about = "Re-run a specific gate evaluation",
+        long_about = "Re-run gate evaluation for a task.\n\nRe-evaluates all gates for the given task, or a single gate if `--gate` is\nspecified. This is a write operation that requires Postgres durability or\nexplicit in-memory opt-in.\n\nValid gate names: required_tasks_closed, required_evidence_present, tests_passed,\n                  no_unapproved_git_ops, no_unresolved_conflicts, worktree_consistent,\n                  policy_clean\n\nExamples:\n  yarli gate rerun 019577a3-...\n  yarli gate rerun <task-id> --gate tests_passed\n  yarli gate rerun <task-id> -g policy_clean"
+    )]
     Rerun {
-        /// Task ID to re-evaluate gates for.
+        /// Task ID to re-evaluate gates for (UUID).
         task_id: String,
-        /// Specific gate name to re-run (e.g. "tests_passed"). If omitted, all gates are re-run.
+        /// Specific gate name to re-run. If omitted, all gates are re-run.
         #[arg(short, long)]
         gate: Option<String>,
     },
@@ -604,16 +657,22 @@ enum GateAction {
 
 #[derive(Subcommand)]
 enum WorktreeAction {
-    /// Show worktree status for a run.
+    #[command(
+        about = "Show worktree status for a run",
+        long_about = "Show worktree status for a run.\n\nLists all worktree bindings associated with the run, including their state,\nbranch, path, and submodule mode.\n\nExamples:\n  yarli worktree status 019577a2-...\n  yarli worktree status <run-id>"
+    )]
     Status {
-        /// Run ID to show worktree status for.
+        /// Run ID to show worktree status for (UUID).
         run_id: String,
     },
-    /// Recover from an interrupted git operation in a worktree.
+    #[command(
+        about = "Recover from an interrupted git operation in a worktree",
+        long_about = "Recover from an interrupted git operation in a worktree.\n\nWhen a git operation (merge, rebase, cherry-pick) is interrupted (e.g. by a\ncrash or signal), this command lets you resolve the worktree state.\n\nRecovery actions:\n  abort         — abort the in-progress operation and reset to pre-operation state\n  resume        — attempt to continue the interrupted operation\n  manual-block  — mark the worktree as manually blocked for operator intervention\n\nThis is a policy-gated write operation and is audited.\n\nExamples:\n  yarli worktree recover 019577a4-... --action abort\n  yarli worktree recover <worktree-id> -a resume\n  yarli worktree recover <worktree-id> --action manual-block"
+    )]
     Recover {
-        /// Worktree ID to recover.
+        /// Worktree ID to recover (UUID).
         worktree_id: String,
-        /// Recovery action: abort, resume, or manual-block.
+        /// Recovery action to take.
         #[arg(short, long, default_value = "abort")]
         action: String,
     },
@@ -621,42 +680,57 @@ enum WorktreeAction {
 
 #[derive(Subcommand)]
 enum MergeAction {
-    /// Request a new merge intent.
+    #[command(
+        about = "Request a new merge intent",
+        long_about = "Request a new merge intent.\n\nCreates a merge intent record that must be approved before execution.\nThe intent tracks the source and target refs, merge strategy, and\nassociated run.\n\nMerge strategies:\n  merge-no-ff    — create a merge commit even if fast-forward is possible (default)\n  rebase-then-ff — rebase source onto target, then fast-forward\n  squash-merge   — squash all source commits into a single merge commit\n\nThis is a policy-gated write operation and is audited.\n\nExamples:\n  yarli merge request feature/foo main --run-id 019577a2-...\n  yarli merge request feature/bar develop --run-id <id> --strategy rebase-then-ff\n  yarli merge request hotfix/fix main --run-id <id> --strategy squash-merge"
+    )]
     Request {
         /// Source branch or ref to merge from.
         source: String,
         /// Target branch or ref to merge into.
         target: String,
-        /// Run ID this merge belongs to.
+        /// Run ID this merge belongs to (UUID).
         #[arg(long)]
         run_id: String,
-        /// Merge strategy: merge-no-ff, rebase-then-ff, squash-merge.
+        /// Merge strategy to use.
         #[arg(long, default_value = "merge-no-ff")]
         strategy: String,
     },
-    /// Approve a pending merge intent.
+    #[command(
+        about = "Approve a pending merge intent",
+        long_about = "Approve a pending merge intent.\n\nTransitions the merge intent from Pending to Approved, allowing the merge\norchestrator to execute it. This is a policy-gated write operation and is audited.\n\nExamples:\n  yarli merge approve 019577a5-...\n  yarli merge approve <merge-id>"
+    )]
     Approve {
-        /// Merge intent ID to approve.
+        /// Merge intent ID to approve (UUID).
         merge_id: String,
     },
-    /// Reject a pending merge intent.
+    #[command(
+        about = "Reject a pending merge intent",
+        long_about = "Reject a pending merge intent.\n\nTransitions the merge intent from Pending to Rejected with a reason.\nThis is a policy-gated write operation and is audited.\n\nExamples:\n  yarli merge reject 019577a5-... --reason \"conflicts with release branch\"\n  yarli merge reject <merge-id> -r \"not ready\""
+    )]
     Reject {
-        /// Merge intent ID to reject.
+        /// Merge intent ID to reject (UUID).
         merge_id: String,
-        /// Reason for rejection.
+        /// Reason for rejection (recorded in audit log).
         #[arg(short, long, default_value = "rejected")]
         reason: String,
     },
-    /// Show status of a merge intent.
+    #[command(
+        about = "Show status of a merge intent",
+        long_about = "Show status of a merge intent.\n\nDisplays the merge intent's state, source/target refs, strategy, and\nassociated run.\n\nExamples:\n  yarli merge status 019577a5-...\n  yarli merge status <merge-id>"
+    )]
     Status {
-        /// Merge intent ID to query.
+        /// Merge intent ID to query (UUID).
         merge_id: String,
     },
 }
 
 #[derive(Subcommand)]
 enum AuditAction {
-    /// Tail the JSONL audit log.
+    #[command(
+        about = "Tail the JSONL audit log",
+        long_about = "Tail the JSONL audit log.\n\nReads the most recent entries from the audit log file and prints them.\nOptionally filter by category.\n\nCategories:\n  policy_decision      — policy engine allow/deny decisions\n  destructive_attempt   — blocked destructive git operations\n  token_consumed        — LLM token usage records\n  gate_evaluation       — gate pass/fail results\n\nExamples:\n  yarli audit tail\n  yarli audit tail --lines 50\n  yarli audit tail --category policy_decision\n  yarli audit tail --file /var/log/yarli-audit.jsonl -l 100 -c gate_evaluation"
+    )]
     Tail {
         /// Path to the audit JSONL file.
         #[arg(short, long, default_value = ".yarl/audit.jsonl")]
@@ -664,7 +738,7 @@ enum AuditAction {
         /// Number of most recent entries to show (0 = all).
         #[arg(short, long, default_value = "20")]
         lines: usize,
-        /// Filter by category (policy_decision, destructive_attempt, token_consumed, gate_evaluation).
+        /// Filter by category.
         #[arg(short, long)]
         category: Option<String>,
     },
@@ -764,11 +838,14 @@ async fn run() -> Result<()> {
             }
             Some(RunAction::Status { run_id }) => cmd_run_status(&run_id),
             Some(RunAction::ExplainExit { run_id }) => cmd_run_explain(&run_id),
+            #[cfg(feature = "sw4rm")]
+            Some(RunAction::Sw4rm) => cmd_run_sw4rm(&loaded_config).await,
         },
         Commands::Task { action } => match action {
             TaskAction::List { run_id } => cmd_task_list(&run_id),
             TaskAction::Explain { task_id } => cmd_task_explain(&task_id),
             TaskAction::Unblock { task_id, reason } => cmd_task_unblock(&task_id, &reason),
+            TaskAction::Annotate { task_id, detail } => cmd_task_annotate(&task_id, &detail),
         },
         Commands::Gate { action } => match action {
             GateAction::List { run } => cmd_gate_list(run),
@@ -1280,6 +1357,119 @@ where
     }
 }
 
+/// `yarli run sw4rm` — boot as a sw4rm orchestrator agent.
+///
+/// Reads `[sw4rm]` config from `yarli.toml`, creates the agent infrastructure,
+/// connects to the sw4rm runtime, and enters the agent message loop.
+#[cfg(feature = "sw4rm")]
+async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
+    use yarli_sw4rm::{
+        OrchestratorLoop, ShutdownBridge, YarliAgent,
+        orchestrator::{VerificationCommand, VerificationSpec},
+    };
+
+    let sw4rm_config = loaded_config.config().sw4rm.clone();
+    println!("Booting sw4rm agent: {}", sw4rm_config.agent_name);
+
+    // Build verification spec from PROMPT.md run spec if available
+    let verification = match yarli_cli::prompt::load_prompt_and_run_spec_from_cwd() {
+        Ok(loaded) => {
+            let commands: Vec<VerificationCommand> = loaded
+                .run_spec
+                .tasks
+                .items
+                .iter()
+                .map(|t| {
+                    let class = match t.class.as_deref().unwrap_or("io") {
+                        "cpu" => yarli_core::domain::CommandClass::Cpu,
+                        "git" => yarli_core::domain::CommandClass::Git,
+                        "tool" => yarli_core::domain::CommandClass::Tool,
+                        _ => yarli_core::domain::CommandClass::Io,
+                    };
+                    VerificationCommand {
+                        task_key: t.key.clone(),
+                        command: t.cmd.clone(),
+                        class,
+                    }
+                })
+                .collect();
+            VerificationSpec {
+                commands,
+                working_dir: loaded_config.config().execution.working_dir.clone(),
+                task_gates: None, // use defaults from yarli-gates
+                run_gates: None,
+            }
+        }
+        Err(_) => {
+            // No PROMPT.md — use a minimal verification spec
+            VerificationSpec {
+                commands: vec![VerificationCommand {
+                    task_key: "build".to_string(),
+                    command: "cargo build".to_string(),
+                    class: yarli_core::domain::CommandClass::Cpu,
+                }],
+                working_dir: loaded_config.config().execution.working_dir.clone(),
+                task_gates: None,
+                run_gates: None,
+            }
+        }
+    };
+
+    // NOTE: Using MockRouterSender — real RouterClient transport not yet implemented.
+    // The agent will boot and register but LLM dispatch will not function.
+    eprintln!("WARNING: using mock router sender — real sw4rm transport not yet implemented");
+    let router = std::sync::Arc::new(yarli_sw4rm::mock::MockRouterSender::new());
+    let orchestrator = std::sync::Arc::new(OrchestratorLoop::new(
+        router,
+        sw4rm_config.clone(),
+        verification,
+    ));
+
+    // Build sw4rm AgentConfig
+    let agent_config = sw4rm_sdk::AgentConfig::new(
+        sw4rm_config.agent_name.clone(),
+        format!("yarli-orchestrator/{}", env!("CARGO_PKG_VERSION")),
+    )
+    .with_capabilities(sw4rm_config.capabilities.clone())
+    .with_endpoints(sw4rm_sdk::Endpoints {
+        registry: sw4rm_config.registry_url.clone(),
+        router: sw4rm_config.router_url.clone(),
+        scheduler: sw4rm_config.scheduler_url.clone(),
+        ..sw4rm_sdk::Endpoints::default()
+    });
+
+    // Create shutdown bridge
+    let shutdown = ShutdownController::new();
+    shutdown.install_signal_handler();
+    let bridge = ShutdownBridge::new(shutdown.clone());
+
+    // Create agent
+    let agent = YarliAgent::new(agent_config.clone(), sw4rm_config, orchestrator)
+        .with_shutdown_bridge(bridge);
+
+    println!("Connecting to sw4rm services...");
+
+    // Boot the runtime
+    let mut runtime = sw4rm_sdk::AgentRuntime::new(agent_config);
+    runtime
+        .init()
+        .await
+        .context("failed to initialize sw4rm runtime")?;
+    runtime
+        .register()
+        .await
+        .context("failed to register with sw4rm registry")?;
+
+    println!("Agent registered. Entering message loop...");
+
+    runtime
+        .run(agent)
+        .await
+        .map_err(|e| anyhow::anyhow!("sw4rm agent runtime error: {e}"))?;
+
+    Ok(())
+}
+
 async fn seed_postgres_run_state_if_needed(
     loaded_config: &LoadedConfig,
     run: &Run,
@@ -1613,6 +1803,7 @@ fn build_memory_observer(
 }
 
 /// Drive the scheduler, emitting StreamEvents to the renderer channel.
+#[allow(clippy::too_many_arguments)]
 async fn drive_scheduler<Q, S, R>(
     scheduler: &Scheduler<Q, S, R>,
     store: &Arc<S>,
@@ -1907,10 +2098,10 @@ fn event_to_stream_event(
             let to_str = event.payload.get("to").and_then(|v| v.as_str());
 
             let from = from_str
-                .and_then(|s| parse_task_state(s))
+                .and_then(parse_task_state)
                 .unwrap_or(TaskState::TaskOpen);
             let to = to_str
-                .and_then(|s| parse_task_state(s))
+                .and_then(parse_task_state)
                 .unwrap_or(TaskState::TaskOpen);
 
             let exit_code = event
@@ -1942,10 +2133,10 @@ fn event_to_stream_event(
             let to_str = event.payload.get("to").and_then(|v| v.as_str());
 
             let from = from_str
-                .and_then(|s| parse_run_state(s))
+                .and_then(parse_run_state)
                 .unwrap_or(RunState::RunOpen);
             let to = to_str
-                .and_then(|s| parse_run_state(s))
+                .and_then(parse_run_state)
                 .unwrap_or(RunState::RunOpen);
 
             let reason = event
@@ -2102,7 +2293,7 @@ fn run_renderer(
                     eprintln!(
                         "warning: stream renderer unavailable ({error}); continuing in headless mode"
                     );
-                    while rx.blocking_recv().is_some() {}
+                    HeadlessRenderer::new().run(rx);
                     return Ok(());
                 }
             };
@@ -2121,7 +2312,7 @@ fn run_renderer(
                     eprintln!(
                         "warning: dashboard renderer unavailable ({error}); continuing in headless mode"
                     );
-                    while rx.blocking_recv().is_some() {}
+                    HeadlessRenderer::new().run(rx);
                     return Ok(());
                 }
             };
@@ -2215,6 +2406,7 @@ struct MemoryObserver {
 }
 
 impl MemoryObserver {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         project_id: String,
         run_id: Uuid,
@@ -2962,6 +3154,8 @@ struct TaskProjection {
     token_usage: Option<TokenUsage>,
     budget_breach_reason: Option<String>,
     memory_hints: Option<MemoryHintsReport>,
+    last_error: Option<String>,
+    blocker_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3097,7 +3291,7 @@ fn run_state_from_event(event: &Event) -> Option<RunState> {
         .get("to")
         .and_then(|v| v.as_str())
         .and_then(parse_run_state)
-        .or_else(|| match event.event_type.as_str() {
+        .or(match event.event_type.as_str() {
             "run.activated" => Some(RunState::RunActive),
             "run.verifying" => Some(RunState::RunVerifying),
             "run.completed" => Some(RunState::RunCompleted),
@@ -3113,7 +3307,7 @@ fn task_state_from_event(event: &Event) -> Option<TaskState> {
         .get("to")
         .and_then(|v| v.as_str())
         .and_then(parse_task_state)
-        .or_else(|| match event.event_type.as_str() {
+        .or(match event.event_type.as_str() {
             "task.ready" | "task.retrying" | "task.unblocked" => Some(TaskState::TaskReady),
             "task.executing" => Some(TaskState::TaskExecuting),
             "task.verifying" => Some(TaskState::TaskVerifying),
@@ -3204,6 +3398,8 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
             token_usage: None,
             budget_breach_reason: None,
             memory_hints: None,
+            last_error: None,
+            blocker_detail: None,
         });
 
         entry.correlation_id = event.correlation_id;
@@ -3275,6 +3471,29 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
             if let Ok(report) = serde_json::from_value::<MemoryHintsReport>(event.payload.clone()) {
                 entry.memory_hints = Some(report);
             }
+        }
+
+        // Extract last_error from failure events (preserve first occurrence).
+        if event.event_type == "task.failed" || event.event_type == "task.gate_failed" {
+            if entry.last_error.is_none() {
+                let error_msg = event
+                    .payload
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| event.payload.get("reason").and_then(|v| v.as_str()));
+                if let Some(msg) = error_msg {
+                    entry.last_error = Some(msg.to_string());
+                }
+            }
+        }
+
+        // Extract blocker_detail from annotate events.
+        if event.event_type == "task.annotated" {
+            entry.blocker_detail = event
+                .payload
+                .get("blocker_detail")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
     }
 
@@ -3843,6 +4062,12 @@ fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
                 "  {}  {:?}  ({})",
                 task.task_id, task.state, task.last_event_type
             )?;
+            if let Some(ref last_error) = task.last_error {
+                writeln!(&mut out, "    last_error: {last_error}")?;
+            }
+            if let Some(ref detail) = task.blocker_detail {
+                writeln!(&mut out, "    blocker_detail: {detail}")?;
+            }
             if let Some(ref breach) = task.budget_breach_reason {
                 writeln!(&mut out, "    budget_exceeded: {breach}")?;
             }
@@ -4069,6 +4294,14 @@ fn render_task_explain(store: &dyn EventStore, task_id: Uuid) -> Result<String> 
         writeln!(&mut out, "Last reason: {reason}")?;
     }
 
+    if let Some(ref last_error) = task.last_error {
+        writeln!(&mut out, "Last error: {last_error}")?;
+    }
+
+    if let Some(ref detail) = task.blocker_detail {
+        writeln!(&mut out, "Blocker detail: {detail}")?;
+    }
+
     if !explain.budget_breaches.is_empty() {
         writeln!(&mut out)?;
         writeln!(&mut out, "Budget breaches:")?;
@@ -4187,6 +4420,7 @@ fn execute_task_unblock(store: &dyn EventStore, task_id: Uuid, reason: &str) -> 
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_worktree_transition_event(
     store: &dyn EventStore,
     projection: &WorktreeProjection,
@@ -4979,6 +5213,7 @@ fn evaluate_merge_policy(
         .map_err(|e| anyhow::anyhow!("policy evaluation failed: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_merge_execution_event(
     store: &dyn EventStore,
     merge: &MergeProjection,
@@ -5765,6 +6000,60 @@ fn cmd_task_unblock(task_id_str: &str, reason: &str) -> Result<()> {
     })?;
     println!("{output}");
     Ok(())
+}
+
+/// `yarli task annotate` — add blocker detail to a task.
+fn cmd_task_annotate(task_id_str: &str, detail: &str) -> Result<()> {
+    let task_id: Uuid = task_id_str
+        .parse()
+        .context("invalid task ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_writes("task annotate")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_task_annotate(store, task_id, detail)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// Execute the task annotate operation.
+fn execute_task_annotate(store: &dyn EventStore, task_id: Uuid, detail: &str) -> Result<String> {
+    use yarli_core::domain::EntityType;
+
+    // Verify the task exists.
+    let task_events = query_events(
+        store,
+        &EventQuery::by_entity(EntityType::Task, task_id.to_string()),
+    )?;
+    if task_events.is_empty() {
+        return Ok(format!("Task {task_id} not found in persisted event log."));
+    }
+
+    // Persist the annotation event.
+    let event = Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Task,
+        entity_id: task_id.to_string(),
+        event_type: "task.annotated".to_string(),
+        payload: serde_json::json!({
+            "blocker_detail": detail,
+        }),
+        correlation_id: task_events
+            .last()
+            .map(|e| e.correlation_id)
+            .unwrap_or_else(Uuid::now_v7),
+        causation_id: None,
+        actor: "operator".to_string(),
+        idempotency_key: None,
+    };
+
+    store
+        .append(event)
+        .context("failed to persist annotation event")?;
+
+    Ok(format!(
+        "Task {task_id} annotated with blocker detail: {detail}"
+    ))
 }
 
 /// `yarli gate list` — show configured gate types.
@@ -7803,7 +8092,7 @@ allow_in_memory_writes = true
 
         for i in 0..5 {
             let entry =
-                AuditEntry::gate_evaluation(&format!("gate_{i}"), true, "ok", Uuid::nil(), None);
+                AuditEntry::gate_evaluation(format!("gate_{i}"), true, "ok", Uuid::nil(), None);
             sink.append(&entry).unwrap();
         }
 
@@ -7841,7 +8130,7 @@ allow_in_memory_writes = true
 
         for i in 0..3 {
             let entry =
-                AuditEntry::gate_evaluation(&format!("gate_{i}"), true, "ok", Uuid::nil(), None);
+                AuditEntry::gate_evaluation(format!("gate_{i}"), true, "ok", Uuid::nil(), None);
             sink.append(&entry).unwrap();
         }
 
@@ -8217,6 +8506,160 @@ allow_in_memory_writes = true
         assert!(
             output.contains("max_rss_bytes=1048576"),
             "task explain must surface resource_usage: {output}"
+        );
+    }
+
+    #[test]
+    fn task_annotate_persists_and_displays_in_explain() {
+        let store = InMemoryEventStore::new();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        // Create a task event first.
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.started",
+                corr,
+                serde_json::json!({"from": "TaskOpen", "to": "TaskReady"}),
+            ))
+            .unwrap();
+
+        // Annotate the task.
+        let result = execute_task_annotate(&store, task_id, "see blocker-001.md").unwrap();
+        assert!(
+            result.contains("blocker-001.md"),
+            "annotate result must contain detail: {result}"
+        );
+
+        // Verify explain output includes the annotation.
+        let explain_output = render_task_explain(&store, task_id).unwrap();
+        assert!(
+            explain_output.contains("blocker-001.md"),
+            "explain must show blocker detail: {explain_output}"
+        );
+    }
+
+    #[test]
+    fn task_annotate_nonexistent_task_returns_not_found() {
+        let store = InMemoryEventStore::new();
+        let task_id = Uuid::now_v7();
+        let result = execute_task_annotate(&store, task_id, "detail").unwrap();
+        assert!(result.contains("not found"), "should report not found: {result}");
+    }
+
+    #[test]
+    fn run_status_displays_blocker_detail() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        // Create run event.
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.started",
+                corr,
+                serde_json::json!({"from": "RunOpen", "to": "RunActive"}),
+            ))
+            .unwrap();
+
+        // Create task event linked by correlation.
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.started",
+                corr,
+                serde_json::json!({"from": "TaskOpen", "to": "TaskReady"}),
+            ))
+            .unwrap();
+
+        // Annotate task.
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.annotated",
+                corr,
+                serde_json::json!({"blocker_detail": "see blocker-002.md"}),
+            ))
+            .unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(
+            output.contains("blocker-002.md"),
+            "run status must show blocker detail: {output}"
+        );
+    }
+
+    #[test]
+    fn task_explain_displays_last_error() {
+        let store = InMemoryEventStore::new();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskExecuting",
+                    "to": "TaskFailed",
+                    "reason": "nonzero_exit",
+                    "detail": "command exited with code 1"
+                }),
+            ))
+            .unwrap();
+
+        let output = render_task_explain(&store, task_id).unwrap();
+        assert!(
+            output.contains("Last error: command exited with code 1"),
+            "explain must show last_error: {output}"
+        );
+    }
+
+    #[test]
+    fn run_status_displays_last_error() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.started",
+                corr,
+                serde_json::json!({"from": "RunOpen", "to": "RunActive"}),
+            ))
+            .unwrap();
+
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskExecuting",
+                    "to": "TaskFailed",
+                    "reason": "nonzero_exit",
+                    "detail": "command exited with code 42"
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(
+            output.contains("last_error: command exited with code 42"),
+            "run status must show last_error: {output}"
         );
     }
 }

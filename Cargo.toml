@@ -10,6 +10,7 @@ members = [
     "crates/yarli-policy",
     "crates/yarli-memory",
     "crates/yarli-observability",
+    "crates/yarli-sw4rm",
     "crates/yarli-cli",
 ]
 
@@ -30,11 +31,16 @@ yarli-gates = { path = "crates/yarli-gates" }
 yarli-policy = { path = "crates/yarli-policy" }
 yarli-memory = { path = "crates/yarli-memory" }
 yarli-observability = { path = "crates/yarli-observability" }
+yarli-sw4rm = { path = "crates/yarli-sw4rm" }
 yarli-cli = { path = "crates/yarli-cli" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+
+# Agent protocol
+sw4rm-sdk = "0.4"
+async-trait = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

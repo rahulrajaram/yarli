@@ -436,51 +436,43 @@ fn compute_blocker_chain(tasks: &[TaskSnapshot]) -> Vec<BlockerChainLink> {
         visited.insert(task.task_id);
         let mut current_id = task.task_id;
 
-        loop {
-            let current = match task_map.get(&current_id) {
-                Some(t) => t,
-                None => break,
-            };
-
+        while let Some(current) = task_map.get(&current_id) {
             let next = current
                 .blocked_by
                 .iter()
                 .find(|id| !visited.contains(id))
                 .copied();
 
-            match next {
-                Some(next_id) => {
-                    visited.insert(next_id);
-                    if let Some(next_task) = task_map.get(&next_id) {
-                        let relation = if next_task.state == TaskState::TaskFailed {
-                            BlockerRelation::Failed
-                        } else if next_task
-                            .gates
-                            .iter()
-                            .any(|(_, r)| matches!(r, GateResult::Failed { .. }))
-                        {
-                            BlockerRelation::GateFailed
-                        } else {
-                            BlockerRelation::BlockedBy
-                        };
+            let Some(next_id) = next else {
+                break;
+            };
 
-                        path.push(BlockerChainLink {
-                            entity_name: next_task.name.clone(),
-                            relation,
-                        });
+            visited.insert(next_id);
+            let Some(next_task) = task_map.get(&next_id) else {
+                break;
+            };
 
-                        if relation == BlockerRelation::Failed
-                            || relation == BlockerRelation::GateFailed
-                        {
-                            break; // reached root cause
-                        }
-                        current_id = next_id;
-                    } else {
-                        break;
-                    }
-                }
-                None => break,
+            let relation = if next_task.state == TaskState::TaskFailed {
+                BlockerRelation::Failed
+            } else if next_task
+                .gates
+                .iter()
+                .any(|(_, r)| matches!(r, GateResult::Failed { .. }))
+            {
+                BlockerRelation::GateFailed
+            } else {
+                BlockerRelation::BlockedBy
+            };
+
+            path.push(BlockerChainLink {
+                entity_name: next_task.name.clone(),
+                relation,
+            });
+
+            if relation == BlockerRelation::Failed || relation == BlockerRelation::GateFailed {
+                break; // reached root cause
             }
+            current_id = next_id;
         }
 
         if path.len() > 1 {

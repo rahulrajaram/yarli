@@ -837,6 +837,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_policy_block(
         &self,
         task_id: TaskId,
@@ -1287,6 +1288,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         failure_reasons.join("; ")
                     );
 
+                    task.set_last_error(&reason);
                     let transition = task.transition(
                         TaskState::TaskFailed,
                         &reason,
@@ -1319,6 +1321,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             }
         } else if cmd_state == CommandState::CmdTimedOut {
             // Timeout: Executing → Failed
+            task.set_last_error("command timed out");
             let transition = task.transition(
                 TaskState::TaskFailed,
                 "command timed out",
@@ -1353,6 +1356,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             TaskOutcome::TimedOut
         } else if cmd_state == CommandState::CmdKilled {
             // Killed: Executing → Failed
+            task.set_last_error("command killed");
             let transition = task.transition(
                 TaskState::TaskFailed,
                 "command killed",
@@ -1387,6 +1391,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             TaskOutcome::Killed
         } else {
             // Nonzero exit code: Executing → Failed
+            task.set_last_error(format!("command exited with code {exit_code}"));
             let transition = task.transition(
                 TaskState::TaskFailed,
                 format!("command exited with code {exit_code}"),
@@ -1438,6 +1443,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             .ok_or(SchedulerError::TaskNotFound(task_id))?;
 
         let correlation_id = task.correlation_id;
+        task.set_last_error(format!("execution error: {error}"));
         let transition = task.transition(
             TaskState::TaskFailed,
             format!("execution error: {error}"),
@@ -3198,7 +3204,7 @@ mod tests {
 
         let run_a = make_run("run A");
         let run_a_id = run_a.id;
-        let corr_a = run_a.correlation_id;
+        let _corr_a = run_a.correlation_id;
 
         let run_b = make_run("run B");
         let run_b_id = run_b.id;
@@ -3252,7 +3258,7 @@ mod tests {
         sched.submit_run(run, vec![t1, t2]).await.unwrap();
 
         // Promote tasks so they get enqueued.
-        let result = sched.tick().await.unwrap();
+        let _result = sched.tick().await.unwrap();
         // Both tasks complete in one tick since they're simple echoes.
         // Let's test with a fresh setup: enqueue directly.
         let run2 = make_run("cancel queue test 2");

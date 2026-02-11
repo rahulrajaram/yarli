@@ -5,7 +5,7 @@
 //! into native terminal scrollback (copy-pasteable). Section 30.
 
 use std::collections::HashMap;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -141,10 +141,13 @@ impl StreamRenderer {
         }
 
         self.draw_viewport()?;
+        // Flush stdout immediately so state transitions appear without delay.
+        io::stdout().flush()?;
         Ok(())
     }
 
     /// Handle a task state transition: push to scrollback and update viewport state.
+    #[allow(clippy::too_many_arguments)]
     fn handle_task_transition(
         &mut self,
         task_id: TaskId,
@@ -166,20 +169,17 @@ impl StreamRenderer {
             self.spinners.remove(&task_id);
         } else {
             // Insert into task_order if new.
-            if !self.tasks.contains_key(&task_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(task_id) {
                 self.task_order.push(task_id);
-                self.tasks.insert(
+                e.insert(TaskView {
                     task_id,
-                    TaskView {
-                        task_id,
-                        name: task_name.to_string(),
-                        state: to,
-                        elapsed,
-                        last_output_line: None,
-                        blocked_by: None,
-                        worker_id: None,
-                    },
-                );
+                    name: task_name.to_string(),
+                    state: to,
+                    elapsed,
+                    last_output_line: None,
+                    blocked_by: None,
+                    worker_id: None,
+                });
             } else {
                 let view = self.tasks.get_mut(&task_id).unwrap();
                 view.state = to;
@@ -187,7 +187,7 @@ impl StreamRenderer {
             }
 
             if to == TaskState::TaskExecuting {
-                self.spinners.entry(task_id).or_insert_with(Spinner::new);
+                self.spinners.entry(task_id).or_default();
             }
         }
 
@@ -198,6 +198,7 @@ impl StreamRenderer {
     ///
     /// Format (Section 33):
     /// `14:32:01 ▸ task/build  EXECUTING → COMPLETE  (34.2s, exit 0)`
+    #[allow(clippy::too_many_arguments)]
     fn push_task_transition(
         &mut self,
         _task_id: TaskId,

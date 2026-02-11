@@ -37,6 +37,7 @@ pub struct Transition {
 
 impl Transition {
     /// Create a new transition record with auto-generated event ID and timestamp.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         entity_kind: impl Into<String>,
         entity_id: Uuid,

@@ -1,0 +1,36 @@
+[package]
+name = "yarli-sw4rm"
+description = "sw4rm agent integration — makes yarli an orchestrator agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sw4rm-sdk = { workspace = true }
+yarli-core = { workspace = true }
+yarli-store = { workspace = true }
+yarli-queue = { workspace = true }
+yarli-exec = { workspace = true }
+yarli-gates = { workspace = true }
+yarli-policy = { workspace = true }
+yarli-observability = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[features]
+default = []
+test-support = []
+
+[dev-dependencies]
+assert_matches = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

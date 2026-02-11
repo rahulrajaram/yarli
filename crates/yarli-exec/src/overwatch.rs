@@ -383,7 +383,7 @@ fn map_terminal_outcome(status: &OverwatchStatusResponse) -> TerminalOutcome {
         return TerminalOutcome::Killed;
     }
 
-    let exit_code = status.exit_code.unwrap_or_else(|| {
+    let exit_code = status.exit_code.unwrap_or(
         if matches!(
             state.as_str(),
             "success" | "succeeded" | "completed" | "done"
@@ -391,8 +391,8 @@ fn map_terminal_outcome(status: &OverwatchStatusResponse) -> TerminalOutcome {
             0
         } else {
             -1
-        }
-    });
+        },
+    );
     TerminalOutcome::Exited { exit_code }
 }
 
