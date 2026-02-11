@@ -793,3 +793,224 @@ fn lifecycle_fail_and_reenqueue() {
     assert_eq!(stats.failed, 1);
     assert_eq!(stats.pending, 1);
 }
+
+// ─── allowed_run_ids filtering ──────────────────────────────────────────
+
+#[test]
+fn claim_with_allowed_run_ids_filters_correctly() {
+    let q = InMemoryTaskQueue::new();
+    let run_a = make_run_id();
+    let run_b = make_run_id();
+    let cfg = default_config();
+
+    let ta = Uuid::now_v7();
+    let tb = Uuid::now_v7();
+    q.enqueue(ta, run_a, 1, CommandClass::Io, None).unwrap();
+    q.enqueue(tb, run_b, 1, CommandClass::Io, None).unwrap();
+
+    // Only claim tasks from run_b.
+    let req = ClaimRequest::new("w1", 10, Duration::seconds(30))
+        .with_allowed_run_ids(vec![run_b]);
+    let claimed = q.claim(&req, &cfg).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].task_id, tb);
+    assert_eq!(claimed[0].run_id, run_b);
+
+    // run_a task is still pending.
+    assert_eq!(q.pending_count(), 1);
+}
+
+#[test]
+fn claim_with_allowed_run_ids_none_claims_all() {
+    let q = InMemoryTaskQueue::new();
+    let run_a = make_run_id();
+    let run_b = make_run_id();
+    let cfg = default_config();
+
+    q.enqueue(Uuid::now_v7(), run_a, 1, CommandClass::Io, None)
+        .unwrap();
+    q.enqueue(Uuid::now_v7(), run_b, 1, CommandClass::Io, None)
+        .unwrap();
+
+    // No filter — claim all.
+    let req = ClaimRequest::new("w1", 10, Duration::seconds(30));
+    let claimed = q.claim(&req, &cfg).unwrap();
+    assert_eq!(claimed.len(), 2);
+}
+
+#[test]
+fn claim_with_empty_allowed_run_ids_claims_none() {
+    let q = InMemoryTaskQueue::new();
+    let run_a = make_run_id();
+    let cfg = default_config();
+
+    q.enqueue(Uuid::now_v7(), run_a, 1, CommandClass::Io, None)
+        .unwrap();
+
+    // Empty vec = no runs allowed.
+    let req = ClaimRequest::new("w1", 10, Duration::seconds(30))
+        .with_allowed_run_ids(vec![]);
+    let claimed = q.claim(&req, &cfg).unwrap();
+    assert!(claimed.is_empty());
+}
+
+// ─── cancel_for_run ─────────────────────────────────────────────────────
+
+#[test]
+fn cancel_for_run_drains_pending_and_leased() {
+    let q = InMemoryTaskQueue::new();
+    let run_a = make_run_id();
+    let run_b = make_run_id();
+    let cfg = default_config();
+
+    // Enqueue 3 for run_a and 1 for run_b.
+    for _ in 0..3 {
+        q.enqueue(Uuid::now_v7(), run_a, 1, CommandClass::Io, None)
+            .unwrap();
+    }
+    q.enqueue(Uuid::now_v7(), run_b, 1, CommandClass::Io, None)
+        .unwrap();
+
+    // Claim 1 from run_a to make it leased.
+    let req = ClaimRequest::new("w1", 1, Duration::seconds(30))
+        .with_allowed_run_ids(vec![run_a]);
+    let claimed = q.claim(&req, &cfg).unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    // Cancel all for run_a: 2 pending + 1 leased = 3.
+    let cancelled = q.cancel_for_run(run_a).unwrap();
+    assert_eq!(cancelled, 3);
+
+    // run_b task is untouched.
+    let stats = q.stats();
+    assert_eq!(stats.pending, 1);
+    assert_eq!(stats.cancelled, 3);
+    assert_eq!(stats.leased, 0);
+}
+
+#[test]
+fn cancel_for_run_returns_zero_when_no_active_entries() {
+    let q = InMemoryTaskQueue::new();
+    let run_a = make_run_id();
+
+    let cancelled = q.cancel_for_run(run_a).unwrap();
+    assert_eq!(cancelled, 0);
+}
+
+#[test]
+fn cancel_for_run_allows_reenqueue() {
+    let q = InMemoryTaskQueue::new();
+    let run_a = make_run_id();
+    let task_id = Uuid::now_v7();
+
+    q.enqueue(task_id, run_a, 1, CommandClass::Io, None)
+        .unwrap();
+
+    q.cancel_for_run(run_a).unwrap();
+
+    // Re-enqueue the same task — should work since it was cancelled.
+    let qid2 = q
+        .enqueue(task_id, run_a, 1, CommandClass::Io, None)
+        .unwrap();
+    assert_ne!(qid2, Uuid::nil());
+}
+
+// ─── cancel_stale_runs ──────────────────────────────────────────────────
+
+#[test]
+fn cancel_stale_runs_drains_non_active_run_rows() {
+    let q = InMemoryTaskQueue::new();
+    let active_run = make_run_id();
+    let stale_run_1 = make_run_id();
+    let stale_run_2 = make_run_id();
+
+    // 2 tasks for active run, 5 for stale runs.
+    q.enqueue(Uuid::now_v7(), active_run, 1, CommandClass::Io, None)
+        .unwrap();
+    q.enqueue(Uuid::now_v7(), active_run, 1, CommandClass::Io, None)
+        .unwrap();
+    for _ in 0..3 {
+        q.enqueue(Uuid::now_v7(), stale_run_1, 1, CommandClass::Io, None)
+            .unwrap();
+    }
+    for _ in 0..2 {
+        q.enqueue(Uuid::now_v7(), stale_run_2, 1, CommandClass::Io, None)
+            .unwrap();
+    }
+
+    assert_eq!(q.pending_count(), 7);
+
+    let cancelled = q.cancel_stale_runs(&[active_run]).unwrap();
+    assert_eq!(cancelled, 5);
+    assert_eq!(q.pending_count(), 2); // only active_run rows remain
+}
+
+#[test]
+fn cancel_stale_runs_with_empty_active_cancels_all() {
+    let q = InMemoryTaskQueue::new();
+    let run_a = make_run_id();
+
+    q.enqueue(Uuid::now_v7(), run_a, 1, CommandClass::Io, None)
+        .unwrap();
+
+    let cancelled = q.cancel_stale_runs(&[]).unwrap();
+    assert_eq!(cancelled, 1);
+    assert_eq!(q.pending_count(), 0);
+}
+
+#[test]
+fn cancel_stale_runs_leaves_completed_entries_alone() {
+    let q = InMemoryTaskQueue::new();
+    let stale_run = make_run_id();
+    let cfg = default_config();
+
+    q.enqueue(Uuid::now_v7(), stale_run, 1, CommandClass::Io, None)
+        .unwrap();
+
+    // Claim and complete one entry.
+    let req = ClaimRequest::single("w1");
+    let claimed = q.claim(&req, &cfg).unwrap();
+    q.complete(claimed[0].queue_id, "w1").unwrap();
+
+    // Add another pending entry.
+    q.enqueue(Uuid::now_v7(), stale_run, 1, CommandClass::Io, None)
+        .unwrap();
+
+    let cancelled = q.cancel_stale_runs(&[]).unwrap();
+    assert_eq!(cancelled, 1); // only the pending one, not the completed one
+    assert_eq!(q.stats().completed, 1);
+}
+
+// ─── Stall scenario: claim with run scoping ─────────────────────────────
+
+#[test]
+fn no_zero_progress_with_claimable_rows_and_stale_contamination() {
+    // Simulates the project bug: 75 stale rows + 5 current-run rows.
+    let q = InMemoryTaskQueue::new();
+    let current_run = make_run_id();
+    let stale_run = make_run_id();
+    let cfg = default_config();
+
+    // Enqueue 75 stale rows.
+    for _ in 0..75 {
+        q.enqueue(Uuid::now_v7(), stale_run, 1, CommandClass::Io, None)
+            .unwrap();
+    }
+
+    // Enqueue 5 current-run rows.
+    for _ in 0..5 {
+        q.enqueue(Uuid::now_v7(), current_run, 1, CommandClass::Io, None)
+            .unwrap();
+    }
+
+    assert_eq!(q.pending_count(), 80);
+
+    // Claim with allowed_run_ids = [current_run].
+    let req = ClaimRequest::new("w1", 4, Duration::seconds(30))
+        .with_allowed_run_ids(vec![current_run]);
+    let claimed = q.claim(&req, &cfg).unwrap();
+
+    // Must claim current run's rows, not zero.
+    assert_eq!(claimed.len(), 4);
+    assert!(claimed.iter().all(|e| e.run_id == current_run));
+}

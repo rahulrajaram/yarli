@@ -21,6 +21,7 @@ use crate::queue::{
     ClaimRequest, ConcurrencyConfig, QueueEntry, QueueStats, QueueStatus, TaskQueue,
 };
 
+/// Claim candidates SQL without run_id filter (used when allowed_run_ids is None).
 const CLAIM_CANDIDATES_SQL: &str = r#"
     SELECT
         queue_id,
@@ -29,6 +30,23 @@ const CLAIM_CANDIDATES_SQL: &str = r#"
     FROM task_queue
     WHERE status = 'pending'
       AND available_at <= $1
+    ORDER BY priority ASC, available_at ASC, queue_id ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT $2
+"#;
+
+/// Claim candidates SQL with run_id filter (used when allowed_run_ids is Some).
+/// The SQL LIMIT would otherwise hide the current run's rows behind stale
+/// pending rows from prior runs, causing zero-claim stalls.
+const CLAIM_CANDIDATES_SCOPED_SQL: &str = r#"
+    SELECT
+        queue_id,
+        run_id,
+        command_class
+    FROM task_queue
+    WHERE status = 'pending'
+      AND available_at <= $1
+      AND run_id = ANY($3::uuid[])
     ORDER BY priority ASC, available_at ASC, queue_id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $2
@@ -168,6 +186,7 @@ impl TaskQueue for PostgresTaskQueue {
         let limit = request.limit;
         let lease_ttl = request.lease_ttl;
         let config = config.clone();
+        let allowed_run_ids = request.allowed_run_ids.clone();
 
         self.run_async(async move {
             if limit == 0 {
@@ -230,12 +249,24 @@ impl TaskQueue for PostgresTaskQueue {
             // Fetch a wider candidate window so per-run/per-class caps can be enforced
             // in-memory while keeping claim+lease assignment atomic in one transaction.
             let candidate_window = limit.saturating_mul(8).max(limit).min(1024);
-            let candidate_rows = sqlx::query(CLAIM_CANDIDATES_SQL)
-                .bind(now)
-                .bind(candidate_window as i64)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|error| QueueError::Database(error.to_string()))?;
+            let candidate_rows = if let Some(ref run_ids) = allowed_run_ids {
+                // Push run_id filter into SQL to avoid stale rows from prior runs
+                // consuming the entire LIMIT window.
+                sqlx::query(CLAIM_CANDIDATES_SCOPED_SQL)
+                    .bind(now)
+                    .bind(candidate_window as i64)
+                    .bind(run_ids)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|error| QueueError::Database(error.to_string()))?
+            } else {
+                sqlx::query(CLAIM_CANDIDATES_SQL)
+                    .bind(now)
+                    .bind(candidate_window as i64)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|error| QueueError::Database(error.to_string()))?
+            };
 
             let mut selected_ids = Vec::new();
             for row in candidate_rows {
@@ -253,6 +284,13 @@ impl TaskQueue for PostgresTaskQueue {
                     .try_get("command_class")
                     .map_err(|error| QueueError::Database(error.to_string()))?;
                 let command_class = command_class_from_db(&command_class_raw)?;
+
+                // Filter by allowed run IDs if specified.
+                if let Some(ref allowed) = allowed_run_ids {
+                    if !allowed.contains(&run_id) {
+                        continue;
+                    }
+                }
 
                 let run_leased = leased_by_run.get(&run_id).copied().unwrap_or(0);
                 if run_leased >= config.per_run_cap {
@@ -654,6 +692,68 @@ impl TaskQueue for PostgresTaskQueue {
                 0
             }
         }
+    }
+
+    fn cancel_for_run(&self, run_id: RunId) -> Result<usize, QueueError> {
+        let pool = self.pool.clone();
+        self.run_async(async move {
+            let result = sqlx::query(
+                r#"
+                UPDATE task_queue
+                SET status = 'cancelled',
+                    updated_at = $1
+                WHERE run_id = $2
+                  AND status IN ('pending', 'leased')
+                "#,
+            )
+            .bind(Utc::now())
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .map_err(|error| QueueError::Database(error.to_string()))?;
+
+            Ok(result.rows_affected() as usize)
+        })
+    }
+
+    fn cancel_stale_runs(&self, active_run_ids: &[RunId]) -> Result<usize, QueueError> {
+        let pool = self.pool.clone();
+        let active_ids = active_run_ids.to_vec();
+        self.run_async(async move {
+            let result = if active_ids.is_empty() {
+                // No active runs — cancel ALL pending/leased rows.
+                sqlx::query(
+                    r#"
+                    UPDATE task_queue
+                    SET status = 'cancelled',
+                        updated_at = $1
+                    WHERE status IN ('pending', 'leased')
+                    "#,
+                )
+                .bind(Utc::now())
+                .execute(&pool)
+                .await
+                .map_err(|error| QueueError::Database(error.to_string()))?
+            } else {
+                // Cancel pending/leased rows NOT belonging to active runs.
+                sqlx::query(
+                    r#"
+                    UPDATE task_queue
+                    SET status = 'cancelled',
+                        updated_at = $1
+                    WHERE status IN ('pending', 'leased')
+                      AND run_id != ALL($2::uuid[])
+                    "#,
+                )
+                .bind(Utc::now())
+                .bind(&active_ids)
+                .execute(&pool)
+                .await
+                .map_err(|error| QueueError::Database(error.to_string()))?
+            };
+
+            Ok(result.rows_affected() as usize)
+        })
     }
 }
 

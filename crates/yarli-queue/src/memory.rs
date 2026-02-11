@@ -108,11 +108,18 @@ impl TaskQueue for InMemoryTaskQueue {
         }
 
         // Collect indices of claimable entries, sorted by (priority ASC, available_at ASC).
+        let allowed = &request.allowed_run_ids;
         let mut candidates: Vec<usize> = inner
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.status == QueueStatus::Pending && e.available_at <= now)
+            .filter(|(_, e)| {
+                e.status == QueueStatus::Pending
+                    && e.available_at <= now
+                    && allowed
+                        .as_ref()
+                        .map_or(true, |ids| ids.contains(&e.run_id))
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -382,6 +389,57 @@ impl TaskQueue for InMemoryTaskQueue {
             .iter()
             .filter(|e| e.status == QueueStatus::Pending)
             .count()
+    }
+
+    fn cancel_for_run(&self, run_id: RunId) -> Result<usize, QueueError> {
+        let mut inner = self.inner.write().unwrap();
+        let now = Utc::now();
+        let mut cancelled = 0;
+
+        // Collect task_ids of entries we're about to cancel.
+        let mut cancelled_task_ids = Vec::new();
+
+        for entry in &mut inner.entries {
+            if entry.run_id == run_id
+                && matches!(entry.status, QueueStatus::Pending | QueueStatus::Leased)
+            {
+                cancelled_task_ids.push(entry.task_id);
+                entry.status = QueueStatus::Cancelled;
+                entry.updated_at = now;
+                cancelled += 1;
+            }
+        }
+
+        // Remove cancelled entries from active_tasks map.
+        for task_id in &cancelled_task_ids {
+            inner.active_tasks.remove(task_id);
+        }
+
+        Ok(cancelled)
+    }
+
+    fn cancel_stale_runs(&self, active_run_ids: &[RunId]) -> Result<usize, QueueError> {
+        let mut inner = self.inner.write().unwrap();
+        let now = Utc::now();
+        let mut cancelled = 0;
+        let mut cancelled_task_ids = Vec::new();
+
+        for entry in &mut inner.entries {
+            if matches!(entry.status, QueueStatus::Pending | QueueStatus::Leased)
+                && !active_run_ids.contains(&entry.run_id)
+            {
+                cancelled_task_ids.push(entry.task_id);
+                entry.status = QueueStatus::Cancelled;
+                entry.updated_at = now;
+                cancelled += 1;
+            }
+        }
+
+        for task_id in &cancelled_task_ids {
+            inner.active_tasks.remove(task_id);
+        }
+
+        Ok(cancelled)
     }
 }
 

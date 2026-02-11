@@ -448,17 +448,38 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         // Step 1: Promote tasks whose dependencies are satisfied
         result.promoted = self.promote_tasks().await?;
 
-        // Step 2: Claim tasks from the queue
+        debug!(promoted = result.promoted, "tick: tasks promoted");
+
+        // Step 2: Claim tasks from the queue (scoped to known runs)
+        let run_ids = {
+            let reg = self.registry.read().await;
+            reg.run_ids()
+        };
         let claim_req = ClaimRequest::new(
             &self.config.worker_id,
             self.config.claim_batch_size,
             self.config.lease_ttl,
-        );
+        )
+        .with_allowed_run_ids(run_ids);
         let claimed = self.queue.claim(&claim_req, &self.config.concurrency)?;
         result.claimed = claimed.len();
 
+        if result.claimed == 0 && result.promoted == 0 {
+            let pending = self.queue.pending_count();
+            if pending > 0 {
+                debug!(
+                    queue_pending = pending,
+                    "tick: 0 claimed despite pending rows (filtered by run scope or caps)"
+                );
+            }
+        } else {
+            debug!(claimed = result.claimed, "tick: tasks claimed");
+        }
+
         // Step 3: Execute claimed tasks
         for entry in claimed {
+            let queue_id = entry.queue_id;
+            let task_id = entry.task_id;
             match self.execute_task(entry, cancel.child_token()).await {
                 Ok(outcome) => {
                     result.executed += 1;
@@ -469,6 +490,26 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         TaskOutcome::Killed => result.killed += 1,
                     }
                 }
+                Err(SchedulerError::TaskNotFound(_) | SchedulerError::RunNotFound(_)) => {
+                    // Claimed a task/run the registry doesn't know about.
+                    // Fail the queue entry to release the lease and prevent stalls.
+                    warn!(
+                        queue_id = %queue_id,
+                        task_id = %task_id,
+                        "claimed task not in registry, failing queue entry"
+                    );
+                    if let Err(fail_err) =
+                        self.queue.fail(queue_id, &self.config.worker_id)
+                    {
+                        warn!(error = %fail_err, queue_id = %queue_id, "failed to fail orphaned queue entry");
+                    }
+                    // Remove lease tracking if it was added
+                    {
+                        let mut reg = self.registry.write().await;
+                        reg.remove_lease(&queue_id);
+                    }
+                    result.errors += 1;
+                }
                 Err(e) => {
                     warn!(error = %e, "task execution error");
                     result.errors += 1;
@@ -478,6 +519,30 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
         // Step 4: Evaluate run-level state changes
         result.runs_completed = self.evaluate_runs().await?;
+
+        if result.claimed > 0 || result.errors > 0 {
+            info!(
+                promoted = result.promoted,
+                claimed = result.claimed,
+                executed = result.executed,
+                succeeded = result.succeeded,
+                failed = result.failed,
+                errors = result.errors,
+                runs_completed = result.runs_completed,
+                "tick complete"
+            );
+        } else {
+            debug!(
+                promoted = result.promoted,
+                claimed = result.claimed,
+                executed = result.executed,
+                succeeded = result.succeeded,
+                failed = result.failed,
+                errors = result.errors,
+                runs_completed = result.runs_completed,
+                "tick complete"
+            );
+        }
 
         Ok(result)
     }
@@ -567,11 +632,16 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 })?;
 
                 // Enqueue into the task queue now that the task is Ready
-                self.queue
-                    .enqueue(task_id, run_id, priority, command_class, None)?;
-
-                promoted += 1;
-                debug!(task_id = %task_id, "task promoted to ready and enqueued");
+                match self.queue.enqueue(task_id, run_id, priority, command_class, None) {
+                    Ok(_) => {
+                        promoted += 1;
+                        debug!(task_id = %task_id, run_id = %run_id, "task promoted to ready and enqueued");
+                    }
+                    Err(e) => {
+                        warn!(task_id = %task_id, run_id = %run_id, error = %e, "failed to enqueue promoted task");
+                        return Err(e.into());
+                    }
+                }
             }
         }
 
@@ -1689,8 +1759,41 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         Ok(completed)
     }
 
+    /// Get queue statistics.
+    pub fn queue_stats(&self) -> crate::queue::QueueStats {
+        self.queue.stats()
+    }
+
+    /// Cancel all stale queue rows not belonging to any run in the registry.
+    ///
+    /// Should be called once at scheduler startup before the first tick to
+    /// drain pending/leased residue from prior crashed or cancelled runs.
+    pub async fn cleanup_stale_queue(&self) -> Result<usize, SchedulerError> {
+        let active_ids = {
+            let reg = self.registry.read().await;
+            reg.run_ids()
+        };
+        let cancelled = self.queue.cancel_stale_runs(&active_ids)?;
+        if cancelled > 0 {
+            info!(cancelled, "cleaned up stale queue entries from prior runs");
+        }
+        Ok(cancelled)
+    }
+
+    /// Cancel all pending/leased queue entries for a run.
+    ///
+    /// Used during run cancellation to drain stale queue rows.
+    /// Returns the number of entries cancelled.
+    pub fn cancel_run_queue(&self, run_id: RunId) -> Result<usize, SchedulerError> {
+        let cancelled = self.queue.cancel_for_run(run_id)?;
+        if cancelled > 0 {
+            info!(run_id = %run_id, cancelled, "cancelled queue entries for run");
+        }
+        Ok(cancelled)
+    }
+
     /// Heartbeat all active leases.
-    async fn heartbeat_active_leases(&self) {
+    pub async fn heartbeat_active_leases(&self) {
         let reg = self.registry.read().await;
         let lease_ids = reg.active_lease_ids();
         drop(reg);
@@ -1706,7 +1809,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     }
 
     /// Reclaim stale leases.
-    async fn reclaim_stale_leases(&self) {
+    pub async fn reclaim_stale_leases(&self) {
         match self.queue.reclaim_stale(self.config.reclaim_grace) {
             Ok(reclaimed) if reclaimed > 0 => {
                 info!(reclaimed, "reclaimed stale leases");
@@ -3009,5 +3112,256 @@ mod tests {
             }
         }
         drop(reg);
+    }
+
+    /// Headless integration test: drives the scheduler tick-by-tick without any
+    /// TTY or renderer, verifying that 3 independent tasks all reach terminal
+    /// state purely through the scheduler loop.
+    #[tokio::test]
+    async fn test_headless_scheduler_completes_all_tasks() {
+        let (sched, store) = test_scheduler();
+        let run = make_run("headless run with 3 tasks");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+
+        let t1 = make_task(run_id, "echo-a", "echo alpha", corr_id);
+        let t2 = make_task(run_id, "echo-b", "echo bravo", corr_id);
+        let t3 = make_task(run_id, "echo-c", "echo charlie", corr_id);
+        let t1_id = t1.id;
+        let t2_id = t2.id;
+        let t3_id = t3.id;
+
+        sched.submit_run(run, vec![t1, t2, t3]).await.unwrap();
+
+        // Drive scheduler tick by tick until the run completes or we hit a safety limit.
+        let cancel = CancellationToken::new();
+        let mut tick_count = 0u32;
+        let max_ticks = 20;
+
+        loop {
+            let result = sched.tick_with_cancel(cancel.child_token()).await.unwrap();
+            tick_count += 1;
+
+            // Check if run is terminal.
+            let reg = sched.registry().read().await;
+            if let Some(run) = reg.get_run(&run_id) {
+                if run.state.is_terminal() {
+                    break;
+                }
+            }
+            drop(reg);
+
+            assert!(
+                tick_count <= max_ticks,
+                "scheduler did not complete run within {max_ticks} ticks (last tick: {result:?})"
+            );
+        }
+
+        // Verify all tasks reached TaskComplete.
+        let reg = sched.registry().read().await;
+        for (label, task_id) in [("t1", t1_id), ("t2", t2_id), ("t3", t3_id)] {
+            let task = reg.get_task(&task_id).unwrap();
+            assert_eq!(
+                task.state,
+                TaskState::TaskComplete,
+                "task {label} should be complete, got {:?}",
+                task.state
+            );
+        }
+
+        // Verify run is completed.
+        let run = reg.get_run(&run_id).unwrap();
+        assert_eq!(run.state, RunState::RunCompleted);
+
+        // Verify events were persisted.
+        let events = store.all().unwrap();
+        let completed_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "task.completed")
+            .collect();
+        assert_eq!(
+            completed_events.len(),
+            3,
+            "expected 3 task.completed events"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_cross_run_claim() {
+        // Enqueue tasks for run A and run B. Scheduler only knows run B.
+        // Claims should only return run B tasks.
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = test_config();
+
+        let run_a = make_run("run A");
+        let run_a_id = run_a.id;
+        let corr_a = run_a.correlation_id;
+
+        let run_b = make_run("run B");
+        let run_b_id = run_b.id;
+        let corr_b = run_b.correlation_id;
+
+        // Manually enqueue tasks for both runs into the queue (simulating stale rows).
+        let task_a = Uuid::now_v7();
+        let task_b = Uuid::now_v7();
+        queue
+            .enqueue(task_a, run_a_id, 1, CommandClass::Io, None)
+            .unwrap();
+        queue
+            .enqueue(task_b, run_b_id, 1, CommandClass::Io, None)
+            .unwrap();
+
+        // Create scheduler with only run B in registry.
+        let mut registry = TaskRegistry::new();
+        let mut run_b_entity = run_b;
+        run_b_entity.state = RunState::RunActive;
+        registry.add_run(run_b_entity);
+        let mut task_b_entity = make_task(run_b_id, "echo-b", "echo b", corr_b);
+        task_b_entity.id = task_b;
+        task_b_entity.state = TaskState::TaskReady;
+        registry.add_task(task_b_entity);
+
+        let sched =
+            Scheduler::with_registry(queue.clone(), store, runner, config, registry);
+
+        // Tick should only claim run B's task.
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.claimed, 1, "should only claim 1 task from run B");
+        assert_eq!(result.succeeded, 1, "run B's task should succeed");
+
+        // run A's task should still be pending in the queue.
+        assert_eq!(queue.pending_count(), 1, "run A task should remain pending");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_run_queue_drains_entries() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = test_config();
+        let sched = Scheduler::new(queue.clone(), store, runner, config);
+
+        let run = make_run("cancel queue test");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+
+        let t1 = make_task(run_id, "t1", "echo a", corr_id);
+        let t2 = make_task(run_id, "t2", "echo b", corr_id);
+        sched.submit_run(run, vec![t1, t2]).await.unwrap();
+
+        // Promote tasks so they get enqueued.
+        let result = sched.tick().await.unwrap();
+        // Both tasks complete in one tick since they're simple echoes.
+        // Let's test with a fresh setup: enqueue directly.
+        let run2 = make_run("cancel queue test 2");
+        let run2_id = run2.id;
+        let corr2 = run2.correlation_id;
+        let t3 = make_task(run2_id, "t3", "echo c", corr2);
+        let t4 = make_task(run2_id, "t4", "echo d", corr2);
+        sched
+            .submit_run(run2, vec![t3, t4])
+            .await
+            .unwrap();
+
+        // Promote so tasks get enqueued.
+        // promote_tasks is private, so we trigger via tick but cancel before execution.
+        // Actually let's just enqueue manually and cancel.
+        let extra_run_id = Uuid::now_v7();
+        queue
+            .enqueue(Uuid::now_v7(), extra_run_id, 1, CommandClass::Io, None)
+            .unwrap();
+        queue
+            .enqueue(Uuid::now_v7(), extra_run_id, 1, CommandClass::Io, None)
+            .unwrap();
+
+        assert!(queue.pending_count() >= 2);
+
+        let cancelled = sched.cancel_run_queue(extra_run_id).unwrap();
+        assert_eq!(cancelled, 2, "should cancel 2 queue entries");
+
+        // The entries for extra_run_id should be cancelled.
+        let stats = queue.stats();
+        assert!(stats.cancelled >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_queue_stats_accessible() {
+        let (sched, _store) = test_scheduler();
+        let stats = sched.queue_stats();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.leased, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_queue_on_startup() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = test_config();
+
+        // Simulate stale rows from old runs.
+        let stale_run = Uuid::now_v7();
+        for _ in 0..10 {
+            queue
+                .enqueue(Uuid::now_v7(), stale_run, 1, CommandClass::Io, None)
+                .unwrap();
+        }
+        assert_eq!(queue.pending_count(), 10);
+
+        let sched = Scheduler::new(queue.clone(), store, runner, config);
+
+        // Submit current run.
+        let run = make_run("current run");
+        let run_id = run.id;
+        let corr = run.correlation_id;
+        let task = make_task(run_id, "t1", "echo hi", corr);
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        // Cleanup stale queue — should cancel all 10 stale rows.
+        let cancelled = sched.cleanup_stale_queue().await.unwrap();
+        assert_eq!(cancelled, 10);
+        assert_eq!(queue.pending_count(), 0); // stale gone, current task not yet enqueued
+
+        // Tick should promote + enqueue + claim + execute the current task.
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.promoted, 1);
+        assert_eq!(result.claimed, 1);
+        assert_eq!(result.succeeded, 1);
+    }
+
+    #[tokio::test]
+    async fn test_no_zero_progress_with_stale_contamination() {
+        // Simulates the project bug at scheduler level:
+        // stale pending rows exist, but current run tasks must still claim.
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = test_config();
+
+        // Populate stale rows.
+        let stale_run = Uuid::now_v7();
+        for _ in 0..50 {
+            queue
+                .enqueue(Uuid::now_v7(), stale_run, 1, CommandClass::Io, None)
+                .unwrap();
+        }
+
+        let sched = Scheduler::new(queue.clone(), store, runner, config);
+
+        let run = make_run("progress test");
+        let run_id = run.id;
+        let corr = run.correlation_id;
+        let t1 = make_task(run_id, "t1", "echo a", corr);
+        let t2 = make_task(run_id, "t2", "echo b", corr);
+        sched.submit_run(run, vec![t1, t2]).await.unwrap();
+
+        // Don't call cleanup_stale_queue — rely on allowed_run_ids filtering.
+        // Tick should still claim current run's tasks (in-memory queue filters correctly).
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.promoted, 2, "should promote both tasks");
+        assert_eq!(result.claimed, 2, "should claim both tasks despite stale rows");
+        assert_eq!(result.succeeded, 2, "should execute both tasks");
     }
 }

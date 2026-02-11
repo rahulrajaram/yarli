@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use yarli_cli::config::{BackendSelection, ExecutionRunner, LoadedConfig, DEFAULT_CONFIG_PATH};
@@ -1249,6 +1249,12 @@ where
         .context("renderer task panicked")?
         .context("renderer error")?;
 
+    // Sync materialized state columns in Postgres so `yarli run status` and
+    // direct DB queries reflect the actual terminal state, not the initial RUN_OPEN.
+    if let Err(e) = sync_postgres_state(&scheduler, loaded_config, run_id).await {
+        warn!(error = %e, "failed to sync postgres state on exit");
+    }
+
     // Print final status.
     let reg = scheduler.registry().read().await;
     let run_state = reg
@@ -1424,6 +1430,93 @@ fn task_blocker_db(blocker: &yarli_core::entities::task::BlockerCode) -> String 
     }
 }
 
+/// Sync the materialized run and task states in Postgres to match in-memory registry.
+///
+/// The `runs.state` and `tasks.state` columns are seeded once at INSERT and never updated,
+/// leaving them stale (e.g. RUN_OPEN) while the event-sourced in-memory registry advances.
+/// This function writes the current in-memory state back to Postgres for observability.
+async fn sync_postgres_state<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    loaded_config: &LoadedConfig,
+    run_id: Uuid,
+) -> Result<()>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let BackendSelection::Postgres { database_url } = loaded_config.backend_selection()? else {
+        return Ok(());
+    };
+
+    let reg = scheduler.registry().read().await;
+    let run = match reg.get_run(&run_id) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let run_state = run_state_db(run.state);
+    let exit_reason = run.exit_reason.map(exit_reason_db);
+    let task_states: Vec<(Uuid, &'static str)> = reg
+        .tasks_for_run(&run_id)
+        .iter()
+        .map(|t| (t.id, task_state_db(t.state)))
+        .collect();
+    drop(reg);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .context("sync_postgres_state: failed to connect")?;
+
+    let mut tx = pool.begin().await.context("sync_postgres_state: begin tx")?;
+
+    sqlx::query(
+        r#"
+        UPDATE runs
+        SET state = $1,
+            exit_reason = $2,
+            updated_at = now()
+        WHERE run_id = $3
+        "#,
+    )
+    .bind(run_state)
+    .bind(exit_reason)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .context("sync_postgres_state: update runs")?;
+
+    for (task_id, state) in &task_states {
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = $1,
+                updated_at = now()
+            WHERE task_id = $2
+            "#,
+        )
+        .bind(*state)
+        .bind(*task_id)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("sync_postgres_state: update task {task_id}"))?;
+    }
+
+    tx.commit()
+        .await
+        .context("sync_postgres_state: commit")?;
+
+    debug!(
+        run_id = %run_id,
+        run_state = run_state,
+        tasks = task_states.len(),
+        "synced postgres state"
+    );
+    Ok(())
+}
+
 fn build_run_config_snapshot(
     loaded_config: &LoadedConfig,
     working_dir: &str,
@@ -1535,6 +1628,8 @@ where
     R: yarli_exec::CommandRunner + Clone,
 {
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut reclaim_interval = tokio::time::interval(Duration::from_secs(10));
     let mut tick_count: u64 = 0;
     let mut stream_cursor = IncrementalEventCursor::new(
         EventQuery::by_correlation(correlation_id),
@@ -1544,8 +1639,23 @@ where
         DeteriorationObserver::new(run_id, correlation_id, OBSERVER_WINDOW_SIZE);
 
     if let Some(observer) = memory_observer.as_mut() {
-        observer.observe_run_start(store.as_ref()).await;
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            observer.observe_run_start(store.as_ref()),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => warn!("memory observer observe_run_start timed out after 15s, continuing"),
+        }
     }
+
+    // Drain stale queue entries from prior runs before first tick.
+    if let Err(e) = scheduler.cleanup_stale_queue().await {
+        warn!(error = %e, "failed to clean up stale queue entries");
+    }
+
+    let mut zero_progress_ticks: u64 = 0;
 
     loop {
         tokio::select! {
@@ -1563,10 +1673,24 @@ where
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
                 deterioration_observer.observe_store(store.as_ref())?;
                 if let Some(observer) = memory_observer.as_mut() {
-                    observer.observe_events(store.as_ref(), &_new_events).await;
+                    match tokio::time::timeout(
+                        Duration::from_secs(15),
+                        observer.observe_events(store.as_ref(), &_new_events),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => warn!("memory observer observe_events timed out after 15s on cancel"),
+                    }
                 }
                 drop(tx);
                 return Ok(());
+            }
+            _ = heartbeat_interval.tick() => {
+                scheduler.heartbeat_active_leases().await;
+            }
+            _ = reclaim_interval.tick() => {
+                scheduler.reclaim_stale_leases().await;
             }
             _ = tick_interval.tick() => {
                 tick_count += 1;
@@ -1575,12 +1699,46 @@ where
                 let _result = scheduler.tick_with_cancel(cancel.child_token()).await
                     .context("scheduler tick failed")?;
 
+                debug!(
+                    tick = tick_count,
+                    promoted = _result.promoted,
+                    claimed = _result.claimed,
+                    executed = _result.executed,
+                    failed = _result.failed,
+                    errors = _result.errors,
+                    "drive_scheduler tick"
+                );
+
+                if _result.claimed == 0 && _result.executed == 0 {
+                    zero_progress_ticks += 1;
+                    if zero_progress_ticks >= 10 && zero_progress_ticks % 10 == 0 {
+                        let stats = scheduler.queue_stats();
+                        warn!(
+                            consecutive_zero_ticks = zero_progress_ticks,
+                            tick = tick_count,
+                            queue_pending = stats.pending,
+                            queue_leased = stats.leased,
+                            "no tasks claimed or executed for {zero_progress_ticks} consecutive ticks"
+                        );
+                    }
+                } else {
+                    zero_progress_ticks = 0;
+                }
+
                 // Emit events using incremental cursor reads.
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
                 deterioration_observer.observe_store(store.as_ref())?;
                 if let Some(observer) = memory_observer.as_mut() {
-                    observer.observe_events(store.as_ref(), &_new_events).await;
+                    match tokio::time::timeout(
+                        Duration::from_secs(15),
+                        observer.observe_events(store.as_ref(), &_new_events),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => warn!("memory observer observe_events timed out after 15s, continuing"),
+                    }
                 }
 
                 // Send tick for spinner animation.
@@ -1703,6 +1861,18 @@ where
     };
 
     drop(reg);
+
+    // Drain pending/leased queue entries for this run to prevent stalls.
+    match scheduler.cancel_run_queue(run_id) {
+        Ok(count) if count > 0 => {
+            info!(run_id = %run_id, cancelled_queue_entries = count, "drained queue entries for cancelled run");
+        }
+        Err(e) => {
+            warn!(run_id = %run_id, error = %e, "failed to drain queue entries for cancelled run");
+        }
+        _ => {}
+    }
+
     for event in events {
         store
             .append(event)

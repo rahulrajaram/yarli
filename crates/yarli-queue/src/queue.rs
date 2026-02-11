@@ -74,6 +74,9 @@ pub struct ClaimRequest {
     pub limit: usize,
     /// Lease TTL duration.
     pub lease_ttl: Duration,
+    /// If set, only claim tasks belonging to these run IDs.
+    /// `None` means no filtering (claim from any run).
+    pub allowed_run_ids: Option<Vec<RunId>>,
 }
 
 impl ClaimRequest {
@@ -82,6 +85,7 @@ impl ClaimRequest {
             worker_id: worker_id.into(),
             limit,
             lease_ttl,
+            allowed_run_ids: None,
         }
     }
 
@@ -91,7 +95,14 @@ impl ClaimRequest {
             worker_id: worker_id.into(),
             limit: 1,
             lease_ttl: Duration::seconds(30),
+            allowed_run_ids: None,
         }
+    }
+
+    /// Restrict claims to only the given run IDs.
+    pub fn with_allowed_run_ids(mut self, run_ids: Vec<RunId>) -> Self {
+        self.allowed_run_ids = Some(run_ids);
+        self
     }
 }
 
@@ -197,6 +208,18 @@ pub trait TaskQueue: Send + Sync {
 
     /// Return total pending entries.
     fn pending_count(&self) -> usize;
+
+    /// Cancel all pending and leased entries for a given run.
+    ///
+    /// Returns the number of entries cancelled. Used during run cancellation
+    /// to drain stale queue rows that would otherwise starve concurrency caps.
+    fn cancel_for_run(&self, run_id: RunId) -> Result<usize, QueueError>;
+
+    /// Cancel all pending and leased entries NOT belonging to the given set of run IDs.
+    ///
+    /// Used at scheduler startup to drain stale rows from prior crashed/cancelled runs.
+    /// Returns the number of entries cancelled.
+    fn cancel_stale_runs(&self, active_run_ids: &[RunId]) -> Result<usize, QueueError>;
 }
 
 /// Summary statistics for the queue.
