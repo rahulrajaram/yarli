@@ -3,6 +3,9 @@
 This runbook covers the baseline local operator workflow for durable mode, migrations, and test execution.
 For final verification and release acceptance decisions, use `docs/ACCEPTANCE_RUBRIC.md`.
 
+For an exhaustive, command-by-command CLI usage guide, see `docs/CLI.md`.
+For memory behavior (when YARLI stores/queries memories), see `docs/MEMORY_POLICY.md`.
+
 ## Requirements
 
 - Rust toolchain compatible with workspace `rust-version` (currently 1.75+).
@@ -87,6 +90,19 @@ Native process execution remains default:
 runner = "native"
 ```
 
+## Default `yarli run` (PROMPT.md)
+
+To avoid repeating long `--cmd ...` lists, YARLI is opinionated: `yarli run` reads the repository's canonical `PROMPT.md` (walking up from the current working directory), expands `@include <path>` directives, and executes the single embedded ```yarli-run fenced TOML block.
+
+```bash
+yarli run --stream
+```
+
+Notes:
+
+- `yarli run start ... --cmd ...` remains available for ad-hoc runs.
+- `yarli run batch` and `[run]` paces are supported for backward compatibility but are no longer the primary workflow.
+
 Optional Overwatch-backed execution is opt-in:
 
 ```toml
@@ -147,6 +163,7 @@ Operator surfaces:
 
 - `yarli run status <run-id>` includes latest deterioration score/trend/factors when available.
 - `yarli run explain-exit <run-id>` includes a sequence deterioration section.
+- `yarli-api` (if you run it) exposes the latest report as an optional `deterioration` field on `GET /v1/runs/<run-id>/status`.
 
 ## Reproducing Budget Stress Checks Locally
 

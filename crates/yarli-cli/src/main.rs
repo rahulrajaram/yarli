@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,7 @@ use uuid::Uuid;
 use yarli_cli::config::{BackendSelection, ExecutionRunner, LoadedConfig, DEFAULT_CONFIG_PATH};
 use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
+use yarli_cli::prompt;
 use yarli_cli::stream::{StreamConfig, StreamEvent, StreamRenderer};
 use yarli_core::domain::{CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode};
 use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
@@ -41,6 +43,9 @@ use yarli_exec::{
 use yarli_gates::{all_passed, default_run_gates, default_task_gates, evaluate_all, GateContext};
 use yarli_git::error::{GitError, RecoveryAction};
 use yarli_git::{LocalMergeOrchestrator, LocalWorktreeManager, MergeOrchestrator, WorktreeManager};
+use yarli_memory::{
+    MemoryCliAdapter, InsertMemory, MemoryAdapter, MemoryClass, MemoryQuery, ScopeId,
+};
 use yarli_observability::{AuditEntry, AuditSink, JsonlAuditSink};
 use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use yarli_queue::{
@@ -53,6 +58,13 @@ use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
 /// YARLI — Yet Another Orchestrator Loop Implementation.
 ///
 /// Deterministic orchestrator with state machines, event log, and safe Git handling.
+///
+/// Default workflow: `yarli run` executes the canonical `PROMPT.md` run spec.
+/// Recommended durability: use Postgres (`core.backend = "postgres"`); in-memory mode blocks writes
+/// unless explicitly opted in via `core.allow_in_memory_writes = true`.
+///
+/// Optional memories: Backend-backed memory hints/storage can be enabled via `yarli.toml`
+/// (`[memory.backend] enabled = true`). See `yarli init --help` for config keys.
 #[derive(Parser)]
 #[command(name = "yarli", version, about)]
 struct Cli {
@@ -73,6 +85,10 @@ const INIT_LONG_ABOUT: &str = r#"Initialize `yarli.toml` with a fully annotated 
 This command is the fastest way to bootstrap YARLI configuration for local dev,
 CI, or production-like runs.
 
+`yarli run` is opinionated and executes the canonical `PROMPT.md` run spec; this
+config file controls runtime behavior (durability, execution runner, budgets,
+and scheduler caps).
+
 Configuration sections and properties you can tune:
 
 [core]
@@ -83,6 +99,25 @@ Configuration sections and properties you can tune:
 
 [postgres]
 - postgres.database_url (required when core.backend = "postgres")
+
+Recommended for consumers: use Postgres (`core.backend = "postgres"`) for durable runs.
+`core.backend = "in-memory"` is intended for local throwaway usage only and blocks write
+commands unless `core.allow_in_memory_writes = true`.
+
+[cli]
+- cli.backend (optional; codex|claude|gemini|custom)
+- cli.prompt_mode (default: "arg"; values: arg|stdin)
+- cli.command (optional; executable to invoke)
+- cli.args (default: []; argv list)
+
+[event_loop]
+- event_loop.max_iterations (default: 5; reserved for future LLM-backed iterative loops)
+- event_loop.max_runtime_seconds (default: 14400; reserved for future LLM-backed iterative loops)
+- event_loop.idle_timeout_secs (default: 1800; reserved for future LLM-backed iterative loops)
+- event_loop.checkpoint_interval (default: 5; reserved for future LLM-backed iterative loops)
+
+[features]
+- features.parallel (default: false; when false, force scheduler concurrency caps to 1)
 
 [queue]
 - queue.claim_batch_size (default: 4)
@@ -106,6 +141,12 @@ Configuration sections and properties you can tune:
 - execution.overwatch.soft_timeout_seconds (optional)
 - execution.overwatch.silent_timeout_seconds (optional)
 - execution.overwatch.max_log_bytes (optional)
+
+[run]
+- run.default_pace (legacy; used by `yarli run batch`)
+- run.paces.<name>.cmds (legacy; list of commands for the named pace)
+- run.paces.<name>.working_dir (legacy; per-pace working dir override)
+- run.paces.<name>.command_timeout_seconds (legacy; per-pace timeout override)
 
 [budgets] (all optional; unset => unlimited)
 - budgets.max_task_rss_bytes
@@ -132,6 +173,15 @@ Configuration sections and properties you can tune:
 [memory.backend]
 - memory.backend.enabled (default: false)
 - memory.backend.endpoint (optional)
+- memory.backend.command (default: "memory-backend")
+- memory.backend.project_dir (optional; defaults to prompt root)
+- memory.backend.query_limit (default: 8)
+- memory.backend.inject_on_run_start (default: true)
+- memory.backend.inject_on_failure (default: true)
+
+[memory]
+- memory.enabled (optional; master switch, defaults to memory.backend.enabled when unset)
+- memory.project_id (optional; defaults to prompt-root directory name)
 
 [observability]
 - observability.audit_file (default: ".yarl/audit.jsonl")
@@ -145,6 +195,9 @@ Examples:
 - yarli init --path ./config/yarli.toml
 - yarli init --force
 - yarli init --print
+- yarli init --backend codex
+- yarli init --backend claude --print
+- yarli init --backend gemini --path ./yarli.toml --force
 "#;
 
 const INIT_CONFIG_TEMPLATE: &str = r#"# YARLI runtime configuration
@@ -159,7 +212,8 @@ const INIT_CONFIG_TEMPLATE: &str = r#"# YARLI runtime configuration
 # - "postgres": durable production-style mode.
 backend = "in-memory"
 
-# Explicit ephemeral override. Keep false for durable-by-default safety.
+# Explicit ephemeral override.
+# Keep false for durable-by-default safety; set true only for local throwaway usage.
 allow_in_memory_writes = false
 
 # Safety policy mode: observe | restricted | execute | breakglass
@@ -171,6 +225,26 @@ safe_mode = "execute"
 [postgres]
 # Required when core.backend = "postgres".
 # database_url = "postgres://postgres:postgres@localhost:5432/yarli"
+
+# --- CLI_BACKEND_BEGIN ---
+[cli]
+# LLM CLI backend configuration (used by iterative planning loops).
+# backend = "codex" | "claude" | "gemini" | "custom"
+# prompt_mode = "arg" | "stdin"
+# command = "codex"
+# args = ["exec", "--json"]
+
+[event_loop]
+# Reserved for future LLM-backed iterative loops (not currently enforced by `yarli run`).
+max_iterations = 5
+max_runtime_seconds = 14400
+idle_timeout_secs = 1800
+checkpoint_interval = 5
+
+[features]
+# Parallel work controls scheduler concurrency caps only (no parallel worktrees).
+parallel = false
+# --- CLI_BACKEND_END ---
 
 [queue]
 # How many ready tasks a worker claims per tick.
@@ -233,6 +307,20 @@ audit_decisions = true
 
 [memory.backend]
 enabled = false
+# [memory]
+# enabled = true
+# project_id = "my-project"
+# command = "memory-backend"
+# project_dir = "."            # defaults to the directory containing PROMPT.md
+# query_limit = 8
+# inject_on_run_start = true
+# inject_on_failure = true
+#
+# Bootstrap Memory-backend for a repository:
+# - `memory-backend init -y`
+#
+# Then YARLI can store/query memories during `yarli run` when enabled=true.
+# endpoint is reserved for a future native gRPC/HTTP adapter.
 # endpoint = "http://localhost:8080"
 
 [observability]
@@ -244,34 +332,153 @@ audit_file = ".yarl/audit.jsonl"
 mode = "auto"
 "#;
 
+fn init_config_template(backend: Option<InitBackend>) -> String {
+    let base = INIT_CONFIG_TEMPLATE.to_string();
+    let replacement = match backend {
+        None => {
+            r#"[cli]
+# LLM CLI backend configuration (used by iterative planning loops).
+# backend = "codex" | "claude" | "gemini" | "custom"
+# prompt_mode = "arg" | "stdin"
+# command = "codex"
+# args = ["exec", "--json"]
+
+[event_loop]
+# Opinionated loop controls (used by `yarli run`).
+max_iterations = 5
+max_runtime_seconds = 14400
+idle_timeout_secs = 1800
+checkpoint_interval = 5
+
+[features]
+# Parallel work controls scheduler concurrency caps only (no parallel worktrees).
+parallel = false
+"#
+        }
+        Some(InitBackend::Codex) => {
+            r#"[cli]
+backend = "codex"
+prompt_mode = "arg"
+command = "codex"
+args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
+
+[event_loop]
+max_iterations = 5
+max_runtime_seconds = 14400
+idle_timeout_secs = 1800
+checkpoint_interval = 5
+
+[features]
+parallel = false
+"#
+        }
+        Some(InitBackend::Claude) => {
+            r#"[cli]
+backend = "claude"
+prompt_mode = "arg"
+command = "claude"
+args = ["--model", "sonnet-4.5"]
+
+[event_loop]
+max_iterations = 5
+max_runtime_seconds = 14400
+idle_timeout_secs = 1800
+checkpoint_interval = 5
+
+[features]
+parallel = false
+"#
+        }
+        Some(InitBackend::Gemini) => {
+            r#"[cli]
+backend = "gemini"
+prompt_mode = "arg"
+command = "gemini"
+args = ["--model", "gemini-2.0-flash"]
+
+[event_loop]
+max_iterations = 5
+max_runtime_seconds = 14400
+idle_timeout_secs = 1800
+checkpoint_interval = 5
+
+[features]
+parallel = false
+"#
+        }
+    };
+
+    replace_between(
+        &base,
+        "# --- CLI_BACKEND_BEGIN ---",
+        "# --- CLI_BACKEND_END ---",
+        replacement,
+    )
+}
+
+fn replace_between(haystack: &str, begin: &str, end: &str, replacement: &str) -> String {
+    let begin_idx = haystack
+        .find(begin)
+        .unwrap_or_else(|| panic!("template missing begin marker {begin}"));
+    let end_idx = haystack
+        .find(end)
+        .unwrap_or_else(|| panic!("template missing end marker {end}"));
+    assert!(end_idx >= begin_idx, "template markers out of order");
+
+    let mut out = String::with_capacity(haystack.len() + replacement.len());
+    out.push_str(&haystack[..begin_idx]);
+    out.push_str(replacement);
+    out.push('\n');
+    out.push_str(&haystack[end_idx + end.len()..]);
+    out
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Manage orchestration runs.
+    #[command(
+        about = "Manage orchestration runs (default: execute PROMPT.md)",
+        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) executes the canonical `PROMPT.md` run spec (walk up from CWD, expand `@include`, run the single ```yarli-run TOML block).\n\nOptional integrations:\n- Memories: enable Backend-backed hints/storage via `yarli.toml` (`[memory.backend] enabled = true`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
+    )]
     Run {
         #[command(subcommand)]
-        action: RunAction,
+        action: Option<RunAction>,
     },
-    /// Manage tasks within a run.
+    #[command(
+        about = "Manage tasks within a run",
+        long_about = "Manage tasks within a run.\n\nExamples:\n- `yarli task list <run-id>`\n- `yarli task explain <task-id>`\n- `yarli task unblock <task-id> --reason \"...\"`\n\nNotes:\n- `task unblock` is a write command and requires Postgres durability or explicit in-memory opt-in."
+    )]
     Task {
         #[command(subcommand)]
         action: TaskAction,
     },
-    /// Manage verification gates.
+    #[command(
+        about = "Manage verification gates",
+        long_about = "Manage verification gates.\n\nExamples:\n- `yarli gate list`\n- `yarli gate list --run`\n- `yarli gate rerun <task-id>`\n- `yarli gate rerun <task-id> --gate tests_passed`\n\nNotes:\n- `gate rerun` is a write command and requires Postgres durability or explicit in-memory opt-in."
+    )]
     Gate {
         #[command(subcommand)]
         action: GateAction,
     },
-    /// Manage Git worktrees.
+    #[command(
+        about = "Manage Git worktrees",
+        long_about = "Manage Git worktrees.\n\nExamples:\n- `yarli worktree status <run-id>`\n- `yarli worktree recover <worktree-id> --action abort`\n\nNotes:\n- Recovery actions are policy-gated write operations and are audited."
+    )]
     Worktree {
         #[command(subcommand)]
         action: WorktreeAction,
     },
-    /// Manage merge intents.
+    #[command(
+        about = "Manage merge intents",
+        long_about = "Manage merge intents.\n\nExamples:\n- `yarli merge request <source> <target> --run-id <run-id> --strategy merge-no-ff`\n- `yarli merge approve <merge-id>`\n- `yarli merge reject <merge-id> --reason \"...\"`\n- `yarli merge status <merge-id>`\n\nNotes:\n- Approve/reject are policy-gated write operations and are audited."
+    )]
     Merge {
         #[command(subcommand)]
         action: MergeAction,
     },
-    /// View the audit log.
+    #[command(
+        about = "View the audit log",
+        long_about = "View the audit log.\n\nExamples:\n- `yarli audit tail`\n- `yarli audit tail --file .yarl/audit.jsonl --lines 200`\n- `yarli audit tail --category policy_decision`"
+    )]
     Audit {
         #[command(subcommand)]
         action: AuditAction,
@@ -290,9 +497,23 @@ enum Commands {
         /// Print the config template to stdout instead of writing a file.
         #[arg(long, default_value_t = false)]
         print: bool,
+        /// Emit an opinionated template for a specific LLM CLI backend.
+        #[arg(long)]
+        backend: Option<InitBackend>,
     },
-    /// Show version and detected terminal capabilities.
+    #[command(
+        about = "Show version and detected terminal capabilities",
+        long_about = "Show version and detected terminal capabilities.\n\nExample:\n- `yarli info`"
+    )]
     Info,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
+enum InitBackend {
+    Codex,
+    Claude,
+    Gemini,
 }
 
 #[derive(Subcommand)]
@@ -304,10 +525,28 @@ enum RunAction {
         /// Commands to execute (one per task). Use multiple times for multiple tasks.
         #[arg(short, long)]
         cmd: Vec<String>,
+        /// Named run pace defined in yarli.toml ([run.paces.<name>]). Mutually exclusive with --cmd.
+        #[arg(long)]
+        pace: Option<String>,
         /// Working directory for command execution (defaults to `execution.working_dir`).
         #[arg(short, long)]
         workdir: Option<String>,
         /// Command timeout in seconds (defaults to `execution.command_timeout_seconds`, 0 = no timeout).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Start the default verification loop (config-backed) for this workspace.
+    Batch {
+        /// Optional objective label (defaults to "batch").
+        #[arg(long)]
+        objective: Option<String>,
+        /// Named run pace to use (defaults to "batch" if defined, otherwise run.default_pace).
+        #[arg(long)]
+        pace: Option<String>,
+        /// Working directory for command execution (overrides pace/config defaults).
+        #[arg(short, long)]
+        workdir: Option<String>,
+        /// Command timeout in seconds (overrides pace/config defaults, 0 = no timeout).
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -469,8 +708,14 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Commands::Init { path, force, print } = &cli.command {
-        return cmd_init(path.clone(), *force, *print);
+    if let Commands::Init {
+        path,
+        force,
+        print,
+        backend,
+    } = &cli.command
+    {
+        return cmd_init(path.clone(), *force, *print, *backend);
     }
 
     let loaded_config = LoadedConfig::load_default().context("failed to load runtime config")?;
@@ -488,24 +733,37 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Run { action } => match action {
-            RunAction::Start {
+            None => cmd_run_default(_render_mode, &loaded_config).await,
+            Some(RunAction::Start {
                 objective,
                 cmd,
+                pace,
                 workdir,
                 timeout,
-            } => {
-                cmd_run_start(
-                    objective,
-                    cmd,
+            }) => {
+                let plan =
+                    resolve_run_plan(&loaded_config, objective, cmd, pace, workdir, timeout, None)?;
+                cmd_run_start(plan, _render_mode, &loaded_config).await
+            }
+            Some(RunAction::Batch {
+                objective,
+                pace,
+                workdir,
+                timeout,
+            }) => {
+                let plan = resolve_run_plan(
+                    &loaded_config,
+                    objective.unwrap_or_else(|| "batch".to_string()),
+                    Vec::new(),
+                    pace,
                     workdir,
                     timeout,
-                    _render_mode,
-                    &loaded_config,
-                )
-                .await
+                    Some("batch"),
+                )?;
+                cmd_run_start(plan, _render_mode, &loaded_config).await
             }
-            RunAction::Status { run_id } => cmd_run_status(&run_id),
-            RunAction::ExplainExit { run_id } => cmd_run_explain(&run_id),
+            Some(RunAction::Status { run_id }) => cmd_run_status(&run_id),
+            Some(RunAction::ExplainExit { run_id }) => cmd_run_explain(&run_id),
         },
         Commands::Task { action } => match action {
             TaskAction::List { run_id } => cmd_task_list(&run_id),
@@ -547,9 +805,10 @@ async fn run() -> Result<()> {
 }
 
 /// `yarli init` — create or print a richly documented default config.
-fn cmd_init(path: PathBuf, force: bool, print: bool) -> Result<()> {
+fn cmd_init(path: PathBuf, force: bool, print: bool, backend: Option<InitBackend>) -> Result<()> {
+    let template = init_config_template(backend);
     if print {
-        print!("{INIT_CONFIG_TEMPLATE}");
+        print!("{template}");
         return Ok(());
     }
 
@@ -567,7 +826,7 @@ fn cmd_init(path: PathBuf, force: bool, print: bool) -> Result<()> {
         }
     }
 
-    fs::write(&path, INIT_CONFIG_TEMPLATE)
+    fs::write(&path, template)
         .with_context(|| format!("failed to write config file {}", path.display()))?;
 
     println!("Initialized config at {}", path.display());
@@ -577,37 +836,154 @@ fn cmd_init(path: PathBuf, force: bool, print: bool) -> Result<()> {
 }
 
 /// `yarli run start` — create a run, submit tasks, drive scheduler with stream output.
-async fn cmd_run_start(
+#[derive(Debug, Clone)]
+struct PlannedTask {
+    task_key: String,
+    command: String,
+    command_class: CommandClass,
+}
+
+/// Fully resolved run execution plan.
+#[derive(Debug, Clone)]
+struct RunPlan {
+    objective: String,
+    tasks: Vec<PlannedTask>,
+    workdir: String,
+    timeout_secs: u64,
+    pace: Option<String>,
+    prompt_snapshot: Option<yarli_cli::prompt::PromptSnapshot>,
+    run_spec: Option<yarli_cli::prompt::RunSpec>,
+}
+
+fn resolve_run_plan(
+    loaded_config: &LoadedConfig,
     objective: String,
     commands: Vec<String>,
+    pace: Option<String>,
     workdir: Option<String>,
     timeout_secs: Option<u64>,
+    default_pace_fallback: Option<&str>,
+) -> Result<RunPlan> {
+    if !commands.is_empty() && pace.is_some() {
+        bail!("--cmd and --pace are mutually exclusive");
+    }
+
+    let mut selected_pace = pace
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    if commands.is_empty() && selected_pace.is_none() {
+        if let Some(fallback) = default_pace_fallback {
+            if loaded_config.config().run.paces.contains_key(fallback) {
+                selected_pace = Some(fallback.to_string());
+            } else {
+                selected_pace = loaded_config
+                    .config()
+                    .run
+                    .default_pace
+                    .clone()
+                    .filter(|value| !value.trim().is_empty());
+            }
+        } else {
+            selected_pace = loaded_config
+                .config()
+                .run
+                .default_pace
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+        }
+    }
+
+    let (commands, pace_name, pace_workdir, pace_timeout) = if commands.is_empty() {
+        let pace_name = selected_pace.ok_or_else(|| {
+            anyhow::anyhow!(
+                "at least one --cmd is required (or configure [run] paces in {})",
+                loaded_config.path().display()
+            )
+        })?;
+
+        let pace = loaded_config
+            .config()
+            .run
+            .paces
+            .get(&pace_name)
+            .ok_or_else(|| {
+                let mut available: Vec<&str> = loaded_config
+                    .config()
+                    .run
+                    .paces
+                    .keys()
+                    .map(|s| s.as_str())
+                    .collect();
+                available.sort_unstable();
+                if available.is_empty() {
+                    anyhow::anyhow!(
+                        "unknown pace {pace_name:?} (no paces configured in {})",
+                        loaded_config.path().display()
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "unknown pace {pace_name:?} (available: {})",
+                        available.join(", ")
+                    )
+                }
+            })?;
+
+        if pace.cmds.is_empty() {
+            bail!("pace {pace_name:?} has no cmds configured");
+        }
+
+        (
+            pace.cmds.clone(),
+            Some(pace_name),
+            pace.working_dir.clone(),
+            pace.command_timeout_seconds,
+        )
+    } else {
+        (commands, None, None, None)
+    };
+
+    let tasks = commands
+        .into_iter()
+        .enumerate()
+        .map(|(idx, cmd)| PlannedTask {
+            task_key: format!("task-{}", idx + 1),
+            command: cmd,
+            command_class: CommandClass::Io,
+        })
+        .collect::<Vec<_>>();
+
+    let selected_workdir = workdir
+        .or(pace_workdir)
+        .unwrap_or_else(|| loaded_config.config().execution.working_dir.clone());
+    let selected_timeout_secs = timeout_secs
+        .or(pace_timeout)
+        .unwrap_or(loaded_config.config().execution.command_timeout_seconds);
+
+    Ok(RunPlan {
+        objective,
+        tasks,
+        workdir: selected_workdir,
+        timeout_secs: selected_timeout_secs,
+        pace: pace_name,
+        prompt_snapshot: None,
+        run_spec: None,
+    })
+}
+
+async fn cmd_run_start(
+    plan: RunPlan,
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
 ) -> Result<()> {
     ensure_write_backend_guard(loaded_config, "run start")?;
-
-    let selected_workdir =
-        workdir.unwrap_or_else(|| loaded_config.config().execution.working_dir.clone());
-    let selected_timeout_secs =
-        timeout_secs.unwrap_or(loaded_config.config().execution.command_timeout_seconds);
 
     match loaded_config.backend_selection()? {
         BackendSelection::InMemory => {
             println!("Using backend: in-memory");
             let store = Arc::new(InMemoryEventStore::new());
             let queue = Arc::new(InMemoryTaskQueue::new());
-            cmd_run_start_with_backend(
-                objective,
-                commands,
-                selected_workdir,
-                selected_timeout_secs,
-                render_mode,
-                loaded_config,
-                store,
-                queue,
-            )
-            .await
+            cmd_run_start_with_backend(plan.clone(), render_mode, loaded_config, store, queue).await
         }
         BackendSelection::Postgres { database_url } => {
             println!("Using backend: postgres");
@@ -619,26 +995,64 @@ async fn cmd_run_start(
                 Arc::new(PostgresTaskQueue::new(&database_url).map_err(|e| {
                     anyhow::anyhow!("failed to initialize postgres task queue: {e}")
                 })?);
-            cmd_run_start_with_backend(
-                objective,
-                commands,
-                selected_workdir,
-                selected_timeout_secs,
-                render_mode,
-                loaded_config,
-                store,
-                queue,
-            )
-            .await
+            cmd_run_start_with_backend(plan, render_mode, loaded_config, store, queue).await
         }
     }
 }
 
+/// `yarli run` — opinionated default entrypoint: read PROMPT.md and execute the embedded run spec.
+async fn cmd_run_default(render_mode: RenderMode, loaded_config: &LoadedConfig) -> Result<()> {
+    let loaded =
+        prompt::load_prompt_and_run_spec_from_cwd().context("failed to load PROMPT.md run spec")?;
+
+    let objective = loaded
+        .run_spec
+        .objective
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "yarli run".to_string());
+
+    let tasks = loaded
+        .run_spec
+        .tasks
+        .items
+        .iter()
+        .map(|t| {
+            let class = match t.class.as_deref().unwrap_or("io") {
+                "io" => CommandClass::Io,
+                "cpu" => CommandClass::Cpu,
+                "git" => CommandClass::Git,
+                "tool" => CommandClass::Tool,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "unknown command class {other:?} for task key {}",
+                        t.key
+                    ));
+                }
+            };
+            Ok(PlannedTask {
+                task_key: t.key.clone(),
+                command: t.cmd.clone(),
+                command_class: class,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let plan = RunPlan {
+        objective,
+        tasks,
+        workdir: loaded_config.config().execution.working_dir.clone(),
+        timeout_secs: loaded_config.config().execution.command_timeout_seconds,
+        pace: None,
+        prompt_snapshot: Some(loaded.snapshot),
+        run_spec: Some(loaded.run_spec),
+    };
+
+    cmd_run_start(plan, render_mode, loaded_config).await
+}
+
 async fn cmd_run_start_with_backend<Q, S>(
-    objective: String,
-    commands: Vec<String>,
-    workdir: String,
-    timeout_secs: u64,
+    plan: RunPlan,
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
     store: Arc<S>,
@@ -648,8 +1062,8 @@ where
     Q: TaskQueue + 'static,
     S: EventStore + 'static,
 {
-    if commands.is_empty() {
-        bail!("at least one --cmd is required");
+    if plan.tasks.is_empty() {
+        bail!("at least one task is required");
     }
 
     let runner = match loaded_config.config().execution.runner {
@@ -674,14 +1088,14 @@ where
         }
     };
 
-    let command_timeout = if timeout_secs == 0 {
+    let command_timeout = if plan.timeout_secs == 0 {
         None
     } else {
-        Some(Duration::from_secs(timeout_secs))
+        Some(Duration::from_secs(plan.timeout_secs))
     };
 
     let mut config = SchedulerConfig {
-        working_dir: workdir.clone(),
+        working_dir: plan.workdir.clone(),
         command_timeout,
         ..SchedulerConfig::default()
     };
@@ -699,6 +1113,14 @@ where
     config.concurrency.cpu_cap = loaded_config.config().queue.cpu_cap;
     config.concurrency.git_cap = loaded_config.config().queue.git_cap;
     config.concurrency.tool_cap = loaded_config.config().queue.tool_cap;
+    if !loaded_config.config().features.parallel {
+        config.claim_batch_size = 1;
+        config.concurrency.per_run_cap = 1;
+        config.concurrency.io_cap = 1;
+        config.concurrency.cpu_cap = 1;
+        config.concurrency.git_cap = 1;
+        config.concurrency.tool_cap = 1;
+    }
     if let Some(worker_id) = loaded_config.config().core.worker_id.as_ref() {
         config.worker_id = worker_id.clone();
     }
@@ -733,25 +1155,33 @@ where
     }
 
     // Build run and tasks.
-    let run_snapshot = build_run_config_snapshot(loaded_config, &workdir, timeout_secs, &commands)
-        .context("failed to build run config snapshot")?;
+    let run_snapshot = build_run_config_snapshot(
+        loaded_config,
+        &plan.workdir,
+        plan.timeout_secs,
+        &plan.tasks,
+        plan.pace.as_deref(),
+        plan.prompt_snapshot.as_ref(),
+        plan.run_spec.as_ref(),
+    )
+    .context("failed to build run config snapshot")?;
     let run = Run::with_config(
-        &objective,
+        &plan.objective,
         loaded_config.config().core.safe_mode,
         run_snapshot.clone(),
     );
     let run_id = run.id;
     let correlation_id = run.correlation_id;
 
-    let tasks: Vec<Task> = commands
+    let tasks: Vec<Task> = plan
+        .tasks
         .iter()
-        .enumerate()
-        .map(|(i, cmd)| {
+        .map(|t| {
             Task::new(
                 run_id,
-                format!("task-{}", i + 1),
-                cmd,
-                CommandClass::Io,
+                t.task_key.clone(),
+                &t.command,
+                t.command_class,
                 correlation_id,
             )
         })
@@ -769,7 +1199,7 @@ where
         entity_id: run_id.to_string(),
         event_type: "run.config_snapshot".to_string(),
         payload: serde_json::json!({
-            "objective": objective.clone(),
+            "objective": plan.objective.clone(),
             "safe_mode": loaded_config.config().core.safe_mode,
             "config_snapshot": run_snapshot,
         }),
@@ -785,7 +1215,7 @@ where
         .await
         .context("failed to submit run")?;
 
-    info!(run_id = %run_id, "run started: {objective}");
+    info!(run_id = %run_id, objective = %plan.objective, "run started");
 
     // Set up shutdown controller.
     let shutdown = ShutdownController::new();
@@ -794,15 +1224,6 @@ where
 
     // Set up event channel for renderer.
     let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
-
-    // Send initial run transition event.
-    let _ = tx.send(StreamEvent::RunTransition {
-        run_id,
-        from: RunState::RunOpen,
-        to: RunState::RunActive,
-        reason: Some("run submitted".into()),
-        at: chrono::Utc::now(),
-    });
 
     // Spawn renderer task.
     let renderer_shutdown = shutdown.clone();
@@ -818,6 +1239,7 @@ where
         run_id,
         correlation_id,
         &task_names,
+        build_memory_observer(loaded_config, run_id, correlation_id, &plan, &task_names)?,
     )
     .await?;
 
@@ -1006,7 +1428,10 @@ fn build_run_config_snapshot(
     loaded_config: &LoadedConfig,
     working_dir: &str,
     timeout_secs: u64,
-    commands: &[String],
+    tasks: &[PlannedTask],
+    pace: Option<&str>,
+    prompt_snapshot: Option<&yarli_cli::prompt::PromptSnapshot>,
+    run_spec: Option<&yarli_cli::prompt::RunSpec>,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "config_source": loaded_config.source().label(),
@@ -1014,12 +1439,83 @@ fn build_run_config_snapshot(
         "backend": loaded_config.config().core.backend.as_str(),
         "config": loaded_config.snapshot()?,
         "runtime": {
+            "pace": pace,
             "working_dir": working_dir,
             "timeout_secs": timeout_secs,
-            "command_count": commands.len(),
-            "commands": commands,
+            "task_count": tasks.len(),
+            "tasks": tasks.iter().map(|t| serde_json::json!({
+                "task_key": &t.task_key,
+                "command": &t.command,
+                "command_class": format!("{:?}", t.command_class),
+            })).collect::<Vec<_>>(),
+            "prompt": prompt_snapshot,
+            "run_spec": run_spec,
         },
     }))
+}
+
+fn build_memory_observer(
+    loaded_config: &LoadedConfig,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    plan: &RunPlan,
+    task_names: &[(Uuid, String)],
+) -> Result<Option<MemoryObserver>> {
+    let memory_cfg = &loaded_config.config().memory;
+    let mem = &memory_cfg.backend;
+    let enabled = memory_cfg.enabled.unwrap_or(mem.enabled);
+    if !enabled || !mem.enabled {
+        return Ok(None);
+    }
+
+    let cwd = std::env::current_dir().context("failed to read current working directory")?;
+    let prompt_root = prompt::find_prompt_upwards(cwd.clone())
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or(cwd);
+
+    let project_id = memory_cfg
+        .project_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            prompt_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    let project_dir = mem
+        .project_dir
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|raw| {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() {
+                path
+            } else {
+                prompt_root.join(path)
+            }
+        })
+        .unwrap_or_else(|| prompt_root.clone());
+
+    let adapter = MemoryCliAdapter::new(mem.command.clone(), project_dir);
+
+    let task_keys = plan.tasks.iter().map(|t| t.task_key.clone()).collect();
+
+    Ok(Some(MemoryObserver::new(
+        project_id,
+        run_id,
+        correlation_id,
+        plan.objective.clone(),
+        adapter,
+        mem.query_limit,
+        mem.inject_on_run_start,
+        mem.inject_on_failure,
+        task_keys,
+        task_names,
+    )))
 }
 
 /// Drive the scheduler, emitting StreamEvents to the renderer channel.
@@ -1031,6 +1527,7 @@ async fn drive_scheduler<Q, S, R>(
     run_id: Uuid,
     correlation_id: Uuid,
     task_names: &[(Uuid, String)],
+    mut memory_observer: Option<MemoryObserver>,
 ) -> Result<()>
 where
     Q: yarli_queue::TaskQueue,
@@ -1045,6 +1542,10 @@ where
     );
     let mut deterioration_observer =
         DeteriorationObserver::new(run_id, correlation_id, OBSERVER_WINDOW_SIZE);
+
+    if let Some(observer) = memory_observer.as_mut() {
+        observer.observe_run_start(store.as_ref()).await;
+    }
 
     loop {
         tokio::select! {
@@ -1061,6 +1562,9 @@ where
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
                 deterioration_observer.observe_store(store.as_ref())?;
+                if let Some(observer) = memory_observer.as_mut() {
+                    observer.observe_events(store.as_ref(), &_new_events).await;
+                }
                 drop(tx);
                 return Ok(());
             }
@@ -1075,6 +1579,9 @@ where
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
                 deterioration_observer.observe_store(store.as_ref())?;
+                if let Some(observer) = memory_observer.as_mut() {
+                    observer.observe_events(store.as_ref(), &_new_events).await;
+                }
 
                 // Send tick for spinner animation.
                 let _ = tx.send(StreamEvent::Tick);
@@ -1252,13 +1759,14 @@ fn event_to_stream_event(
                 exit_code,
                 detail: event
                     .payload
-                    .get("reason")
+                    .get("detail")
                     .and_then(|v| v.as_str())
+                    .or_else(|| event.payload.get("reason").and_then(|v| v.as_str()))
                     .map(String::from),
                 at: event.occurred_at,
             })
         }
-        "run.activated" | "run.verifying" | "run.completed" | "run.failed" => {
+        "run.activated" | "run.verifying" | "run.completed" | "run.failed" | "run.cancelled" => {
             let from_str = event.payload.get("from").and_then(|v| v.as_str());
             let to_str = event.payload.get("to").and_then(|v| v.as_str());
 
@@ -1271,8 +1779,9 @@ fn event_to_stream_event(
 
             let reason = event
                 .payload
-                .get("reason")
+                .get("detail")
                 .and_then(|v| v.as_str())
+                .or_else(|| event.payload.get("reason").and_then(|v| v.as_str()))
                 .map(String::from);
 
             let run_id = event.entity_id.parse().unwrap_or(Uuid::nil());
@@ -1498,6 +2007,375 @@ struct IncrementalEventCursor {
     query: EventQuery,
     after_event_id: Option<Uuid>,
     batch_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct MemoryHint {
+    memory_id: String,
+    scope_id: String,
+    memory_class: MemoryClass,
+    relevance_score: f64,
+    content_snippet: String,
+    metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct MemoryHintsReport {
+    query_text: String,
+    limit: u32,
+    results: Vec<MemoryHint>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryObserver {
+    enabled: bool,
+    project_id: String,
+    project_scope: ScopeId,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    query_limit: u32,
+    inject_on_run_start: bool,
+    inject_on_failure: bool,
+    adapter: MemoryCliAdapter,
+    run_objective: String,
+    task_keys: Vec<String>,
+    task_names: BTreeMap<Uuid, String>,
+    run_start_done: bool,
+}
+
+impl MemoryObserver {
+    fn new(
+        project_id: String,
+        run_id: Uuid,
+        correlation_id: Uuid,
+        run_objective: String,
+        adapter: MemoryCliAdapter,
+        query_limit: u32,
+        inject_on_run_start: bool,
+        inject_on_failure: bool,
+        task_keys: Vec<String>,
+        task_names: &[(Uuid, String)],
+    ) -> Self {
+        let project_scope = ScopeId(format!("project/{project_id}"));
+        Self {
+            enabled: true,
+            project_id,
+            project_scope,
+            run_id,
+            correlation_id,
+            query_limit,
+            inject_on_run_start,
+            inject_on_failure,
+            adapter,
+            run_objective,
+            task_keys,
+            task_names: task_names.iter().cloned().collect(),
+            run_start_done: false,
+        }
+    }
+
+    async fn observe_run_start(&mut self, store: &dyn EventStore) {
+        if !self.enabled || self.run_start_done || !self.inject_on_run_start {
+            self.run_start_done = true;
+            return;
+        }
+        self.run_start_done = true;
+
+        let query_text = format!(
+            "objective: {} tasks: {}",
+            self.run_objective,
+            self.task_keys.join(",")
+        );
+        let query = MemoryQuery {
+            scope_id: self.project_scope.clone(),
+            query_text: query_text.clone(),
+            limit: self.query_limit,
+            memory_class: Some(MemoryClass::Semantic),
+        };
+
+        match self.adapter.query(&self.project_id, query).await {
+            Ok(records) => {
+                let report = MemoryHintsReport {
+                    query_text,
+                    limit: self.query_limit,
+                    results: records
+                        .into_iter()
+                        .map(|r| MemoryHint {
+                            memory_id: r.memory_id,
+                            scope_id: r.scope_id.0,
+                            memory_class: r.memory_class,
+                            relevance_score: r.relevance_score,
+                            content_snippet: truncate_for_snippet(&r.content),
+                            metadata: r.metadata.into_iter().collect(),
+                        })
+                        .collect(),
+                };
+
+                let _ = append_event(
+                    store,
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: self.run_id.to_string(),
+                        event_type: "run.observer.memory_hints".to_string(),
+                        payload: serde_json::to_value(&report).unwrap_or_else(|_| {
+                            serde_json::json!({
+                                "query_text": report.query_text,
+                                "limit": report.limit,
+                                "results": [],
+                            })
+                        }),
+                        correlation_id: self.correlation_id,
+                        causation_id: None,
+                        actor: "observer.memory".to_string(),
+                        idempotency_key: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let _ = append_event(
+                    store,
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: self.run_id.to_string(),
+                        event_type: "run.observer.memory_query_failed".to_string(),
+                        payload: serde_json::json!({
+                            "error": err.to_string(),
+                            "scope_id": self.project_scope.as_str(),
+                        }),
+                        correlation_id: self.correlation_id,
+                        causation_id: None,
+                        actor: "observer.memory".to_string(),
+                        idempotency_key: None,
+                    },
+                );
+            }
+        }
+    }
+
+    async fn observe_events(&mut self, store: &dyn EventStore, events: &[Event]) {
+        if !self.enabled {
+            return;
+        }
+
+        for event in events {
+            match event.event_type.as_str() {
+                "task.failed" => {
+                    self.on_task_failed(store, event).await;
+                    if self.inject_on_failure {
+                        self.emit_task_hints(store, event, "failed").await;
+                    }
+                }
+                "task.blocked" => {
+                    if self.inject_on_failure {
+                        self.emit_task_hints(store, event, "blocked").await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn on_task_failed(&self, store: &dyn EventStore, event: &Event) {
+        let Ok(task_id) = event.entity_id.parse::<Uuid>() else {
+            return;
+        };
+        let task_key = self
+            .task_names
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_else(|| event.entity_id[..8].to_string());
+
+        let reason = event
+            .payload
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let exit_code = event.payload.get("exit_code").and_then(|v| v.as_i64());
+        let detail = event
+            .payload
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let content = truncate_for_memory(&format!(
+            "task_failed: task_key={task_key} reason={reason} exit_code={} detail={detail}",
+            exit_code
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
+
+        let mut semantic =
+            InsertMemory::new(self.project_scope.clone(), MemoryClass::Semantic, content);
+        semantic
+            .metadata
+            .insert("run_id".to_string(), self.run_id.to_string());
+        semantic
+            .metadata
+            .insert("task_id".to_string(), task_id.to_string());
+        semantic
+            .metadata
+            .insert("task_key".to_string(), task_key.clone());
+        semantic
+            .metadata
+            .insert("reason".to_string(), reason.clone());
+        semantic
+            .metadata
+            .insert("event_id".to_string(), event.event_id.to_string());
+
+        match self.adapter.store(&self.project_id, semantic).await {
+            Ok(record) => {
+                let _ = append_event(
+                    store,
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Task,
+                        entity_id: task_id.to_string(),
+                        event_type: "task.observer.memory_stored".to_string(),
+                        payload: serde_json::json!({
+                            "memory_id": record.memory_id,
+                            "scope_id": record.scope_id.as_str(),
+                            "memory_class": record.memory_class,
+                        }),
+                        correlation_id: self.correlation_id,
+                        causation_id: Some(event.event_id),
+                        actor: "observer.memory".to_string(),
+                        idempotency_key: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let _ = append_event(
+                    store,
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Task,
+                        entity_id: task_id.to_string(),
+                        event_type: "task.observer.memory_store_failed".to_string(),
+                        payload: serde_json::json!({
+                            "error": err.to_string(),
+                            "scope_id": self.project_scope.as_str(),
+                        }),
+                        correlation_id: self.correlation_id,
+                        causation_id: Some(event.event_id),
+                        actor: "observer.memory".to_string(),
+                        idempotency_key: None,
+                    },
+                );
+            }
+        }
+    }
+
+    async fn emit_task_hints(&self, store: &dyn EventStore, event: &Event, state: &str) {
+        let Ok(task_id) = event.entity_id.parse::<Uuid>() else {
+            return;
+        };
+
+        let task_key = self
+            .task_names
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_else(|| event.entity_id[..8].to_string());
+        let reason = event
+            .payload
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let query_text = format!("{state} task_key={task_key} reason={reason}");
+
+        let query = MemoryQuery {
+            scope_id: self.project_scope.clone(),
+            query_text: query_text.clone(),
+            limit: self.query_limit,
+            memory_class: Some(MemoryClass::Semantic),
+        };
+
+        match self.adapter.query(&self.project_id, query).await {
+            Ok(records) => {
+                let report = MemoryHintsReport {
+                    query_text,
+                    limit: self.query_limit,
+                    results: records
+                        .into_iter()
+                        .map(|r| MemoryHint {
+                            memory_id: r.memory_id,
+                            scope_id: r.scope_id.0,
+                            memory_class: r.memory_class,
+                            relevance_score: r.relevance_score,
+                            content_snippet: truncate_for_snippet(&r.content),
+                            metadata: r.metadata.into_iter().collect(),
+                        })
+                        .collect(),
+                };
+                let _ = append_event(
+                    store,
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Task,
+                        entity_id: task_id.to_string(),
+                        event_type: "task.observer.memory_hints".to_string(),
+                        payload: serde_json::to_value(&report).unwrap_or_else(|_| {
+                            serde_json::json!({
+                                "query_text": report.query_text,
+                                "limit": report.limit,
+                                "results": [],
+                            })
+                        }),
+                        correlation_id: self.correlation_id,
+                        causation_id: Some(event.event_id),
+                        actor: "observer.memory".to_string(),
+                        idempotency_key: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let _ = append_event(
+                    store,
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Task,
+                        entity_id: task_id.to_string(),
+                        event_type: "task.observer.memory_query_failed".to_string(),
+                        payload: serde_json::json!({
+                            "error": err.to_string(),
+                            "scope_id": self.project_scope.as_str(),
+                        }),
+                        correlation_id: self.correlation_id,
+                        causation_id: Some(event.event_id),
+                        actor: "observer.memory".to_string(),
+                        idempotency_key: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn truncate_for_snippet(content: &str) -> String {
+    const MAX: usize = 160;
+    let trimmed = content.trim();
+    if trimmed.len() <= MAX {
+        return trimmed.to_string();
+    }
+    format!("{}...", &trimmed[..MAX])
+}
+
+fn truncate_for_memory(content: &str) -> String {
+    const MAX: usize = 1024;
+    let trimmed = content.trim();
+    if trimmed.len() <= MAX {
+        return trimmed.to_string();
+    }
+    format!("{}...", &trimmed[..MAX])
 }
 
 impl IncrementalEventCursor {
@@ -1912,6 +2790,7 @@ struct TaskProjection {
     resource_usage: Option<CommandResourceUsage>,
     token_usage: Option<TokenUsage>,
     budget_breach_reason: Option<String>,
+    memory_hints: Option<MemoryHintsReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -1925,6 +2804,7 @@ struct RunProjection {
     tasks: Vec<TaskProjection>,
     failed_gates: Vec<(GateType, String)>,
     deterioration: Option<DeteriorationReport>,
+    memory_hints: Option<MemoryHintsReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -2152,6 +3032,7 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
             resource_usage: None,
             token_usage: None,
             budget_breach_reason: None,
+            memory_hints: None,
         });
 
         entry.correlation_id = event.correlation_id;
@@ -2218,6 +3099,12 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
                 .unwrap_or("budget_exceeded");
             entry.budget_breach_reason = Some(detail.to_string());
         }
+
+        if event.event_type == "task.observer.memory_hints" {
+            if let Ok(report) = serde_json::from_value::<MemoryHintsReport>(event.payload.clone()) {
+                entry.memory_hints = Some(report);
+            }
+        }
     }
 
     let mut values: Vec<_> = tasks.into_values().collect();
@@ -2258,6 +3145,7 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
     let mut last_event_type = run_events[0].event_type.clone();
     let mut failed_gates = Vec::new();
     let mut deterioration = None;
+    let mut memory_hints = None;
 
     for event in &run_events {
         correlation_id = event.correlation_id;
@@ -2288,6 +3176,12 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
         if let Some(report) = deterioration_from_event(event) {
             deterioration = Some(report);
         }
+
+        if event.event_type == "run.observer.memory_hints" {
+            if let Ok(report) = serde_json::from_value::<MemoryHintsReport>(event.payload.clone()) {
+                memory_hints = Some(report);
+            }
+        }
     }
 
     let by_correlation = query_events(store, &EventQuery::by_correlation(correlation_id))?;
@@ -2307,6 +3201,7 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
         tasks,
         failed_gates,
         deterioration,
+        memory_hints,
     }))
 }
 
@@ -2749,6 +3644,23 @@ fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
         }
     }
 
+    if let Some(hints) = run.memory_hints.as_ref() {
+        writeln!(&mut out)?;
+        writeln!(
+            &mut out,
+            "Memories: {} hint(s) (query={:?})",
+            hints.results.len(),
+            hints.query_text
+        )?;
+        for hint in hints.results.iter().take(3) {
+            writeln!(
+                &mut out,
+                "  {} score={:.2} {}",
+                hint.memory_id, hint.relevance_score, hint.content_snippet
+            )?;
+        }
+    }
+
     if run.tasks.is_empty() {
         writeln!(&mut out, "No task events recorded for this run.")?;
     } else {
@@ -2776,6 +3688,14 @@ fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
                     .map(|v| format!("{v}"))
                     .unwrap_or_else(|| "-".into());
                 writeln!(&mut out, "    resource_usage: max_rss_bytes={rss}")?;
+            }
+            if let Some(ref hints) = task.memory_hints {
+                writeln!(
+                    &mut out,
+                    "    memory_hints: {} (query={:?})",
+                    hints.results.len(),
+                    hints.query_text
+                )?;
             }
         }
     }
@@ -2893,6 +3813,44 @@ fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
                 &mut out,
                 "  {} impact={:.2} ({})",
                 factor.name, factor.impact, factor.detail
+            )?;
+        }
+    }
+
+    if let Some(hints) = run.memory_hints.as_ref() {
+        writeln!(&mut out)?;
+        writeln!(
+            &mut out,
+            "Memories: {} hint(s) (query={:?})",
+            hints.results.len(),
+            hints.query_text
+        )?;
+        for hint in hints.results.iter().take(5) {
+            writeln!(
+                &mut out,
+                "  {} score={:.2} {}",
+                hint.memory_id, hint.relevance_score, hint.content_snippet
+            )?;
+        }
+    }
+
+    let hinted_tasks: Vec<_> = run
+        .tasks
+        .iter()
+        .filter(|task| task.memory_hints.is_some())
+        .collect();
+    if !hinted_tasks.is_empty() {
+        writeln!(&mut out)?;
+        writeln!(&mut out, "Task memory hints:")?;
+        for task in hinted_tasks {
+            let hints = task.memory_hints.as_ref().unwrap();
+            writeln!(
+                &mut out,
+                "  {} {:?}: {} hint(s) (query={:?})",
+                task.task_id,
+                task.state,
+                hints.results.len(),
+                hints.query_text
             )?;
         }
     }
@@ -4931,7 +5889,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("yarli.toml");
 
-        cmd_init(path.clone(), false, false).unwrap();
+        cmd_init(path.clone(), false, false, None).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("[core]"));
@@ -4948,7 +5906,7 @@ mod tests {
         let path = temp_dir.path().join("yarli.toml");
         std::fs::write(&path, "existing = true\n").unwrap();
 
-        let err = cmd_init(path.clone(), false, false).unwrap_err();
+        let err = cmd_init(path.clone(), false, false, None).unwrap_err();
         assert!(err.to_string().contains("use --force"));
 
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -4961,7 +5919,7 @@ mod tests {
         let path = temp_dir.path().join("yarli.toml");
         std::fs::write(&path, "existing = true\n").unwrap();
 
-        cmd_init(path.clone(), true, false).unwrap();
+        cmd_init(path.clone(), true, false, None).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("existing = true"));
@@ -4984,6 +5942,15 @@ mod tests {
             "core.safe_mode",
             "core.worker_id",
             "postgres.database_url",
+            "cli.backend",
+            "cli.prompt_mode",
+            "cli.command",
+            "cli.args",
+            "event_loop.max_iterations",
+            "event_loop.max_runtime_seconds",
+            "event_loop.idle_timeout_secs",
+            "event_loop.checkpoint_interval",
+            "features.parallel",
             "queue.claim_batch_size",
             "queue.lease_ttl_seconds",
             "queue.heartbeat_interval_seconds",
@@ -5003,6 +5970,10 @@ mod tests {
             "execution.overwatch.soft_timeout_seconds",
             "execution.overwatch.silent_timeout_seconds",
             "execution.overwatch.max_log_bytes",
+            "run.default_pace",
+            "run.paces.<name>.cmds",
+            "run.paces.<name>.working_dir",
+            "run.paces.<name>.command_timeout_seconds",
             "budgets.max_task_rss_bytes",
             "budgets.max_task_cpu_user_ticks",
             "budgets.max_task_cpu_system_ticks",
@@ -5021,6 +5992,13 @@ mod tests {
             "policy.audit_decisions",
             "memory.backend.enabled",
             "memory.backend.endpoint",
+            "memory.backend.command",
+            "memory.backend.project_dir",
+            "memory.backend.query_limit",
+            "memory.backend.inject_on_run_start",
+            "memory.backend.inject_on_failure",
+            "memory.enabled",
+            "memory.project_id",
             "observability.audit_file",
             "observability.log_level",
             "ui.mode",
@@ -5030,6 +6008,171 @@ mod tests {
                 "init --help should mention config property {key}"
             );
         }
+    }
+
+    #[test]
+    fn run_help_mentions_prompt_default_behavior() {
+        let mut cmd = Cli::command();
+        let run = cmd
+            .find_subcommand_mut("run")
+            .expect("run subcommand should exist");
+        let mut help = Vec::new();
+        run.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("PROMPT.md")
+                && help.contains("yarli run")
+                && help.contains("no subcommand"),
+            "run --help should mention PROMPT.md default execution behavior"
+        );
+    }
+
+    #[test]
+    fn root_help_mentions_prompt_default_behavior() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("Default workflow")
+                && help.contains("PROMPT.md")
+                && help.contains("yarli run"),
+            "yarli --help should mention PROMPT.md default execution behavior"
+        );
+    }
+
+    #[test]
+    fn resolve_run_plan_rejects_cmd_and_pace() {
+        let loaded = write_test_config("");
+
+        let err = resolve_run_plan(
+            &loaded,
+            "obj".to_string(),
+            vec!["echo hi".to_string()],
+            Some("batch".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn resolve_run_plan_uses_named_pace_for_commands_and_overrides() {
+        let loaded = write_test_config(
+            r#"
+[execution]
+working_dir = "/default"
+command_timeout_seconds = 111
+
+[run]
+default_pace = "batch"
+
+[run.paces.batch]
+cmds = ["echo one", "echo two"]
+working_dir = "/pace"
+command_timeout_seconds = 222
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "obj".to_string(),
+            Vec::new(),
+            Some("batch".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].task_key, "task-1");
+        assert_eq!(plan.tasks[0].command, "echo one");
+        assert_eq!(plan.tasks[1].task_key, "task-2");
+        assert_eq!(plan.tasks[1].command, "echo two");
+        assert_eq!(plan.workdir, "/pace");
+        assert_eq!(plan.timeout_secs, 222);
+        assert_eq!(plan.pace.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn resolve_run_plan_start_without_cmd_uses_run_default_pace() {
+        let loaded = write_test_config(
+            r#"
+[run]
+default_pace = "batch"
+
+[run.paces.batch]
+cmds = ["echo ok"]
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "obj".to_string(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].command, "echo ok");
+        assert_eq!(plan.pace.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn resolve_run_plan_batch_defaults_to_batch_pace_name() {
+        let loaded = write_test_config(
+            r#"
+[run.paces.batch]
+cmds = ["echo ok"]
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "batch".to_string(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some("batch"),
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].command, "echo ok");
+        assert_eq!(plan.pace.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn resolve_run_plan_batch_falls_back_to_default_pace_when_batch_not_defined() {
+        let loaded = write_test_config(
+            r#"
+[run]
+default_pace = "ci"
+
+[run.paces.ci]
+cmds = ["echo ok"]
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "batch".to_string(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some("batch"),
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].command, "echo ok");
+        assert_eq!(plan.pace.as_deref(), Some("ci"));
     }
 
     fn make_event(
@@ -6742,6 +7885,73 @@ allow_in_memory_writes = true
         assert!(output.contains("Deterioration: score=72.5"));
         assert!(output.contains("runtime_drift"));
         assert!(output.contains("Deteriorating"));
+    }
+
+    #[test]
+    fn render_run_status_surfaces_memory_hints() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.observer.memory_hints",
+                corr,
+                serde_json::json!({
+                    "query_text": "objective: verify",
+                    "limit": 8,
+                    "results": [
+                        {
+                            "memory_id": "m1",
+                            "scope_id": "project/test",
+                            "memory_class": "semantic",
+                            "relevance_score": 0.9,
+                            "content_snippet": "remember to run migrations",
+                            "metadata": { "fingerprint": "abc" }
+                        }
+                    ]
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.observer.memory_hints",
+                corr,
+                serde_json::json!({
+                    "query_text": "failed reason=budget_exceeded",
+                    "limit": 8,
+                    "results": [
+                        {
+                            "memory_id": "m2",
+                            "scope_id": "project/test",
+                            "memory_class": "semantic",
+                            "relevance_score": 0.2,
+                            "content_snippet": "previous budget exceeded fix: lower parallelism",
+                            "metadata": {}
+                        }
+                    ]
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(output.contains("Memories: 1 hint(s)"));
+        assert!(output.contains("remember to run migrations"));
+        assert!(output.contains("memory_hints: 1"));
     }
 
     #[test]

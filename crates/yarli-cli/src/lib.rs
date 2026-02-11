@@ -9,4 +9,5 @@
 pub mod config;
 pub mod dashboard;
 pub mod mode;
+pub mod prompt;
 pub mod stream;

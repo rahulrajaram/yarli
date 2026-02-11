@@ -11,6 +11,7 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 use yarli_core::domain::{EntityType, Event};
+use yarli_core::explain::DeteriorationReport;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 use yarli_store::event_store::EventQuery;
@@ -67,6 +68,9 @@ pub struct RunStatusResponse {
     correlation_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     objective: Option<String>,
+    /// Latest rolling sequence-deterioration report (if emitted by the observer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deterioration: Option<DeteriorationReport>,
     task_summary: TaskStatusSummary,
 }
 
@@ -110,6 +114,7 @@ fn load_run_status(
     let mut correlation_id = run_events[0].correlation_id;
     let mut updated_at = run_events[0].occurred_at;
     let mut last_event_type = run_events[0].event_type.clone();
+    let mut deterioration: Option<DeteriorationReport> = None;
 
     for event in &run_events {
         correlation_id = event.correlation_id;
@@ -127,6 +132,14 @@ fn load_run_status(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
         }
+
+        // Observer output: best-effort parse; does not affect status computation.
+        if event.event_type == "run.observer.deterioration" {
+            if let Ok(report) = serde_json::from_value::<DeteriorationReport>(event.payload.clone())
+            {
+                deterioration = Some(report);
+            }
+        }
     }
 
     let task_summary = summarize_tasks(store, correlation_id)?;
@@ -137,6 +150,7 @@ fn load_run_status(
         updated_at,
         correlation_id,
         objective,
+        deterioration,
         task_summary,
     }))
 }
@@ -347,6 +361,21 @@ mod tests {
                 json!({"to":"TaskFailed"}),
             ))
             .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.observer.deterioration",
+                correlation_id,
+                now + Duration::seconds(4),
+                json!({
+                    "score": 72.5,
+                    "window_size": 32,
+                    "factors": [{"name":"runtime_drift","impact":0.8,"detail":"runtime trend"}],
+                    "trend": "deteriorating"
+                }),
+            ))
+            .unwrap();
 
         let response = router(store)
             .oneshot(
@@ -367,6 +396,8 @@ mod tests {
         assert_eq!(payload["task_summary"]["total"], json!(2));
         assert_eq!(payload["task_summary"]["complete"], json!(1));
         assert_eq!(payload["task_summary"]["failed"], json!(1));
+        assert_eq!(payload["deterioration"]["score"], json!(72.5));
+        assert_eq!(payload["deterioration"]["trend"], json!("deteriorating"));
     }
 
     #[tokio::test]

@@ -111,9 +111,17 @@ pub struct YarliConfig {
     #[serde(default)]
     pub postgres: PostgresConfig,
     #[serde(default)]
+    pub cli: CliConfig,
+    #[serde(default)]
+    pub event_loop: EventLoopConfig,
+    #[serde(default)]
+    pub features: FeaturesConfig,
+    #[serde(default)]
     pub queue: QueueConfig,
     #[serde(default)]
     pub execution: ExecutionConfig,
+    #[serde(default)]
+    pub run: RunConfig,
     #[serde(default)]
     pub budgets: BudgetsConfig,
     #[serde(default)]
@@ -133,8 +141,12 @@ impl Default for YarliConfig {
         Self {
             core: CoreConfig::default(),
             postgres: PostgresConfig::default(),
+            cli: CliConfig::default(),
+            event_loop: EventLoopConfig::default(),
+            features: FeaturesConfig::default(),
             queue: QueueConfig::default(),
             execution: ExecutionConfig::default(),
+            run: RunConfig::default(),
             budgets: BudgetsConfig::default(),
             git: GitConfig::default(),
             policy: PolicyConfig::default(),
@@ -203,6 +215,92 @@ pub struct PostgresConfig {
 impl Default for PostgresConfig {
     fn default() -> Self {
         Self { database_url: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CliConfig {
+    /// Named backend for operator readability (codex|claude|gemini|custom).
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// How the prompt is passed to the CLI: arg or stdin.
+    #[serde(default)]
+    pub prompt_mode: PromptMode,
+    /// Executable to invoke (e.g. "codex", "claude", "gemini").
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments to pass to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            prompt_mode: PromptMode::default(),
+            command: None,
+            args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptMode {
+    #[default]
+    Arg,
+    Stdin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventLoopConfig {
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+    #[serde(default = "default_max_runtime_seconds")]
+    pub max_runtime_seconds: u64,
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_checkpoint_interval")]
+    pub checkpoint_interval: u32,
+}
+
+impl Default for EventLoopConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: default_max_iterations(),
+            max_runtime_seconds: default_max_runtime_seconds(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+            checkpoint_interval: default_checkpoint_interval(),
+        }
+    }
+}
+
+fn default_max_iterations() -> u32 {
+    5
+}
+
+fn default_max_runtime_seconds() -> u64 {
+    4 * 60 * 60
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    30 * 60
+}
+
+fn default_checkpoint_interval() -> u32 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeaturesConfig {
+    #[serde(default)]
+    pub parallel: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self { parallel: false }
     }
 }
 
@@ -364,6 +462,29 @@ fn default_overwatch_service_url() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RunConfig {
+    /// The default named pace used by shorthand commands like `yarli run batch`.
+    #[serde(default)]
+    pub default_pace: Option<String>,
+    /// Named run presets (pace -> commands + optional overrides).
+    #[serde(default)]
+    pub paces: std::collections::BTreeMap<String, RunPaceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RunPaceConfig {
+    /// Commands to execute in order (one per task).
+    #[serde(default)]
+    pub cmds: Vec<String>,
+    /// Optional working directory override for this pace.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Optional timeout override for this pace (0 disables timeout).
+    #[serde(default)]
+    pub command_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BudgetsConfig {
     #[serde(default)]
     pub max_task_rss_bytes: Option<u64>,
@@ -435,6 +556,15 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryConfig {
+    /// Master switch. When unset, defaults to `memory.backend.enabled`.
+    ///
+    /// This is intentionally optional to preserve the simple legacy toggle:
+    /// setting `[memory.backend].enabled = true` should be enough to turn memory on.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Optional explicit project identifier for memory scoping.
+    #[serde(default)]
+    pub project_id: Option<String>,
     #[serde(default)]
     pub backend: MemoryBackendConfig,
 }
@@ -442,6 +572,8 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            enabled: None,
+            project_id: None,
             haake: MemoryBackendConfig::default(),
         }
     }
@@ -453,6 +585,21 @@ pub struct MemoryBackendConfig {
     pub enabled: bool,
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Executable to invoke for Memory backend CLI integration.
+    #[serde(default = "default_memory_command")]
+    pub command: String,
+    /// Directory to run memory backend CLI from (defaults to the directory containing `PROMPT.md`).
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Max results to query and inject.
+    #[serde(default = "default_memory_query_limit")]
+    pub query_limit: u32,
+    /// Query and emit memory hints once at run start.
+    #[serde(default = "default_true")]
+    pub inject_on_run_start: bool,
+    /// Query and emit memory hints when a task blocks/fails.
+    #[serde(default = "default_true")]
+    pub inject_on_failure: bool,
 }
 
 impl Default for MemoryBackendConfig {
@@ -460,8 +607,21 @@ impl Default for MemoryBackendConfig {
         Self {
             enabled: false,
             endpoint: None,
+            command: default_memory_command(),
+            project_dir: None,
+            query_limit: default_memory_query_limit(),
+            inject_on_run_start: true,
+            inject_on_failure: true,
         }
     }
+}
+
+fn default_memory_command() -> String {
+    "memory-backend".to_string()
+}
+
+fn default_memory_query_limit() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -522,6 +682,8 @@ mod tests {
         assert_eq!(loaded.source(), ConfigSource::Defaults);
         assert_eq!(loaded.config().core.backend, BackendKind::InMemory);
         assert!(!loaded.config().core.allow_in_memory_writes);
+        assert_eq!(loaded.config().event_loop.max_iterations, 5);
+        assert_eq!(loaded.config().features.parallel, false);
         assert_eq!(loaded.config().execution.runner, ExecutionRunner::Native);
         assert_eq!(loaded.config().execution.working_dir, ".");
     }
@@ -542,6 +704,21 @@ safe_mode = "restricted"
 [postgres]
 database_url = "postgres://localhost/yarli"
 
+[cli]
+backend = "codex"
+prompt_mode = "arg"
+command = "codex"
+args = ["exec", "--json"]
+
+[event_loop]
+max_iterations = 3
+max_runtime_seconds = 60
+idle_timeout_secs = 10
+checkpoint_interval = 2
+
+[features]
+parallel = true
+
 [queue]
 claim_batch_size = 2
 
@@ -556,6 +733,13 @@ soft_timeout_seconds = 120
 silent_timeout_seconds = 60
 max_log_bytes = 2048
 
+[run]
+default_pace = "batch"
+[run.paces.batch]
+cmds = ["echo fmt", "echo clippy", "echo test"]
+working_dir = "/repo"
+command_timeout_seconds = 123
+
 [budgets]
 max_task_total_tokens = 1000
 max_run_total_tokens = 5000
@@ -566,9 +750,14 @@ default_target_branch = "develop"
 [policy]
 enforce_policies = true
 
-[memory.backend]
-enabled = true
-endpoint = "http://localhost:8080"
+	[memory.backend]
+	enabled = true
+	endpoint = "http://localhost:8080"
+	command = "memory-backend"
+	project_dir = "."
+	query_limit = 5
+	inject_on_run_start = true
+	inject_on_failure = true
 
 [observability]
 audit_file = "/tmp/yarli-audit.jsonl"
@@ -584,6 +773,10 @@ mode = "stream"
         assert_eq!(loaded.config().core.backend, BackendKind::Postgres);
         assert!(loaded.config().core.allow_in_memory_writes);
         assert_eq!(loaded.config().core.safe_mode, SafeMode::Restricted);
+        assert_eq!(loaded.config().cli.backend.as_deref(), Some("codex"));
+        assert_eq!(loaded.config().cli.command.as_deref(), Some("codex"));
+        assert_eq!(loaded.config().event_loop.max_iterations, 3);
+        assert_eq!(loaded.config().features.parallel, true);
         assert_eq!(loaded.config().execution.runner, ExecutionRunner::Overwatch);
         assert_eq!(
             loaded.config().execution.overwatch.service_url,
@@ -598,8 +791,27 @@ mode = "stream"
             Some(2048)
         );
         assert_eq!(loaded.config().memory.backend.enabled, true);
+        assert_eq!(loaded.config().memory.backend.command, "memory-backend");
+        assert_eq!(
+            loaded.config().memory.backend.project_dir.as_deref(),
+            Some(".")
+        );
+        assert_eq!(loaded.config().memory.backend.query_limit, 5);
+        assert!(loaded.config().memory.backend.inject_on_run_start);
+        assert!(loaded.config().memory.backend.inject_on_failure);
         assert_eq!(loaded.config().ui.mode, UiMode::Stream);
         assert_eq!(loaded.config().budgets.max_task_total_tokens, Some(1000));
+        assert_eq!(loaded.config().run.default_pace.as_deref(), Some("batch"));
+        assert_eq!(
+            loaded
+                .config()
+                .run
+                .paces
+                .get("batch")
+                .unwrap()
+                .command_timeout_seconds,
+            Some(123)
+        );
     }
 
     #[test]
@@ -631,8 +843,12 @@ mode = "stream"
         for key in [
             "core",
             "postgres",
+            "cli",
+            "event_loop",
+            "features",
             "queue",
             "execution",
+            "run",
             "budgets",
             "git",
             "policy",

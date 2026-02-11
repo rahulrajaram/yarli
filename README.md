@@ -15,6 +15,18 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
+## Default `yarli run`
+
+`yarli run` is opinionated: it loads the canonical `PROMPT.md` (walking up from the current directory), expands any `@include <path>` directives, then executes the single embedded ```yarli-run TOML block.
+
+```bash
+yarli run --stream
+```
+
+## CLI Usage
+
+See `docs/CLI.md` for an exhaustive, command-by-command guide (with `init` backend examples).
+
 ## Postgres Integration Tests
 
 ```bash

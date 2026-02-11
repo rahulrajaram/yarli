@@ -1026,6 +1026,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 entity_id: task_id.to_string(),
                 event_type: "task.failed".to_string(),
                 payload: serde_json::json!({
+                    "from": transition.from_state,
+                    "to": transition.to_state,
                     "reason": "budget_exceeded",
                     "detail": reason,
                     "scope": violation.scope,
@@ -1080,6 +1082,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 entity_id: task_id.to_string(),
                 event_type: "task.verifying".to_string(),
                 payload: serde_json::json!({
+                    "from": transition.from_state,
+                    "to": transition.to_state,
+                    "reason": transition.reason,
                     "exit_code": exit_code,
                     "resource_usage": result.execution.resource_usage,
                     "token_usage": result.execution.token_usage,
@@ -1107,6 +1112,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     entity_id: task_id.to_string(),
                     event_type: "task.completed".to_string(),
                     payload: serde_json::json!({
+                        "from": transition.from_state,
+                        "to": transition.to_state,
+                        "reason": transition.reason,
                         "exit_code": exit_code,
                         "auto_verified": true,
                         "resource_usage": result.execution.resource_usage,
@@ -1168,6 +1176,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         entity_id: task_id.to_string(),
                         event_type: "task.completed".to_string(),
                         payload: serde_json::json!({
+                            "from": transition.from_state,
+                            "to": transition.to_state,
+                            "reason": transition.reason,
                             "exit_code": exit_code,
                             "gates_evaluated": gate_names,
                             "auto_verified": false,
@@ -1251,7 +1262,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 entity_id: task_id.to_string(),
                 event_type: "task.failed".to_string(),
                 payload: serde_json::json!({
+                    "from": transition.from_state,
+                    "to": transition.to_state,
                     "reason": "timeout",
+                    "detail": transition.reason,
                     "resource_usage": result.execution.resource_usage,
                     "token_usage": result.execution.token_usage,
                 }),
@@ -1282,7 +1296,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 entity_id: task_id.to_string(),
                 event_type: "task.failed".to_string(),
                 payload: serde_json::json!({
+                    "from": transition.from_state,
+                    "to": transition.to_state,
                     "reason": "killed",
+                    "detail": transition.reason,
                     "resource_usage": result.execution.resource_usage,
                     "token_usage": result.execution.token_usage,
                 }),
@@ -1313,8 +1330,11 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 entity_id: task_id.to_string(),
                 event_type: "task.failed".to_string(),
                 payload: serde_json::json!({
+                    "from": transition.from_state,
+                    "to": transition.to_state,
                     "exit_code": exit_code,
                     "reason": "nonzero_exit",
+                    "detail": transition.reason,
                     "resource_usage": result.execution.resource_usage,
                     "token_usage": result.execution.token_usage,
                 }),
@@ -1361,7 +1381,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             entity_id: task_id.to_string(),
             event_type: "task.failed".to_string(),
             payload: serde_json::json!({
+                "from": transition.from_state,
+                "to": transition.to_state,
                 "reason": "exec_error",
+                "detail": transition.reason,
                 "error": error.to_string(),
             }),
             correlation_id,
@@ -1400,6 +1423,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 entity_id: task_id.to_string(),
                 event_type: "task.retrying".to_string(),
                 payload: serde_json::json!({
+                    "from": transition.from_state,
+                    "to": transition.to_state,
+                    "reason": transition.reason,
                     "attempt_no": task.attempt_no,
                     "max_attempts": task.max_attempts,
                 }),
@@ -1495,6 +1521,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         entity_id: run_id.to_string(),
                         event_type: "run.verifying".to_string(),
                         payload: serde_json::json!({
+                            "from": transition.from_state,
+                            "to": transition.to_state,
+                            "reason": transition.reason,
                             "task_count": task_states.len(),
                         }),
                         correlation_id,
@@ -1524,6 +1553,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                             entity_id: run_id.to_string(),
                             event_type: "run.completed".to_string(),
                             payload: serde_json::json!({
+                                "from": transition.from_state,
+                                "to": transition.to_state,
+                                "reason": transition.reason,
                                 "task_count": task_states.len(),
                                 "auto_verified": true,
                             }),
@@ -1560,6 +1592,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                                 entity_id: run_id.to_string(),
                                 event_type: "run.completed".to_string(),
                                 payload: serde_json::json!({
+                                    "from": transition.from_state,
+                                    "to": transition.to_state,
+                                    "reason": transition.reason,
                                     "task_count": task_states.len(),
                                     "gates_evaluated": gate_names,
                                     "auto_verified": false,
@@ -1636,7 +1671,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     entity_id: run_id.to_string(),
                     event_type: "run.failed".to_string(),
                     payload: serde_json::json!({
+                        "from": transition.from_state,
+                        "to": transition.to_state,
                         "reason": "task_permanently_failed",
+                        "detail": transition.reason,
                     }),
                     correlation_id,
                     causation_id: None,
@@ -1905,6 +1943,33 @@ mod tests {
         assert!(event_types.contains(&"task.completed"));
         assert!(event_types.contains(&"run.verifying"));
         assert!(event_types.contains(&"run.completed"));
+
+        let find = |ty: &str| -> &Event {
+            events
+                .iter()
+                .find(|e| e.event_type == ty)
+                .unwrap_or_else(|| panic!("missing event_type {ty}"))
+        };
+
+        let task_verifying = find("task.verifying");
+        assert_eq!(task_verifying.payload["to"], "TaskVerifying");
+        assert_eq!(task_verifying.payload["from"], "TaskExecuting");
+        assert!(task_verifying.payload.get("reason").is_some());
+
+        let task_completed = find("task.completed");
+        assert_eq!(task_completed.payload["to"], "TaskComplete");
+        assert_eq!(task_completed.payload["from"], "TaskVerifying");
+        assert!(task_completed.payload.get("reason").is_some());
+
+        let run_verifying = find("run.verifying");
+        assert_eq!(run_verifying.payload["to"], "RunVerifying");
+        assert_eq!(run_verifying.payload["from"], "RunActive");
+        assert!(run_verifying.payload.get("reason").is_some());
+
+        let run_completed = find("run.completed");
+        assert_eq!(run_completed.payload["to"], "RunCompleted");
+        assert_eq!(run_completed.payload["from"], "RunVerifying");
+        assert!(run_completed.payload.get("reason").is_some());
     }
 
     #[tokio::test]

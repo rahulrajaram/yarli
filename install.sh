@@ -14,8 +14,11 @@ echo "Creating install directory: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
 echo "Installing yarli to $INSTALL_DIR/$BINARY_NAME"
-cp target/release/yarli "$INSTALL_DIR/$BINARY_NAME"
-chmod +x "$INSTALL_DIR/$BINARY_NAME"
+# Avoid "Text file busy" by doing an atomic replace.
+TMP_PATH="$INSTALL_DIR/${BINARY_NAME}.new.$$"
+cp target/release/yarli "$TMP_PATH"
+chmod +x "$TMP_PATH"
+mv -f "$TMP_PATH" "$INSTALL_DIR/$BINARY_NAME"
 
 echo ""
 echo "yarli installed successfully."

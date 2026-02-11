@@ -1,3 +1,5 @@
 target/
 .agent/
 .orchestrator/
+.yarl/
+yarli.toml
