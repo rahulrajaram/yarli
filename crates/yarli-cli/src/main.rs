@@ -1470,7 +1470,10 @@ where
         .await
         .context("sync_postgres_state: failed to connect")?;
 
-    let mut tx = pool.begin().await.context("sync_postgres_state: begin tx")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("sync_postgres_state: begin tx")?;
 
     sqlx::query(
         r#"
@@ -1504,9 +1507,7 @@ where
         .with_context(|| format!("sync_postgres_state: update task {task_id}"))?;
     }
 
-    tx.commit()
-        .await
-        .context("sync_postgres_state: commit")?;
+    tx.commit().await.context("sync_postgres_state: commit")?;
 
     debug!(
         run_id = %run_id,

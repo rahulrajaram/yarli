@@ -137,10 +137,14 @@ impl CommandRunner for LocalCommandRunner {
         // Spawn the child process.
         debug!(command = %request.command, working_dir = %request.working_dir, "spawning command");
 
+        // TODO(phase1): Before spawn, create cgroup sandbox and set resource limits.
+        //   After spawn, obtain pidfd for race-free lifecycle management.
+        //   See IMPLEMENTATION_PLAN.md Section 18 sections 5.1, 5.2, 6.
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&request.command)
             .current_dir(&request.working_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(request.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -337,6 +341,29 @@ fn estimate_tokens(input: &str) -> u64 {
     }
 }
 
+// TODO: Replace /proc polling with proactive enforcement. See IMPLEMENTATION_PLAN.md Section 18.
+//
+// TODO(phase1): cgroup v2 sandbox — create /sys/fs/cgroup/yarli/<run_id>/<task_id>/,
+//   set memory.max, cpu.max, pids.max before spawn, use cgroup.kill on timeout.
+//
+// TODO(phase1): pidfd-based spawn/kill/reap — use pidfd_open(2) for race-free
+//   liveness checks and SIGTERM→SIGKILL escalation without PID recycling races.
+//
+// TODO(phase2): rlimits — set RLIMIT_AS, RLIMIT_CPU, RLIMIT_NPROC, RLIMIT_NOFILE
+//   in child pre-exec via Command::pre_exec + libc::setrlimit.
+//
+// TODO(phase2): eBPF-based resource tracking for zero-overhead in-kernel enforcement.
+//   - Attach BPF programs to task cgroup to track RSS, CPU, and I/O.
+//   - Use eBPF maps to enforce budgets and send signals when thresholds are breached.
+//   - Consider libbpf-rs or aya crate for safe Rust BPF program loading.
+//
+// TODO(phase2): DTrace-based resource tracking on macOS/Illumos/FreeBSD.
+//   - Use DTrace probes (proc:::, syscall:::, io:::) to instrument child processes.
+//   - On macOS where /proc is unavailable, DTrace is the primary introspection path.
+//   - Consider shelling out to `dtrace -n` with a D script or using libdtrace bindings.
+//   - Fall back gracefully when DTrace is not available or SIP restricts it.
+//
+// TODO(phase3): seccomp profiles per command class, namespace isolation.
 fn spawn_resource_monitor(
     pid: u32,
 ) -> (
@@ -453,6 +480,10 @@ fn read_process_sample(pid: u32) -> Option<ProcessSample> {
     Some(sample)
 }
 
+// TODO: Implement macOS/BSD process sampling via DTrace or libproc.
+//   - macOS: use `proc_pidinfo(PROC_PIDTASKINFO)` from libproc for RSS/CPU,
+//     or DTrace probes for IO tracking.
+//   - FreeBSD/Illumos: use kinfo_proc via sysctl or DTrace.
 #[cfg(not(target_os = "linux"))]
 fn read_process_sample(_pid: u32) -> Option<ProcessSample> {
     None

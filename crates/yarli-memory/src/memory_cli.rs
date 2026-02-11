@@ -43,14 +43,19 @@ impl MemoryCliAdapter {
     }
 
     async fn run(&self, args: &[String]) -> Result<String, MemoryError> {
-        let output = Command::new(&self.command)
+        let child_fut = Command::new(&self.command)
             .args(args)
             .current_dir(&self.project_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .output();
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), child_fut)
             .await
+            .map_err(|_| {
+                MemoryError::ConnectionFailed("memory backend CLI timed out after 10s".to_string())
+            })?
             .map_err(|e| MemoryError::ConnectionFailed(e.to_string()))?;
 
         if !output.status.success() {

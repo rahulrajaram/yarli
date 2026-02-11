@@ -498,9 +498,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         task_id = %task_id,
                         "claimed task not in registry, failing queue entry"
                     );
-                    if let Err(fail_err) =
-                        self.queue.fail(queue_id, &self.config.worker_id)
-                    {
+                    if let Err(fail_err) = self.queue.fail(queue_id, &self.config.worker_id) {
                         warn!(error = %fail_err, queue_id = %queue_id, "failed to fail orphaned queue entry");
                     }
                     // Remove lease tracking if it was added
@@ -632,7 +630,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 })?;
 
                 // Enqueue into the task queue now that the task is Ready
-                match self.queue.enqueue(task_id, run_id, priority, command_class, None) {
+                match self
+                    .queue
+                    .enqueue(task_id, run_id, priority, command_class, None)
+                {
                     Ok(_) => {
                         promoted += 1;
                         debug!(task_id = %task_id, run_id = %run_id, "task promoted to ready and enqueued");
@@ -3223,8 +3224,7 @@ mod tests {
         task_b_entity.state = TaskState::TaskReady;
         registry.add_task(task_b_entity);
 
-        let sched =
-            Scheduler::with_registry(queue.clone(), store, runner, config, registry);
+        let sched = Scheduler::with_registry(queue.clone(), store, runner, config, registry);
 
         // Tick should only claim run B's task.
         let result = sched.tick().await.unwrap();
@@ -3260,10 +3260,7 @@ mod tests {
         let corr2 = run2.correlation_id;
         let t3 = make_task(run2_id, "t3", "echo c", corr2);
         let t4 = make_task(run2_id, "t4", "echo d", corr2);
-        sched
-            .submit_run(run2, vec![t3, t4])
-            .await
-            .unwrap();
+        sched.submit_run(run2, vec![t3, t4]).await.unwrap();
 
         // Promote so tasks get enqueued.
         // promote_tasks is private, so we trigger via tick but cancel before execution.
@@ -3361,7 +3358,10 @@ mod tests {
         // Tick should still claim current run's tasks (in-memory queue filters correctly).
         let result = sched.tick().await.unwrap();
         assert_eq!(result.promoted, 2, "should promote both tasks");
-        assert_eq!(result.claimed, 2, "should claim both tasks despite stale rows");
+        assert_eq!(
+            result.claimed, 2,
+            "should claim both tasks despite stale rows"
+        );
         assert_eq!(result.succeeded, 2, "should execute both tasks");
     }
 }

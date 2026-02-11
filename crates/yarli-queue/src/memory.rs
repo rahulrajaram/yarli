@@ -116,9 +116,7 @@ impl TaskQueue for InMemoryTaskQueue {
             .filter(|(_, e)| {
                 e.status == QueueStatus::Pending
                     && e.available_at <= now
-                    && allowed
-                        .as_ref()
-                        .map_or(true, |ids| ids.contains(&e.run_id))
+                    && allowed.as_ref().map_or(true, |ids| ids.contains(&e.run_id))
             })
             .map(|(i, _)| i)
             .collect();

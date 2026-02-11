@@ -59,10 +59,12 @@ pub struct OverwatchCommandRunner {
 impl OverwatchCommandRunner {
     pub fn new(config: OverwatchRunnerConfig) -> Result<Self, ExecError> {
         config.validate()?;
-        Ok(Self {
-            client: reqwest::Client::new(),
-            config,
-        })
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| ExecError::Protocol(format!("failed to build HTTP client: {e}")))?;
+        Ok(Self { client, config })
     }
 
     pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {

@@ -809,8 +809,7 @@ fn claim_with_allowed_run_ids_filters_correctly() {
     q.enqueue(tb, run_b, 1, CommandClass::Io, None).unwrap();
 
     // Only claim tasks from run_b.
-    let req = ClaimRequest::new("w1", 10, Duration::seconds(30))
-        .with_allowed_run_ids(vec![run_b]);
+    let req = ClaimRequest::new("w1", 10, Duration::seconds(30)).with_allowed_run_ids(vec![run_b]);
     let claimed = q.claim(&req, &cfg).unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, tb);
@@ -848,8 +847,7 @@ fn claim_with_empty_allowed_run_ids_claims_none() {
         .unwrap();
 
     // Empty vec = no runs allowed.
-    let req = ClaimRequest::new("w1", 10, Duration::seconds(30))
-        .with_allowed_run_ids(vec![]);
+    let req = ClaimRequest::new("w1", 10, Duration::seconds(30)).with_allowed_run_ids(vec![]);
     let claimed = q.claim(&req, &cfg).unwrap();
     assert!(claimed.is_empty());
 }
@@ -872,8 +870,7 @@ fn cancel_for_run_drains_pending_and_leased() {
         .unwrap();
 
     // Claim 1 from run_a to make it leased.
-    let req = ClaimRequest::new("w1", 1, Duration::seconds(30))
-        .with_allowed_run_ids(vec![run_a]);
+    let req = ClaimRequest::new("w1", 1, Duration::seconds(30)).with_allowed_run_ids(vec![run_a]);
     let claimed = q.claim(&req, &cfg).unwrap();
     assert_eq!(claimed.len(), 1);
 
@@ -1006,8 +1003,8 @@ fn no_zero_progress_with_claimable_rows_and_stale_contamination() {
     assert_eq!(q.pending_count(), 80);
 
     // Claim with allowed_run_ids = [current_run].
-    let req = ClaimRequest::new("w1", 4, Duration::seconds(30))
-        .with_allowed_run_ids(vec![current_run]);
+    let req =
+        ClaimRequest::new("w1", 4, Duration::seconds(30)).with_allowed_run_ids(vec![current_run]);
     let claimed = q.claim(&req, &cfg).unwrap();
 
     // Must claim current run's rows, not zero.
