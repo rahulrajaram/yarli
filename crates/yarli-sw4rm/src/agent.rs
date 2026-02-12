@@ -7,14 +7,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sw4rm_sdk::{AgentConfig, EnvelopeBuilder, EnvelopeData, PreemptionManager, CT_SCHEDULER_COMMAND_V1};
+use sw4rm_sdk::{
+    AgentConfig, EnvelopeBuilder, EnvelopeData, PreemptionManager, CT_SCHEDULER_COMMAND_V1,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::bridge::ShutdownBridge;
 use crate::config::Sw4rmConfig;
-use crate::messages::{
-    CT_ORCHESTRATION_REPORT, OrchestrationReport,
-};
+use crate::messages::{OrchestrationReport, CT_ORCHESTRATION_REPORT};
 use crate::orchestrator::{ObjectiveParams, OrchestratorLoop, RouterSender};
 
 /// YarliAgent implements `sw4rm_sdk::Agent` to act as an orchestrator
@@ -50,13 +50,10 @@ impl<R: RouterSender + 'static> YarliAgent<R> {
     }
 
     /// Handle a scheduler command (stage=Run).
-    async fn handle_scheduler_command(
-        &self,
-        envelope: &EnvelopeData,
-    ) -> sw4rm_sdk::Result<()> {
-        let cmd: sw4rm_sdk::SchedulerCommandV1 = envelope
-            .json_payload()
-            .map_err(|e| sw4rm_sdk::Error::Internal(format!("failed to parse scheduler command: {e}")))?;
+    async fn handle_scheduler_command(&self, envelope: &EnvelopeData) -> sw4rm_sdk::Result<()> {
+        let cmd: sw4rm_sdk::SchedulerCommandV1 = envelope.json_payload().map_err(|e| {
+            sw4rm_sdk::Error::Internal(format!("failed to parse scheduler command: {e}"))
+        })?;
 
         let objective = cmd
             .input
@@ -137,8 +134,7 @@ impl<R: RouterSender + 'static> YarliAgent<R> {
 
         // Emit the report as an envelope. We log if it fails rather than
         // propagating, since the orchestration itself already completed.
-        match EnvelopeBuilder::new(self.agent_config.agent_id.clone(), 1)
-            .with_json_payload(&report)
+        match EnvelopeBuilder::new(self.agent_config.agent_id.clone(), 1).with_json_payload(&report)
         {
             Ok(builder) => {
                 let _report_envelope = builder
@@ -198,8 +194,8 @@ impl<R: RouterSender + 'static> sw4rm_sdk::Agent for YarliAgent<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::MockRouterSender;
     use crate::messages::ImplementationResponse;
+    use crate::mock::MockRouterSender;
     use crate::orchestrator::{VerificationCommand, VerificationSpec};
     use sw4rm_sdk::{Agent, EnvelopeBuilder, SchedulerCommandV1, SchedulerStage};
     use yarli_core::domain::CommandClass;
@@ -326,11 +322,10 @@ mod tests {
     async fn scheduler_command_with_scope() {
         let mut agent = test_agent();
 
-        let cmd = SchedulerCommandV1::new(SchedulerStage::Run)
-            .with_input(serde_json::json!({
-                "objective": "fix module",
-                "scope": ["src/lib.rs", "src/util.rs"]
-            }));
+        let cmd = SchedulerCommandV1::new(SchedulerStage::Run).with_input(serde_json::json!({
+            "objective": "fix module",
+            "scope": ["src/lib.rs", "src/util.rs"]
+        }));
 
         let envelope = EnvelopeBuilder::new("scheduler".to_string(), 1)
             .with_json_payload(&cmd)

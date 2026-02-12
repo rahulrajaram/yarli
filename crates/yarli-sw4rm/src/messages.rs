@@ -5,16 +5,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Content type for implementation requests sent to LLM agents.
-pub const CT_IMPLEMENTATION_REQUEST: &str =
-    "application/vnd.yarli.implementation.request+json;v=1";
+pub const CT_IMPLEMENTATION_REQUEST: &str = "application/vnd.yarli.implementation.request+json;v=1";
 
 /// Content type for implementation responses from LLM agents.
 pub const CT_IMPLEMENTATION_RESPONSE: &str =
     "application/vnd.yarli.implementation.response+json;v=1";
 
 /// Content type for orchestration result reports sent back to the sw4rm scheduler.
-pub const CT_ORCHESTRATION_REPORT: &str =
-    "application/vnd.yarli.orchestration.report+json;v=1";
+pub const CT_ORCHESTRATION_REPORT: &str = "application/vnd.yarli.orchestration.report+json;v=1";
 
 /// Request sent to an LLM agent to implement or fix code.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -90,9 +90,20 @@ Native process execution remains default:
 runner = "native"
 ```
 
-## Default `yarli run` (PROMPT.md)
+## Default `yarli run` (Config-First)
 
-To avoid repeating long `--cmd ...` lists, YARLI is opinionated: `yarli run` reads the repository's canonical `PROMPT.md` (walking up from the current working directory), expands `@include <path>` directives, and executes the single embedded ```yarli-run fenced TOML block.
+To avoid repeating long `--cmd ...` lists, YARLI is opinionated: `yarli run` resolves prompt context in this order, expands `@include <path>`, and drives execution from config + plan state.
+
+1. `yarli run --prompt-file <path>`
+2. `yarli.toml` `[run].prompt_file`
+3. fallback lookup of `PROMPT.md` by walking upward from the current directory
+
+Execution behavior:
+
+- Discover incomplete tranches from `IMPLEMENTATION_PLAN.md` in plan order.
+- Dispatch each tranche as its own Yarli task via `[cli]` command settings.
+- Append a verification task automatically.
+- If no incomplete tranches are found, execute verification-only.
 
 ```bash
 yarli run --stream

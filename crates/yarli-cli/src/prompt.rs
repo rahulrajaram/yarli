@@ -1,7 +1,7 @@
 //! Prompt loading and run-spec parsing for `yarli run`.
 //!
 //! Opinionated rules:
-//! - The canonical entrypoint is repo-root `PROMPT.md` (resolved by walking up from CWD).
+//! - Default fallback entrypoint is `PROMPT.md` (resolved by walking up from CWD).
 //! - `PROMPT.md` may contain `@include <path>` directives (repo-confined).
 //! - A single fenced code block with info string `yarli-run` defines what to execute.
 
@@ -21,11 +21,17 @@ const MAX_EXPANDED_BYTES: usize = 512 * 1024;
 pub struct RunSpec {
     pub version: u32,
     pub objective: Option<String>,
+    #[serde(default)]
     pub tasks: RunSpecTasks,
+    #[serde(default)]
+    pub tranches: Option<RunSpecTranches>,
+    #[serde(default)]
+    pub plan_guard: Option<RunSpecPlanGuard>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RunSpecTasks {
+    #[serde(default)]
     pub items: Vec<RunSpecTask>,
 }
 
@@ -35,6 +41,39 @@ pub struct RunSpecTask {
     pub cmd: String,
     #[serde(default)]
     pub class: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunSpecTranches {
+    pub items: Vec<RunSpecTranche>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunSpecTranche {
+    pub key: String,
+    #[serde(default)]
+    pub objective: Option<String>,
+    pub task_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunSpecPlanGuard {
+    pub target: String,
+    #[serde(default)]
+    pub mode: RunSpecPlanGuardMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunSpecPlanGuardMode {
+    Implement,
+    VerifyOnly,
+}
+
+impl Default for RunSpecPlanGuardMode {
+    fn default() -> Self {
+        Self::Implement
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,9 +168,6 @@ pub fn load_prompt_and_run_spec(entry_prompt_path: &Path) -> Result<LoadedPrompt
             run_spec.version
         );
     }
-    if run_spec.tasks.items.is_empty() {
-        bail!("run spec has no tasks.items");
-    }
     let mut keys = BTreeSet::new();
     for task in &run_spec.tasks.items {
         if task.key.trim().is_empty() {
@@ -145,6 +181,49 @@ pub fn load_prompt_and_run_spec(entry_prompt_path: &Path) -> Result<LoadedPrompt
         }
         if !keys.insert(task.key.clone()) {
             bail!("duplicate task key in run spec: {}", task.key);
+        }
+    }
+
+    if let Some(tranches) = run_spec.tranches.as_ref() {
+        if tranches.items.is_empty() {
+            bail!("run spec tranches.items must be non-empty when [tranches] is present");
+        }
+        let mut tranche_keys = BTreeSet::new();
+        let mut referenced = BTreeSet::new();
+        for tranche in &tranches.items {
+            if tranche.key.trim().is_empty() {
+                bail!("run spec tranche.key must be non-empty");
+            }
+            if !tranche_keys.insert(tranche.key.clone()) {
+                bail!("duplicate tranche key in run spec: {}", tranche.key);
+            }
+            if tranche.task_keys.is_empty() {
+                bail!(
+                    "run spec tranche.task_keys must be non-empty (tranche key {})",
+                    tranche.key
+                );
+            }
+            for task_key in &tranche.task_keys {
+                if !keys.contains(task_key) {
+                    bail!(
+                        "run spec tranche {} references unknown task key: {}",
+                        tranche.key,
+                        task_key
+                    );
+                }
+                if !referenced.insert(task_key.clone()) {
+                    bail!(
+                        "run spec task key appears in multiple tranches: {}",
+                        task_key
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(plan_guard) = run_spec.plan_guard.as_ref() {
+        if plan_guard.target.trim().is_empty() {
+            bail!("run spec plan_guard.target must be non-empty");
         }
     }
 
@@ -383,5 +462,89 @@ items = [{ key = "a", cmd = "echo ok" }]
         .unwrap();
         let err = load_prompt_and_run_spec(&root.join("PROMPT.md")).unwrap_err();
         assert!(err.to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn accepts_explicit_tranche_sequence() {
+        let md = r#"
+```yarli-run
+version = 1
+objective = "x"
+[tasks]
+items = [
+  { key = "a", cmd = "echo a" },
+  { key = "b", cmd = "echo b" },
+]
+[tranches]
+items = [
+  { key = "first", task_keys = ["a"] },
+  { key = "second", objective = "second pass", task_keys = ["b"] },
+]
+```
+"#;
+        let blocks = extract_fenced_blocks(md, "yarli-run");
+        let spec: RunSpec = toml::from_str(&blocks[0]).unwrap();
+        assert_eq!(spec.tranches.as_ref().unwrap().items.len(), 2);
+    }
+
+    #[test]
+    fn rejects_duplicate_tranche_task_keys() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("PROMPT.md"),
+            "```yarli-run\nversion=1\n[tasks]\nitems=[{key=\"a\",cmd=\"echo ok\"},{key=\"b\",cmd=\"echo ok\"}]\n[tranches]\nitems=[{key=\"t1\",task_keys=[\"a\"]},{key=\"t2\",task_keys=[\"a\",\"b\"]}]\n```\n",
+        )
+        .unwrap();
+        let err = load_prompt_and_run_spec(&root.join("PROMPT.md")).unwrap_err();
+        assert!(err.to_string().contains("appears in multiple tranches"));
+    }
+
+    #[test]
+    fn parses_plan_guard_verify_only_mode() {
+        let md = r#"
+```yarli-run
+version = 1
+objective = "verification-only: CARD-R8-01"
+[tasks]
+items = [{ key = "test", cmd = "cargo test --workspace" }]
+[plan_guard]
+target = "CARD-R8-01"
+mode = "verify-only"
+```
+"#;
+        let blocks = extract_fenced_blocks(md, "yarli-run");
+        let spec: RunSpec = toml::from_str(&blocks[0]).unwrap();
+        let guard = spec.plan_guard.expect("plan_guard should parse");
+        assert_eq!(guard.target, "CARD-R8-01");
+        assert_eq!(guard.mode, RunSpecPlanGuardMode::VerifyOnly);
+    }
+
+    #[test]
+    fn rejects_empty_plan_guard_target() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("PROMPT.md"),
+            "```yarli-run\nversion=1\n[tasks]\nitems=[{key=\"a\",cmd=\"echo ok\"}]\n[plan_guard]\ntarget=\"\"\n```\n",
+        )
+        .unwrap();
+        let err = load_prompt_and_run_spec(&root.join("PROMPT.md")).unwrap_err();
+        assert!(err.to_string().contains("plan_guard.target"));
+    }
+
+    #[test]
+    fn accepts_minimal_run_spec_without_tasks_for_config_first_mode() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(
+            root.join("PROMPT.md"),
+            "```yarli-run\nversion=1\nobjective=\"implement plan\"\n```\n",
+        )
+        .unwrap();
+
+        let loaded = load_prompt_and_run_spec(&root.join("PROMPT.md")).unwrap();
+        assert_eq!(loaded.run_spec.version, 1);
+        assert!(loaded.run_spec.tasks.items.is_empty());
     }
 }

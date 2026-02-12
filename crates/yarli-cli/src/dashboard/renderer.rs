@@ -127,6 +127,17 @@ impl DashboardRenderer {
                     view.worker_id = Some(worker_id);
                 }
             }
+            StreamEvent::RunStarted {
+                run_id,
+                objective,
+                at: _,
+            } => {
+                self.state.run_id = Some(run_id);
+                self.state.objective = Some(objective);
+            }
+            StreamEvent::RunExited { payload } => {
+                self.state.continuation_payload = Some(payload);
+            }
             StreamEvent::TransientStatus { .. } => {
                 // Transient status is stream-mode only; dashboard ignores.
             }

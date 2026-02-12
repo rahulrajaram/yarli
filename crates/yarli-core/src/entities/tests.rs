@@ -374,11 +374,17 @@ mod task_tests {
         assert!(task.last_error.is_none());
 
         task.set_last_error("command exited with code 1");
-        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("command exited with code 1")
+        );
 
         // Second call should not overwrite.
         task.set_last_error("command killed");
-        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("command exited with code 1")
+        );
     }
 
     #[test]
@@ -418,7 +424,10 @@ mod task_tests {
         task.set_last_error("command exited with code 1");
         task.transition(TaskState::TaskFailed, "nonzero exit", "worker", None)
             .unwrap();
-        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("command exited with code 1")
+        );
 
         // Retry and kill — last_error preserved.
         task.transition(TaskState::TaskReady, "retry", "scheduler", None)
@@ -428,7 +437,10 @@ mod task_tests {
         task.set_last_error("command killed"); // Should NOT overwrite.
         task.transition(TaskState::TaskFailed, "killed", "worker", None)
             .unwrap();
-        assert_eq!(task.last_error.as_deref(), Some("command exited with code 1"));
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("command exited with code 1")
+        );
     }
 }
 

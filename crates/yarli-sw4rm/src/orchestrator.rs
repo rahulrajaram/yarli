@@ -156,10 +156,10 @@ impl<R: RouterSender> OrchestratorLoop<R> {
             };
 
             // Fix #5: enforce LLM response timeout from config
-            let response = tokio::time::timeout(timeout, self.router.send_implementation_request(request))
-                .await
-                .map_err(|_| OrchestratorError::LlmTimeout)?
-                ?;
+            let response =
+                tokio::time::timeout(timeout, self.router.send_implementation_request(request))
+                    .await
+                    .map_err(|_| OrchestratorError::LlmTimeout)??;
 
             debug!(
                 iteration,
@@ -240,18 +240,17 @@ impl<R: RouterSender> OrchestratorLoop<R> {
         // Create run
         let mut run = Run::new("verification", SafeMode::Execute);
         let run_id = run.id;
-        run.transition(RunState::RunActive, "start verification", "yarli-sw4rm", None)
-            .map_err(|e| OrchestratorError::Scheduler(e.to_string()))?;
+        run.transition(
+            RunState::RunActive,
+            "start verification",
+            "yarli-sw4rm",
+            None,
+        )
+        .map_err(|e| OrchestratorError::Scheduler(e.to_string()))?;
 
         let mut task_info = Vec::new();
         for cmd in &self.verification.commands {
-            let task = Task::new(
-                run_id,
-                &cmd.task_key,
-                &cmd.command,
-                cmd.class,
-                corr_id,
-            );
+            let task = Task::new(run_id, &cmd.task_key, &cmd.command, cmd.class, corr_id);
             let task_id = task.id;
             task_info.push((task_id, cmd.task_key.clone(), cmd.command.clone()));
 
@@ -354,7 +353,8 @@ fn classify_failure(task: &Task) -> FailureType {
                 FailureType::CompileError
             } else if lower.contains("clippy") || lower.contains("lint") {
                 FailureType::LintError
-            } else if lower.contains("killed") || lower.contains("oom") || lower.contains("signal") {
+            } else if lower.contains("killed") || lower.contains("oom") || lower.contains("signal")
+            {
                 FailureType::Killed
             } else {
                 FailureType::TestFailure
@@ -406,7 +406,12 @@ mod tests {
 
         let orch = OrchestratorLoop::new(mock.clone(), test_config(), test_verification());
         let result = orch
-            .run_objective("add feature", "corr-1", CancellationToken::new(), &default_params())
+            .run_objective(
+                "add feature",
+                "corr-1",
+                CancellationToken::new(),
+                &default_params(),
+            )
             .await
             .unwrap();
 
@@ -432,7 +437,12 @@ mod tests {
 
         let orch = OrchestratorLoop::new(mock.clone(), test_config(), test_verification());
         let result = orch
-            .run_objective("fix bug", "corr-2", CancellationToken::new(), &default_params())
+            .run_objective(
+                "fix bug",
+                "corr-2",
+                CancellationToken::new(),
+                &default_params(),
+            )
             .await
             .unwrap();
 
@@ -466,7 +476,12 @@ mod tests {
 
         let orch = OrchestratorLoop::new(mock.clone(), test_config(), verification);
         let result = orch
-            .run_objective("impossible task", "corr-3", CancellationToken::new(), &default_params())
+            .run_objective(
+                "impossible task",
+                "corr-3",
+                CancellationToken::new(),
+                &default_params(),
+            )
             .await
             .unwrap();
 
@@ -500,7 +515,12 @@ mod tests {
         let mock = Arc::new(MockRouterSender::new());
         let orch = OrchestratorLoop::new(mock, test_config(), test_verification());
         let result = orch
-            .run_objective("task", "corr-5", CancellationToken::new(), &default_params())
+            .run_objective(
+                "task",
+                "corr-5",
+                CancellationToken::new(),
+                &default_params(),
+            )
             .await;
         assert!(matches!(result, Err(OrchestratorError::LlmTimeout)));
     }
@@ -535,7 +555,12 @@ mod tests {
 
         let orch = OrchestratorLoop::new(mock, test_config(), verification);
         let result = orch
-            .run_objective("verify multi", "corr-6", CancellationToken::new(), &default_params())
+            .run_objective(
+                "verify multi",
+                "corr-6",
+                CancellationToken::new(),
+                &default_params(),
+            )
             .await
             .unwrap();
 
@@ -561,7 +586,12 @@ mod tests {
 
         let orch = OrchestratorLoop::new(mock, test_config(), test_verification());
         let result = orch
-            .run_objective("multi", "corr-7", CancellationToken::new(), &default_params())
+            .run_objective(
+                "multi",
+                "corr-7",
+                CancellationToken::new(),
+                &default_params(),
+            )
             .await
             .unwrap();
 
@@ -648,7 +678,9 @@ mod tests {
             CommandClass::Io,
             Uuid::now_v7(),
         );
-        task.blocker = Some(BlockerCode::Custom("process timed out after 300s".to_string()));
+        task.blocker = Some(BlockerCode::Custom(
+            "process timed out after 300s".to_string(),
+        ));
         assert_eq!(classify_failure(&task), FailureType::Timeout);
     }
 

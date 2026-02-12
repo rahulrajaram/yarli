@@ -423,12 +423,61 @@ fn default_overwatch_service_url() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RunConfig {
+    /// Optional prompt file for `yarli run` default execution.
+    ///
+    /// When unset, `yarli run` falls back to the legacy `PROMPT.md` lookup.
+    #[serde(default)]
+    pub prompt_file: Option<String>,
+    /// How long `yarli run continue` should wait for continuation availability.
+    ///
+    /// Value is seconds. `0` disables waiting (fail-fast behavior).
+    #[serde(default)]
+    pub continue_wait_timeout_seconds: u64,
+    /// Allow planned-tranche auto-advance when deterioration trend is `stable`.
+    ///
+    /// Default is `false` (improving-only).
+    #[serde(default)]
+    pub allow_stable_auto_advance: bool,
+    /// Auto-advance policy for planned tranches.
+    ///
+    /// `improving-only` (default): only improving deterioration trend advances.
+    /// `stable-ok`: stable and improving trends advance.
+    /// `always`: always advance to planned next tranche.
+    #[serde(default)]
+    pub auto_advance_policy: AutoAdvancePolicy,
+    /// Maximum number of planned-tranche auto-advances in a single invocation.
+    ///
+    /// `0` means unlimited.
+    #[serde(default)]
+    pub max_auto_advance_tranches: u32,
     /// The default named pace used by shorthand commands like `yarli run batch`.
     #[serde(default)]
     pub default_pace: Option<String>,
     /// Named run presets (pace -> commands + optional overrides).
     #[serde(default)]
     pub paces: std::collections::BTreeMap<String, RunPaceConfig>,
+}
+
+impl RunConfig {
+    pub fn effective_auto_advance_policy(&self) -> AutoAdvancePolicy {
+        if self.auto_advance_policy != AutoAdvancePolicy::ImprovingOnly {
+            return self.auto_advance_policy;
+        }
+        if self.allow_stable_auto_advance {
+            AutoAdvancePolicy::StableOk
+        } else {
+            AutoAdvancePolicy::ImprovingOnly
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoAdvancePolicy {
+    #[default]
+    ImprovingOnly,
+    StableOk,
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -628,6 +677,14 @@ mod tests {
         assert!(!loaded.config().features.parallel);
         assert_eq!(loaded.config().execution.runner, ExecutionRunner::Native);
         assert_eq!(loaded.config().execution.working_dir, ".");
+        assert_eq!(loaded.config().run.prompt_file, None);
+        assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 0);
+        assert!(!loaded.config().run.allow_stable_auto_advance);
+        assert_eq!(
+            loaded.config().run.auto_advance_policy,
+            AutoAdvancePolicy::ImprovingOnly
+        );
+        assert_eq!(loaded.config().run.max_auto_advance_tranches, 0);
     }
 
     #[test]
@@ -676,6 +733,11 @@ silent_timeout_seconds = 60
 max_log_bytes = 2048
 
 [run]
+prompt_file = "prompts/I8B.md"
+continue_wait_timeout_seconds = 7
+allow_stable_auto_advance = true
+auto_advance_policy = "always"
+max_auto_advance_tranches = 0
 default_pace = "batch"
 [run.paces.batch]
 cmds = ["echo fmt", "echo clippy", "echo test"]
@@ -743,6 +805,17 @@ mode = "stream"
         assert!(loaded.config().memory.backend.inject_on_failure);
         assert_eq!(loaded.config().ui.mode, UiMode::Stream);
         assert_eq!(loaded.config().budgets.max_task_total_tokens, Some(1000));
+        assert_eq!(
+            loaded.config().run.prompt_file.as_deref(),
+            Some("prompts/I8B.md")
+        );
+        assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 7);
+        assert!(loaded.config().run.allow_stable_auto_advance);
+        assert_eq!(
+            loaded.config().run.auto_advance_policy,
+            AutoAdvancePolicy::Always
+        );
+        assert_eq!(loaded.config().run.max_auto_advance_tranches, 0);
         assert_eq!(loaded.config().run.default_pace.as_deref(), Some("batch"));
         assert_eq!(
             loaded

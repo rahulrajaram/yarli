@@ -4,18 +4,24 @@ This is the exhaustive, command-by-command usage guide for `yarli`.
 
 ## Core Concepts
 
-### Canonical Run Spec: `PROMPT.md`
+### Prompt Resolution Precedence
 
 `yarli run` is opinionated:
 
-- It searches upwards from your current directory for the canonical `PROMPT.md`.
-- It expands any `@include <path>` directives (confined under the directory containing `PROMPT.md`).
+- It resolves the prompt file in this order:
+  1. `yarli run --prompt-file <path>`
+  2. `[run].prompt_file` in `yarli.toml`
+  3. fallback lookup for `PROMPT.md` by walking upward from your current directory
+- Relative prompt paths from `--prompt-file` or `run.prompt_file` are resolved from repo root (`.git` ancestor) when available, otherwise from the config file directory.
+- It expands any `@include <path>` directives (confined under the directory containing the resolved prompt file).
 - It requires **exactly one** fenced code block with info string `yarli-run`, containing TOML.
-- It executes the tasks in that TOML block deterministically.
+- It uses prompt context/objective plus `yarli.toml` runtime config for execution behavior.
+- Default execution discovers incomplete tranches in `IMPLEMENTATION_PLAN.md`, dispatches each tranche as a task, then appends a verification task.
+- If no incomplete tranches are found, it runs verification-only automatically.
 
 Minimum `PROMPT.md` structure:
 
-```markdown
+````markdown
 # Project Prompt
 
 @include IMPLEMENTATION_PLAN.md
@@ -23,22 +29,23 @@ Minimum `PROMPT.md` structure:
 ```yarli-run
 version = 1
 objective = "verify workspace"
-
-[tasks]
-items = [
-  { key = "fmt",    cmd = "cargo fmt --all",                        class = "io"  },
-  { key = "clippy", cmd = "cargo clippy --workspace --all-targets", class = "cpu" },
-  { key = "test",   cmd = "cargo test --workspace",                class = "cpu" },
-]
 ```
+````
+
+For config-first mode, dispatch is configured in `yarli.toml` `[cli]` (`command`, `args`, `prompt_mode`).
+Prompt-embedded `[tasks]` remains legacy fallback compatibility.
+
+Optional plan guard (recommended for tranche/card workflows):
+
+```toml
+[plan_guard]
+target = "CARD-R8-01"
+mode = "implement"   # "implement" (default) or "verify-only"
 ```
 
-Task `class` values:
-
-- `io`
-- `cpu`
-- `git`
-- `tool`
+- `mode = "implement"` validates target presence/state and allows completed targets to proceed via verification-only routing.
+- `mode = "verify-only"` requires the target to already be complete and requires verification-oriented objective text.
+- `target` matching supports checklist lines and common status formats such as `I8B ... complete/incomplete`.
 
 ### Runtime Config: `yarli.toml`
 
@@ -173,14 +180,14 @@ yarli init --backend gemini --path ./yarli.toml --force
 
 Notes:
 
-- Today, `yarli run` does not invoke the `[cli]` backend; `[cli]` is reserved for future iteration loops.
-- The template is still valuable because initializing the CLI invocation is frequently non-trivial and is modeled after `orchestrator.yml`.
+- `yarli run` uses `[cli]` as the primary dispatch backend in config-first mode.
+- The template is modeled after `orchestrator.yml` to keep migration straightforward.
 
 Orchestrator-orchestrator config mapping reference:
 
 - See `orchestrator.yml` in this repository.
 - Rough mapping (conceptual):
-  - `orchestrator.yml: event_loop.prompt_file` -> YARLI canonical `PROMPT.md` (not configurable)
+  - `orchestrator.yml: event_loop.prompt_file` -> `yarli.toml: [run].prompt_file` (or `--prompt-file` override)
   - `orchestrator.yml: cli.backend/prompt_mode/command/args` -> `yarli.toml: [cli] backend/prompt_mode/command/args`
   - `orchestrator.yml: features.parallel` -> `yarli.toml: [features] parallel` (scheduler caps only)
 
@@ -189,13 +196,23 @@ Orchestrator-orchestrator config mapping reference:
 Purpose:
 
 - Start, monitor, and explain orchestration runs.
-- `yarli run` (no subcommand) executes `PROMPT.md` as described above (this is the primary workflow).
+- `yarli run` (no subcommand) is config-first and plan-driven (primary workflow).
+- Auto-advance policy is configured with:
+  - `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"`
+  - `[run] max_auto_advance_tranches = <N>` (`0` = unlimited)
+- `run.allow_stable_auto_advance` remains as a legacy compatibility toggle.
+- If continuation is not yet published when `yarli run continue` is invoked, configure wait behavior with:
+  - `[run] continue_wait_timeout_seconds = <seconds>` (default `0` = fail fast).
+- If `[plan_guard]` is set in the run spec, `yarli run` performs a preflight plan/prompt consistency check against `IMPLEMENTATION_PLAN.md` before dispatching tasks.
 
 Examples:
 
 ```bash
-# Run the workspace's canonical prompt-defined loop.
+# Run the workspace's default prompt-defined loop.
 yarli run --stream
+
+# Override the prompt file for this invocation.
+yarli run --prompt-file prompts/I8C.md --stream
 
 # Start an ad-hoc run with explicit commands (one task per --cmd).
 yarli run start "verify" --cmd "cargo fmt --all" --cmd "cargo test --workspace" --stream
@@ -205,6 +222,34 @@ yarli run status <run-id>
 
 # Explain why the run exited (or why it is not done).
 yarli run explain-exit <run-id>
+
+# Continue from the latest persisted continuation payload
+# (event store first, `.yarli/continuation.json` fallback).
+yarli run continue
+```
+
+Notes:
+
+- For `yarli run status` and `yarli run explain-exit`, `<run-id>` can be either a full UUID or a unique short prefix from `yarli run list`.
+
+Legacy prompt-run-spec tranche example (`PROMPT.md` `yarli-run` block):
+
+```toml
+version = 1
+objective = "workspace verification"
+
+[tasks]
+items = [
+  { key = "fmt", cmd = "cargo fmt --all -- --check", class = "io" },
+  { key = "lint", cmd = "cargo clippy --workspace -- -D warnings", class = "cpu" },
+  { key = "test", cmd = "cargo test --workspace", class = "cpu" },
+]
+
+[tranches]
+items = [
+  { key = "fast", task_keys = ["fmt", "lint"] },
+  { key = "full", objective = "full verification", task_keys = ["test"] },
+]
 ```
 
 Legacy compatibility:

@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use yarli_core::domain::TaskId;
+use yarli_core::entities::ContinuationPayload;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 
@@ -53,6 +54,16 @@ pub enum StreamEvent {
 
     /// A task's worker assignment for display.
     TaskWorker { task_id: TaskId, worker_id: String },
+
+    /// Run started — emitted once at the beginning so operators know the run ID.
+    RunStarted {
+        run_id: Uuid,
+        objective: String,
+        at: DateTime<Utc>,
+    },
+
+    /// Run exited — structured continuation payload for downstream tooling.
+    RunExited { payload: ContinuationPayload },
 
     /// Tick event — advance spinners and refresh viewport.
     Tick,

@@ -17,7 +17,15 @@ cargo test --workspace
 
 ## Default `yarli run`
 
-`yarli run` is opinionated: it loads the canonical `PROMPT.md` (walking up from the current directory), expands any `@include <path>` directives, then executes the single embedded ```yarli-run TOML block.
+`yarli run` is opinionated: prompt resolution precedence is:
+1. `yarli run --prompt-file <path>`
+2. `yarli.toml` `[run].prompt_file`
+3. fallback lookup for `PROMPT.md` (walking up from the current directory)
+
+YARLI then expands any `@include <path>` directives, discovers incomplete tranches from
+`IMPLEMENTATION_PLAN.md`, and dispatches tranche + verification tasks via `[cli]` config.
+Legacy prompt-embedded task execution remains as fallback compatibility when config-first
+dispatch cannot be materialized.
 
 ```bash
 yarli run --stream

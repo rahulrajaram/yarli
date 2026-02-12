@@ -34,6 +34,18 @@ service_url = "http://127.0.0.1:8089"
 # silent_timeout_seconds = 300
 # max_log_bytes = 131072
 
+[run]
+# Optional default prompt file for `yarli run`.
+# Resolution precedence: --prompt-file > run.prompt_file > PROMPT.md fallback.
+# prompt_file = "PROMPT.md"
+continue_wait_timeout_seconds = 0
+# Legacy compatibility toggle; prefer run.auto_advance_policy.
+allow_stable_auto_advance = false
+# improving-only | stable-ok | always
+auto_advance_policy = "improving-only"
+# 0 = unlimited auto-advance tranches in one invocation.
+max_auto_advance_tranches = 0
+
 [budgets]
 # Optional hard limits; unset values are unlimited.
 # Values are per-task unless prefixed with max_run_.

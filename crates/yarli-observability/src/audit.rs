@@ -165,8 +165,12 @@ impl AuditEntry {
             rule_id: None,
             reason: format!(
                 "exit_code={} duration_ms={}",
-                exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
-                duration_ms.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+                exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                duration_ms
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "-".into()),
             ),
             run_id,
             task_id,
@@ -793,14 +797,7 @@ mod tests {
 
     #[test]
     fn command_execution_roundtrip() {
-        let entry = AuditEntry::command_execution(
-            "echo hello",
-            Some(0),
-            "",
-            Some(100),
-            None,
-            None,
-        );
+        let entry = AuditEntry::command_execution("echo hello", Some(0), "", Some(100), None, None);
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: AuditEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.audit_id, entry.audit_id);

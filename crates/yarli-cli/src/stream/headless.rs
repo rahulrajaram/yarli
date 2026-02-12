@@ -10,11 +10,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::events::StreamEvent;
+use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 
 /// Counts for the final run summary.
 #[derive(Default)]
 struct RunSummary {
+    run_id: Option<uuid::Uuid>,
+    run_state: Option<RunState>,
     tasks_complete: u32,
     tasks_failed: u32,
     tasks_cancelled: u32,
@@ -68,12 +71,8 @@ impl HeadlessRenderer {
                 let elapsed_str = elapsed
                     .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
                     .unwrap_or_default();
-                let exit_str = exit_code
-                    .map(|c| format!(", exit {c}"))
-                    .unwrap_or_default();
-                let detail_str = detail
-                    .map(|d| format!(", {d}"))
-                    .unwrap_or_default();
+                let exit_str = exit_code.map(|c| format!(", exit {c}")).unwrap_or_default();
+                let detail_str = detail.map(|d| format!(", {d}")).unwrap_or_default();
                 let time_str = at.format("%H:%M:%S");
 
                 let line = format!(
@@ -95,12 +94,27 @@ impl HeadlessRenderer {
                 at,
             } => {
                 let time_str = at.format("%H:%M:%S");
-                let reason_str = reason
-                    .map(|r| format!(" ({r})"))
-                    .unwrap_or_default();
+                let reason_str = reason.map(|r| format!(" ({r})")).unwrap_or_default();
                 let line = format!(
                     "{time_str} run/{} {from:?} -> {to:?}{reason_str}",
-                    &run_id.to_string()[..8]
+                    display_run_id(run_id)
+                );
+                if to.is_terminal() {
+                    self.summary.run_state = Some(to);
+                }
+                info!("{}", line);
+                let _ = writeln!(io::stderr(), "{line}");
+            }
+            StreamEvent::RunStarted {
+                run_id,
+                objective,
+                at,
+            } => {
+                self.summary.run_id = Some(run_id);
+                let time_str = at.format("%H:%M:%S");
+                let line = format!(
+                    "{time_str} run/{} started: {objective}",
+                    display_run_id(run_id)
                 );
                 info!("{}", line);
                 let _ = writeln!(io::stderr(), "{line}");
@@ -125,6 +139,17 @@ impl HeadlessRenderer {
             } => {
                 // No output needed for headless mode.
             }
+            StreamEvent::RunExited { payload } => {
+                self.summary.run_id = Some(payload.run_id);
+                self.summary.run_state = Some(payload.exit_state);
+                self.summary.tasks_complete = payload.summary.completed;
+                self.summary.tasks_failed = payload.summary.failed;
+                self.summary.tasks_cancelled = payload.summary.cancelled;
+                // Print machine-readable JSON to stdout (not stderr).
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    let _ = writeln!(io::stdout(), "{json}");
+                }
+            }
             StreamEvent::Tick => {
                 // No spinners in headless mode.
             }
@@ -133,14 +158,36 @@ impl HeadlessRenderer {
 
     fn print_summary(&self) {
         let s = &self.summary;
-        let status = if s.tasks_failed > 0 { "FAILED" } else { "OK" };
+        let status = match s.run_state {
+            Some(RunState::RunCompleted) => "OK",
+            Some(RunState::RunFailed | RunState::RunBlocked) => "FAILED",
+            Some(RunState::RunCancelled) => "CANCELLED",
+            Some(_) => "DONE",
+            None => {
+                if s.tasks_failed > 0 {
+                    "FAILED"
+                } else {
+                    "OK"
+                }
+            }
+        };
+        let run_label = s
+            .run_id
+            .map(|id| format!(" [{}]", display_run_id(id)))
+            .unwrap_or_default();
         let line = format!(
-            "--- Run {status}: {} complete, {} failed, {} cancelled ({} transitions) ---",
+            "--- Run {status}{run_label}: {} complete, {} failed, {} cancelled ({} transitions) ---",
             s.tasks_complete, s.tasks_failed, s.tasks_cancelled, s.transitions
         );
         info!("{}", line);
         let _ = writeln!(io::stderr(), "{line}");
     }
+}
+
+fn display_run_id(run_id: uuid::Uuid) -> String {
+    const RUN_ID_DISPLAY_LEN: usize = 12;
+    let compact = run_id.simple().to_string();
+    compact[..RUN_ID_DISPLAY_LEN.min(compact.len())].to_string()
 }
 
 #[cfg(test)]
@@ -204,6 +251,44 @@ mod tests {
     }
 
     #[test]
+    fn headless_records_run_id_from_run_started() {
+        let mut renderer = HeadlessRenderer::new();
+        let run_id = Uuid::new_v4();
+        renderer.handle_event(StreamEvent::RunStarted {
+            run_id,
+            objective: "build everything".into(),
+            at: Utc::now(),
+        });
+        assert_eq!(renderer.summary.run_id, Some(run_id));
+        // RunStarted doesn't affect task counts.
+        assert_eq!(renderer.summary.transitions, 0);
+    }
+
+    #[test]
+    fn headless_summary_includes_run_id() {
+        let mut renderer = HeadlessRenderer::new();
+        let run_id = Uuid::new_v4();
+        renderer.handle_event(StreamEvent::RunStarted {
+            run_id,
+            objective: "test".into(),
+            at: Utc::now(),
+        });
+        renderer.handle_event(StreamEvent::TaskTransition {
+            task_id: Uuid::new_v4(),
+            task_name: "build".into(),
+            from: TaskState::TaskExecuting,
+            to: TaskState::TaskComplete,
+            elapsed: None,
+            exit_code: Some(0),
+            detail: None,
+            at: Utc::now(),
+        });
+        // Verify run_id is captured for summary.
+        assert_eq!(renderer.summary.run_id, Some(run_id));
+        assert_eq!(renderer.summary.tasks_complete, 1);
+    }
+
+    #[test]
     fn headless_handles_run_transition() {
         let mut renderer = HeadlessRenderer::new();
         renderer.handle_event(StreamEvent::RunTransition {
@@ -257,5 +342,78 @@ mod tests {
         assert_eq!(renderer.summary.tasks_failed, 1);
         assert_eq!(renderer.summary.tasks_cancelled, 1);
         assert_eq!(renderer.summary.transitions, 5);
+    }
+
+    #[test]
+    fn headless_handles_run_exited_without_panic() {
+        use yarli_core::domain::{CommandClass, SafeMode};
+        use yarli_core::entities::continuation::ContinuationPayload;
+        use yarli_core::entities::run::Run;
+        use yarli_core::entities::task::Task;
+
+        let run = Run::new("test", SafeMode::Execute);
+        let mut t = Task::new(
+            run.id,
+            "build",
+            "do build",
+            CommandClass::Io,
+            run.correlation_id,
+        );
+        t.state = TaskState::TaskComplete;
+        let payload = ContinuationPayload::build(&run, &[&t]);
+
+        let mut renderer = HeadlessRenderer::new();
+        renderer.handle_event(StreamEvent::RunExited { payload });
+        // No panic — success.
+    }
+
+    #[test]
+    fn run_exited_summary_overrides_transition_failure_counts() {
+        use yarli_core::entities::continuation::{ContinuationPayload, RunSummary, TrancheSpec};
+
+        let mut renderer = HeadlessRenderer::new();
+        let run_id = Uuid::new_v4();
+        renderer.handle_event(StreamEvent::TaskTransition {
+            task_id: Uuid::new_v4(),
+            task_name: "retryable".into(),
+            from: TaskState::TaskExecuting,
+            to: TaskState::TaskFailed,
+            elapsed: None,
+            exit_code: Some(1),
+            detail: None,
+            at: Utc::now(),
+        });
+
+        renderer.handle_event(StreamEvent::RunExited {
+            payload: ContinuationPayload {
+                run_id,
+                objective: "retry flow".into(),
+                exit_state: RunState::RunCompleted,
+                exit_reason: None,
+                completed_at: Utc::now(),
+                tasks: Vec::new(),
+                summary: RunSummary {
+                    total: 1,
+                    completed: 1,
+                    failed: 0,
+                    cancelled: 0,
+                    pending: 0,
+                },
+                next_tranche: Some(TrancheSpec {
+                    suggested_objective: "next".into(),
+                    kind: yarli_core::entities::continuation::TrancheKind::PlannedNext,
+                    retry_task_keys: Vec::new(),
+                    unfinished_task_keys: Vec::new(),
+                    planned_task_keys: vec!["t2".into()],
+                    planned_tranche_key: Some("t2".into()),
+                    cursor: None,
+                    config_snapshot: serde_json::json!({}),
+                }),
+                quality_gate: None,
+            },
+        });
+
+        assert_eq!(renderer.summary.run_state, Some(RunState::RunCompleted));
+        assert_eq!(renderer.summary.tasks_failed, 0);
     }
 }

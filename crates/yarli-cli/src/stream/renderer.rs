@@ -24,6 +24,7 @@ use super::style::Tier;
 
 /// Default number of lines for the inline viewport.
 const DEFAULT_VIEWPORT_HEIGHT: u16 = 8;
+const RUN_ID_DISPLAY_LEN: usize = 12;
 
 /// Configuration for the stream renderer.
 #[derive(Debug, Clone)]
@@ -113,6 +114,13 @@ impl StreamRenderer {
             } => {
                 self.push_run_transition(run_id, from, to, reason.as_deref(), at)?;
             }
+            StreamEvent::RunStarted {
+                run_id,
+                objective,
+                at,
+            } => {
+                self.push_run_started(run_id, &objective, at)?;
+            }
             StreamEvent::CommandOutput {
                 task_id,
                 task_name: _,
@@ -132,6 +140,9 @@ impl StreamRenderer {
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     view.worker_id = Some(worker_id);
                 }
+            }
+            StreamEvent::RunExited { payload } => {
+                self.push_continuation_summary(&payload)?;
             }
             StreamEvent::Tick => {
                 for spinner in self.spinners.values_mut() {
@@ -249,6 +260,32 @@ impl StreamRenderer {
         Ok(())
     }
 
+    /// Push a "run started" banner to scrollback.
+    fn push_run_started(
+        &mut self,
+        run_id: uuid::Uuid,
+        objective: &str,
+        at: DateTime<Utc>,
+    ) -> io::Result<()> {
+        let time_str = at.format("%H:%M:%S").to_string();
+        let display_id = display_run_id(run_id);
+
+        let spans = vec![
+            Span::styled(time_str, Tier::Contextual.style()),
+            Span::styled(" ▸ ", Tier::Background.style()),
+            Span::styled(format!("run/{display_id}"), Tier::Active.style()),
+            Span::styled(format!(" started: {objective}"), Tier::Contextual.style()),
+        ];
+
+        let line = Line::from(spans);
+
+        self.terminal.insert_before(1, |buf| {
+            Paragraph::new(line).render(buf.area, buf);
+        })?;
+
+        Ok(())
+    }
+
     /// Push a run transition line to scrollback.
     fn push_run_transition(
         &mut self,
@@ -260,12 +297,12 @@ impl StreamRenderer {
     ) -> io::Result<()> {
         let tier = tier_for_run_state(to);
         let time_str = at.format("%H:%M:%S").to_string();
-        let short_id = &run_id.to_string()[..8];
+        let display_id = display_run_id(run_id);
 
         let mut spans = vec![
             Span::styled(time_str, Tier::Contextual.style()),
             Span::styled(" ▸ ", Tier::Background.style()),
-            Span::styled(format!("run/{:<16}", short_id), tier.style()),
+            Span::styled(format!("run/{:<20}", display_id), tier.style()),
             Span::styled(format!("{:?}", from), Tier::Contextual.style()),
             Span::styled(" → ", Tier::Background.style()),
             Span::styled(format!("{:?}", to), tier.style()),
@@ -283,6 +320,62 @@ impl StreamRenderer {
         self.terminal.insert_before(1, |buf| {
             Paragraph::new(line).render(buf.area, buf);
         })?;
+
+        Ok(())
+    }
+
+    /// Push a continuation summary block to scrollback.
+    fn push_continuation_summary(
+        &mut self,
+        payload: &yarli_core::entities::ContinuationPayload,
+    ) -> io::Result<()> {
+        let s = &payload.summary;
+
+        // Header line.
+        let header = Line::from(vec![Span::styled(
+            "── Continuation ──",
+            Tier::Active.style(),
+        )]);
+        self.terminal.insert_before(1, |buf| {
+            Paragraph::new(header).render(buf.area, buf);
+        })?;
+
+        // Counts line.
+        let counts = format!(
+            "  {} completed, {} failed, {} pending",
+            s.completed, s.failed, s.pending
+        );
+        let counts_line = Line::from(vec![Span::styled(counts, Tier::Contextual.style())]);
+        self.terminal.insert_before(1, |buf| {
+            Paragraph::new(counts_line).render(buf.area, buf);
+        })?;
+
+        // Retry/next lines if there's a tranche.
+        if let Some(tranche) = &payload.next_tranche {
+            if !tranche.retry_task_keys.is_empty() {
+                let retry = format!("  Retry: [{}]", tranche.retry_task_keys.join(", "));
+                let retry_line = Line::from(vec![Span::styled(retry, Tier::Urgent.style())]);
+                self.terminal.insert_before(1, |buf| {
+                    Paragraph::new(retry_line).render(buf.area, buf);
+                })?;
+            }
+            if !tranche.unfinished_task_keys.is_empty() {
+                let unfinished = format!(
+                    "  Unfinished: [{}]",
+                    tranche.unfinished_task_keys.join(", ")
+                );
+                let unfinished_line =
+                    Line::from(vec![Span::styled(unfinished, Tier::Contextual.style())]);
+                self.terminal.insert_before(1, |buf| {
+                    Paragraph::new(unfinished_line).render(buf.area, buf);
+                })?;
+            }
+            let next = format!("  Next: \"{}\"", tranche.suggested_objective);
+            let next_line = Line::from(vec![Span::styled(next, Tier::Active.style())]);
+            self.terminal.insert_before(1, |buf| {
+                Paragraph::new(next_line).render(buf.area, buf);
+            })?;
+        }
 
         Ok(())
     }
@@ -398,6 +491,11 @@ fn tier_for_task_state(state: TaskState) -> Tier {
     }
 }
 
+fn display_run_id(run_id: uuid::Uuid) -> String {
+    let compact = run_id.simple().to_string();
+    compact[..RUN_ID_DISPLAY_LEN.min(compact.len())].to_string()
+}
+
 /// Determine visual tier for a run state.
 fn tier_for_run_state(state: yarli_core::fsm::run::RunState) -> Tier {
     use yarli_core::fsm::run::RunState;
@@ -481,5 +579,12 @@ mod tests {
     fn tier_for_completed_run() {
         use yarli_core::fsm::run::RunState;
         assert_eq!(tier_for_run_state(RunState::RunCompleted), Tier::Contextual);
+    }
+
+    #[test]
+    fn display_run_id_uses_compact_prefix() {
+        let run_id =
+            uuid::Uuid::parse_str("019c4f51-5f70-7d84-a0c8-2f5c6bb8ef12").expect("valid uuid");
+        assert_eq!(display_run_id(run_id), "019c4f515f70");
     }
 }

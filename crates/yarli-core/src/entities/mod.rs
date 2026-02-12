@@ -6,6 +6,7 @@
 //! `Transition` event record.
 
 pub mod command_execution;
+pub mod continuation;
 pub mod merge_intent;
 pub mod run;
 pub mod task;
@@ -14,6 +15,10 @@ pub mod worktree_binding;
 
 pub use command_execution::{
     CommandExecution, CommandResourceUsage, StreamChunk, StreamType, TokenUsage,
+};
+pub use continuation::{
+    ContinuationPayload, ContinuationQualityGate, RunSummary, TaskOutcome, TrancheCursor,
+    TrancheKind, TrancheSpec,
 };
 pub use merge_intent::{ConflictRecord, ConflictType, MergeIntent, MergeStrategy};
 pub use run::Run;

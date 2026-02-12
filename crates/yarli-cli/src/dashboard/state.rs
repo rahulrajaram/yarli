@@ -108,10 +108,14 @@ pub struct PanelManager {
     pub copy_mode: bool,
     /// Current run ID being displayed.
     pub run_id: Option<Uuid>,
+    /// Current run objective.
+    pub objective: Option<String>,
     /// Current run state.
     pub run_state: Option<yarli_core::fsm::run::RunState>,
     /// Help overlay visible.
     pub show_help: bool,
+    /// Continuation payload from run exit.
+    pub continuation_payload: Option<yarli_core::entities::ContinuationPayload>,
 }
 
 impl PanelManager {
@@ -134,8 +138,10 @@ impl PanelManager {
             gate_results: Vec::new(),
             copy_mode: false,
             run_id: None,
+            objective: None,
             run_state: None,
             show_help: false,
+            continuation_payload: None,
         }
     }
 
