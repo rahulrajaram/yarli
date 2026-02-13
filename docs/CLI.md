@@ -14,10 +14,13 @@ This is the exhaustive, command-by-command usage guide for `yarli`.
   3. fallback lookup for `PROMPT.md` by walking upward from your current directory
 - Relative prompt paths from `--prompt-file` or `run.prompt_file` are resolved from repo root (`.git` ancestor) when available, otherwise from the config file directory.
 - It expands any `@include <path>` directives (confined under the directory containing the resolved prompt file).
-- It requires **exactly one** fenced code block with info string `yarli-run`, containing TOML.
+- Run-spec defaults can be configured in `yarli.toml` (`[run]`, `[[run.tasks]]`, `[[run.tranches]]`, `[run.plan_guard]`).
+- If present, a fenced code block with info string `yarli-run` provides per-prompt run-spec overrides.
 - It uses prompt context/objective plus `yarli.toml` runtime config for execution behavior.
 - Default execution discovers incomplete tranches in `IMPLEMENTATION_PLAN.md`, dispatches each tranche as a task, then appends a verification task.
-- If no incomplete tranches are found, it runs verification-only automatically.
+- Optional grouped dispatch is enabled with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.
+- Optional tranche file-scope policy metadata is `allowed_paths=...` on plan lines; enable explicit scope instructions with `[run].enforce_plan_tranche_allowed_paths = true`.
+- If no run-spec configuration exists and no incomplete tranches are found, it dispatches the full prompt text as one task.
 
 Minimum `PROMPT.md` structure:
 
@@ -25,20 +28,22 @@ Minimum `PROMPT.md` structure:
 # Project Prompt
 
 @include IMPLEMENTATION_PLAN.md
-
-```yarli-run
-version = 1
-objective = "verify workspace"
-```
 ````
 
-For config-first mode, dispatch is configured in `yarli.toml` `[cli]` (`command`, `args`, `prompt_mode`).
-Prompt-embedded `[tasks]` remains legacy fallback compatibility.
+For config-first mode, dispatch is configured in `yarli.toml` `[cli]` (`command`, `args`, `prompt_mode`, optional `env_unset`).
+Prompt-embedded `[tasks]` remains legacy fallback compatibility (overrides `yarli.toml` by task key).
+
+### Control Terminology
+
+- Built-in Yarli policy gates: code-defined checks evaluated by Yarli (`yarli gate ...`).
+- Verification command chain: plan/config/script-defined command execution (tranche + verification tasks).
+- Observer mode: monitoring/reporting only; observer events never gate or mutate active run execution.
+- Operator controls: explicit control-plane actions via `yarli run pause|resume|cancel`.
 
 Optional plan guard (recommended for tranche/card workflows):
 
 ```toml
-[plan_guard]
+[run.plan_guard]
 target = "CARD-R8-01"
 mode = "implement"   # "implement" (default) or "verify-only"
 ```
@@ -189,7 +194,7 @@ Orchestrator-orchestrator config mapping reference:
 - Rough mapping (conceptual):
   - `orchestrator.yml: event_loop.prompt_file` -> `yarli.toml: [run].prompt_file` (or `--prompt-file` override)
   - `orchestrator.yml: cli.backend/prompt_mode/command/args` -> `yarli.toml: [cli] backend/prompt_mode/command/args`
-  - `orchestrator.yml: features.parallel` -> `yarli.toml: [features] parallel` (scheduler caps only)
+  - `orchestrator.yml: features.parallel` -> `yarli.toml: [features] parallel` + `[execution] worktree_root` (parallel per-task workspaces)
 
 ### `yarli run`
 
@@ -197,13 +202,36 @@ Purpose:
 
 - Start, monitor, and explain orchestration runs.
 - `yarli run` (no subcommand) is config-first and plan-driven (primary workflow).
+- `yarli run` is the authoritative execution entry point; observers are telemetry-only.
+- Parallel mode defaults to enabled (`[features].parallel = true`).
+- Parallel mode requires `[execution].worktree_root`; otherwise `yarli run` fails fast and asks you to update `yarli.toml`.
+- In parallel mode, YARLI prepares one workspace copy per task under `execution.worktree_root` (`~` and `$ENV_VAR` tokens are expanded for execution paths).
+- Configure workspace copy exclusions with `[execution].worktree_exclude_paths` (for example: `["target", "node_modules", ".venv", "venv", "__pycache__"]`).
+- On `RunCompleted`, YARLI scopes each task merge to paths that actually differ from the source workspace, then applies a patch with `git apply --3way`.
+- If any workspace merge conflicts, YARLI records `run.parallel_merge_failed`, returns a non-zero exit, preserves the run workspace root, and writes `PARALLEL_MERGE_RECOVERY.txt` with deterministic recovery commands.
 - Auto-advance policy is configured with:
-  - `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"`
+  - `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"` (default: `stable-ok`)
   - `[run] max_auto_advance_tranches = <N>` (`0` = unlimited)
+- Grouped tranche dispatch is configured with:
+  - `[run] enable_plan_tranche_grouping = true|false`
+  - `[run] max_grouped_tasks_per_tranche = <N>` (`0` = unlimited)
+  - `IMPLEMENTATION_PLAN.md` metadata: append `tranche_group=<name>` to related open lines.
+- Optional tranche file-scope policy is configured with:
+  - `[run] enforce_plan_tranche_allowed_paths = true|false`
+  - `IMPLEMENTATION_PLAN.md` metadata: append `allowed_paths=path/a,path/b` to tranche lines.
+- Optional run-spec task catalog in config:
+  - `[[run.tasks]]` entries (`key`, `cmd`, optional `class`)
+  - `[[run.tranches]]` entries (`key`, optional `objective`, `task_keys`)
+  - `[run.plan_guard]` for target/mode plan contract
+- Operator controls are available for live runs:
+  - `yarli run pause [<run-id>|--all-active]`
+  - `yarli run resume [<run-id>|--all-paused]`
+  - `yarli run cancel [<run-id>|--all-active]`
+- Long-running execution emits heartbeat progress events (`run.observer.progress`) so stream output does not go silent for minutes.
 - `run.allow_stable_auto_advance` remains as a legacy compatibility toggle.
 - If continuation is not yet published when `yarli run continue` is invoked, configure wait behavior with:
   - `[run] continue_wait_timeout_seconds = <seconds>` (default `0` = fail fast).
-- If `[plan_guard]` is set in the run spec, `yarli run` performs a preflight plan/prompt consistency check against `IMPLEMENTATION_PLAN.md` before dispatching tasks.
+- If `[run.plan_guard]` (or prompt override plan guard) is set in the effective run spec, `yarli run` performs a preflight plan/prompt consistency check against `IMPLEMENTATION_PLAN.md` before dispatching tasks.
 
 Examples:
 
@@ -223,6 +251,18 @@ yarli run status <run-id>
 # Explain why the run exited (or why it is not done).
 yarli run explain-exit <run-id>
 
+# Pause one active run or all active/verifying runs.
+yarli run pause <run-id>
+yarli run pause --all-active --reason "maintenance window"
+
+# Resume one paused run or all paused runs.
+yarli run resume <run-id>
+yarli run resume --all-paused --reason "maintenance complete"
+
+# Cancel one run or all active/verifying runs.
+yarli run cancel <run-id>
+yarli run cancel --all-active --reason "operator stop"
+
 # Continue from the latest persisted continuation payload
 # (event store first, `.yarli/continuation.json` fallback).
 yarli run continue
@@ -231,6 +271,7 @@ yarli run continue
 Notes:
 
 - For `yarli run status` and `yarli run explain-exit`, `<run-id>` can be either a full UUID or a unique short prefix from `yarli run list`.
+- `yarli run status` includes tranche mapping (`tranche -> group -> task_key -> task_id -> worker_actor`) plus scope metadata when available.
 
 Legacy prompt-run-spec tranche example (`PROMPT.md` `yarli-run` block):
 

@@ -209,6 +209,9 @@ pub struct CliConfig {
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Environment variables to unset before invoking the CLI command.
+    #[serde(default)]
+    pub env_unset: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -258,10 +261,22 @@ fn default_checkpoint_interval() -> u32 {
     5
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeaturesConfig {
-    #[serde(default)]
+    #[serde(default = "default_features_parallel")]
     pub parallel: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self {
+            parallel: default_features_parallel(),
+        }
+    }
+}
+
+fn default_features_parallel() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -351,6 +366,16 @@ pub struct ExecutionConfig {
     pub runner: ExecutionRunner,
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
+    /// Optional root directory where per-task workspaces/worktrees are created.
+    ///
+    /// Required when `features.parallel = true`.
+    #[serde(default)]
+    pub worktree_root: Option<String>,
+    /// Directory names or relative paths to exclude from parallel workspace copies.
+    ///
+    /// Examples: `target`, `node_modules`, `.venv`, `venv`, `sdks/rust_sdk/target`.
+    #[serde(default = "default_worktree_exclude_paths")]
+    pub worktree_exclude_paths: Vec<String>,
     #[serde(default = "default_command_timeout_seconds")]
     pub command_timeout_seconds: u64,
     #[serde(default = "default_tick_interval_ms")]
@@ -364,6 +389,8 @@ impl Default for ExecutionConfig {
         Self {
             runner: ExecutionRunner::default(),
             working_dir: default_working_dir(),
+            worktree_root: None,
+            worktree_exclude_paths: default_worktree_exclude_paths(),
             command_timeout_seconds: default_command_timeout_seconds(),
             tick_interval_ms: default_tick_interval_ms(),
             overwatch: OverwatchConfig::default(),
@@ -381,6 +408,18 @@ fn default_command_timeout_seconds() -> u64 {
 
 fn default_tick_interval_ms() -> u64 {
     100
+}
+
+fn default_worktree_exclude_paths() -> Vec<String> {
+    vec![
+        ".yarl/workspaces".to_string(),
+        ".yarli".to_string(),
+        "target".to_string(),
+        "node_modules".to_string(),
+        ".venv".to_string(),
+        "venv".to_string(),
+        "__pycache__".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -428,6 +467,9 @@ pub struct RunConfig {
     /// When unset, `yarli run` falls back to the legacy `PROMPT.md` lookup.
     #[serde(default)]
     pub prompt_file: Option<String>,
+    /// Optional default objective when no prompt-level override is provided.
+    #[serde(default)]
+    pub objective: Option<String>,
     /// How long `yarli run continue` should wait for continuation availability.
     ///
     /// Value is seconds. `0` disables waiting (fail-fast behavior).
@@ -435,12 +477,13 @@ pub struct RunConfig {
     pub continue_wait_timeout_seconds: u64,
     /// Allow planned-tranche auto-advance when deterioration trend is `stable`.
     ///
-    /// Default is `false` (improving-only).
+    /// Legacy compatibility toggle; prefer `auto_advance_policy`.
     #[serde(default)]
     pub allow_stable_auto_advance: bool,
     /// Auto-advance policy for planned tranches.
     ///
-    /// `improving-only` (default): only improving deterioration trend advances.
+    /// `stable-ok` (default): stable and improving trends advance.
+    /// `improving-only`: only improving deterioration trend advances.
     /// `stable-ok`: stable and improving trends advance.
     /// `always`: always advance to planned next tranche.
     #[serde(default)]
@@ -450,6 +493,35 @@ pub struct RunConfig {
     /// `0` means unlimited.
     #[serde(default)]
     pub max_auto_advance_tranches: u32,
+    /// Enable grouping adjacent plan entries with shared `tranche_group=` metadata.
+    #[serde(default)]
+    pub enable_plan_tranche_grouping: bool,
+    /// Cap grouped tasks per planned tranche.
+    ///
+    /// `0` means unlimited.
+    #[serde(default)]
+    pub max_grouped_tasks_per_tranche: u32,
+    /// Enforce per-tranche allowed path hints from `IMPLEMENTATION_PLAN.md`.
+    ///
+    /// When enabled, `allowed_paths=` metadata is surfaced as explicit scope instructions
+    /// in tranche task prompts.
+    #[serde(default)]
+    pub enforce_plan_tranche_allowed_paths: bool,
+    /// Optional project-level task catalog for run-spec execution.
+    ///
+    /// Serialized as `[[run.tasks]]`.
+    #[serde(default)]
+    pub tasks: Vec<RunTaskConfig>,
+    /// Optional explicit tranche definitions for run-spec execution.
+    ///
+    /// Serialized as `[[run.tranches]]`.
+    #[serde(default)]
+    pub tranches: Vec<RunTrancheConfig>,
+    /// Optional plan guard contract for run-spec execution.
+    ///
+    /// Serialized as `[run.plan_guard]`.
+    #[serde(default)]
+    pub plan_guard: Option<RunPlanGuardConfig>,
     /// The default named pace used by shorthand commands like `yarli run batch`.
     #[serde(default)]
     pub default_pace: Option<String>,
@@ -474,8 +546,8 @@ impl RunConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AutoAdvancePolicy {
-    #[default]
     ImprovingOnly,
+    #[default]
     StableOk,
     Always,
 }
@@ -491,6 +563,42 @@ pub struct RunPaceConfig {
     /// Optional timeout override for this pace (0 disables timeout).
     #[serde(default)]
     pub command_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunTaskConfig {
+    pub key: String,
+    pub cmd: String,
+    #[serde(default)]
+    pub class: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunTrancheConfig {
+    pub key: String,
+    #[serde(default)]
+    pub objective: Option<String>,
+    pub task_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunPlanGuardConfig {
+    pub target: String,
+    #[serde(default)]
+    pub mode: RunPlanGuardModeConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunPlanGuardModeConfig {
+    Implement,
+    VerifyOnly,
+}
+
+impl Default for RunPlanGuardModeConfig {
+    fn default() -> Self {
+        Self::Implement
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -674,17 +782,44 @@ mod tests {
         assert_eq!(loaded.config().core.backend, BackendKind::InMemory);
         assert!(!loaded.config().core.allow_in_memory_writes);
         assert_eq!(loaded.config().event_loop.max_iterations, 5);
-        assert!(!loaded.config().features.parallel);
+        assert!(loaded.config().features.parallel);
         assert_eq!(loaded.config().execution.runner, ExecutionRunner::Native);
         assert_eq!(loaded.config().execution.working_dir, ".");
+        assert_eq!(loaded.config().execution.worktree_root, None);
+        assert!(loaded
+            .config()
+            .execution
+            .worktree_exclude_paths
+            .iter()
+            .any(|path| path == "target"));
+        assert!(loaded
+            .config()
+            .execution
+            .worktree_exclude_paths
+            .iter()
+            .any(|path| path == "node_modules"));
+        assert!(loaded
+            .config()
+            .execution
+            .worktree_exclude_paths
+            .iter()
+            .any(|path| path == ".venv"));
         assert_eq!(loaded.config().run.prompt_file, None);
+        assert_eq!(loaded.config().run.objective, None);
         assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 0);
         assert!(!loaded.config().run.allow_stable_auto_advance);
         assert_eq!(
             loaded.config().run.auto_advance_policy,
-            AutoAdvancePolicy::ImprovingOnly
+            AutoAdvancePolicy::StableOk
         );
         assert_eq!(loaded.config().run.max_auto_advance_tranches, 0);
+        assert!(!loaded.config().run.enable_plan_tranche_grouping);
+        assert_eq!(loaded.config().run.max_grouped_tasks_per_tranche, 0);
+        assert!(!loaded.config().run.enforce_plan_tranche_allowed_paths);
+        assert!(loaded.config().run.tasks.is_empty());
+        assert!(loaded.config().run.tranches.is_empty());
+        assert!(loaded.config().run.plan_guard.is_none());
+        assert!(loaded.config().cli.env_unset.is_empty());
     }
 
     #[test]
@@ -708,6 +843,7 @@ backend = "codex"
 prompt_mode = "arg"
 command = "codex"
 args = ["exec", "--json"]
+env_unset = ["CLAUDECODE"]
 
 [event_loop]
 max_iterations = 3
@@ -724,6 +860,8 @@ claim_batch_size = 2
 [execution]
 runner = "overwatch"
 working_dir = "/work"
+worktree_root = "/worktrees"
+worktree_exclude_paths = ["target", "node_modules", ".venv", "venv"]
 command_timeout_seconds = 600
 [execution.overwatch]
 service_url = "http://127.0.0.1:9999"
@@ -734,11 +872,32 @@ max_log_bytes = 2048
 
 [run]
 prompt_file = "prompts/I8B.md"
+objective = "ship it"
 continue_wait_timeout_seconds = 7
 allow_stable_auto_advance = true
 auto_advance_policy = "always"
 max_auto_advance_tranches = 0
+enable_plan_tranche_grouping = true
+max_grouped_tasks_per_tranche = 3
+enforce_plan_tranche_allowed_paths = true
 default_pace = "batch"
+[[run.tasks]]
+key = "lint"
+cmd = "cargo clippy --workspace -- -D warnings"
+class = "cpu"
+
+[[run.tasks]]
+key = "test"
+cmd = "cargo test --workspace"
+
+[[run.tranches]]
+key = "verify"
+task_keys = ["lint", "test"]
+objective = "verification tranche"
+
+[run.plan_guard]
+target = "I8B"
+mode = "verify-only"
 [run.paces.batch]
 cmds = ["echo fmt", "echo clippy", "echo test"]
 working_dir = "/repo"
@@ -779,9 +938,26 @@ mode = "stream"
         assert_eq!(loaded.config().core.safe_mode, SafeMode::Restricted);
         assert_eq!(loaded.config().cli.backend.as_deref(), Some("codex"));
         assert_eq!(loaded.config().cli.command.as_deref(), Some("codex"));
+        assert_eq!(
+            loaded.config().cli.env_unset,
+            vec!["CLAUDECODE".to_string()]
+        );
         assert_eq!(loaded.config().event_loop.max_iterations, 3);
         assert!(loaded.config().features.parallel);
         assert_eq!(loaded.config().execution.runner, ExecutionRunner::Overwatch);
+        assert_eq!(
+            loaded.config().execution.worktree_root.as_deref(),
+            Some("/worktrees")
+        );
+        assert_eq!(
+            loaded.config().execution.worktree_exclude_paths,
+            vec![
+                "target".to_string(),
+                "node_modules".to_string(),
+                ".venv".to_string(),
+                "venv".to_string()
+            ]
+        );
         assert_eq!(
             loaded.config().execution.overwatch.service_url,
             "http://127.0.0.1:9999"
@@ -809,6 +985,7 @@ mode = "stream"
             loaded.config().run.prompt_file.as_deref(),
             Some("prompts/I8B.md")
         );
+        assert_eq!(loaded.config().run.objective.as_deref(), Some("ship it"));
         assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 7);
         assert!(loaded.config().run.allow_stable_auto_advance);
         assert_eq!(
@@ -816,6 +993,36 @@ mode = "stream"
             AutoAdvancePolicy::Always
         );
         assert_eq!(loaded.config().run.max_auto_advance_tranches, 0);
+        assert!(loaded.config().run.enable_plan_tranche_grouping);
+        assert_eq!(loaded.config().run.max_grouped_tasks_per_tranche, 3);
+        assert!(loaded.config().run.enforce_plan_tranche_allowed_paths);
+        assert_eq!(loaded.config().run.tasks.len(), 2);
+        assert_eq!(loaded.config().run.tasks[0].key, "lint");
+        assert_eq!(loaded.config().run.tasks[0].class.as_deref(), Some("cpu"));
+        assert_eq!(loaded.config().run.tranches.len(), 1);
+        assert_eq!(loaded.config().run.tranches[0].key, "verify");
+        assert_eq!(
+            loaded.config().run.tranches[0].objective.as_deref(),
+            Some("verification tranche")
+        );
+        assert_eq!(
+            loaded
+                .config()
+                .run
+                .plan_guard
+                .as_ref()
+                .map(|guard| guard.target.as_str()),
+            Some("I8B")
+        );
+        assert_eq!(
+            loaded
+                .config()
+                .run
+                .plan_guard
+                .as_ref()
+                .map(|guard| guard.mode),
+            Some(RunPlanGuardModeConfig::VerifyOnly)
+        );
         assert_eq!(loaded.config().run.default_pace.as_deref(), Some("batch"));
         assert_eq!(
             loaded
@@ -892,5 +1099,34 @@ mode = "stream"
     fn backend_kind_as_str() {
         assert_eq!(BackendKind::InMemory.as_str(), "in-memory");
         assert_eq!(BackendKind::Postgres.as_str(), "postgres");
+    }
+
+    #[test]
+    fn run_effective_auto_advance_policy_respects_explicit_policy_and_legacy_toggle() {
+        let default_cfg = RunConfig::default();
+        assert_eq!(
+            default_cfg.effective_auto_advance_policy(),
+            AutoAdvancePolicy::StableOk
+        );
+
+        let improving_explicit = RunConfig {
+            auto_advance_policy: AutoAdvancePolicy::ImprovingOnly,
+            allow_stable_auto_advance: false,
+            ..RunConfig::default()
+        };
+        assert_eq!(
+            improving_explicit.effective_auto_advance_policy(),
+            AutoAdvancePolicy::ImprovingOnly
+        );
+
+        let improving_with_legacy_toggle = RunConfig {
+            auto_advance_policy: AutoAdvancePolicy::ImprovingOnly,
+            allow_stable_auto_advance: true,
+            ..RunConfig::default()
+        };
+        assert_eq!(
+            improving_with_legacy_toggle.effective_auto_advance_policy(),
+            AutoAdvancePolicy::StableOk
+        );
     }
 }

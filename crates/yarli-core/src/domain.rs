@@ -97,6 +97,21 @@ pub enum ExitReason {
     StalledNoProgress,
 }
 
+impl std::fmt::Display for ExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CompletedAllGates => write!(f, "completed_all_gates"),
+            Self::BlockedOpenTasks => write!(f, "blocked_open_tasks"),
+            Self::BlockedGateFailure => write!(f, "blocked_gate_failure"),
+            Self::FailedPolicyDenial => write!(f, "failed_policy_denial"),
+            Self::FailedRuntimeError => write!(f, "failed_runtime_error"),
+            Self::CancelledByOperator => write!(f, "cancelled_by_operator"),
+            Self::TimedOut => write!(f, "timed_out"),
+            Self::StalledNoProgress => write!(f, "stalled_no_progress"),
+        }
+    }
+}
+
 /// Safe modes for the orchestrator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

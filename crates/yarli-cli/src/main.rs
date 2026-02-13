@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::process;
+use std::io::Write as IoWrite;
+use std::path::{Component, Path, PathBuf};
+use std::process::{self, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use uuid::Uuid;
 
 use yarli_cli::config::{
     AutoAdvancePolicy, BackendSelection, ExecutionRunner, LoadedConfig, PromptMode,
-    DEFAULT_CONFIG_PATH,
+    RunPlanGuardModeConfig, UiMode, DEFAULT_CONFIG_PATH,
 };
 use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
@@ -131,6 +132,7 @@ commands unless `core.allow_in_memory_writes = true`.
 - cli.prompt_mode (default: "arg"; values: arg|stdin)
 - cli.command (optional; executable to invoke)
 - cli.args (default: []; argv list)
+- cli.env_unset (default: []; environment variables to unset before CLI invocation)
 
 [event_loop]
 - event_loop.max_iterations (default: 5; reserved for future iterative loop controls)
@@ -139,7 +141,7 @@ commands unless `core.allow_in_memory_writes = true`.
 - event_loop.checkpoint_interval (default: 5; reserved for future iterative loop controls)
 
 [features]
-- features.parallel (default: false; when false, force scheduler concurrency caps to 1)
+- features.parallel (default: true; requires execution.worktree_root and enables per-task workspace execution)
 
 [queue]
 - queue.claim_batch_size (default: 4)
@@ -155,7 +157,9 @@ commands unless `core.allow_in_memory_writes = true`.
 
 [execution]
 - execution.runner (default: "native"; values: native|overwatch)
-- execution.working_dir (default: ".")
+- execution.working_dir (default: "."; expands `~` and `$ENV_VAR`)
+- execution.worktree_root (default: unset; required when features.parallel = true; expands `~` and `$ENV_VAR`)
+- execution.worktree_exclude_paths (default: [".yarl/workspaces",".yarli","target","node_modules",".venv","venv","__pycache__"]; names/paths excluded from workspace copies)
 - execution.command_timeout_seconds (default: 300; 0 disables timeout)
 - execution.tick_interval_ms (default: 100)
 - execution.overwatch.service_url (required when runner = "overwatch")
@@ -166,10 +170,18 @@ commands unless `core.allow_in_memory_writes = true`.
 
 [run]
 - run.prompt_file (optional; default prompt file for `yarli run`, relative to repo root)
+- run.objective (optional; default objective when no prompt override is provided)
 - run.continue_wait_timeout_seconds (default: 0; seconds to wait for continuation availability before failing)
 - run.allow_stable_auto_advance (legacy compatibility toggle; prefer run.auto_advance_policy)
-- run.auto_advance_policy (default: improving-only; values: improving-only|stable-ok|always)
+- run.auto_advance_policy (default: stable-ok; values: improving-only|stable-ok|always)
 - run.max_auto_advance_tranches (default: 0; 0 = unlimited auto-advance per invocation)
+- run.enable_plan_tranche_grouping (default: false; group adjacent plan entries by shared tranche_group metadata)
+- run.max_grouped_tasks_per_tranche (default: 0; 0 = unlimited tasks per grouped tranche)
+- run.enforce_plan_tranche_allowed_paths (default: false; surface `allowed_paths=` plan metadata as scope constraints)
+- run.tasks (optional; array-of-table `[[run.tasks]]` entries with key/cmd/class)
+- run.tranches (optional; array-of-table `[[run.tranches]]` entries with key/objective/task_keys)
+- run.plan_guard.target (optional; when set, enforces plan target contract)
+- run.plan_guard.mode (default: implement; values: implement|verify-only)
 - run.default_pace (legacy; used by `yarli run batch`)
 - run.paces.<name>.cmds (legacy; list of commands for the named pace)
 - run.paces.<name>.working_dir (legacy; per-pace working dir override)
@@ -269,6 +281,7 @@ safe_mode = "execute"
 # prompt_mode = "arg" | "stdin"
 # command = "codex"
 # args = ["exec", "--json"]
+# env_unset = ["CLAUDECODE"]
 
 [event_loop]
 # Reserved for future iterative loop controls.
@@ -278,8 +291,8 @@ idle_timeout_secs = 1800
 checkpoint_interval = 5
 
 [features]
-# Parallel work controls scheduler concurrency caps only (no parallel worktrees).
-parallel = false
+# Parallel task execution (requires [execution].worktree_root for per-task workspaces).
+parallel = true
 # --- CLI_BACKEND_END ---
 
 [queue]
@@ -303,8 +316,13 @@ tool_cap = 8
 [execution]
 # Runner backend: native | overwatch
 runner = "native"
-# Working directory for command execution.
+# Working directory for command execution (`~` and `$VARS` are expanded).
 working_dir = "."
+# Root directory for per-task workspaces/worktrees (required when features.parallel = true).
+# `~` and `$VARS` are expanded.
+# worktree_root = ".yarl/workspaces"
+# Directory names or paths to exclude from per-task workspace copies.
+worktree_exclude_paths = [".yarl/workspaces", ".yarli", "target", "node_modules", ".venv", "venv", "__pycache__"]
 # Default command timeout in seconds (0 disables timeout).
 command_timeout_seconds = 300
 # Scheduler tick cadence.
@@ -322,14 +340,43 @@ service_url = "http://127.0.0.1:8089"
 # Optional default prompt file for `yarli run`.
 # Resolution precedence: --prompt-file > run.prompt_file > PROMPT.md fallback.
 # prompt_file = "PROMPT.md"
+# Optional default objective when no prompt override is present.
+# objective = "verify workspace"
 # Seconds to wait for continuation payload availability (`yarli run continue`).
 continue_wait_timeout_seconds = 0
 # Legacy compatibility toggle for stable-trend auto-advance.
 allow_stable_auto_advance = false
 # Preferred auto-advance policy: improving-only | stable-ok | always
-auto_advance_policy = "improving-only"
+auto_advance_policy = "stable-ok"
 # Maximum planned-tranche auto-advances per invocation (0 = unlimited).
 max_auto_advance_tranches = 0
+# Group adjacent open plan entries with matching `tranche_group=<name>` metadata.
+enable_plan_tranche_grouping = false
+# Cap grouped tasks per tranche (0 = unlimited).
+max_grouped_tasks_per_tranche = 0
+# Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
+enforce_plan_tranche_allowed_paths = false
+# Optional run-spec task catalog (project-level verification/work commands).
+# [[run.tasks]]
+# key = "lint"
+# cmd = "cargo clippy --workspace -- -D warnings"
+# class = "cpu"
+#
+# [[run.tasks]]
+# key = "test"
+# cmd = "cargo test --workspace"
+# class = "io"
+#
+# Optional explicit tranche definitions for run-spec execution.
+# [[run.tranches]]
+# key = "verify"
+# objective = "verification tranche"
+# task_keys = ["lint", "test"]
+#
+# Optional plan-guard contract for run-spec execution.
+# [run.plan_guard]
+# target = "I8B"
+# mode = "implement"
 # default_pace = "batch"
 
 [budgets]
@@ -401,8 +448,8 @@ idle_timeout_secs = 1800
 checkpoint_interval = 5
 
 [features]
-# Parallel work controls scheduler concurrency caps only (no parallel worktrees).
-parallel = false
+# Parallel execution requires [execution].worktree_root.
+parallel = true
 "#
         }
         Some(InitBackend::Codex) => {
@@ -419,7 +466,7 @@ idle_timeout_secs = 1800
 checkpoint_interval = 5
 
 [features]
-parallel = false
+parallel = true
 "#
         }
         Some(InitBackend::Claude) => {
@@ -428,6 +475,7 @@ backend = "claude"
 prompt_mode = "arg"
 command = "claude"
 args = ["--model", "sonnet-4.5"]
+# env_unset = ["CLAUDECODE"]
 
 [event_loop]
 max_iterations = 5
@@ -436,7 +484,7 @@ idle_timeout_secs = 1800
 checkpoint_interval = 5
 
 [features]
-parallel = false
+parallel = true
 "#
         }
         Some(InitBackend::Gemini) => {
@@ -453,7 +501,7 @@ idle_timeout_secs = 1800
 checkpoint_interval = 5
 
 [features]
-parallel = false
+parallel = true
 "#
         }
     };
@@ -487,7 +535,7 @@ fn replace_between(haystack: &str, begin: &str, end: &str, replacement: &str) ->
 enum Commands {
     #[command(
         about = "Manage orchestration runs (default: config-first plan-driven execution)",
-        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- `yarli run` then discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- If no incomplete tranches are found, `yarli run` executes verification-only.\n- Legacy prompt task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nOptional integrations:\n- Memories: enable Backend-backed hints/storage via `yarli.toml` (`[memory.backend] enabled = true`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
+        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable Backend-backed hints/storage via `yarli.toml` (`[memory.backend] enabled = true`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
     )]
     Run {
         /// Override the prompt file used by default `yarli run` (no subcommand).
@@ -506,7 +554,7 @@ enum Commands {
     },
     #[command(
         about = "Manage verification gates",
-        long_about = "Manage verification gates.\n\nExamples:\n- `yarli gate list`\n- `yarli gate list --run`\n- `yarli gate rerun <task-id>`\n- `yarli gate rerun <task-id> --gate tests_passed`\n\nNotes:\n- `gate rerun` is a write command and requires Postgres durability or explicit in-memory opt-in."
+        long_about = "Manage built-in Yarli policy gates (code-defined checks).\n\nExamples:\n- `yarli gate list`\n- `yarli gate list --run`\n- `yarli gate rerun <task-id>`\n- `yarli gate rerun <task-id> --gate tests_passed`\n\nNotes:\n- These gates are distinct from the verification command chain configured by plan/config/scripts.\n- `gate rerun` is a write command and requires Postgres durability or explicit in-memory opt-in."
     )]
     Gate {
         #[command(subcommand)]
@@ -638,6 +686,48 @@ enum RunAction {
         /// Path to the continuation file (defaults to `.yarli/continuation.json`).
         #[arg(long, default_value = DEFAULT_CONTINUATION_FILE)]
         file: PathBuf,
+    },
+    #[command(
+        about = "Pause active runs (operator control)",
+        long_about = "Pause active runs (operator control).\n\nTransitions the selected run(s) to RUN_BLOCKED with operator reason metadata.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to pause all active/verifying runs.\n\nExamples:\n  yarli run pause 019577a2-...\n  yarli run pause --all-active --reason \"maintenance window\""
+    )]
+    Pause {
+        /// Run ID to pause (UUID or unique run-list prefix).
+        run_id: Option<String>,
+        /// Pause all active/verifying runs.
+        #[arg(long, default_value_t = false, conflicts_with = "run_id")]
+        all_active: bool,
+        /// Reason for pause.
+        #[arg(short, long, default_value = "paused by operator")]
+        reason: String,
+    },
+    #[command(
+        about = "Resume paused runs (operator control)",
+        long_about = "Resume paused runs (operator control).\n\nTransitions selected RUN_BLOCKED runs back to RUN_ACTIVE.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-paused` to resume all paused runs.\n\nExamples:\n  yarli run resume 019577a2-...\n  yarli run resume --all-paused --reason \"maintenance complete\""
+    )]
+    Resume {
+        /// Run ID to resume (UUID or unique run-list prefix).
+        run_id: Option<String>,
+        /// Resume all paused runs.
+        #[arg(long, default_value_t = false, conflicts_with = "run_id")]
+        all_paused: bool,
+        /// Reason for resume.
+        #[arg(short, long, default_value = "resumed by operator")]
+        reason: String,
+    },
+    #[command(
+        about = "Cancel active runs (operator control)",
+        long_about = "Cancel active runs (operator control).\n\nTransitions selected run(s) to RUN_CANCELLED, cancels non-terminal tasks,\nand drains queued entries for those runs.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to cancel all active/verifying runs.\n\nExamples:\n  yarli run cancel 019577a2-...\n  yarli run cancel --all-active --reason \"operator stop\""
+    )]
+    Cancel {
+        /// Run ID to cancel (UUID or unique run-list prefix).
+        run_id: Option<String>,
+        /// Cancel all active/verifying runs.
+        #[arg(long, default_value_t = false, conflicts_with = "run_id")]
+        all_active: bool,
+        /// Reason for cancellation.
+        #[arg(short, long, default_value = "cancelled by operator")]
+        reason: String,
     },
     #[cfg(feature = "sw4rm")]
     #[command(
@@ -838,6 +928,24 @@ async fn main() {
     }
 }
 
+fn resolve_render_mode(
+    term_info: &TerminalInfo,
+    cli_force_stream: bool,
+    cli_force_tui: bool,
+    configured_ui_mode: UiMode,
+) -> Result<RenderMode> {
+    let (force_stream, force_tui) = if cli_force_stream || cli_force_tui {
+        (cli_force_stream, cli_force_tui)
+    } else {
+        match configured_ui_mode {
+            UiMode::Auto => (false, false),
+            UiMode::Stream => (true, false),
+            UiMode::Tui => (false, true),
+        }
+    };
+    mode::select_render_mode(term_info, force_stream, force_tui).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Commands::Init {
@@ -858,17 +966,27 @@ async fn run() -> Result<()> {
         "loaded runtime config"
     );
 
-    // Detect terminal capabilities and select render mode.
+    // Detect terminal capabilities once; only commands that need a renderer
+    // should fail render-mode selection.
     let term_info = TerminalInfo::detect();
-    let _render_mode = mode::select_render_mode(&term_info, cli.stream, cli.tui)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let select_render_mode = || {
+        resolve_render_mode(
+            &term_info,
+            cli.stream,
+            cli.tui,
+            loaded_config.config().ui.mode,
+        )
+    };
 
     match cli.command {
         Commands::Run {
             prompt_file,
             action,
         } => match action {
-            None => cmd_run_default(_render_mode, &loaded_config, prompt_file).await,
+            None => {
+                let render_mode = select_render_mode()?;
+                cmd_run_default(render_mode, &loaded_config, prompt_file).await
+            }
             Some(RunAction::Start {
                 objective,
                 cmd,
@@ -881,7 +999,8 @@ async fn run() -> Result<()> {
                 }
                 let plan =
                     resolve_run_plan(&loaded_config, objective, cmd, pace, workdir, timeout, None)?;
-                cmd_run_start(plan, _render_mode, &loaded_config).await
+                let render_mode = select_render_mode()?;
+                cmd_run_start(plan, render_mode, &loaded_config).await
             }
             Some(RunAction::Batch {
                 objective,
@@ -901,7 +1020,8 @@ async fn run() -> Result<()> {
                     timeout,
                     Some("batch"),
                 )?;
-                cmd_run_start(plan, _render_mode, &loaded_config).await
+                let render_mode = select_render_mode()?;
+                cmd_run_start(plan, render_mode, &loaded_config).await
             }
             Some(RunAction::Status { run_id }) => {
                 if prompt_file.is_some() {
@@ -925,7 +1045,38 @@ async fn run() -> Result<()> {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
-                cmd_run_continue(file, _render_mode, &loaded_config).await
+                let render_mode = select_render_mode()?;
+                cmd_run_continue(file, render_mode, &loaded_config).await
+            }
+            Some(RunAction::Pause {
+                run_id,
+                all_active,
+                reason,
+            }) => {
+                if prompt_file.is_some() {
+                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                cmd_run_pause(run_id.as_deref(), all_active, &reason)
+            }
+            Some(RunAction::Resume {
+                run_id,
+                all_paused,
+                reason,
+            }) => {
+                if prompt_file.is_some() {
+                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                cmd_run_resume(run_id.as_deref(), all_paused, &reason)
+            }
+            Some(RunAction::Cancel {
+                run_id,
+                all_active,
+                reason,
+            }) => {
+                if prompt_file.is_some() {
+                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                cmd_run_cancel(run_id.as_deref(), all_active, &reason)
             }
             #[cfg(feature = "sw4rm")]
             Some(RunAction::Sw4rm) => {
@@ -971,7 +1122,12 @@ async fn run() -> Result<()> {
             } => cmd_audit_tail(&file, lines, category.as_deref()),
         },
         Commands::Init { .. } => unreachable!("init command handled before runtime config load"),
-        Commands::Info => cmd_info(&term_info, _render_mode, &loaded_config),
+        Commands::Info => {
+            // `info` should report capabilities even if the current terminal
+            // cannot satisfy a forced render mode.
+            let render_mode = select_render_mode().unwrap_or(RenderMode::Stream);
+            cmd_info(&term_info, render_mode, &loaded_config)
+        }
     }
 }
 
@@ -1012,6 +1168,9 @@ struct PlannedTask {
     task_key: String,
     command: String,
     command_class: CommandClass,
+    tranche_key: Option<String>,
+    tranche_group: Option<String>,
+    allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1019,6 +1178,8 @@ struct PlannedTranche {
     key: String,
     objective: String,
     task_keys: Vec<String>,
+    #[serde(default)]
+    tranche_group: Option<String>,
 }
 
 /// Fully resolved run execution plan.
@@ -1044,6 +1205,18 @@ struct RunExecutionOutcome {
 }
 
 #[derive(Debug, Clone)]
+struct ParallelWorkspaceLayout {
+    run_workspace_root: PathBuf,
+    task_workspace_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ParallelWorkspaceMergeReport {
+    merged_task_keys: Vec<String>,
+    skipped_task_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct PlanGuardContext {
     target: String,
     mode: prompt::RunSpecPlanGuardMode,
@@ -1056,6 +1229,8 @@ struct ImplementationPlanEntry {
     key: String,
     summary: String,
     is_complete: bool,
+    tranche_group: Option<String>,
+    allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1063,12 +1238,1076 @@ struct CliInvocationConfig {
     command: String,
     args: Vec<String>,
     prompt_mode: PromptMode,
+    env_unset: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AutoAdvanceConfig {
     policy: AutoAdvancePolicy,
     max_tranches: u32,
+}
+
+fn configured_parallel_worktree_root(loaded_config: &LoadedConfig) -> Option<String> {
+    loaded_config
+        .config()
+        .execution
+        .worktree_root
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn resolve_path_from_cwd(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to read current working directory")?
+            .join(path))
+    }
+}
+
+fn home_directory_for_expansion() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let home_path = std::env::var_os("HOMEPATH")?;
+            let mut combined = PathBuf::from(drive);
+            combined.push(home_path);
+            Some(combined.into_os_string())
+        })
+        .map(PathBuf::from)
+}
+
+fn is_env_var_name_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_env_var_name_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn expand_env_variables(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        let ch = raw[index..]
+            .chars()
+            .next()
+            .expect("index should be in bounds");
+        if ch != '$' {
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let token_start = index;
+        index += ch.len_utf8();
+        if index >= raw.len() {
+            out.push('$');
+            break;
+        }
+
+        let next = raw[index..]
+            .chars()
+            .next()
+            .expect("index should be in bounds");
+        if next == '{' {
+            let mut cursor = index + next.len_utf8();
+            let name_start = cursor;
+            while cursor < raw.len() {
+                let c = raw[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor should be in bounds");
+                if c == '}' {
+                    break;
+                }
+                cursor += c.len_utf8();
+            }
+
+            if cursor >= raw.len() {
+                out.push_str(&raw[token_start..]);
+                break;
+            }
+
+            let name = &raw[name_start..cursor];
+            index = cursor + 1;
+            let valid_name = !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .map(is_env_var_name_start)
+                    .unwrap_or(false)
+                && name.chars().skip(1).all(is_env_var_name_continue);
+            if valid_name {
+                if let Ok(value) = std::env::var(name) {
+                    out.push_str(&value);
+                } else {
+                    out.push_str(&raw[token_start..index]);
+                }
+            } else {
+                out.push_str(&raw[token_start..index]);
+            }
+            continue;
+        }
+
+        if is_env_var_name_start(next) {
+            let name_start = index;
+            index += next.len_utf8();
+            while index < raw.len() {
+                let c = raw[index..]
+                    .chars()
+                    .next()
+                    .expect("index should be in bounds");
+                if !is_env_var_name_continue(c) {
+                    break;
+                }
+                index += c.len_utf8();
+            }
+            let name = &raw[name_start..index];
+            if let Ok(value) = std::env::var(name) {
+                out.push_str(&value);
+            } else {
+                out.push('$');
+                out.push_str(name);
+            }
+            continue;
+        }
+
+        out.push('$');
+    }
+
+    out
+}
+
+fn expand_home_prefix(path: &str) -> Result<PathBuf> {
+    if path == "~" {
+        let home = home_directory_for_expansion().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~` because HOME/USERPROFILE is unset")
+        })?;
+        return Ok(home);
+    }
+
+    if path.starts_with("~/") || path.starts_with("~\\") {
+        let home = home_directory_for_expansion().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~` because HOME/USERPROFILE is unset")
+        })?;
+        let suffix = &path[2..];
+        return Ok(home.join(suffix));
+    }
+
+    Ok(PathBuf::from(path))
+}
+
+fn resolve_execution_path_from_cwd(raw_path: &str, setting_name: &str) -> Result<PathBuf> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        bail!("{setting_name} path is empty");
+    }
+
+    let env_expanded = expand_env_variables(trimmed);
+    let home_expanded = expand_home_prefix(&env_expanded).with_context(|| {
+        format!(
+            "failed to expand {setting_name} from configured value {:?}",
+            raw_path
+        )
+    })?;
+    resolve_path_from_cwd(&home_expanded).with_context(|| {
+        format!(
+            "failed to resolve {setting_name} from configured value {:?}",
+            raw_path
+        )
+    })
+}
+
+fn ensure_parallel_workspace_contract(loaded_config: &LoadedConfig) -> Result<()> {
+    if !loaded_config.config().features.parallel {
+        return Ok(());
+    }
+
+    if configured_parallel_worktree_root(loaded_config).is_some() {
+        return Ok(());
+    }
+
+    bail!(
+        "`yarli run` requires `[execution].worktree_root` when `[features].parallel = true`.\nUpdate {} with:\n\n[execution]\nworktree_root = \".yarl/workspaces\"",
+        loaded_config.path().display()
+    );
+}
+
+fn path_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn path_matches_excluded_dir_name(
+    path: &Path,
+    file_type: &fs::FileType,
+    dir_names: &[String],
+) -> bool {
+    if dir_names.is_empty() {
+        return false;
+    }
+
+    let mut path_components = Vec::new();
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            path_components.push(name.to_string_lossy().to_string());
+        }
+    }
+    if path_components.is_empty() {
+        return false;
+    }
+
+    for excluded in dir_names {
+        if excluded.is_empty() {
+            continue;
+        }
+        if file_type.is_dir()
+            && path_components
+                .last()
+                .map(|part| part == excluded)
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        if path_components[..path_components.len().saturating_sub(1)]
+            .iter()
+            .any(|part| part == excluded)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_workspace_copy_exclusions(
+    source_workdir: &Path,
+    loaded_config: &LoadedConfig,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut excluded_roots = Vec::new();
+    let mut excluded_dir_names = Vec::new();
+    for raw in &loaded_config.config().execution.worktree_exclude_paths {
+        let trimmed = raw.trim().trim_end_matches('/').trim_end_matches('\\');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix("**/") {
+            if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+                excluded_dir_names.push(name.to_string());
+                continue;
+            }
+        }
+        if !trimmed.contains('/') && !trimmed.contains('\\') {
+            excluded_dir_names.push(trimmed.to_string());
+            continue;
+        }
+        let path = Path::new(trimmed);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            source_workdir.join(path)
+        };
+        excluded_roots.push(resolved);
+    }
+
+    (excluded_roots, excluded_dir_names)
+}
+
+fn copy_workspace_tree(
+    src_root: &Path,
+    dst_root: &Path,
+    excluded_roots: &[PathBuf],
+    excluded_dir_names: &[String],
+) -> Result<()> {
+    if dst_root.exists() {
+        bail!(
+            "workspace destination already exists: {}",
+            dst_root.display()
+        );
+    }
+    fs::create_dir_all(dst_root).with_context(|| {
+        format!(
+            "failed to create workspace directory {}",
+            dst_root.display()
+        )
+    })?;
+    copy_workspace_tree_recursive(
+        src_root,
+        src_root,
+        dst_root,
+        excluded_roots,
+        excluded_dir_names,
+    )
+}
+
+fn copy_workspace_tree_recursive(
+    src_root: &Path,
+    current: &Path,
+    dst_root: &Path,
+    excluded_roots: &[PathBuf],
+    excluded_dir_names: &[String],
+) -> Result<()> {
+    for entry in fs::read_dir(current)
+        .with_context(|| format!("failed to read directory {}", current.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", current.display()))?;
+        let src_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", src_path.display()))?;
+        if path_within_any_root(&src_path, excluded_roots) {
+            continue;
+        }
+        let relative = src_path.strip_prefix(src_root).with_context(|| {
+            format!(
+                "failed to compute relative path for {} from {}",
+                src_path.display(),
+                src_root.display()
+            )
+        })?;
+        if path_matches_excluded_dir_name(relative, &file_type, excluded_dir_names) {
+            continue;
+        }
+        let dst_path = dst_root.join(relative);
+
+        if file_type.is_dir() {
+            fs::create_dir_all(&dst_path)
+                .with_context(|| format!("failed to create directory {}", dst_path.display()))?;
+            copy_workspace_tree_recursive(
+                src_root,
+                &src_path,
+                dst_root,
+                excluded_roots,
+                excluded_dir_names,
+            )?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory {}", parent.display()))?;
+            }
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "failed to copy file {} -> {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        } else if file_type.is_symlink() {
+            copy_symlink_entry(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink_entry(src_path: &Path, dst_path: &Path) -> Result<()> {
+    let target = fs::read_link(src_path)
+        .with_context(|| format!("failed to read symlink target {}", src_path.display()))?;
+    if let Some(parent) = dst_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    std::os::unix::fs::symlink(&target, dst_path).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            dst_path.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_symlink_entry(src_path: &Path, _dst_path: &Path) -> Result<()> {
+    bail!(
+        "workspace source contains symlink {} but this platform does not support symlink cloning",
+        src_path.display()
+    )
+}
+
+fn prepare_parallel_workspace_layout(
+    plan: &RunPlan,
+    loaded_config: &LoadedConfig,
+) -> Result<Option<ParallelWorkspaceLayout>> {
+    if !loaded_config.config().features.parallel {
+        return Ok(None);
+    }
+
+    let configured_root = configured_parallel_worktree_root(loaded_config).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`yarli run` requires `[execution].worktree_root` when `[features].parallel = true`"
+        )
+    })?;
+    let source_workdir = resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+    if !source_workdir.is_dir() {
+        bail!(
+            "execution working_dir is not a directory: {}",
+            source_workdir.display()
+        );
+    }
+    let source_workdir = source_workdir.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize execution working_dir {}",
+            source_workdir.display()
+        )
+    })?;
+
+    let worktree_root =
+        resolve_execution_path_from_cwd(&configured_root, "execution.worktree_root")?;
+    fs::create_dir_all(&worktree_root).with_context(|| {
+        format!(
+            "failed to create execution.worktree_root {}",
+            worktree_root.display()
+        )
+    })?;
+    let worktree_root = worktree_root.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize execution.worktree_root {}",
+            worktree_root.display()
+        )
+    })?;
+    if worktree_root == source_workdir {
+        bail!(
+            "execution.worktree_root must not equal execution.working_dir ({}); choose a dedicated workspace root",
+            worktree_root.display()
+        );
+    }
+
+    let run_workspace_root = worktree_root.join(format!("run-{}", Uuid::now_v7()));
+    fs::create_dir_all(&run_workspace_root).with_context(|| {
+        format!(
+            "failed to create run workspace root {}",
+            run_workspace_root.display()
+        )
+    })?;
+
+    let mut excluded_roots = Vec::new();
+    if worktree_root.starts_with(&source_workdir) {
+        excluded_roots.push(worktree_root.clone());
+    }
+    let (mut configured_excluded_roots, excluded_dir_names) =
+        resolve_workspace_copy_exclusions(&source_workdir, loaded_config);
+    excluded_roots.append(&mut configured_excluded_roots);
+
+    let mut task_workspace_dirs = Vec::with_capacity(plan.tasks.len());
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let slug = sanitize_task_key_component(&task.task_key);
+        let slug = if slug.is_empty() {
+            format!("task-{}", index + 1)
+        } else {
+            slug
+        };
+        let workspace_dir = run_workspace_root.join(format!("{:03}-{slug}", index + 1));
+        copy_workspace_tree(
+            &source_workdir,
+            &workspace_dir,
+            &excluded_roots,
+            &excluded_dir_names,
+        )?;
+        task_workspace_dirs.push(workspace_dir);
+    }
+
+    Ok(Some(ParallelWorkspaceLayout {
+        run_workspace_root,
+        task_workspace_dirs,
+    }))
+}
+
+fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to run git {:?} in {}", args, cwd.display()))
+}
+
+fn run_git_capture_with_input(
+    cwd: &Path,
+    args: &[&str],
+    stdin_data: &[u8],
+) -> Result<std::process::Output> {
+    let mut child = process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn git {:?} in {}", args, cwd.display()))?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to open git stdin for {:?} in {}",
+                args,
+                cwd.display()
+            )
+        })?;
+        stdin.write_all(stdin_data).with_context(|| {
+            format!(
+                "failed to write git stdin for {:?} in {}",
+                args,
+                cwd.display()
+            )
+        })?;
+    }
+
+    child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for git {:?} in {}", args, cwd.display()))
+}
+
+fn ensure_git_success(
+    output: std::process::Output,
+    cwd: &Path,
+    args: &[&str],
+    context: &str,
+) -> Result<String> {
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "{context}: git {:?} failed in {}: {}",
+        args,
+        cwd.display(),
+        stderr.trim()
+    );
+}
+
+fn ensure_git_repository(cwd: &Path) -> Result<()> {
+    let output = run_git_capture(cwd, &["rev-parse", "--git-dir"])?;
+    ensure_git_success(
+        output,
+        cwd,
+        &["rev-parse", "--git-dir"],
+        "git repository check",
+    )?;
+    Ok(())
+}
+
+/// Parses a unified diff patch for `new file mode` entries and removes any that already
+/// exist (untracked) in the source working directory. Returns backed-up content so the
+/// caller can detect content divergence after the patch is applied.
+fn remove_conflicting_new_files_for_patch(
+    source_workdir: &Path,
+    patch: &[u8],
+) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let patch_str = String::from_utf8_lossy(patch);
+    let lines: Vec<&str> = patch_str.lines().collect();
+    let mut backed_up = Vec::new();
+
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(rest) = lines[i].strip_prefix("diff --git a/") {
+            // Extract path from "diff --git a/X b/Y" — take the b/Y part
+            if let Some(b_idx) = rest.find(" b/") {
+                let rel_path = &rest[b_idx + 3..];
+                // Peek at next non-empty line for "new file mode"
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].is_empty() {
+                    j += 1;
+                }
+                if j < lines.len() && lines[j].starts_with("new file mode") {
+                    let full_path = source_workdir.join(rel_path);
+                    if full_path.exists() {
+                        let content = fs::read(&full_path).with_context(|| {
+                            format!(
+                                "reading conflicting new file {} for backup",
+                                full_path.display()
+                            )
+                        })?;
+                        // Remove from git index first (if tracked/staged), then working tree
+                        let _ = run_git_capture(
+                            source_workdir,
+                            &["rm", "--cached", "--force", "--quiet", "--", rel_path],
+                        );
+                        fs::remove_file(&full_path).with_context(|| {
+                            format!(
+                                "removing conflicting new file {} before patch",
+                                full_path.display()
+                            )
+                        })?;
+                        backed_up.push((PathBuf::from(rel_path), content));
+                        info!(
+                            path = rel_path,
+                            "removed conflicting new file from source before patch application"
+                        );
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    Ok(backed_up)
+}
+
+/// After a patch is applied, compares backed-up file content with the newly created
+/// content. Logs a warning if they differ (the later workspace's version wins).
+fn warn_on_new_file_content_divergence(
+    source_workdir: &Path,
+    backed_up: &[(PathBuf, Vec<u8>)],
+) {
+    for (rel_path, old_content) in backed_up {
+        let full_path = source_workdir.join(rel_path);
+        match fs::read(&full_path) {
+            Ok(new_content) if new_content != *old_content => {
+                warn!(
+                    path = %rel_path.display(),
+                    "new file content divergence: earlier workspace version was overwritten by later workspace"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_workspace_patch_to_source(
+    source_workdir: &Path,
+    task_key: &str,
+    patch: &[u8],
+) -> Result<()> {
+    let backed_up_new_files = remove_conflicting_new_files_for_patch(source_workdir, patch)?;
+
+    let apply_args = ["apply", "--3way", "--whitespace=nowarn", "-"];
+    let apply_output = run_git_capture_with_input(source_workdir, &apply_args, patch)?;
+    if apply_output.status.success() {
+        warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
+        return Ok(());
+    }
+
+    // --3way failed. Check if it's an index-related issue where plain apply might
+    // work (e.g. permission-only changes, shallow repos without base blobs).
+    let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
+    let index_related = apply_stderr.contains("does not exist in index")
+        || apply_stderr.contains("does not match index");
+    if index_related {
+        let direct_apply_args = ["apply", "--whitespace=nowarn", "-"];
+        let direct_apply_output =
+            run_git_capture_with_input(source_workdir, &direct_apply_args, patch)?;
+        ensure_git_success(
+            direct_apply_output,
+            source_workdir,
+            &direct_apply_args,
+            &format!(
+                "parallel workspace merge apply failed for task {task_key} after index-mismatch fallback"
+            ),
+        )?;
+        warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
+        return Ok(());
+    }
+
+    // Not index-related — propagate the original --3way error.
+    ensure_git_success(
+        apply_output,
+        source_workdir,
+        &apply_args,
+        &format!("parallel workspace merge apply failed for task {task_key}"),
+    )?;
+    warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
+    Ok(())
+}
+
+fn is_parallel_merge_internal_path(relative: &Path) -> bool {
+    let Some(component) = relative.components().next() else {
+        return false;
+    };
+    match component {
+        Component::Normal(value) => {
+            let value = value.to_string_lossy();
+            value == ".git" || value == ".yarl" || value == ".yarli"
+        }
+        _ => false,
+    }
+}
+
+fn workspace_candidate_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>> {
+    let args_unstaged = [
+        "ls-files",
+        "-z",
+        "-m",
+        "-o",
+        "--exclude-standard",
+        "--deleted",
+    ];
+    let unstaged_output = run_git_capture(workspace_dir, &args_unstaged)?;
+    let unstaged_stdout = ensure_git_success(
+        unstaged_output,
+        workspace_dir,
+        &args_unstaged,
+        "workspace changed-path discovery",
+    )?;
+    let args_staged = ["diff", "--cached", "--name-only", "-z"];
+    let staged_output = run_git_capture(workspace_dir, &args_staged)?;
+    let staged_stdout = ensure_git_success(
+        staged_output,
+        workspace_dir,
+        &args_staged,
+        "workspace staged-path discovery",
+    )?;
+
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for token in unstaged_stdout.split('\0').chain(staged_stdout.split('\0')) {
+        if token.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(token);
+        if is_parallel_merge_internal_path(&relative) {
+            continue;
+        }
+        if seen.insert(relative.clone()) {
+            paths.push(relative);
+        }
+    }
+    Ok(paths)
+}
+
+fn metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+fn workspace_path_matches_source(
+    source_workdir: &Path,
+    workspace_dir: &Path,
+    relative: &Path,
+) -> Result<bool> {
+    let source_path = source_workdir.join(relative);
+    let workspace_path = workspace_dir.join(relative);
+    let source_meta = metadata_if_exists(&source_path)?;
+    let workspace_meta = metadata_if_exists(&workspace_path)?;
+
+    let Some(source_meta) = source_meta else {
+        return Ok(workspace_meta.is_none());
+    };
+    let Some(workspace_meta) = workspace_meta else {
+        return Ok(false);
+    };
+
+    let source_type = source_meta.file_type();
+    let workspace_type = workspace_meta.file_type();
+    if source_type.is_symlink() || workspace_type.is_symlink() {
+        if !source_type.is_symlink() || !workspace_type.is_symlink() {
+            return Ok(false);
+        }
+        let source_target = fs::read_link(&source_path)
+            .with_context(|| format!("failed to read symlink {}", source_path.display()))?;
+        let workspace_target = fs::read_link(&workspace_path)
+            .with_context(|| format!("failed to read symlink {}", workspace_path.display()))?;
+        return Ok(source_target == workspace_target);
+    }
+
+    if source_meta.is_dir() || workspace_meta.is_dir() {
+        return Ok(source_meta.is_dir() && workspace_meta.is_dir());
+    }
+
+    if source_meta.is_file() && workspace_meta.is_file() {
+        if source_meta.len() != workspace_meta.len() {
+            return Ok(false);
+        }
+        let source_contents = fs::read(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+        let workspace_contents = fs::read(&workspace_path)
+            .with_context(|| format!("failed to read {}", workspace_path.display()))?;
+        return Ok(source_contents == workspace_contents
+            && file_permissions_equivalent(&source_meta, &workspace_meta));
+    }
+
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn file_permissions_equivalent(source_meta: &fs::Metadata, workspace_meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    source_meta.permissions().mode() == workspace_meta.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn file_permissions_equivalent(source_meta: &fs::Metadata, workspace_meta: &fs::Metadata) -> bool {
+    source_meta.permissions().readonly() == workspace_meta.permissions().readonly()
+}
+
+fn scoped_workspace_changed_paths(
+    source_workdir: &Path,
+    workspace_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut scoped_paths = Vec::new();
+    for relative in workspace_candidate_paths(workspace_dir)? {
+        if !workspace_path_matches_source(source_workdir, workspace_dir, &relative)? {
+            scoped_paths.push(relative);
+        }
+    }
+    Ok(scoped_paths)
+}
+
+fn stage_workspace_paths(workspace_dir: &Path, scoped_paths: &[PathBuf]) -> Result<()> {
+    let reset_args = ["reset", "--quiet"];
+    let reset_output = run_git_capture(workspace_dir, &reset_args)?;
+    ensure_git_success(
+        reset_output,
+        workspace_dir,
+        &reset_args,
+        "workspace index reset",
+    )?;
+
+    for relative in scoped_paths {
+        let relative = relative.to_string_lossy().to_string();
+        let add_args = ["add", "-A", "--", relative.as_str()];
+        let add_output = run_git_capture(workspace_dir, &add_args)?;
+        ensure_git_success(
+            add_output,
+            workspace_dir,
+            &add_args,
+            "workspace scoped staging",
+        )?;
+    }
+    Ok(())
+}
+
+fn export_staged_workspace_patch(workspace_dir: &Path) -> Result<String> {
+    let diff_args = ["diff", "--binary", "--cached", "--no-color"];
+    let patch_output = run_git_capture(workspace_dir, &diff_args)?;
+    ensure_git_success(
+        patch_output,
+        workspace_dir,
+        &diff_args,
+        "workspace patch export",
+    )
+}
+
+fn persist_workspace_patch_for_recovery(
+    run_workspace_root: &Path,
+    task_key: &str,
+    task_index: usize,
+    patch: &str,
+) -> Result<PathBuf> {
+    let patch_dir = run_workspace_root.join("merge-patches");
+    fs::create_dir_all(&patch_dir).with_context(|| {
+        format!(
+            "failed to create merge patch directory {}",
+            patch_dir.display()
+        )
+    })?;
+    let task_slug = sanitize_task_key_component(task_key);
+    let task_slug = if task_slug.is_empty() {
+        format!("task-{}", task_index + 1)
+    } else {
+        task_slug
+    };
+    let patch_path = patch_dir.join(format!("{:03}-{task_slug}.patch", task_index + 1));
+    fs::write(&patch_path, patch)
+        .with_context(|| format!("failed to write merge patch {}", patch_path.display()))?;
+    Ok(patch_path)
+}
+
+fn write_parallel_merge_recovery_note(
+    run_id: Uuid,
+    source_workdir: &Path,
+    run_workspace_root: &Path,
+    workspace_dir: &Path,
+    task_key: &str,
+    patch_path: &Path,
+) -> Result<PathBuf> {
+    let note_path = run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+    let note = format!(
+        "Parallel workspace merge failed for run {run_id} task {task_key}.\n\n\
+Source workspace: {}\n\
+Task workspace: {}\n\
+Patch artifact: {}\n\n\
+Operator recovery steps:\n\
+1. Inspect the repo and conflicted files:\n\
+   git -C \"{}\" status --short\n\
+2. Preview the generated patch:\n\
+   git -C \"{}\" apply --stat \"{}\"\n\
+3. Retry manual apply for this task:\n\
+   git -C \"{}\" apply --3way --whitespace=nowarn \"{}\"\n\
+4. If conflicts remain, resolve markers, stage the files, and continue your normal flow.\n\
+5. If you want to abort this task patch, restore conflicting files before retrying.\n",
+        source_workdir.display(),
+        workspace_dir.display(),
+        patch_path.display(),
+        source_workdir.display(),
+        source_workdir.display(),
+        patch_path.display(),
+        source_workdir.display(),
+        patch_path.display()
+    );
+    fs::write(&note_path, note).with_context(|| {
+        format!(
+            "failed to write merge recovery note {}",
+            note_path.display()
+        )
+    })?;
+    Ok(note_path)
+}
+
+fn merge_parallel_workspace_results(
+    source_workdir: &Path,
+    run_id: Uuid,
+    run_workspace_root: &Path,
+    task_workspaces: &[(String, PathBuf)],
+) -> Result<ParallelWorkspaceMergeReport> {
+    ensure_git_repository(source_workdir)?;
+
+    // Stash any pre-existing dirty state from prior runs so workspace patches
+    // apply against the clean HEAD they were cloned from. Previous yarli versions
+    // did not commit after workspace merges, leaving staged/modified files whose
+    // content diverges from HEAD. Committing this dirty state moves HEAD forward,
+    // causing workspace patches (whose context lines match the old HEAD) to fail
+    // with --3way conflicts. Stashing preserves the dirty state without moving
+    // HEAD, then we reapply it after all workspace patches are merged.
+    let pre_status = run_git_capture(source_workdir, &["status", "--porcelain"])?;
+    let pre_status_text = String::from_utf8_lossy(&pre_status.stdout);
+    let has_stashed_dirty_state = if !pre_status_text.trim().is_empty() {
+        info!("stashing pre-existing dirty state before parallel workspace merge");
+        let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let stash_result = run_git_capture(source_workdir, &[
+            "stash", "push", "-m",
+            "yarli: stash pre-existing workspace state before merge",
+        ]);
+        stash_result
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let mut merged_task_keys = Vec::new();
+    let mut skipped_task_keys = Vec::new();
+    for (task_index, (task_key, workspace_dir)) in task_workspaces.iter().enumerate() {
+        ensure_git_repository(workspace_dir)?;
+        let scoped_paths = scoped_workspace_changed_paths(source_workdir, workspace_dir)?;
+        if scoped_paths.is_empty() {
+            skipped_task_keys.push(task_key.clone());
+            continue;
+        }
+
+        stage_workspace_paths(workspace_dir, &scoped_paths)?;
+        let patch = export_staged_workspace_patch(workspace_dir)?;
+        if patch.trim().is_empty() {
+            skipped_task_keys.push(task_key.clone());
+            continue;
+        }
+
+        let patch_path =
+            persist_workspace_patch_for_recovery(run_workspace_root, task_key, task_index, &patch)?;
+        if let Err(err) =
+            apply_workspace_patch_to_source(source_workdir, task_key, patch.as_bytes())
+        {
+            let note_path = write_parallel_merge_recovery_note(
+                run_id,
+                source_workdir,
+                run_workspace_root,
+                workspace_dir,
+                task_key,
+                &patch_path,
+            )
+            .ok();
+            let mut guidance = format!(
+                "parallel workspace merge failed for run {run_id} task {task_key}\n\
+Operator recovery steps:\n\
+1. Inspect merge state: git -C \"{}\" status --short\n\
+2. Review task patch: git -C \"{}\" apply --stat \"{}\"\n\
+3. Retry task patch: git -C \"{}\" apply --3way --whitespace=nowarn \"{}\"",
+                source_workdir.display(),
+                source_workdir.display(),
+                patch_path.display(),
+                source_workdir.display(),
+                patch_path.display()
+            );
+            if let Some(path) = note_path {
+                guidance.push_str(&format!("\nDetailed recovery note: {}", path.display()));
+            }
+            guidance.push_str(&format!(
+                "\nWorkspace root preserved for inspection: {}",
+                run_workspace_root.display()
+            ));
+            return Err(err.context(guidance));
+        }
+        merged_task_keys.push(task_key.clone());
+
+        // Commit the merged result so the next workspace starts with a clean
+        // working tree + index. git apply --3way requires working tree == index,
+        // and without committing, a prior merge's staged results would cause
+        // "does not match index" errors for subsequent patches. These interim
+        // commits are transparent to the user (not pushed, can be squashed).
+        let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let commit_msg = format!("yarli: merge workspace result for {task_key}");
+        let _ = run_git_capture(
+            source_workdir,
+            &["commit", "--no-verify", "--allow-empty", "-m", &commit_msg],
+        );
+    }
+
+    // Reapply stashed dirty state. If it conflicts with workspace changes,
+    // resolve conflicting files in favor of the workspace (HEAD) while
+    // preserving non-conflicting stash changes (e.g. edits to lines the
+    // workspace didn't touch).
+    if has_stashed_dirty_state {
+        let pop_result = run_git_capture(source_workdir, &["stash", "pop"]);
+        let pop_ok = pop_result
+            .as_ref()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !pop_ok {
+            warn!("pre-existing dirty state partially conflicted with workspace merge; resolving conflicts in favor of workspace");
+            // Resolve each conflicted file by keeping the workspace (ours) version.
+            // Non-conflicting stash changes are already applied in the working tree.
+            if let Ok(status_output) = run_git_capture(source_workdir, &["status", "--porcelain"]) {
+                let status_text = String::from_utf8_lossy(&status_output.stdout);
+                for line in status_text.lines() {
+                    if line.len() < 3 {
+                        continue;
+                    }
+                    let prefix = &line[..2];
+                    let path = line[3..].trim();
+                    match prefix {
+                        "UU" | "AA" | "UD" => {
+                            // Both modified / both added / ours modified, theirs deleted
+                            // Keep workspace (ours) version.
+                            let _ = run_git_capture(
+                                source_workdir,
+                                &["checkout", "--ours", "--", path],
+                            );
+                        }
+                        "DU" => {
+                            // Deleted in workspace (ours), modified in stash (theirs).
+                            // Keep it deleted — workspace decision wins.
+                            let _ = run_git_capture(
+                                source_workdir,
+                                &["rm", "-f", "--", path],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let _ = run_git_capture(source_workdir, &["add", "-A"]);
+            let _ = run_git_capture(source_workdir, &["stash", "drop"]);
+        }
+        // Commit the reapplied dirty state (clean pop or resolved conflicts).
+        let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let _ = run_git_capture(source_workdir, &[
+            "commit", "--no-verify", "--allow-empty", "-m",
+            "yarli: reapply pre-existing workspace state after merge",
+        ]);
+    }
+
+    Ok(ParallelWorkspaceMergeReport {
+        merged_task_keys,
+        skipped_task_keys,
+    })
 }
 
 impl AutoAdvanceConfig {
@@ -1179,6 +2418,9 @@ fn resolve_run_plan(
             task_key: format!("task-{}", idx + 1),
             command: cmd,
             command_class: CommandClass::Io,
+            tranche_key: None,
+            tranche_group: None,
+            allowed_paths: Vec::new(),
         })
         .collect::<Vec<_>>();
 
@@ -1231,12 +2473,35 @@ fn resolve_cli_invocation_config(loaded_config: &LoadedConfig) -> Result<CliInvo
                 loaded_config.path().display()
             )
         })?;
+    let mut env_unset = Vec::with_capacity(cli.env_unset.len());
+    for name in &cli.env_unset {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            bail!("cli.env_unset entries must be non-empty environment variable names");
+        }
+        if !is_valid_env_var_name(trimmed) {
+            bail!("invalid cli.env_unset entry {trimmed:?}: must match [A-Za-z_][A-Za-z0-9_]*");
+        }
+        env_unset.push(trimmed.to_string());
+    }
 
     Ok(CliInvocationConfig {
         command,
         args: cli.args.clone(),
         prompt_mode: cli.prompt_mode,
+        env_unset,
     })
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1248,17 +2513,22 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn build_cli_command(invocation: &CliInvocationConfig, prompt_text: &str) -> String {
-    let mut base = shell_quote(&invocation.command);
-    if !invocation.args.is_empty() {
-        let joined = invocation
-            .args
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        base.push(' ');
-        base.push_str(&joined);
+    let mut parts =
+        Vec::with_capacity(2 + invocation.env_unset.len() * 2 + invocation.args.len() + 1);
+    if !invocation.env_unset.is_empty() {
+        parts.push("env".to_string());
+        for name in &invocation.env_unset {
+            parts.push("-u".to_string());
+            parts.push(name.clone());
+        }
     }
+    parts.push(invocation.command.clone());
+    parts.extend(invocation.args.iter().cloned());
+    let base = parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     match invocation.prompt_mode {
         PromptMode::Arg => {
@@ -1301,16 +2571,38 @@ fn build_tranche_task_prompt(
     tranche: &ImplementationPlanEntry,
     index: usize,
     total: usize,
+    enforce_allowed_paths: bool,
 ) -> String {
+    let tranche_group_line = tranche
+        .tranche_group
+        .as_ref()
+        .map(|group| format!("Tranche group: {}.\n", group))
+        .unwrap_or_default();
+    let allowed_paths_line = if enforce_allowed_paths && !tranche.allowed_paths.is_empty() {
+        format!(
+            "Allowed file scope: {}.\n",
+            tranche.allowed_paths.join(", ")
+        )
+    } else {
+        String::new()
+    };
+    let allowed_paths_instruction = if enforce_allowed_paths && !tranche.allowed_paths.is_empty() {
+        "5. Restrict edits to the allowed file scope above.\n6. Keep output concise and concrete."
+    } else {
+        "5. Keep output concise and concrete."
+    };
     format!(
-        "YARLI tranche task {}/{}.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nTarget tranche: {}.\nTarget summary: {}\nMode: implementation.\n\nInstructions:\n1. Read PROMPT and plan context from the workspace paths above.\n2. Implement only the target tranche if it is still incomplete.\n3. Update IMPLEMENTATION_PLAN.md and evidence in-repo.\n4. Run the tranche's required verification commands before finishing.\n5. Keep output concise and concrete.",
+        "YARLI tranche task {}/{}.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nTarget tranche: {}.\nTarget summary: {}\n{}{}Mode: implementation.\n\nInstructions:\n1. Read PROMPT and plan context from the workspace paths above.\n2. Implement only the target tranche if it is still incomplete.\n3. Update IMPLEMENTATION_PLAN.md and evidence in-repo.\n4. Run the tranche's required verification commands before finishing.\n{}",
         index + 1,
         total,
         objective,
         loaded_prompt.entry_path.display(),
         plan_path.display(),
         tranche.key,
-        tranche.summary
+        tranche.summary,
+        tranche_group_line,
+        allowed_paths_line,
+        allowed_paths_instruction
     )
 }
 
@@ -1329,6 +2621,52 @@ fn build_verification_task_prompt(
     )
 }
 
+fn build_grouped_plan_tranches(
+    objective: &str,
+    entry_task_pairs: &[(ImplementationPlanEntry, String)],
+    enable_grouping: bool,
+    max_grouped_tasks_per_tranche: u32,
+) -> Vec<PlannedTranche> {
+    let grouped_task_cap = if max_grouped_tasks_per_tranche == 0 {
+        usize::MAX
+    } else {
+        max_grouped_tasks_per_tranche as usize
+    };
+    let mut tranches: Vec<PlannedTranche> = Vec::new();
+
+    for (idx, (entry, task_key)) in entry_task_pairs.iter().enumerate() {
+        if enable_grouping {
+            if let Some(group) = entry.tranche_group.as_deref() {
+                if let Some(last) = tranches.last_mut() {
+                    if last.tranche_group.as_deref() == Some(group)
+                        && last.task_keys.len() < grouped_task_cap
+                    {
+                        last.task_keys.push(task_key.clone());
+                        continue;
+                    }
+                }
+
+                tranches.push(PlannedTranche {
+                    key: format!("group-{:03}-{}", idx + 1, group),
+                    objective: format!("{objective} [group:{group}]"),
+                    task_keys: vec![task_key.clone()],
+                    tranche_group: Some(group.to_string()),
+                });
+                continue;
+            }
+        }
+
+        tranches.push(PlannedTranche {
+            key: entry.key.clone(),
+            objective: format!("{objective} [{}]", entry.key),
+            task_keys: vec![task_key.clone()],
+            tranche_group: entry.tranche_group.clone(),
+        });
+    }
+
+    tranches
+}
+
 fn build_plan_driven_run_sequence(
     loaded_config: &LoadedConfig,
     loaded_prompt: &prompt::LoadedPrompt,
@@ -1337,14 +2675,14 @@ fn build_plan_driven_run_sequence(
     let plan_path = plan_path_for_prompt_entry(&loaded_prompt.entry_path)?;
     let plan_text = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read plan file {}", plan_path.display()))?;
-    let open_tranches: Vec<ImplementationPlanEntry> = discover_plan_entries(&plan_text)
+    let open_tranches: Vec<ImplementationPlanEntry> = discover_plan_dispatch_entries(&plan_text)
         .into_iter()
         .filter(|entry| !entry.is_complete)
         .collect();
 
     let cli_invocation = resolve_cli_invocation_config(loaded_config)?;
     let mut task_catalog = Vec::new();
-    let mut tranche_plan = Vec::new();
+    let mut entry_task_pairs = Vec::new();
 
     for (idx, tranche) in open_tranches.iter().enumerate() {
         let component = sanitize_task_key_component(&tranche.key);
@@ -1361,19 +2699,29 @@ fn build_plan_driven_run_sequence(
             tranche,
             idx,
             open_tranches.len(),
+            loaded_config
+                .config()
+                .run
+                .enforce_plan_tranche_allowed_paths,
         );
         let command = build_cli_command(&cli_invocation, &prompt_text);
         task_catalog.push(PlannedTask {
             task_key: task_key.clone(),
             command,
             command_class: CommandClass::Tool,
+            tranche_key: Some(tranche.key.clone()),
+            tranche_group: tranche.tranche_group.clone(),
+            allowed_paths: tranche.allowed_paths.clone(),
         });
-        tranche_plan.push(PlannedTranche {
-            key: tranche.key.clone(),
-            objective: format!("{objective} [{}]", tranche.key),
-            task_keys: vec![task_key],
-        });
+        entry_task_pairs.push((tranche.clone(), task_key));
     }
+
+    let mut tranche_plan = build_grouped_plan_tranches(
+        objective,
+        &entry_task_pairs,
+        loaded_config.config().run.enable_plan_tranche_grouping,
+        loaded_config.config().run.max_grouped_tasks_per_tranche,
+    );
 
     let verification_key = format!("verify-{:03}", open_tranches.len() + 1);
     let verification_prompt =
@@ -1383,12 +2731,42 @@ fn build_plan_driven_run_sequence(
         task_key: verification_key.clone(),
         command: verification_command,
         command_class: CommandClass::Tool,
+        tranche_key: Some("verification".to_string()),
+        tranche_group: None,
+        allowed_paths: Vec::new(),
     });
     tranche_plan.push(PlannedTranche {
         key: "verification".to_string(),
         objective: format!("{objective} [verification]"),
         task_keys: vec![verification_key],
+        tranche_group: None,
     });
+
+    Ok((task_catalog, tranche_plan))
+}
+
+fn build_plain_prompt_run_sequence(
+    loaded_config: &LoadedConfig,
+    loaded_prompt: &prompt::LoadedPrompt,
+    objective: &str,
+) -> Result<(Vec<PlannedTask>, Vec<PlannedTranche>)> {
+    let cli_invocation = resolve_cli_invocation_config(loaded_config)?;
+    let command = build_cli_command(&cli_invocation, &loaded_prompt.expanded_text);
+    let task_key = "prompt-001".to_string();
+    let task_catalog = vec![PlannedTask {
+        task_key: task_key.clone(),
+        command,
+        command_class: CommandClass::Tool,
+        tranche_key: Some("prompt".to_string()),
+        tranche_group: None,
+        allowed_paths: Vec::new(),
+    }];
+    let tranche_plan = vec![PlannedTranche {
+        key: "prompt".to_string(),
+        objective: format!("{objective} [prompt]"),
+        task_keys: vec![task_key],
+        tranche_group: None,
+    }];
 
     Ok((task_catalog, tranche_plan))
 }
@@ -1401,6 +2779,118 @@ fn parse_command_class(label: &str) -> Result<CommandClass> {
         "tool" => Ok(CommandClass::Tool),
         other => bail!("unknown command class {other:?}"),
     }
+}
+
+fn run_config_has_run_spec_data(run_config: &yarli_cli::config::RunConfig) -> bool {
+    run_config
+        .objective
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || !run_config.tasks.is_empty()
+        || !run_config.tranches.is_empty()
+        || run_config.plan_guard.is_some()
+}
+
+fn run_spec_from_run_config(run_config: &yarli_cli::config::RunConfig) -> prompt::RunSpec {
+    let objective = run_config
+        .objective
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let tasks = prompt::RunSpecTasks {
+        items: run_config
+            .tasks
+            .iter()
+            .map(|task| prompt::RunSpecTask {
+                key: task.key.clone(),
+                cmd: task.cmd.clone(),
+                class: task.class.clone(),
+            })
+            .collect(),
+    };
+    let tranches = if run_config.tranches.is_empty() {
+        None
+    } else {
+        Some(prompt::RunSpecTranches {
+            items: run_config
+                .tranches
+                .iter()
+                .map(|tranche| prompt::RunSpecTranche {
+                    key: tranche.key.clone(),
+                    objective: tranche.objective.clone(),
+                    task_keys: tranche.task_keys.clone(),
+                })
+                .collect(),
+        })
+    };
+    let plan_guard = run_config
+        .plan_guard
+        .as_ref()
+        .map(|guard| prompt::RunSpecPlanGuard {
+            target: guard.target.clone(),
+            mode: match guard.mode {
+                RunPlanGuardModeConfig::Implement => prompt::RunSpecPlanGuardMode::Implement,
+                RunPlanGuardModeConfig::VerifyOnly => prompt::RunSpecPlanGuardMode::VerifyOnly,
+            },
+        });
+
+    prompt::RunSpec {
+        version: 1,
+        objective,
+        tasks,
+        tranches,
+        plan_guard,
+    }
+}
+
+fn merge_run_specs(
+    base_spec: &prompt::RunSpec,
+    prompt_override: Option<&prompt::RunSpec>,
+) -> prompt::RunSpec {
+    let Some(prompt_spec) = prompt_override else {
+        return base_spec.clone();
+    };
+
+    let mut merged = base_spec.clone();
+    merged.version = prompt_spec.version;
+
+    if let Some(prompt_objective) = prompt_spec
+        .objective
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        merged.objective = Some(prompt_objective.to_string());
+    }
+
+    let mut task_indexes: HashMap<String, usize> = merged
+        .tasks
+        .items
+        .iter()
+        .enumerate()
+        .map(|(idx, task)| (task.key.clone(), idx))
+        .collect();
+    for task in &prompt_spec.tasks.items {
+        if let Some(idx) = task_indexes.get(&task.key).copied() {
+            merged.tasks.items[idx] = task.clone();
+            continue;
+        }
+        let next_idx = merged.tasks.items.len();
+        merged.tasks.items.push(task.clone());
+        task_indexes.insert(task.key.clone(), next_idx);
+    }
+
+    if prompt_spec.tranches.is_some() {
+        merged.tranches = prompt_spec.tranches.clone();
+    }
+
+    if prompt_spec.plan_guard.is_some() {
+        merged.plan_guard = prompt_spec.plan_guard.clone();
+    }
+
+    merged
 }
 
 fn build_task_catalog_from_run_spec(
@@ -1417,6 +2907,9 @@ fn build_task_catalog_from_run_spec(
                 task_key: t.key.clone(),
                 command: t.cmd.clone(),
                 command_class: class,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -1445,6 +2938,7 @@ fn build_tranche_plan_from_run_spec(
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| format!("{default_objective} [{}]", tranche.key)),
                 task_keys: tranche.task_keys.clone(),
+                tranche_group: None,
             })
             .collect()
     } else {
@@ -1452,6 +2946,7 @@ fn build_tranche_plan_from_run_spec(
             key: "default".to_string(),
             objective: default_objective.to_string(),
             task_keys,
+            tranche_group: None,
         }]
     };
 
@@ -1507,6 +3002,26 @@ fn parse_task_catalog_from_snapshot(config_snapshot: &serde_json::Value) -> Vec<
                     task_key,
                     command,
                     command_class,
+                    tranche_key: task
+                        .get("tranche_key")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .filter(|value| !value.trim().is_empty()),
+                    tranche_group: task
+                        .get("tranche_group")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .filter(|value| !value.trim().is_empty()),
+                    allowed_paths: task
+                        .get("allowed_paths")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(ToString::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
                 })
             })
             .collect::<Vec<_>>()
@@ -1551,6 +3066,11 @@ fn parse_tranche_plan_from_snapshot(config_snapshot: &serde_json::Value) -> Vec<
                         .iter()
                         .filter_map(|value| value.as_str().map(ToString::to_string))
                         .collect::<Vec<_>>();
+                    let tranche_group = tranche
+                        .get("tranche_group")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .filter(|value| !value.trim().is_empty());
                     if task_keys.is_empty() {
                         return None;
                     }
@@ -1558,6 +3078,7 @@ fn parse_tranche_plan_from_snapshot(config_snapshot: &serde_json::Value) -> Vec<
                         key,
                         objective,
                         task_keys,
+                        tranche_group,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1588,6 +3109,7 @@ async fn execute_run_plan(
     loaded_config: &LoadedConfig,
 ) -> Result<RunExecutionOutcome> {
     ensure_write_backend_guard(loaded_config, "run start")?;
+    ensure_parallel_workspace_contract(loaded_config)?;
 
     match loaded_config.backend_selection()? {
         BackendSelection::InMemory => {
@@ -1612,6 +3134,8 @@ async fn execute_run_plan(
 }
 
 fn finalize_run_outcome(outcome: &RunExecutionOutcome) -> Result<()> {
+    print_run_summary(outcome);
+
     match outcome.run_state {
         RunState::RunCompleted => {
             println!("Run {} completed successfully.", outcome.run_id);
@@ -1627,6 +3151,80 @@ fn finalize_run_outcome(outcome: &RunExecutionOutcome) -> Result<()> {
             outcome.run_id
         ),
     }
+}
+
+fn print_run_summary(outcome: &RunExecutionOutcome) {
+    let payload = &outcome.continuation_payload;
+    let summary = &payload.summary;
+
+    // Compute duration from UUIDv7 timestamp to completed_at
+    let duration_str = uuid_v7_timestamp(outcome.run_id)
+        .map(|start| {
+            let dur = payload.completed_at.signed_duration_since(start);
+            let total_secs = dur.num_seconds().max(0);
+            let mins = total_secs / 60;
+            let secs = total_secs % 60;
+            if mins > 0 {
+                format!("{mins}m {secs:02}s")
+            } else {
+                format!("{secs}s")
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let exit_reason_str = payload
+        .exit_reason
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    let bar: String = "═".repeat(75);
+    let suffix: String = "═".repeat(59);
+
+    println!();
+    println!("═══ Run Summary {suffix}");
+    println!("  Run ID:      {}", outcome.run_id);
+    println!("  Objective:   {}", payload.objective);
+    println!("  Exit state:  {:?}", outcome.run_state);
+    println!("  Exit reason: {exit_reason_str}");
+    println!(
+        "  Tasks:       {} completed, {} failed, {} pending",
+        summary.completed, summary.failed, summary.pending
+    );
+    println!("  Duration:    {duration_str}");
+
+    // Show failed tasks with their blocker/error
+    if summary.failed > 0 {
+        for task in &payload.tasks {
+            if task.state == TaskState::TaskFailed {
+                let detail = task
+                    .blocker
+                    .as_ref()
+                    .map(|b| format!("{b:?}"))
+                    .or_else(|| task.last_error.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!("  Failed:      {} ({})", task.task_key, detail);
+            }
+        }
+    }
+
+    println!("{bar}");
+    println!();
+}
+
+fn uuid_v7_timestamp(id: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+    // UUIDv7: first 48 bits are unix timestamp in milliseconds
+    let bytes = id.as_bytes();
+    let version = (bytes[6] >> 4) & 0x0F;
+    if version != 7 {
+        return None;
+    }
+    let ms = ((bytes[0] as u64) << 40)
+        | ((bytes[1] as u64) << 32)
+        | ((bytes[2] as u64) << 24)
+        | ((bytes[3] as u64) << 16)
+        | ((bytes[4] as u64) << 8)
+        | (bytes[5] as u64);
+    chrono::DateTime::from_timestamp_millis(ms as i64).map(|dt| dt.to_utc())
 }
 
 fn build_plan_from_continuation_tranche(
@@ -1672,6 +3270,9 @@ fn build_plan_from_continuation_tranche(
                     task_key: key.clone(),
                     command: key,
                     command_class: CommandClass::Io,
+                    tranche_key: None,
+                    tranche_group: None,
+                    allowed_paths: Vec::new(),
                 }
             }
         })
@@ -1756,6 +3357,14 @@ fn should_auto_advance_planned_tranche(
     } else {
         (false, gate.reason.clone())
     }
+}
+
+fn is_verification_only_dispatch(tranche_plan: &[PlannedTranche]) -> bool {
+    tranche_plan.len() == 1
+        && tranche_plan
+            .first()
+            .map(|tranche| tranche.key.eq_ignore_ascii_case("verification"))
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1975,6 +3584,97 @@ fn parse_plan_status_keywords(text: &str) -> Option<bool> {
     None
 }
 
+fn parse_tranche_group_token(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '[' | ']' | '(' | ')' | '{' | '}' | ',' | ';' | '"' | '\''
+        )
+    });
+    let (key, value) = trimmed.split_once('=')?;
+    if !key.eq_ignore_ascii_case("tranche_group") {
+        return None;
+    }
+    let normalized = sanitize_task_key_component(value.trim());
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn normalize_allowed_path(raw: &str) -> Option<String> {
+    let normalized = raw.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '[' | ']' | '(' | ')' | '{' | '}' | ',' | ';' | '"' | '\''
+        )
+    });
+    if normalized.is_empty() {
+        return None;
+    }
+    let path = Path::new(normalized);
+    if path.is_absolute() {
+        return None;
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(normalized.to_string())
+}
+
+fn parse_allowed_paths_token(token: &str) -> Option<Vec<String>> {
+    let trimmed = token.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '[' | ']' | '(' | ')' | '{' | '}' | ',' | ';' | '"' | '\''
+        )
+    });
+    let (key, value) = trimmed.split_once('=')?;
+    if !key.eq_ignore_ascii_case("allowed_paths") {
+        return None;
+    }
+    Some(
+        value
+            .split(',')
+            .filter_map(normalize_allowed_path)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn parse_plan_tranche_group(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(parse_tranche_group_token)
+}
+
+fn parse_plan_allowed_paths(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    text.split_whitespace()
+        .filter_map(parse_allowed_paths_token)
+        .flat_map(|items| items.into_iter())
+        .filter(|path| seen.insert(path.to_ascii_lowercase()))
+        .collect()
+}
+
+fn strip_plan_metadata_tokens(text: &str) -> String {
+    let filtered = text
+        .split_whitespace()
+        .filter(|token| {
+            parse_tranche_group_token(token).is_none() && parse_allowed_paths_token(token).is_none()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if filtered.trim().is_empty() {
+        text.trim().to_string()
+    } else {
+        filtered.trim().to_string()
+    }
+}
+
 fn extract_plan_target_key(text: &str) -> Option<String> {
     for raw in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')) {
         let token = raw.trim();
@@ -1996,11 +3696,14 @@ fn token_has_alpha_and_digit(token: &str) -> bool {
 
 fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntry> {
     if let Some((is_complete, entry)) = parse_plan_checkbox_status(line) {
-        let key = extract_plan_target_key(entry)?;
+        let normalized_summary = strip_plan_metadata_tokens(entry);
+        let key = extract_plan_target_key(&normalized_summary)?;
         return Some(ImplementationPlanEntry {
             key,
-            summary: entry.trim().to_string(),
+            summary: normalized_summary,
             is_complete,
+            tranche_group: parse_plan_tranche_group(entry),
+            allowed_paths: parse_plan_allowed_paths(entry),
         });
     }
 
@@ -2019,11 +3722,14 @@ fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntry> {
         trimmed
     };
     let is_complete = parse_plan_status_keywords(candidate)?;
-    let key = extract_plan_target_key(candidate)?;
+    let normalized_summary = strip_plan_metadata_tokens(candidate);
+    let key = extract_plan_target_key(&normalized_summary)?;
     Some(ImplementationPlanEntry {
         key,
-        summary: candidate.trim().to_string(),
+        summary: normalized_summary,
         is_complete,
+        tranche_group: parse_plan_tranche_group(candidate),
+        allowed_paths: parse_plan_allowed_paths(candidate),
     })
 }
 
@@ -2045,6 +3751,112 @@ fn discover_plan_entries(plan_text: &str) -> Vec<ImplementationPlanEntry> {
     }
     dedup_reversed.reverse();
     dedup_reversed
+}
+
+fn parse_plan_tranche_header_line(line: &str) -> Option<ImplementationPlanEntry> {
+    // Tranche headers are top-level lines inside `## Next Work Tranches`.
+    if line
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx == 0 || idx >= bytes.len() || bytes[idx] != b'.' {
+        return None;
+    }
+    idx += 1;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return None;
+    }
+
+    let candidate = &trimmed[idx..];
+    let split_at = candidate.rfind(':')?;
+    let summary_text = candidate[..split_at].trim();
+    let status_segment = candidate[split_at + 1..].trim();
+    let status_word = status_segment.split_whitespace().next().map(|token| {
+        token
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '[' | ']' | '(' | ')' | '{' | '}' | ',' | ';' | '.' | ':' | '"' | '\''
+                )
+            })
+            .to_ascii_lowercase()
+    })?;
+    let is_complete = match status_word.as_str() {
+        "complete" => true,
+        "incomplete" | "blocked" => false,
+        _ => return None,
+    };
+
+    let normalized_summary = strip_plan_metadata_tokens(summary_text);
+    let key_token = normalized_summary
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+    // Contract: `<ordinal>. I<id> ...: <status>.`
+    if key_token.is_empty()
+        || !key_token
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.eq_ignore_ascii_case(&'I'))
+        || !token_has_alpha_and_digit(key_token)
+    {
+        return None;
+    }
+
+    Some(ImplementationPlanEntry {
+        key: key_token.to_string(),
+        summary: normalized_summary,
+        is_complete,
+        tranche_group: parse_plan_tranche_group(candidate),
+        allowed_paths: parse_plan_allowed_paths(candidate),
+    })
+}
+
+fn discover_plan_dispatch_entries(plan_text: &str) -> Vec<ImplementationPlanEntry> {
+    let mut in_next_work_tranches = false;
+    let mut saw_next_work_tranches_header = false;
+    let mut entries = Vec::new();
+
+    for line in plan_text.lines() {
+        let trimmed = line.trim();
+        if !in_next_work_tranches {
+            if trimmed.eq_ignore_ascii_case("## Next Work Tranches") {
+                in_next_work_tranches = true;
+                saw_next_work_tranches_header = true;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("## ") {
+            break;
+        }
+        if let Some(entry) = parse_plan_tranche_header_line(line) {
+            entries.push(entry);
+        }
+    }
+
+    if saw_next_work_tranches_header {
+        entries
+    } else {
+        discover_plan_entries(plan_text)
+    }
 }
 
 fn target_matches_entry_key(entry_key: &str, target: &str) -> bool {
@@ -2410,31 +4222,62 @@ async fn cmd_run_default(
         prompt_source = resolved_prompt.source.as_str(),
         "resolved prompt file for yarli run"
     );
-    let loaded =
-        prompt::load_prompt_and_run_spec(&resolved_prompt.entry_path).with_context(|| {
-            format!(
-                "failed to load run spec from prompt file {}",
-                resolved_prompt.entry_path.display()
-            )
-        })?;
+    let loaded_optional = prompt::load_prompt_with_optional_run_spec(&resolved_prompt.entry_path)
+        .with_context(|| {
+        format!(
+            "failed to load prompt context from {}",
+            resolved_prompt.entry_path.display()
+        )
+    })?;
+    let has_prompt_run_spec = loaded_optional.run_spec.is_some();
+    let has_config_run_spec = run_config_has_run_spec_data(&loaded_config.config().run);
+    let config_run_spec = run_spec_from_run_config(&loaded_config.config().run);
+    if has_config_run_spec {
+        prompt::validate_run_spec(&config_run_spec)
+            .context("invalid [run] run-spec configuration in yarli.toml")?;
+    }
+    let run_spec = merge_run_specs(&config_run_spec, loaded_optional.run_spec.as_ref());
+    prompt::validate_run_spec(&run_spec).context(
+        "invalid effective run spec after merging yarli.toml [run] with optional PROMPT.md overrides",
+    )?;
+    let has_effective_run_spec = has_prompt_run_spec || has_config_run_spec;
+    let loaded = prompt::LoadedPrompt {
+        entry_path: loaded_optional.entry_path.clone(),
+        expanded_text: loaded_optional.expanded_text.clone(),
+        snapshot: loaded_optional.snapshot.clone(),
+        run_spec: run_spec.clone(),
+    };
     let plan_guard_context = run_spec_plan_guard_preflight(&loaded)?;
 
-    let objective = loaded
-        .run_spec
+    let objective = run_spec
         .objective
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "yarli run".to_string());
-
-    let run_spec = loaded.run_spec.clone();
     let auto_advance = AutoAdvanceConfig::from_loaded(loaded_config);
 
-    let (task_catalog, tranche_plan, execution_mode): (
+    let (task_catalog, tranche_plan, execution_mode, plan_run_spec): (
         Vec<PlannedTask>,
         Vec<PlannedTranche>,
         &'static str,
+        Option<prompt::RunSpec>,
     ) = match build_plan_driven_run_sequence(loaded_config, &loaded, &objective) {
-        Ok((tasks, tranches)) => (tasks, tranches, "config-first-plan"),
+        Ok((_tasks, tranches))
+            if !has_effective_run_spec && is_verification_only_dispatch(&tranches) =>
+        {
+            info!(
+                "no configured run spec and no open implementation tranches; dispatching plain prompt"
+            );
+            let (tasks, tranches) =
+                build_plain_prompt_run_sequence(loaded_config, &loaded, &objective)?;
+            (tasks, tranches, "plain-prompt", None)
+        }
+        Ok((tasks, tranches)) => (
+            tasks,
+            tranches,
+            "config-first-plan",
+            has_effective_run_spec.then_some(run_spec.clone()),
+        ),
         Err(err) if !run_spec.tasks.items.is_empty() => {
             warn!(
                 error = %err,
@@ -2442,7 +4285,16 @@ async fn cmd_run_default(
             );
             let tasks = build_task_catalog_from_run_spec(&run_spec)?;
             let tranches = build_tranche_plan_from_run_spec(&run_spec, &objective)?;
-            (tasks, tranches, "legacy-prompt")
+            (tasks, tranches, "legacy-prompt", Some(run_spec.clone()))
+        }
+        Err(err) if !has_effective_run_spec => {
+            warn!(
+                error = %err,
+                "plan-driven dispatch unavailable for plain prompt; dispatching prompt text directly"
+            );
+            let (tasks, tranches) =
+                build_plain_prompt_run_sequence(loaded_config, &loaded, &objective)?;
+            (tasks, tranches, "plain-prompt", None)
         }
         Err(err) => {
             return Err(err.context(
@@ -2467,10 +4319,12 @@ async fn cmd_run_default(
         timeout_secs: loaded_config.config().execution.command_timeout_seconds,
         pace: None,
         prompt_snapshot: Some(loaded.snapshot.clone()),
-        run_spec: Some(run_spec.clone()),
+        run_spec: plan_run_spec,
         tranche_plan: tranche_plan.clone(),
         current_tranche_index: Some(0),
     };
+    let verification_only_dispatch =
+        execution_mode == "config-first-plan" && is_verification_only_dispatch(&plan.tranche_plan);
 
     let mut iteration = 1usize;
     let mut advances_taken = 0usize;
@@ -2484,6 +4338,18 @@ async fn cmd_run_default(
         );
         let outcome = execute_run_plan(plan.clone(), render_mode, loaded_config).await?;
         if outcome.run_state != RunState::RunCompleted {
+            return finalize_run_outcome(&outcome);
+        }
+        if verification_only_dispatch && advances_taken == 0 {
+            if outcome.continuation_payload.next_tranche.is_some() {
+                warn!(
+                    run_id = %outcome.run_id,
+                    "ignoring continuation next_tranche for verification-only dispatch"
+                );
+            }
+            if let Some(context) = plan_guard_context.as_ref() {
+                enforce_plan_guard_post_run(&loaded, context)?;
+            }
             return finalize_run_outcome(&outcome);
         }
 
@@ -2535,6 +4401,15 @@ where
         bail!("at least one task is required");
     }
 
+    let parallel_workspace_layout = prepare_parallel_workspace_layout(&plan, loaded_config)?;
+    if let Some(layout) = parallel_workspace_layout.as_ref() {
+        println!(
+            "Parallel workspaces prepared: {} task workspace(s) at {}",
+            layout.task_workspace_dirs.len(),
+            layout.run_workspace_root.display()
+        );
+    }
+
     let runner = match loaded_config.config().execution.runner {
         ExecutionRunner::Native => {
             Arc::new(SelectedCommandRunner::Native(LocalCommandRunner::new()))
@@ -2563,8 +4438,10 @@ where
         Some(Duration::from_secs(plan.timeout_secs))
     };
 
+    let scheduler_workdir =
+        resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
     let mut config = SchedulerConfig {
-        working_dir: plan.workdir.clone(),
+        working_dir: scheduler_workdir.display().to_string(),
         command_timeout,
         ..SchedulerConfig::default()
     };
@@ -2659,6 +4536,24 @@ where
         })
         .collect();
 
+    let mut task_workspace_by_id: HashMap<Uuid, String> = HashMap::new();
+    if let Some(layout) = parallel_workspace_layout.as_ref() {
+        if layout.task_workspace_dirs.len() != tasks.len() {
+            bail!(
+                "parallel workspace provisioning mismatch: {} workspaces for {} tasks",
+                layout.task_workspace_dirs.len(),
+                tasks.len()
+            );
+        }
+        for (task, workspace_dir) in tasks.iter().zip(layout.task_workspace_dirs.iter()) {
+            let workspace_dir = workspace_dir.display().to_string();
+            scheduler
+                .bind_task_working_dir(task.id, workspace_dir.clone())
+                .await;
+            task_workspace_by_id.insert(task.id, workspace_dir);
+        }
+    }
+
     let task_names: Vec<(Uuid, String)> =
         tasks.iter().map(|t| (t.id, t.task_key.clone())).collect();
 
@@ -2681,6 +4576,33 @@ where
         idempotency_key: Some(format!("{run_id}:config_snapshot")),
     })?;
 
+    store.append(Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Run,
+        entity_id: run_id.to_string(),
+        event_type: "run.task_catalog".to_string(),
+        payload: serde_json::json!({
+            "tasks": plan
+                .tasks
+                .iter()
+                .zip(tasks.iter())
+                .map(|(planned, task)| serde_json::json!({
+                    "task_id": task.id,
+                    "task_key": planned.task_key,
+                    "tranche_key": planned.tranche_key,
+                    "tranche_group": planned.tranche_group,
+                    "allowed_paths": planned.allowed_paths,
+                    "workspace_dir": task_workspace_by_id.get(&task.id),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        correlation_id,
+        causation_id: None,
+        actor: "cli".to_string(),
+        idempotency_key: Some(format!("{run_id}:task_catalog")),
+    })?;
+
     // Submit run.
     scheduler
         .submit_run(run, tasks)
@@ -2697,12 +4619,9 @@ where
     // Set up event channel for renderer.
     let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
 
-    // Emit run ID immediately so operators can discover the active run.
-    let _ = tx.send(StreamEvent::RunStarted {
-        run_id,
-        objective: plan.objective.clone(),
-        at: chrono::Utc::now(),
-    });
+    // Emit known run/task identity immediately so the UI has deterministic
+    // startup state before the first scheduler tick/event-store poll.
+    emit_initial_stream_state(&tx, run_id, &plan.objective, &task_names);
 
     // Spawn renderer task.
     let renderer_shutdown = shutdown.clone();
@@ -2728,6 +4647,99 @@ where
         .await
         .context("renderer task panicked")?
         .context("renderer error")?;
+
+    let mut parallel_merge_error: Option<anyhow::Error> = None;
+    if continuation_payload.exit_state == RunState::RunCompleted {
+        if let Some(layout) = parallel_workspace_layout.as_ref() {
+            let source_workdir =
+                resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+            let source_workdir = source_workdir.canonicalize().with_context(|| {
+                format!(
+                    "failed to canonicalize execution working_dir {}",
+                    source_workdir.display()
+                )
+            })?;
+            let task_workspaces = plan
+                .tasks
+                .iter()
+                .zip(layout.task_workspace_dirs.iter())
+                .map(|(task, workspace_dir)| (task.task_key.clone(), workspace_dir.clone()))
+                .collect::<Vec<_>>();
+            match merge_parallel_workspace_results(
+                &source_workdir,
+                run_id,
+                &layout.run_workspace_root,
+                &task_workspaces,
+            ) {
+                Ok(report) => {
+                    let merged_count = report.merged_task_keys.len();
+                    let skipped_count = report.skipped_task_keys.len();
+                    println!(
+                        "Parallel workspace merge: merged {merged_count} task workspace(s), skipped {skipped_count} with no changes."
+                    );
+                    if let Err(err) = store.append(Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: run_id.to_string(),
+                        event_type: "run.parallel_merge_succeeded".to_string(),
+                        payload: serde_json::json!({
+                            "merged_task_keys": report.merged_task_keys,
+                            "skipped_task_keys": report.skipped_task_keys,
+                            "source_workdir": source_workdir.display().to_string(),
+                            "workspace_root": layout.run_workspace_root.display().to_string(),
+                        }),
+                        correlation_id,
+                        causation_id: None,
+                        actor: "cli".to_string(),
+                        idempotency_key: Some(format!("{run_id}:parallel_merge_succeeded")),
+                    }) {
+                        warn!(error = %err, "failed to persist parallel merge success event");
+                    }
+                }
+                Err(err) => {
+                    if let Err(append_err) = store.append(Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: run_id.to_string(),
+                        event_type: "run.parallel_merge_failed".to_string(),
+                        payload: serde_json::json!({
+                            "reason": err.to_string(),
+                            "source_workdir": source_workdir.display().to_string(),
+                            "workspace_root": layout.run_workspace_root.display().to_string(),
+                        }),
+                        correlation_id,
+                        causation_id: None,
+                        actor: "cli".to_string(),
+                        idempotency_key: Some(format!("{run_id}:parallel_merge_failed")),
+                    }) {
+                        warn!(error = %append_err, "failed to persist parallel merge failure event");
+                    }
+                    parallel_merge_error = Some(
+                        err.context(format!("parallel workspace merge failed for run {run_id}")),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(layout) = parallel_workspace_layout.as_ref() {
+        if parallel_merge_error.is_none() {
+            if let Err(err) = fs::remove_dir_all(&layout.run_workspace_root) {
+                warn!(
+                    error = %err,
+                    workspace_root = %layout.run_workspace_root.display(),
+                    "failed to clean parallel run workspace root"
+                );
+            }
+        } else {
+            warn!(
+                workspace_root = %layout.run_workspace_root.display(),
+                "preserving parallel run workspace root after merge failure for inspection"
+            );
+        }
+    }
 
     // Sync materialized state columns in Postgres so `yarli run status` and
     // direct DB queries reflect the actual terminal state, not the initial RUN_OPEN.
@@ -2758,6 +4770,10 @@ where
         }
     }
 
+    if let Some(err) = parallel_merge_error {
+        return Err(err);
+    }
+
     Ok(RunExecutionOutcome {
         run_id,
         run_state: continuation_payload.exit_state,
@@ -2779,54 +4795,81 @@ async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
     let sw4rm_config = loaded_config.config().sw4rm.clone();
     println!("Booting sw4rm agent: {}", sw4rm_config.agent_name);
 
-    // Build verification spec from the configured/default prompt run spec if available.
-    let verification = match resolve_prompt_entry_path(loaded_config, None).and_then(|resolved| {
-        prompt::load_prompt_and_run_spec(&resolved.entry_path).with_context(|| {
-            format!(
-                "failed to load sw4rm verification prompt {}",
-                resolved.entry_path.display()
-            )
-        })
-    }) {
-        Ok(loaded) => {
-            let commands: Vec<VerificationCommand> = loaded
-                .run_spec
-                .tasks
-                .items
-                .iter()
-                .map(|t| {
-                    let class = match t.class.as_deref().unwrap_or("io") {
-                        "cpu" => yarli_core::domain::CommandClass::Cpu,
-                        "git" => yarli_core::domain::CommandClass::Git,
-                        "tool" => yarli_core::domain::CommandClass::Tool,
-                        _ => yarli_core::domain::CommandClass::Io,
-                    };
-                    VerificationCommand {
-                        task_key: t.key.clone(),
-                        command: t.cmd.clone(),
-                        class,
-                    }
-                })
-                .collect();
-            VerificationSpec {
-                commands,
-                working_dir: loaded_config.config().execution.working_dir.clone(),
-                task_gates: None, // use defaults from yarli-gates
-                run_gates: None,
+    // Build verification spec from merged run-spec configuration:
+    // yarli.toml [run] defaults + optional PROMPT.md override block.
+    let has_config_run_spec = run_config_has_run_spec_data(&loaded_config.config().run);
+    let mut base_run_spec = run_spec_from_run_config(&loaded_config.config().run);
+    if has_config_run_spec {
+        if let Err(err) = prompt::validate_run_spec(&base_run_spec) {
+            warn!(
+                error = %err,
+                "invalid [run] run-spec configuration for sw4rm; using fallback verification defaults"
+            );
+            base_run_spec = prompt::RunSpec {
+                version: 1,
+                objective: None,
+                tasks: prompt::RunSpecTasks::default(),
+                tranches: None,
+                plan_guard: None,
+            };
+        }
+    }
+    if let Ok(resolved) = resolve_prompt_entry_path(loaded_config, None) {
+        if let Ok(loaded_prompt) = prompt::load_prompt_with_optional_run_spec(&resolved.entry_path)
+        {
+            if let Some(prompt_run_spec) = loaded_prompt.run_spec.as_ref() {
+                base_run_spec = merge_run_specs(&base_run_spec, Some(prompt_run_spec));
             }
         }
-        Err(_) => {
-            // No usable prompt — use a minimal verification spec.
-            VerificationSpec {
-                commands: vec![VerificationCommand {
-                    task_key: "build".to_string(),
-                    command: "cargo build".to_string(),
-                    class: yarli_core::domain::CommandClass::Cpu,
-                }],
-                working_dir: loaded_config.config().execution.working_dir.clone(),
-                task_gates: None,
-                run_gates: None,
-            }
+    }
+    if let Err(err) = prompt::validate_run_spec(&base_run_spec) {
+        warn!(
+            error = %err,
+            "invalid effective sw4rm run-spec after merge; using fallback verification defaults"
+        );
+        base_run_spec = prompt::RunSpec {
+            version: 1,
+            objective: None,
+            tasks: prompt::RunSpecTasks::default(),
+            tranches: None,
+            plan_guard: None,
+        };
+    }
+    let verification_tasks = base_run_spec.tasks.items;
+    let verification = if !verification_tasks.is_empty() {
+        let commands: Vec<VerificationCommand> = verification_tasks
+            .iter()
+            .map(|t| {
+                let class = match t.class.as_deref().unwrap_or("io") {
+                    "cpu" => yarli_core::domain::CommandClass::Cpu,
+                    "git" => yarli_core::domain::CommandClass::Git,
+                    "tool" => yarli_core::domain::CommandClass::Tool,
+                    _ => yarli_core::domain::CommandClass::Io,
+                };
+                VerificationCommand {
+                    task_key: t.key.clone(),
+                    command: t.cmd.clone(),
+                    class,
+                }
+            })
+            .collect();
+        VerificationSpec {
+            commands,
+            working_dir: loaded_config.config().execution.working_dir.clone(),
+            task_gates: None, // use defaults from yarli-gates
+            run_gates: None,
+        }
+    } else {
+        // No usable run-spec tasks — use a minimal verification spec.
+        VerificationSpec {
+            commands: vec![VerificationCommand {
+                task_key: "build".to_string(),
+                command: "cargo build".to_string(),
+                class: yarli_core::domain::CommandClass::Cpu,
+            }],
+            working_dir: loaded_config.config().execution.working_dir.clone(),
+            task_gates: None,
+            run_gates: None,
         }
     };
 
@@ -3149,16 +5192,23 @@ fn build_run_config_snapshot(
                 "task_key": &t.task_key,
                 "command": &t.command,
                 "command_class": format!("{:?}", t.command_class),
+                "tranche_key": &t.tranche_key,
+                "tranche_group": &t.tranche_group,
+                "allowed_paths": &t.allowed_paths,
             })).collect::<Vec<_>>(),
             "task_catalog": task_catalog.iter().map(|t| serde_json::json!({
                 "task_key": &t.task_key,
                 "command": &t.command,
                 "command_class": format!("{:?}", t.command_class),
+                "tranche_key": &t.tranche_key,
+                "tranche_group": &t.tranche_group,
+                "allowed_paths": &t.allowed_paths,
             })).collect::<Vec<_>>(),
             "tranche_plan": tranche_plan.iter().map(|t| serde_json::json!({
                 "key": &t.key,
                 "objective": &t.objective,
                 "task_keys": &t.task_keys,
+                "tranche_group": &t.tranche_group,
             })).collect::<Vec<_>>(),
             "current_tranche_index": current_tranche_index,
             "prompt": prompt_snapshot,
@@ -3371,6 +5421,7 @@ where
     }
 
     let mut zero_progress_ticks: u64 = 0;
+    let mut paused = false;
 
     loop {
         tokio::select! {
@@ -3423,6 +5474,43 @@ where
             }
             _ = heartbeat_interval.tick() => {
                 scheduler.heartbeat_active_leases().await;
+                let stats = scheduler.queue_stats();
+                let heartbeat_message = if paused {
+                    format!(
+                        "paused: pending={} leased={} tick={} zero_progress_ticks={}",
+                        stats.pending, stats.leased, tick_count, zero_progress_ticks
+                    )
+                } else {
+                    format!(
+                        "heartbeat: pending={} leased={} tick={} zero_progress_ticks={}",
+                        stats.pending, stats.leased, tick_count, zero_progress_ticks
+                    )
+                };
+                let _ = tx.send(StreamEvent::TransientStatus {
+                    message: heartbeat_message.clone(),
+                });
+                let _ = append_event(
+                    store.as_ref(),
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: run_id.to_string(),
+                        event_type: "run.observer.progress".to_string(),
+                        payload: serde_json::json!({
+                            "tick": tick_count,
+                            "queue_pending": stats.pending,
+                            "queue_leased": stats.leased,
+                            "paused": paused,
+                            "zero_progress_ticks": zero_progress_ticks,
+                            "summary": heartbeat_message,
+                        }),
+                        correlation_id,
+                        causation_id: None,
+                        actor: "observer.progress".to_string(),
+                        idempotency_key: None,
+                    },
+                );
             }
             _ = reclaim_interval.tick() => {
                 scheduler.reclaim_stale_leases().await;
@@ -3430,39 +5518,49 @@ where
             _ = tick_interval.tick() => {
                 tick_count += 1;
 
-                // Run a scheduler tick.
-                let _result = scheduler.tick_with_cancel(cancel.child_token()).await
-                    .context("scheduler tick failed")?;
-
-                debug!(
-                    tick = tick_count,
-                    promoted = _result.promoted,
-                    claimed = _result.claimed,
-                    executed = _result.executed,
-                    failed = _result.failed,
-                    errors = _result.errors,
-                    "drive_scheduler tick"
-                );
-
-                if _result.claimed == 0 && _result.executed == 0 {
+                if paused {
                     zero_progress_ticks += 1;
-                    if zero_progress_ticks >= 10 && zero_progress_ticks % 10 == 0 {
-                        let stats = scheduler.queue_stats();
-                        warn!(
-                            consecutive_zero_ticks = zero_progress_ticks,
-                            tick = tick_count,
-                            queue_pending = stats.pending,
-                            queue_leased = stats.leased,
-                            "no tasks claimed or executed for {zero_progress_ticks} consecutive ticks"
-                        );
-                    }
                 } else {
-                    zero_progress_ticks = 0;
+                    // Run a scheduler tick.
+                    let _result = scheduler
+                        .tick_with_cancel(cancel.child_token())
+                        .await
+                        .context("scheduler tick failed")?;
+
+                    debug!(
+                        tick = tick_count,
+                        promoted = _result.promoted,
+                        claimed = _result.claimed,
+                        executed = _result.executed,
+                        failed = _result.failed,
+                        errors = _result.errors,
+                        "drive_scheduler tick"
+                    );
+
+                    if _result.claimed == 0 && _result.executed == 0 {
+                        zero_progress_ticks += 1;
+                        if zero_progress_ticks >= 10 && zero_progress_ticks % 10 == 0 {
+                            let stats = scheduler.queue_stats();
+                            warn!(
+                                consecutive_zero_ticks = zero_progress_ticks,
+                                tick = tick_count,
+                                queue_pending = stats.pending,
+                                queue_leased = stats.leased,
+                                "no tasks claimed or executed for {zero_progress_ticks} consecutive ticks"
+                            );
+                        }
+                    } else {
+                        zero_progress_ticks = 0;
+                    }
                 }
 
                 // Emit events using incremental cursor reads.
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                let control_signal = _new_events
+                    .iter()
+                    .filter_map(|event| operator_control_signal_from_event(event, run_id))
+                    .last();
                 deterioration_observer.observe_store(store.as_ref())?;
                 if let Some(observer) = memory_observer.as_mut() {
                     match tokio::time::timeout(
@@ -3474,6 +5572,63 @@ where
                         Ok(()) => {}
                         Err(_) => warn!("memory observer observe_events timed out after 15s, continuing"),
                     }
+                }
+                match control_signal {
+                    Some(OperatorControlSignal::Pause { reason }) => {
+                        paused = true;
+                        let _ = tx.send(StreamEvent::TransientStatus {
+                            message: format!("operator pause: {reason}"),
+                        });
+                    }
+                    Some(OperatorControlSignal::Resume { reason }) => {
+                        paused = false;
+                        let _ = tx.send(StreamEvent::TransientStatus {
+                            message: format!("operator resume: {reason}"),
+                        });
+                    }
+                    Some(OperatorControlSignal::Cancel { reason }) => {
+                        info!(%reason, "received operator cancel signal");
+                        let _ = cancel_active_run(scheduler, store, run_id, &reason).await?;
+                        let cancel_events =
+                            emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                        deterioration_observer.observe_store(store.as_ref())?;
+                        if let Some(observer) = memory_observer.as_mut() {
+                            match tokio::time::timeout(
+                                Duration::from_secs(15),
+                                observer.observe_events(store.as_ref(), &cancel_events),
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(_) => warn!("memory observer observe_events timed out after operator cancel"),
+                            }
+                        }
+                        let payload = {
+                            let reg = scheduler.registry().read().await;
+                            let run = reg.get_run(&run_id).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "run {run_id} missing from registry after operator cancel"
+                                )
+                            })?;
+                            let tasks: Vec<&yarli_core::entities::Task> = run
+                                .task_ids
+                                .iter()
+                                .filter_map(|tid| reg.get_task(tid))
+                                .collect();
+                            build_continuation_payload(
+                                run,
+                                &tasks,
+                                deterioration_observer.latest_report(),
+                                auto_advance_policy,
+                            )
+                        };
+                        let _ = tx.send(StreamEvent::RunExited {
+                            payload: payload.clone(),
+                        });
+                        drop(tx);
+                        return Ok(payload);
+                    }
+                    None => {}
                 }
 
                 // Send tick for spinner animation.
@@ -3525,12 +5680,68 @@ fn emit_new_stream_events<S: EventStore>(
     let new_events = cursor.read_new_events(store.as_ref())?;
 
     for event in &new_events {
+        for (task_id, task_name) in stream_task_catalog_entries(event) {
+            let _ = tx.send(StreamEvent::TaskDiscovered { task_id, task_name });
+        }
+        if let (Ok(task_id), Some(worker_id)) = (
+            event.entity_id.parse::<Uuid>(),
+            event.payload.get("worker").and_then(|v| v.as_str()),
+        ) {
+            let _ = tx.send(StreamEvent::TaskWorker {
+                task_id,
+                worker_id: worker_id.to_string(),
+            });
+        }
         if let Some(se) = event_to_stream_event(event, task_names) {
             let _ = tx.send(se);
         }
     }
 
     Ok(new_events)
+}
+
+fn emit_initial_stream_state(
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    run_id: Uuid,
+    objective: &str,
+    task_names: &[(Uuid, String)],
+) {
+    let _ = tx.send(StreamEvent::RunStarted {
+        run_id,
+        objective: objective.to_string(),
+        at: chrono::Utc::now(),
+    });
+    for (task_id, task_name) in task_names {
+        let _ = tx.send(StreamEvent::TaskDiscovered {
+            task_id: *task_id,
+            task_name: task_name.clone(),
+        });
+    }
+}
+
+fn stream_task_catalog_entries(event: &Event) -> Vec<(Uuid, String)> {
+    if event.event_type != "run.task_catalog" {
+        return Vec::new();
+    }
+    event
+        .payload
+        .get("tasks")
+        .and_then(|tasks| tasks.as_array())
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter_map(|task| {
+                    let task_id = task.get("task_id")?.as_str()?.parse::<Uuid>().ok()?;
+                    let task_name = task
+                        .get("task_key")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| task_id.to_string()[..8].to_string());
+                    Some((task_id, task_name))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn cancel_active_run<Q, S, R>(
@@ -3688,7 +5899,8 @@ fn event_to_stream_event(
                 at: event.occurred_at,
             })
         }
-        "run.activated" | "run.verifying" | "run.completed" | "run.failed" | "run.cancelled" => {
+        "run.activated" | "run.verifying" | "run.blocked" | "run.completed" | "run.failed"
+        | "run.cancelled" => {
             let from_str = event.payload.get("from").and_then(|v| v.as_str());
             let to_str = event.payload.get("to").and_then(|v| v.as_str());
 
@@ -3716,22 +5928,63 @@ fn event_to_stream_event(
                 at: event.occurred_at,
             })
         }
-        "command.output" => {
-            let line = event
+        "run.observer.progress" => {
+            let summary = event
                 .payload
-                .get("line")
+                .get("summary")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .unwrap_or("progress update")
                 .to_string();
-            let name = task_name(&event.entity_id);
+            Some(StreamEvent::TransientStatus { message: summary })
+        }
+        "command.output" => {
+            let line = extract_command_output_line(&event.payload);
+            if line.trim().is_empty() {
+                return None;
+            }
+            let task_id = task_id_from_command_event(event).unwrap_or_else(Uuid::nil);
+            let task_entity = if task_id == Uuid::nil() {
+                event.entity_id.clone()
+            } else {
+                task_id.to_string()
+            };
+            let name = task_name(&task_entity);
             Some(StreamEvent::CommandOutput {
-                task_id: event.entity_id.parse().unwrap_or(Uuid::nil()),
+                task_id,
                 task_name: name,
                 line,
             })
         }
         _ => None,
     }
+}
+
+fn task_id_from_command_event(event: &yarli_core::domain::Event) -> Option<Uuid> {
+    let idempotency_key = event.idempotency_key.as_deref()?;
+    let (task_id_raw, _) = idempotency_key.split_once(":cmd:")?;
+    task_id_raw.parse().ok()
+}
+
+fn extract_command_output_line(payload: &serde_json::Value) -> String {
+    let chunk_lines = payload
+        .get("chunks")
+        .and_then(|value| value.as_array())
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter_map(|chunk| chunk.get("data").and_then(|value| value.as_str()))
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !chunk_lines.is_empty() {
+        return chunk_lines.join("\n");
+    }
+    payload
+        .get("line")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Parse a TaskState from its serialized form.
@@ -3926,6 +6179,39 @@ const OBSERVER_WINDOW_SIZE: usize = 64;
 const CONTINUATION_WAIT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_CONTINUATION_FILE: &str = ".yarli/continuation.json";
 const RUN_CONTINUATION_EVENT_TYPE: &str = "run.continuation";
+const OPERATOR_CONTROL_ACTOR: &str = "cli.operator";
+
+#[derive(Debug, Clone)]
+enum OperatorControlSignal {
+    Pause { reason: String },
+    Resume { reason: String },
+    Cancel { reason: String },
+}
+
+fn operator_control_signal_from_event(
+    event: &Event,
+    run_id: Uuid,
+) -> Option<OperatorControlSignal> {
+    if event.entity_type != EntityType::Run {
+        return None;
+    }
+    if event.entity_id != run_id.to_string() || event.actor != OPERATOR_CONTROL_ACTOR {
+        return None;
+    }
+    let reason = event
+        .payload
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| event.payload.get("detail").and_then(|v| v.as_str()))
+        .unwrap_or("operator control action")
+        .to_string();
+    match event.event_type.as_str() {
+        "run.blocked" => Some(OperatorControlSignal::Pause { reason }),
+        "run.activated" => Some(OperatorControlSignal::Resume { reason }),
+        "run.cancelled" => Some(OperatorControlSignal::Cancel { reason }),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct IncrementalEventCursor {
@@ -4712,6 +6998,7 @@ impl DeteriorationObserverState {
 #[derive(Debug, Clone)]
 struct TaskProjection {
     task_id: Uuid,
+    task_key: Option<String>,
     state: TaskState,
     correlation_id: Uuid,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -4726,6 +7013,11 @@ struct TaskProjection {
     memory_hints: Option<MemoryHintsReport>,
     last_error: Option<String>,
     blocker_detail: Option<String>,
+    worker_actor: Option<String>,
+    workspace_dir: Option<String>,
+    tranche_key: Option<String>,
+    tranche_group: Option<String>,
+    allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4740,6 +7032,7 @@ struct RunProjection {
     failed_gates: Vec<(GateType, String)>,
     deterioration: Option<DeteriorationReport>,
     memory_hints: Option<MemoryHintsReport>,
+    tranche_plan: Vec<PlannedTranche>,
 }
 
 #[derive(Debug, Clone)]
@@ -4843,6 +7136,26 @@ fn with_event_store<T>(
     }
 }
 
+fn with_event_store_and_queue<T>(
+    loaded_config: &LoadedConfig,
+    operation: impl FnOnce(&dyn EventStore, &dyn TaskQueue) -> Result<T>,
+) -> Result<T> {
+    match loaded_config.backend_selection()? {
+        BackendSelection::InMemory => {
+            let store = InMemoryEventStore::new();
+            let queue = InMemoryTaskQueue::new();
+            operation(&store, &queue)
+        }
+        BackendSelection::Postgres { database_url } => {
+            let store = PostgresEventStore::new(&database_url)
+                .map_err(|e| anyhow::anyhow!("failed to initialize postgres event store: {e}"))?;
+            let queue = PostgresTaskQueue::new(&database_url)
+                .map_err(|e| anyhow::anyhow!("failed to initialize postgres task queue: {e}"))?;
+            operation(&store, &queue)
+        }
+    }
+}
+
 fn query_events(store: &dyn EventStore, query: &EventQuery) -> Result<Vec<Event>> {
     store
         .query(query)
@@ -4863,6 +7176,7 @@ fn run_state_from_event(event: &Event) -> Option<RunState> {
         .and_then(parse_run_state)
         .or(match event.event_type.as_str() {
             "run.activated" => Some(RunState::RunActive),
+            "run.blocked" => Some(RunState::RunBlocked),
             "run.verifying" => Some(RunState::RunVerifying),
             "run.completed" => Some(RunState::RunCompleted),
             "run.failed" | "run.gate_failed" => Some(RunState::RunFailed),
@@ -4945,6 +7259,77 @@ fn deterioration_from_event(event: &Event) -> Option<DeteriorationReport> {
     serde_json::from_value(event.payload.clone()).ok()
 }
 
+#[derive(Debug, Clone)]
+struct TaskCatalogProjection {
+    task_key: Option<String>,
+    workspace_dir: Option<String>,
+    tranche_key: Option<String>,
+    tranche_group: Option<String>,
+    allowed_paths: Vec<String>,
+}
+
+fn task_catalog_entries_from_event(event: &Event) -> HashMap<Uuid, TaskCatalogProjection> {
+    if event.event_type != "run.task_catalog" {
+        return HashMap::new();
+    }
+    event
+        .payload
+        .get("tasks")
+        .and_then(|value| value.as_array())
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter_map(|task| {
+                    let task_id = task
+                        .get("task_id")
+                        .and_then(|value| value.as_str())
+                        .and_then(|raw| raw.parse::<Uuid>().ok())?;
+                    let task_key = task
+                        .get("task_key")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .filter(|value| !value.trim().is_empty());
+                    let workspace_dir = task
+                        .get("workspace_dir")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .filter(|value| !value.trim().is_empty());
+                    let tranche_key = task
+                        .get("tranche_key")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .filter(|value| !value.trim().is_empty());
+                    let tranche_group = task
+                        .get("tranche_group")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .filter(|value| !value.trim().is_empty());
+                    let allowed_paths = task
+                        .get("allowed_paths")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(ToString::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    Some((
+                        task_id,
+                        TaskCatalogProjection {
+                            task_key,
+                            workspace_dir,
+                            tranche_key,
+                            tranche_group,
+                            allowed_paths,
+                        },
+                    ))
+                })
+                .collect::<HashMap<Uuid, TaskCatalogProjection>>()
+        })
+        .unwrap_or_default()
+}
+
 fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
     let mut tasks: BTreeMap<Uuid, TaskProjection> = BTreeMap::new();
 
@@ -4956,6 +7341,7 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
 
         let entry = tasks.entry(task_id).or_insert_with(|| TaskProjection {
             task_id,
+            task_key: None,
             state: TaskState::TaskOpen,
             correlation_id: event.correlation_id,
             updated_at: event.occurred_at,
@@ -4970,6 +7356,11 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
             memory_hints: None,
             last_error: None,
             blocker_detail: None,
+            worker_actor: None,
+            workspace_dir: None,
+            tranche_key: None,
+            tranche_group: None,
+            allowed_paths: Vec::new(),
         });
 
         entry.correlation_id = event.correlation_id;
@@ -4979,6 +7370,18 @@ fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> {
 
         if let Some(next_state) = task_state_from_event(event) {
             entry.state = next_state;
+        }
+
+        if let Some(task_key) = event.payload.get("task_key").and_then(|v| v.as_str()) {
+            entry.task_key = Some(task_key.to_string());
+        }
+        if let Some(worker_id) = event.payload.get("worker").and_then(|v| v.as_str()) {
+            entry.worker_actor = Some(worker_id.to_string());
+        } else if matches!(
+            event.event_type.as_str(),
+            "task.executing" | "task.ready" | "task.retrying"
+        ) {
+            entry.worker_actor = Some(event.actor.clone());
         }
 
         if let Some(reason) = event_reason(event) {
@@ -5106,6 +7509,8 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
     let mut failed_gates = Vec::new();
     let mut deterioration = None;
     let mut memory_hints = None;
+    let mut tranche_plan = Vec::new();
+    let mut task_catalog_by_id: HashMap<Uuid, TaskCatalogProjection> = HashMap::new();
 
     for event in &run_events {
         correlation_id = event.correlation_id;
@@ -5122,6 +7527,13 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
                 .get("objective")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            if let Some(config_snapshot) = event.payload.get("config_snapshot") {
+                tranche_plan = parse_tranche_plan_from_snapshot(config_snapshot);
+            }
+        }
+
+        if event.event_type == "run.task_catalog" {
+            task_catalog_by_id = task_catalog_entries_from_event(event);
         }
 
         if event.event_type == "run.gate_failed" {
@@ -5149,7 +7561,37 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
         .into_iter()
         .filter(|event| event.entity_type == EntityType::Task)
         .collect();
-    let tasks = collect_task_projections(&task_events);
+    let mut tasks = collect_task_projections(&task_events);
+    for task in &mut tasks {
+        if let Some(metadata) = task_catalog_by_id.get(&task.task_id) {
+            if task.task_key.is_none() {
+                task.task_key = metadata.task_key.clone();
+            }
+            if task.tranche_key.is_none() {
+                task.tranche_key = metadata.tranche_key.clone();
+            }
+            if task.workspace_dir.is_none() {
+                task.workspace_dir = metadata.workspace_dir.clone();
+            }
+            if task.tranche_group.is_none() {
+                task.tranche_group = metadata.tranche_group.clone();
+            }
+            if task.allowed_paths.is_empty() {
+                task.allowed_paths = metadata.allowed_paths.clone();
+            }
+        }
+    }
+
+    if let Some(latest_task) = tasks.iter().max_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    }) {
+        if latest_task.updated_at > updated_at {
+            updated_at = latest_task.updated_at;
+            last_event_type = latest_task.last_event_type.clone();
+        }
+    }
 
     Ok(Some(RunProjection {
         run_id,
@@ -5162,6 +7604,7 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
         failed_gates,
         deterioration,
         memory_hints,
+        tranche_plan,
     }))
 }
 
@@ -5627,11 +8070,34 @@ fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
         writeln!(&mut out)?;
         writeln!(&mut out, "Task states:")?;
         for task in &run.tasks {
+            let task_key = task.task_key.as_deref().unwrap_or("-");
             writeln!(
                 &mut out,
-                "  {}  {:?}  ({})",
-                task.task_id, task.state, task.last_event_type
+                "  {} [{}]  {:?}  ({})",
+                task_key, task.task_id, task.state, task.last_event_type
             )?;
+            if let Some(worker_actor) = task.worker_actor.as_ref() {
+                writeln!(&mut out, "    worker_actor: {worker_actor}")?;
+            }
+            if let Some(workspace_dir) = task.workspace_dir.as_ref() {
+                writeln!(&mut out, "    workspace_dir: {workspace_dir}")?;
+            }
+            if task.tranche_key.is_some()
+                || task.tranche_group.is_some()
+                || !task.allowed_paths.is_empty()
+            {
+                writeln!(
+                    &mut out,
+                    "    scope: tranche={} group={} allowed_paths={}",
+                    task.tranche_key.as_deref().unwrap_or("-"),
+                    task.tranche_group.as_deref().unwrap_or("-"),
+                    if task.allowed_paths.is_empty() {
+                        "-".to_string()
+                    } else {
+                        task.allowed_paths.join(", ")
+                    }
+                )?;
+            }
             if let Some(ref last_error) = task.last_error {
                 writeln!(&mut out, "    last_error: {last_error}")?;
             }
@@ -5662,6 +8128,41 @@ fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
                     hints.results.len(),
                     hints.query_text
                 )?;
+            }
+        }
+    }
+
+    if !run.tranche_plan.is_empty() {
+        let tasks_by_key: HashMap<&str, &TaskProjection> = run
+            .tasks
+            .iter()
+            .filter_map(|task| task.task_key.as_deref().map(|key| (key, task)))
+            .collect();
+        writeln!(&mut out)?;
+        writeln!(&mut out, "Tranche mapping:")?;
+        for tranche in &run.tranche_plan {
+            writeln!(
+                &mut out,
+                "  tranche={} group={}",
+                tranche.key,
+                tranche.tranche_group.as_deref().unwrap_or("-")
+            )?;
+            for task_key in &tranche.task_keys {
+                if let Some(task) = tasks_by_key.get(task_key.as_str()) {
+                    writeln!(
+                        &mut out,
+                        "    task_key={} task_id={} worker_actor={}",
+                        task_key,
+                        task.task_id,
+                        task.worker_actor.as_deref().unwrap_or("-")
+                    )?;
+                } else {
+                    writeln!(
+                        &mut out,
+                        "    task_key={} task_id=- worker_actor=-",
+                        task_key
+                    )?;
+                }
             }
         }
     }
@@ -7507,6 +10008,331 @@ fn cmd_run_list() -> Result<()> {
     Ok(())
 }
 
+fn list_runs_by_latest_state(store: &dyn EventStore) -> Result<BTreeMap<Uuid, RunState>> {
+    let run_events = query_events(store, &EventQuery::by_entity_type(EntityType::Run))?;
+    let mut runs: BTreeMap<Uuid, RunState> = BTreeMap::new();
+    for event in run_events {
+        let Ok(run_id) = Uuid::parse_str(&event.entity_id) else {
+            continue;
+        };
+        let entry = runs.entry(run_id).or_insert(RunState::RunOpen);
+        if let Some(state) = run_state_from_event(&event) {
+            *entry = state;
+        }
+    }
+    Ok(runs)
+}
+
+fn render_run_candidates(run_ids: &[Uuid]) -> String {
+    let strings = run_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let prefixes = unique_run_id_prefixes(strings.clone(), 10);
+    strings
+        .iter()
+        .map(|id| {
+            prefixes
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| compact_run_id(id))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn select_run_targets_for_control(
+    store: &dyn EventStore,
+    run_id_input: Option<&str>,
+    all_selected: bool,
+    eligible_states: &[RunState],
+    all_flag_name: &str,
+    action_name: &str,
+) -> Result<Vec<Uuid>> {
+    let runs = list_runs_by_latest_state(store)?;
+    if let Some(raw_run_id) = run_id_input {
+        let run_id = resolve_run_id_input(store, raw_run_id)?;
+        let state = runs
+            .get(&run_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Run {run_id} not found in persisted event log."))?;
+        if !eligible_states.contains(&state) {
+            bail!(
+                "run {run_id} is {:?}; cannot {action_name}. Eligible states: {}",
+                state,
+                eligible_states
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(vec![run_id]);
+    }
+
+    let eligible = runs
+        .iter()
+        .filter_map(|(run_id, state)| eligible_states.contains(state).then_some(*run_id))
+        .collect::<Vec<_>>();
+
+    if all_selected {
+        if eligible.is_empty() {
+            bail!("no eligible runs found for `{action_name}`");
+        }
+        return Ok(eligible);
+    }
+
+    match eligible.len() {
+        0 => bail!("no eligible runs found for `{action_name}`"),
+        1 => Ok(eligible),
+        _ => bail!(
+            "multiple eligible runs found for `{action_name}`; pass <run-id> or --{all_flag_name}. Candidates: {}",
+            render_run_candidates(&eligible)
+        ),
+    }
+}
+
+fn append_run_transition_event(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    from: RunState,
+    to: RunState,
+    event_type: &str,
+    reason: &str,
+    idempotency_key: Option<String>,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: event_type.to_string(),
+            payload: serde_json::json!({
+                "from": format!("{:?}", from),
+                "to": format!("{:?}", to),
+                "reason": reason,
+                "detail": reason,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: "cli.operator".to_string(),
+            idempotency_key,
+        },
+    )
+}
+
+fn append_task_cancelled_event(
+    store: &dyn EventStore,
+    task: &TaskProjection,
+    reason: &str,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Task,
+            entity_id: task.task_id.to_string(),
+            event_type: "task.cancelled".to_string(),
+            payload: serde_json::json!({
+                "from": format!("{:?}", task.state),
+                "to": format!("{:?}", TaskState::TaskCancelled),
+                "reason": reason,
+                "detail": reason,
+                "attempt_no": task.attempt_no,
+            }),
+            correlation_id: task.correlation_id,
+            causation_id: None,
+            actor: "cli.operator".to_string(),
+            idempotency_key: Some(format!(
+                "{}:operator_cancel:{}",
+                task.task_id,
+                task.attempt_no.unwrap_or(0)
+            )),
+        },
+    )
+}
+
+fn execute_run_pause_control(store: &dyn EventStore, run_id: Uuid, reason: &str) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    if run.state == RunState::RunBlocked {
+        return Ok(format!("Run {run_id} is already paused (RunBlocked)."));
+    }
+    if !run.state.can_transition_to(RunState::RunBlocked) {
+        return Ok(format!(
+            "Run {run_id} is {:?}; pause is not valid from this state.",
+            run.state
+        ));
+    }
+    append_run_transition_event(
+        store,
+        run_id,
+        run.correlation_id,
+        run.state,
+        RunState::RunBlocked,
+        "run.blocked",
+        reason,
+        Some(format!("{run_id}:operator_pause")),
+    )?;
+    Ok(format!(
+        "Run {run_id} transitioned {:?} -> RunBlocked (reason: {reason}).",
+        run.state
+    ))
+}
+
+fn execute_run_resume_control(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    reason: &str,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    if run.state == RunState::RunActive {
+        return Ok(format!("Run {run_id} is already active."));
+    }
+    if !run.state.can_transition_to(RunState::RunActive) {
+        return Ok(format!(
+            "Run {run_id} is {:?}; resume is not valid from this state.",
+            run.state
+        ));
+    }
+    append_run_transition_event(
+        store,
+        run_id,
+        run.correlation_id,
+        run.state,
+        RunState::RunActive,
+        "run.activated",
+        reason,
+        Some(format!("{run_id}:operator_resume")),
+    )?;
+    Ok(format!(
+        "Run {run_id} transitioned {:?} -> RunActive (reason: {reason}).",
+        run.state
+    ))
+}
+
+fn execute_run_cancel_control(
+    store: &dyn EventStore,
+    queue: &dyn TaskQueue,
+    run_id: Uuid,
+    reason: &str,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    if run.state.is_terminal() {
+        return Ok(format!(
+            "Run {run_id} is already terminal ({:?}).",
+            run.state
+        ));
+    }
+    if !run.state.can_transition_to(RunState::RunCancelled) {
+        return Ok(format!(
+            "Run {run_id} is {:?}; cancel is not valid from this state.",
+            run.state
+        ));
+    }
+
+    let mut cancelled_tasks = 0usize;
+    for task in &run.tasks {
+        if task.state.is_terminal() || !task.state.can_transition_to(TaskState::TaskCancelled) {
+            continue;
+        }
+        append_task_cancelled_event(store, task, reason)?;
+        cancelled_tasks += 1;
+    }
+
+    append_run_transition_event(
+        store,
+        run_id,
+        run.correlation_id,
+        run.state,
+        RunState::RunCancelled,
+        "run.cancelled",
+        reason,
+        Some(format!("{run_id}:operator_cancelled")),
+    )?;
+    let queue_cancelled = queue.cancel_for_run(run_id)?;
+    Ok(format!(
+        "Run {run_id} transitioned {:?} -> RunCancelled (reason: {reason}); cancelled {cancelled_tasks} task(s), drained {queue_cancelled} queue entry(ies).",
+        run.state
+    ))
+}
+
+fn cmd_run_pause(run_id: Option<&str>, all_active: bool, reason: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_writes("run pause")?;
+    let output = with_event_store_and_queue(&loaded_config, |store, _queue| {
+        let targets = select_run_targets_for_control(
+            store,
+            run_id,
+            all_active,
+            &[RunState::RunActive, RunState::RunVerifying],
+            "all-active",
+            "pause",
+        )?;
+        let mut lines = Vec::new();
+        for run_id in targets {
+            lines.push(execute_run_pause_control(store, run_id, reason)?);
+        }
+        Ok(lines.join("\n"))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+fn cmd_run_resume(run_id: Option<&str>, all_paused: bool, reason: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_writes("run resume")?;
+    let output = with_event_store_and_queue(&loaded_config, |store, _queue| {
+        let targets = select_run_targets_for_control(
+            store,
+            run_id,
+            all_paused,
+            &[RunState::RunBlocked],
+            "all-paused",
+            "resume",
+        )?;
+        let mut lines = Vec::new();
+        for run_id in targets {
+            lines.push(execute_run_resume_control(store, run_id, reason)?);
+        }
+        Ok(lines.join("\n"))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+fn cmd_run_cancel(run_id: Option<&str>, all_active: bool, reason: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_writes("run cancel")?;
+    let output = with_event_store_and_queue(&loaded_config, |store, queue| {
+        let targets = if let Some(raw_run_id) = run_id {
+            vec![resolve_run_id_input(store, raw_run_id)?]
+        } else {
+            select_run_targets_for_control(
+                store,
+                None,
+                all_active,
+                &[RunState::RunActive, RunState::RunVerifying],
+                "all-active",
+                "cancel",
+            )?
+        };
+        let mut lines = Vec::new();
+        for run_id in targets {
+            lines.push(execute_run_cancel_control(store, queue, run_id, reason)?);
+        }
+        Ok(lines.join("\n"))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
 /// Render a table of all runs discovered in the event store.
 fn render_run_list(store: &dyn EventStore) -> Result<String> {
     let run_events = query_events(store, &EventQuery::by_entity_type(EntityType::Run))?;
@@ -7554,6 +10380,11 @@ fn render_run_list(store: &dyn EventStore) -> Result<String> {
     let mut task_states: HashMap<String, HashMap<String, TaskState>> = HashMap::new();
     for event in &task_events {
         if let Some(run_id) = corr_to_run.get(&event.correlation_id) {
+            if let Some((_, _, updated_at, _)) = runs.get_mut(run_id) {
+                if event.occurred_at > *updated_at {
+                    *updated_at = event.occurred_at;
+                }
+            }
             let tasks = task_states.entry(run_id.clone()).or_default();
             if let Some(state) = task_state_from_event(event) {
                 tasks.insert(event.entity_id.clone(), state);
@@ -8150,6 +10981,9 @@ mod tests {
         assert!(raw.contains("max_task_total_tokens"));
         assert!(raw.contains("[ui]"));
         assert!(raw.contains("mode = \"auto\""));
+        assert!(raw.contains("[features]"));
+        assert!(raw.contains("parallel = true"));
+        assert!(raw.contains("worktree_root"));
     }
 
     #[test]
@@ -8214,6 +11048,8 @@ mod tests {
             "queue.git_cap",
             "queue.tool_cap",
             "execution.working_dir",
+            "execution.worktree_root",
+            "execution.worktree_exclude_paths",
             "execution.command_timeout_seconds",
             "execution.tick_interval_ms",
             "execution.runner",
@@ -8223,10 +11059,18 @@ mod tests {
             "execution.overwatch.silent_timeout_seconds",
             "execution.overwatch.max_log_bytes",
             "run.prompt_file",
+            "run.objective",
             "run.continue_wait_timeout_seconds",
             "run.allow_stable_auto_advance",
             "run.auto_advance_policy",
             "run.max_auto_advance_tranches",
+            "run.enable_plan_tranche_grouping",
+            "run.max_grouped_tasks_per_tranche",
+            "run.enforce_plan_tranche_allowed_paths",
+            "run.tasks",
+            "run.tranches",
+            "run.plan_guard.target",
+            "run.plan_guard.mode",
             "run.default_pace",
             "run.paces.<name>.cmds",
             "run.paces.<name>.working_dir",
@@ -8268,6 +11112,1681 @@ mod tests {
     }
 
     #[test]
+    fn parallel_workspace_contract_requires_worktree_root_when_parallel_enabled() {
+        let loaded = write_test_config(
+            r#"
+[features]
+parallel = true
+
+[execution]
+working_dir = "."
+"#,
+        );
+
+        let err = ensure_parallel_workspace_contract(&loaded).unwrap_err();
+        assert!(err.to_string().contains("execution].worktree_root"));
+    }
+
+    #[test]
+    fn parallel_workspace_contract_allows_parallel_disabled_without_worktree_root() {
+        let loaded = write_test_config(
+            r#"
+[features]
+parallel = false
+"#,
+        );
+
+        ensure_parallel_workspace_contract(&loaded).unwrap();
+    }
+
+    #[test]
+    fn resolve_execution_path_from_cwd_expands_env_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let env_key = format!("YARLI_TEST_EXEC_PATH_{}", Uuid::now_v7().simple());
+        std::env::set_var(&env_key, temp_dir.path());
+        let tokenized = format!("${{{env_key}}}/nested");
+        let resolved =
+            resolve_execution_path_from_cwd(&tokenized, "execution.worktree_root").unwrap();
+        std::env::remove_var(&env_key);
+        assert_eq!(resolved, temp_dir.path().join("nested"));
+    }
+
+    #[test]
+    fn resolve_execution_path_from_cwd_expands_tilde_prefix() {
+        let Some(home) = home_directory_for_expansion() else {
+            return;
+        };
+
+        let resolved = resolve_execution_path_from_cwd("~/yarli-tmp", "execution.working_dir")
+            .expect("tilde expansion should succeed when HOME/USERPROFILE is set");
+        assert_eq!(resolved, home.join("yarli-tmp"));
+    }
+
+    #[test]
+    fn prepare_parallel_workspace_layout_creates_task_workspaces() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(repo.join("sdks/rust_sdk/target")).unwrap();
+        std::fs::create_dir_all(repo.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(repo.join(".venv/lib")).unwrap();
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        std::fs::write(repo.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            repo.join("sdks/rust_sdk/target/cache.bin"),
+            "compiled artifact",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("node_modules/pkg/index.js"),
+            "module.exports = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".venv/lib/python"), "python").unwrap();
+
+        let config_path = temp_dir.path().join("yarli.toml");
+        let config = format!(
+            r#"
+[features]
+parallel = true
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+            repo.display(),
+            repo.join(".yarl/workspaces").display()
+        );
+        let loaded = write_test_config_at(&config_path, &config);
+
+        let task = PlannedTask {
+            task_key: "I1".to_string(),
+            command: "echo one".to_string(),
+            command_class: CommandClass::Io,
+            tranche_key: None,
+            tranche_group: None,
+            allowed_paths: Vec::new(),
+        };
+        let plan = RunPlan {
+            objective: "test".to_string(),
+            tasks: vec![
+                task.clone(),
+                PlannedTask {
+                    task_key: "I2".to_string(),
+                    command: "echo two".to_string(),
+                    ..task
+                },
+            ],
+            task_catalog: Vec::new(),
+            workdir: repo.display().to_string(),
+            timeout_secs: 60,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: Vec::new(),
+            current_tranche_index: None,
+        };
+
+        let layout = prepare_parallel_workspace_layout(&plan, &loaded)
+            .unwrap()
+            .expect("parallel workspace layout should be present");
+        assert_eq!(layout.task_workspace_dirs.len(), 2);
+        for workspace in &layout.task_workspace_dirs {
+            assert!(workspace.exists());
+            assert!(workspace.join("README.md").exists());
+            assert!(workspace.join("src/main.rs").exists());
+            assert!(
+                !workspace.join("sdks/rust_sdk/target/cache.bin").exists(),
+                "workspace clone should exclude target directories by default"
+            );
+            assert!(
+                !workspace.join("node_modules/pkg/index.js").exists(),
+                "workspace clone should exclude node_modules directories by default"
+            );
+            assert!(
+                !workspace.join(".venv/lib/python").exists(),
+                "workspace clone should exclude virtualenv directories by default"
+            );
+            assert!(
+                !workspace.join(".yarl/workspaces").exists(),
+                "workspace clone should exclude nested worktree root to avoid recursion"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_parallel_workspace_layout_ignores_excluded_names_in_repo_ancestors() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("target").join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let config_path = temp_dir.path().join("yarli.toml");
+        let config = format!(
+            r#"
+[features]
+parallel = true
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+            repo.display(),
+            repo.join(".yarl/workspaces").display()
+        );
+        let loaded = write_test_config_at(&config_path, &config);
+        let plan = RunPlan {
+            objective: "test".to_string(),
+            tasks: vec![PlannedTask {
+                task_key: "I1".to_string(),
+                command: "echo one".to_string(),
+                command_class: CommandClass::Io,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
+            }],
+            task_catalog: Vec::new(),
+            workdir: repo.display().to_string(),
+            timeout_secs: 60,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: Vec::new(),
+            current_tranche_index: None,
+        };
+
+        let layout = prepare_parallel_workspace_layout(&plan, &loaded)
+            .unwrap()
+            .expect("parallel workspace layout should be present");
+        assert_eq!(layout.task_workspace_dirs.len(), 1);
+        assert!(
+            layout.task_workspace_dirs[0].join("src/main.rs").exists(),
+            "repo ancestor named `target` should not trigger workspace exclusions"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_copy_exclusions_supports_paths_and_dir_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let loaded = write_test_config_at(
+            &temp_dir.path().join("yarli.toml"),
+            r#"
+[execution]
+worktree_exclude_paths = ["target", "**/dist", "sdks/rust_sdk/target"]
+"#,
+        );
+
+        let (roots, dir_names) = resolve_workspace_copy_exclusions(&source, &loaded);
+        assert!(dir_names.iter().any(|name| name == "target"));
+        assert!(dir_names.iter().any(|name| name == "dist"));
+        assert!(roots
+            .iter()
+            .any(|root| root == &source.join("sdks/rust_sdk/target")));
+    }
+
+    #[test]
+    fn prepare_parallel_workspace_layout_rejects_equal_root_and_workdir() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+
+        let config_path = temp_dir.path().join("yarli.toml");
+        let config = format!(
+            r#"
+[features]
+parallel = true
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+            repo.display(),
+            repo.display()
+        );
+        let loaded = write_test_config_at(&config_path, &config);
+
+        let plan = RunPlan {
+            objective: "test".to_string(),
+            tasks: vec![PlannedTask {
+                task_key: "I1".to_string(),
+                command: "echo one".to_string(),
+                command_class: CommandClass::Io,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
+            }],
+            task_catalog: Vec::new(),
+            workdir: repo.display().to_string(),
+            timeout_secs: 60,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: Vec::new(),
+            current_tranche_index: None,
+        };
+
+        let err = prepare_parallel_workspace_layout(&plan, &loaded).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("execution.worktree_root must not equal execution.working_dir"));
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_applies_non_conflicting_workspace_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("alpha.txt"), "alpha base\n").unwrap();
+        std::fs::write(source_repo.join("beta.txt"), "beta base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace_one = temp_dir.path().join("workspace-one");
+        let workspace_two = temp_dir.path().join("workspace-two");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_one_str = workspace_one.to_str().unwrap();
+        let workspace_two_str = workspace_two.to_str().unwrap();
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_one_str],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_two_str],
+        );
+
+        std::fs::write(
+            workspace_one.join("alpha.txt"),
+            "alpha merged from workspace one\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_two.join("beta.txt"),
+            "beta merged from workspace two\n",
+        )
+        .unwrap();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[
+                ("task-alpha".to_string(), workspace_one.clone()),
+                ("task-beta".to_string(), workspace_two.clone()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.merged_task_keys,
+            vec!["task-alpha".to_string(), "task-beta".to_string()]
+        );
+        assert!(report.skipped_task_keys.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("alpha.txt")).unwrap(),
+            "alpha merged from workspace one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("beta.txt")).unwrap(),
+            "beta merged from workspace two\n"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_merges_staged_only_workspace_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("alpha.txt"), "alpha base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace-one");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_str = workspace.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_repo_str, workspace_str]);
+
+        std::fs::write(workspace.join("alpha.txt"), "alpha staged-only change\n").unwrap();
+        run_git_expect_ok(&workspace, &["add", "alpha.txt"]);
+        let (_ok, status_stdout, _stderr) = run_git(&workspace, &["status", "--porcelain"]);
+        assert!(
+            status_stdout.starts_with("M  alpha.txt"),
+            "expected staged-only workspace change, got: {status_stdout:?}"
+        );
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[("task-alpha".to_string(), workspace.clone())],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged_task_keys, vec!["task-alpha".to_string()]);
+        assert!(report.skipped_task_keys.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("alpha.txt")).unwrap(),
+            "alpha staged-only change\n"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_ignores_baseline_untracked_artifacts() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("alpha.txt"), "alpha base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace_one = temp_dir.path().join("workspace-one");
+        let workspace_two = temp_dir.path().join("workspace-two");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_one_str = workspace_one.to_str().unwrap();
+        let workspace_two_str = workspace_two.to_str().unwrap();
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_one_str],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_two_str],
+        );
+
+        let artifact_rel = Path::new("tmp/cache.bin");
+        let source_artifact = source_repo.join(artifact_rel);
+        let ws1_artifact = workspace_one.join(artifact_rel);
+        let ws2_artifact = workspace_two.join(artifact_rel);
+        std::fs::create_dir_all(source_artifact.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ws1_artifact.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ws2_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&source_artifact, "baseline artifact\n").unwrap();
+        std::fs::write(&ws1_artifact, "baseline artifact\n").unwrap();
+        std::fs::write(&ws2_artifact, "baseline artifact\n").unwrap();
+
+        std::fs::write(workspace_one.join("alpha.txt"), "alpha merged by task\n").unwrap();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[
+                ("task-alpha".to_string(), workspace_one.clone()),
+                ("task-beta".to_string(), workspace_two.clone()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged_task_keys, vec!["task-alpha".to_string()]);
+        assert_eq!(report.skipped_task_keys, vec!["task-beta".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("alpha.txt")).unwrap(),
+            "alpha merged by task\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_artifact).unwrap(),
+            "baseline artifact\n"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_ignores_unrelated_tracked_drift() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("alpha.txt"), "alpha base\n").unwrap();
+        std::fs::write(source_repo.join("beta.txt"), "beta base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace_one = temp_dir.path().join("workspace-one");
+        let workspace_two = temp_dir.path().join("workspace-two");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_one_str = workspace_one.to_str().unwrap();
+        let workspace_two_str = workspace_two.to_str().unwrap();
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_one_str],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_two_str],
+        );
+
+        std::fs::write(source_repo.join("beta.txt"), "beta local drift\n").unwrap();
+        std::fs::write(workspace_one.join("beta.txt"), "beta local drift\n").unwrap();
+        std::fs::write(workspace_two.join("beta.txt"), "beta local drift\n").unwrap();
+
+        std::fs::write(
+            workspace_one.join("alpha.txt"),
+            "alpha merged from workspace one\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_two.join("gamma.txt"),
+            "gamma from workspace two\n",
+        )
+        .unwrap();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[
+                ("task-alpha".to_string(), workspace_one.clone()),
+                ("task-gamma".to_string(), workspace_two.clone()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.merged_task_keys,
+            vec!["task-alpha".to_string(), "task-gamma".to_string()]
+        );
+        assert!(report.skipped_task_keys.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("alpha.txt")).unwrap(),
+            "alpha merged from workspace one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("gamma.txt")).unwrap(),
+            "gamma from workspace two\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("beta.txt")).unwrap(),
+            "beta local drift\n"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_merges_non_overlapping_hunks_in_same_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        let baseline = "line1\nline2\nline3\nline4\nline5\nline6\n";
+        std::fs::write(source_repo.join("shared.txt"), baseline).unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace_one = temp_dir.path().join("workspace-one");
+        let workspace_two = temp_dir.path().join("workspace-two");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_one_str = workspace_one.to_str().unwrap();
+        let workspace_two_str = workspace_two.to_str().unwrap();
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_one_str],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_two_str],
+        );
+
+        std::fs::write(
+            workspace_one.join("shared.txt"),
+            "line1\nline2 task-one\nline3\nline4\nline5\nline6\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_two.join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5 task-two\nline6\n",
+        )
+        .unwrap();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[
+                ("task-one".to_string(), workspace_one.clone()),
+                ("task-two".to_string(), workspace_two.clone()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            report.merged_task_keys,
+            vec!["task-one".to_string(), "task-two".to_string()]
+        );
+        assert!(report.skipped_task_keys.is_empty());
+
+        let merged = std::fs::read_to_string(source_repo.join("shared.txt")).unwrap();
+        assert!(
+            merged.contains("line2 task-one"),
+            "merged contents: {merged}"
+        );
+        assert!(
+            merged.contains("line5 task-two"),
+            "merged contents: {merged}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_parallel_workspace_results_applies_permission_only_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        let script_path = source_repo.join("script.sh");
+        std::fs::write(&script_path, "#!/usr/bin/env bash\necho hi\n").unwrap();
+        let mut source_perms = std::fs::metadata(&script_path).unwrap().permissions();
+        source_perms.set_mode(0o644);
+        std::fs::set_permissions(&script_path, source_perms).unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace-one");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_str = workspace.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_repo_str, workspace_str]);
+
+        let workspace_script = workspace.join("script.sh");
+        let mut workspace_perms = std::fs::metadata(&workspace_script).unwrap().permissions();
+        workspace_perms.set_mode(0o755);
+        std::fs::set_permissions(&workspace_script, workspace_perms).unwrap();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[("task-mode".to_string(), workspace.clone())],
+        )
+        .unwrap();
+        assert_eq!(report.merged_task_keys, vec!["task-mode".to_string()]);
+        assert!(report.skipped_task_keys.is_empty());
+
+        let source_mode = std::fs::metadata(script_path).unwrap().permissions().mode();
+        assert_ne!(
+            source_mode & 0o111,
+            0,
+            "expected executable bit to be merged"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_returns_error_on_conflicting_workspace_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("shared.txt"), "base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace_one = temp_dir.path().join("workspace-one");
+        let workspace_two = temp_dir.path().join("workspace-two");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_one_str = workspace_one.to_str().unwrap();
+        let workspace_two_str = workspace_two.to_str().unwrap();
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_one_str],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_two_str],
+        );
+
+        std::fs::write(workspace_one.join("shared.txt"), "workspace one change\n").unwrap();
+        std::fs::write(workspace_two.join("shared.txt"), "workspace two change\n").unwrap();
+
+        let run_id = Uuid::now_v7();
+        let err = merge_parallel_workspace_results(
+            &source_repo,
+            run_id,
+            &run_workspace_root,
+            &[
+                ("task-one".to_string(), workspace_one.clone()),
+                ("task-two".to_string(), workspace_two.clone()),
+            ],
+        )
+        .unwrap_err();
+
+        let err_text = err.to_string();
+        assert!(err_text.contains("task task-two"), "{err_text}");
+        assert!(err_text.contains("Operator recovery steps"), "{err_text}");
+        let note_path = run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+        assert!(
+            note_path.exists(),
+            "expected recovery note at {}",
+            note_path.display()
+        );
+        let note = std::fs::read_to_string(&note_path).unwrap();
+        assert!(note.contains(&run_id.to_string()));
+        assert!(note.contains("task-two"));
+        let merged_contents = std::fs::read_to_string(source_repo.join("shared.txt")).unwrap();
+        assert!(
+            merged_contents.contains("<<<<<<<"),
+            "expected conflict markers in merge result: {merged_contents}"
+        );
+        assert!(
+            merged_contents.contains("workspace one change"),
+            "expected first workspace change to remain visible: {merged_contents}"
+        );
+        assert!(
+            merged_contents.contains("workspace two change"),
+            "expected second workspace change to remain visible: {merged_contents}"
+        );
+    }
+
+    /// Integration test 7: 3 workspaces merging non-conflicting edits to different files
+    /// plus a new file addition, verifying all 3 changes land.
+    #[test]
+    fn parallel_workspace_merge_three_workspaces_with_new_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("alpha.txt"), "alpha base\n").unwrap();
+        std::fs::write(source_repo.join("beta.txt"), "beta base\n").unwrap();
+        std::fs::write(source_repo.join("gamma.txt"), "gamma base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let ws1 = temp_dir.path().join("ws1");
+        let ws2 = temp_dir.path().join("ws2");
+        let ws3 = temp_dir.path().join("ws3");
+        let source_str = source_repo.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws1.to_str().unwrap()]);
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws2.to_str().unwrap()]);
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws3.to_str().unwrap()]);
+
+        // ws1 edits alpha
+        std::fs::write(ws1.join("alpha.txt"), "alpha modified by ws1\n").unwrap();
+        // ws2 edits beta
+        std::fs::write(ws2.join("beta.txt"), "beta modified by ws2\n").unwrap();
+        // ws3 adds delta.txt (new file)
+        std::fs::write(ws3.join("delta.txt"), "delta new file from ws3\n").unwrap();
+
+        let run_id = Uuid::now_v7();
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            run_id,
+            &run_workspace_root,
+            &[
+                ("task-alpha".to_string(), ws1.clone()),
+                ("task-beta".to_string(), ws2.clone()),
+                ("task-delta".to_string(), ws3.clone()),
+            ],
+        )
+        .unwrap();
+
+        // All 3 task keys should be merged
+        assert_eq!(report.merged_task_keys.len(), 3);
+        assert!(report.merged_task_keys.contains(&"task-alpha".to_string()));
+        assert!(report.merged_task_keys.contains(&"task-beta".to_string()));
+        assert!(report.merged_task_keys.contains(&"task-delta".to_string()));
+        assert!(report.skipped_task_keys.is_empty());
+
+        // Source repo should have all changes
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("alpha.txt")).unwrap(),
+            "alpha modified by ws1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("beta.txt")).unwrap(),
+            "beta modified by ws2\n"
+        );
+        assert!(
+            source_repo.join("delta.txt").exists(),
+            "delta.txt should exist in source repo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("delta.txt")).unwrap(),
+            "delta new file from ws3\n"
+        );
+
+        // gamma.txt should remain unchanged
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("gamma.txt")).unwrap(),
+            "gamma base\n"
+        );
+
+        // No conflict markers in any file
+        for filename in ["alpha.txt", "beta.txt", "gamma.txt", "delta.txt"] {
+            let contents = std::fs::read_to_string(source_repo.join(filename)).unwrap();
+            assert!(
+                !contents.contains("<<<<<<<"),
+                "no conflict markers expected in {filename}: {contents}"
+            );
+        }
+
+        // Patch files should be persisted for recovery
+        let merge_patches = run_workspace_root.join("merge-patches");
+        assert!(
+            merge_patches.exists(),
+            "merge-patches directory should exist at {}",
+            merge_patches.display()
+        );
+    }
+
+    /// Integration test 8: Deletions, permissions, same-file non-overlapping hunks combined.
+    #[test]
+    fn parallel_workspace_edge_cases_combined() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        // Create main.rs with 20 lines (enough separation for non-overlapping hunks)
+        let mut main_rs_lines: Vec<String> = (1..=20)
+            .map(|i| format!("line {i}: original content"))
+            .collect();
+        let main_rs_content = main_rs_lines.join("\n") + "\n";
+        std::fs::write(source_repo.join("main.rs"), &main_rs_content).unwrap();
+        std::fs::write(source_repo.join("lib.rs"), "// library code\n").unwrap();
+        std::fs::write(source_repo.join("test.rs"), "// test code\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let ws1 = temp_dir.path().join("ws1");
+        let ws2 = temp_dir.path().join("ws2");
+        let source_str = source_repo.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws1.to_str().unwrap()]);
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws2.to_str().unwrap()]);
+
+        // ws1: edit main.rs lines 1-3 (top), delete test.rs
+        main_rs_lines[0] = "line 1: ws1 edit".to_string();
+        main_rs_lines[1] = "line 2: ws1 edit".to_string();
+        main_rs_lines[2] = "line 3: ws1 edit".to_string();
+        let ws1_main = main_rs_lines.join("\n") + "\n";
+        std::fs::write(ws1.join("main.rs"), &ws1_main).unwrap();
+        std::fs::remove_file(ws1.join("test.rs")).unwrap();
+
+        // ws2: edit main.rs lines 18-20 (bottom, non-overlapping), make lib.rs executable
+        // Reset main_rs_lines to original for ws2
+        let mut ws2_lines: Vec<String> = (1..=20)
+            .map(|i| format!("line {i}: original content"))
+            .collect();
+        ws2_lines[17] = "line 18: ws2 edit".to_string();
+        ws2_lines[18] = "line 19: ws2 edit".to_string();
+        ws2_lines[19] = "line 20: ws2 edit".to_string();
+        let ws2_main = ws2_lines.join("\n") + "\n";
+        std::fs::write(ws2.join("main.rs"), &ws2_main).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lib_rs = ws2.join("lib.rs");
+            let mut perms = std::fs::metadata(&lib_rs).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&lib_rs, perms).unwrap();
+        }
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[
+                ("task-ws1".to_string(), ws1.clone()),
+                ("task-ws2".to_string(), ws2.clone()),
+            ],
+        )
+        .unwrap();
+
+        // Both workspaces should merge successfully
+        assert_eq!(report.merged_task_keys.len(), 2);
+        assert!(report.skipped_task_keys.is_empty());
+
+        // test.rs should be deleted in source
+        assert!(
+            !source_repo.join("test.rs").exists(),
+            "test.rs should be deleted from source"
+        );
+
+        // main.rs should contain both ws1 and ws2 edits (non-overlapping hunks)
+        let merged_main = std::fs::read_to_string(source_repo.join("main.rs")).unwrap();
+        assert!(
+            merged_main.contains("line 1: ws1 edit"),
+            "main.rs should have ws1 edits at top: {merged_main}"
+        );
+        assert!(
+            merged_main.contains("line 2: ws1 edit"),
+            "main.rs should have ws1 edits: {merged_main}"
+        );
+        assert!(
+            merged_main.contains("line 18: ws2 edit"),
+            "main.rs should have ws2 edits at bottom: {merged_main}"
+        );
+        assert!(
+            merged_main.contains("line 20: ws2 edit"),
+            "main.rs should have ws2 edits: {merged_main}"
+        );
+
+        // No conflict markers
+        assert!(
+            !merged_main.contains("<<<<<<<"),
+            "no conflict markers in main.rs: {merged_main}"
+        );
+
+        // lib.rs should have executable bit (unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lib_mode = std::fs::metadata(source_repo.join("lib.rs"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(
+                lib_mode & 0o111,
+                0,
+                "lib.rs should have executable bit set"
+            );
+        }
+    }
+
+    /// Integration test 9: Two workspaces both create the same new file and both edit the
+    /// same existing file at non-overlapping locations. Reproduces the production failure
+    /// where `git apply` refuses with "already exists in working directory" for new files
+    /// and "patch does not apply" for context mismatches.
+    #[test]
+    fn parallel_workspace_merge_overlapping_new_files_and_edits() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        // Create PLAN.md with 30 lines — enough separation for non-overlapping hunks
+        let plan_lines: Vec<String> = (1..=30)
+            .map(|i| format!("plan line {i}: original content"))
+            .collect();
+        let plan_content = plan_lines.join("\n") + "\n";
+        std::fs::write(source_repo.join("PLAN.md"), &plan_content).unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let ws1 = temp_dir.path().join("ws1");
+        let ws2 = temp_dir.path().join("ws2");
+        let source_str = source_repo.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws1.to_str().unwrap()]);
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws2.to_str().unwrap()]);
+
+        // ws1: create .evidence/report.md + edit PLAN.md lines 1-3
+        std::fs::create_dir_all(ws1.join(".evidence")).unwrap();
+        std::fs::write(ws1.join(".evidence/report.md"), "ws1 report content\n").unwrap();
+        let mut ws1_plan = plan_lines.clone();
+        for i in 0..3 {
+            ws1_plan[i] = format!("plan line {}: ws1 edit", i + 1);
+        }
+        std::fs::write(ws1.join("PLAN.md"), ws1_plan.join("\n") + "\n").unwrap();
+
+        // ws2: create .evidence/report.md (same path!) + edit PLAN.md lines 28-30
+        std::fs::create_dir_all(ws2.join(".evidence")).unwrap();
+        std::fs::write(ws2.join(".evidence/report.md"), "ws2 report content\n").unwrap();
+        let mut ws2_plan = plan_lines.clone();
+        for i in 27..30 {
+            ws2_plan[i] = format!("plan line {}: ws2 edit", i + 1);
+        }
+        std::fs::write(ws2.join("PLAN.md"), ws2_plan.join("\n") + "\n").unwrap();
+
+        let run_id = Uuid::now_v7();
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            run_id,
+            &run_workspace_root,
+            &[
+                ("task-ws1".to_string(), ws1.clone()),
+                ("task-ws2".to_string(), ws2.clone()),
+            ],
+        )
+        .expect("merge should succeed despite overlapping new files and edits");
+
+        assert_eq!(report.merged_task_keys.len(), 2);
+        assert!(report.skipped_task_keys.is_empty());
+
+        // .evidence/report.md should exist — ws2's version wins (merged second)
+        let report_content =
+            std::fs::read_to_string(source_repo.join(".evidence/report.md")).unwrap();
+        assert_eq!(
+            report_content, "ws2 report content\n",
+            "ws2 (merged second) should overwrite ws1's version of the new file"
+        );
+
+        // PLAN.md should contain both ws1 and ws2 edits (non-overlapping hunks via --3way)
+        let merged_plan = std::fs::read_to_string(source_repo.join("PLAN.md")).unwrap();
+        assert!(
+            merged_plan.contains("plan line 1: ws1 edit"),
+            "PLAN.md should have ws1 edits at top: {merged_plan}"
+        );
+        assert!(
+            merged_plan.contains("plan line 3: ws1 edit"),
+            "PLAN.md should have ws1 edits: {merged_plan}"
+        );
+        assert!(
+            merged_plan.contains("plan line 28: ws2 edit"),
+            "PLAN.md should have ws2 edits at bottom: {merged_plan}"
+        );
+        assert!(
+            merged_plan.contains("plan line 30: ws2 edit"),
+            "PLAN.md should have ws2 edits: {merged_plan}"
+        );
+
+        // No conflict markers
+        assert!(
+            !merged_plan.contains("<<<<<<<"),
+            "no conflict markers expected in PLAN.md: {merged_plan}"
+        );
+    }
+
+    /// Integration test 10: Simulates cross-run dirty state where the source working tree
+    /// has uncommitted changes from a prior merge, and a new workspace patch has context
+    /// drift on the same file plus creates a new file that already exists in source.
+    /// Reproduces the production failure where --3way --check rejects the patch with
+    /// "does not match index" but --3way apply would actually succeed via 3-way merge.
+    #[test]
+    fn parallel_workspace_merge_with_prior_dirty_state_and_context_drift() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        // Create PLAN.md with 30 lines
+        let plan_lines: Vec<String> = (1..=30)
+            .map(|i| format!("plan line {i}: original"))
+            .collect();
+        std::fs::write(source_repo.join("PLAN.md"), plan_lines.join("\n") + "\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        // --- Simulate run 1 merge: modify source working tree (uncommitted) ---
+        // This represents a prior yarli run's merge that modified lines 1-3 and created a report.
+        let mut prior_plan = plan_lines.clone();
+        for i in 0..3 {
+            prior_plan[i] = format!("plan line {}: prior run edit", i + 1);
+        }
+        std::fs::write(source_repo.join("PLAN.md"), prior_plan.join("\n") + "\n").unwrap();
+        std::fs::create_dir_all(source_repo.join(".evidence")).unwrap();
+        std::fs::write(
+            source_repo.join(".evidence/report.md"),
+            "prior run report\n",
+        )
+        .unwrap();
+        // Commit the changes (simulating the temp commit after a prior run's merge)
+        run_git_expect_ok(&source_repo, &["add", "PLAN.md", ".evidence/report.md"]);
+        run_git_expect_ok(
+            &source_repo,
+            &["commit", "--no-verify", "-m", "yarli: merge prior run"],
+        );
+
+        // --- Now simulate run 2: clone from HEAD (not the dirty state) ---
+        let ws = temp_dir.path().join("ws-run2");
+        let source_str = source_repo.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws.to_str().unwrap()]);
+
+        // ws modifies lines 25-27 (non-overlapping with prior run's 1-3) and creates
+        // a new version of .evidence/report.md. The workspace cloned from the committed
+        // state, so it already has the prior run's edits in lines 1-3.
+        let mut ws_plan = prior_plan.clone();
+        for i in 24..27 {
+            ws_plan[i] = format!("plan line {}: run2 edit", i + 1);
+        }
+        std::fs::write(ws.join("PLAN.md"), ws_plan.join("\n") + "\n").unwrap();
+        std::fs::create_dir_all(ws.join(".evidence")).unwrap();
+        std::fs::write(ws.join(".evidence/report.md"), "run2 report\n").unwrap();
+
+        let run_workspace_root = temp_dir.path().join("parallel-run2");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+        let run_id = Uuid::now_v7();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            run_id,
+            &run_workspace_root,
+            &[("task-run2".to_string(), ws.clone())],
+        )
+        .expect("merge should succeed despite dirty source state and context drift");
+
+        assert_eq!(report.merged_task_keys, vec!["task-run2".to_string()]);
+
+        // PLAN.md should have both prior run edits (lines 1-3) and run2 edits (lines 25-27)
+        let merged = std::fs::read_to_string(source_repo.join("PLAN.md")).unwrap();
+        assert!(
+            merged.contains("plan line 1: prior run edit"),
+            "should preserve prior run edits: {merged}"
+        );
+        assert!(
+            merged.contains("plan line 25: run2 edit"),
+            "should have run2 edits: {merged}"
+        );
+        assert!(
+            !merged.contains("<<<<<<<"),
+            "no conflict markers expected: {merged}"
+        );
+
+        // .evidence/report.md should be run2's version (overwrites prior)
+        let report_content =
+            std::fs::read_to_string(source_repo.join(".evidence/report.md")).unwrap();
+        assert_eq!(report_content, "run2 report\n");
+    }
+
+    /// Integration test 10b: Pre-existing dirty state (staged + working tree changes)
+    /// from prior yarli runs that did NOT have the temp commit code. The source has
+    /// uncommitted modifications that cause --3way to fail with "does not match index".
+    /// Verifies that the pre-merge dirty state commit resolves this.
+    #[test]
+    fn parallel_workspace_merge_with_preexisting_uncommitted_dirty_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        // Create PLAN.md with 30 lines
+        let plan_lines: Vec<String> = (1..=30)
+            .map(|i| format!("plan line {i}: original"))
+            .collect();
+        std::fs::write(source_repo.join("PLAN.md"), plan_lines.join("\n") + "\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        // --- Simulate old yarli leaving dirty state (no temp commit) ---
+        // Modify lines 1-3 and create .evidence/report.md, stage both but do NOT commit.
+        let mut dirty_plan = plan_lines.clone();
+        for i in 0..3 {
+            dirty_plan[i] = format!("plan line {}: prior dirty edit", i + 1);
+        }
+        std::fs::write(source_repo.join("PLAN.md"), dirty_plan.join("\n") + "\n").unwrap();
+        std::fs::create_dir_all(source_repo.join(".evidence")).unwrap();
+        std::fs::write(
+            source_repo.join(".evidence/report.md"),
+            "prior dirty report\n",
+        )
+        .unwrap();
+        // Stage both files but do NOT commit — this is the key difference from test 10.
+        run_git_expect_ok(&source_repo, &["add", "PLAN.md", ".evidence/report.md"]);
+
+        // --- Clone workspace from source HEAD (committed state, not dirty state) ---
+        let ws = temp_dir.path().join("ws-new-run");
+        let source_str = source_repo.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws.to_str().unwrap()]);
+
+        // Workspace modifies lines 25-27 and creates .evidence/report.md
+        let mut ws_plan = plan_lines.clone();
+        for i in 24..27 {
+            ws_plan[i] = format!("plan line {}: new run edit", i + 1);
+        }
+        std::fs::write(ws.join("PLAN.md"), ws_plan.join("\n") + "\n").unwrap();
+        std::fs::create_dir_all(ws.join(".evidence")).unwrap();
+        std::fs::write(ws.join(".evidence/report.md"), "new run report\n").unwrap();
+
+        let run_workspace_root = temp_dir.path().join("parallel-run-dirty");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+        let run_id = Uuid::now_v7();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            run_id,
+            &run_workspace_root,
+            &[("task-new-run".to_string(), ws.clone())],
+        )
+        .expect("merge should succeed despite pre-existing uncommitted dirty state");
+
+        assert_eq!(report.merged_task_keys, vec!["task-new-run".to_string()]);
+
+        // PLAN.md should have both prior dirty edits (1-3) and new run edits (25-27)
+        let merged = std::fs::read_to_string(source_repo.join("PLAN.md")).unwrap();
+        assert!(
+            merged.contains("plan line 1: prior dirty edit"),
+            "should preserve prior dirty edits: {merged}"
+        );
+        assert!(
+            merged.contains("plan line 3: prior dirty edit"),
+            "should preserve prior dirty edits: {merged}"
+        );
+        assert!(
+            merged.contains("plan line 25: new run edit"),
+            "should have new run edits: {merged}"
+        );
+        assert!(
+            merged.contains("plan line 27: new run edit"),
+            "should have new run edits: {merged}"
+        );
+        assert!(
+            !merged.contains("<<<<<<<"),
+            "no conflict markers expected: {merged}"
+        );
+
+        // .evidence/report.md should be new run's version
+        let report_content =
+            std::fs::read_to_string(source_repo.join(".evidence/report.md")).unwrap();
+        assert_eq!(report_content, "new run report\n");
+    }
+
+    /// Integration test 10c: Dirty state and workspace both modify the SAME region of a
+    /// file (overlapping hunks). Reproduces the production failure where IMPLEMENTATION_PLAN.md
+    /// has prior-run appended entries AND the workspace also appends entries in the same spot.
+    /// The stash pop should conflict on the overlapping file, and we resolve by keeping the
+    /// workspace version while preserving non-conflicting dirty state changes.
+    #[test]
+    fn parallel_workspace_merge_dirty_state_overlapping_with_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        // Create PLAN.md ending with a "### Next" marker, and a separate config file.
+        let plan_content = "\
+plan line 1: original
+plan line 2: original
+plan line 3: original
+### Next Priority Actions
+1. Do the next thing
+";
+        std::fs::write(source_repo.join("PLAN.md"), plan_content).unwrap();
+        std::fs::write(source_repo.join("config.txt"), "key=value\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        // --- Dirty state: prior run appended entries BEFORE "### Next" AND modified config ---
+        let dirty_plan = "\
+plan line 1: original
+plan line 2: original
+plan line 3: original
+4. Prior run entry A
+5. Prior run entry B
+### Next Priority Actions
+1. Do the next thing
+";
+        std::fs::write(source_repo.join("PLAN.md"), dirty_plan).unwrap();
+        std::fs::write(source_repo.join("config.txt"), "key=dirty_value\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "PLAN.md", "config.txt"]);
+        // Do NOT commit — simulates old yarli
+
+        // --- Clone workspace from HEAD (gets original, not dirty) ---
+        let ws = temp_dir.path().join("ws");
+        let source_str = source_repo.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws.to_str().unwrap()]);
+
+        // Workspace appends DIFFERENT entries at the same spot
+        let ws_plan = "\
+plan line 1: original
+plan line 2: original
+plan line 3: original
+10. Workspace entry X
+11. Workspace entry Y
+### Next Priority Actions
+1. Do the next thing
+";
+        std::fs::write(ws.join("PLAN.md"), ws_plan).unwrap();
+
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+        let run_id = Uuid::now_v7();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            run_id,
+            &run_workspace_root,
+            &[("task-overlap".to_string(), ws.clone())],
+        )
+        .expect("merge should succeed despite overlapping dirty state");
+
+        assert_eq!(report.merged_task_keys, vec!["task-overlap".to_string()]);
+
+        let merged = std::fs::read_to_string(source_repo.join("PLAN.md")).unwrap();
+        // Workspace entries must be present (workspace always wins for conflicts)
+        assert!(
+            merged.contains("10. Workspace entry X"),
+            "workspace entries must be present: {merged}"
+        );
+        assert!(
+            merged.contains("11. Workspace entry Y"),
+            "workspace entries must be present: {merged}"
+        );
+        // No conflict markers
+        assert!(
+            !merged.contains("<<<<<<<"),
+            "no conflict markers expected: {merged}"
+        );
+
+        // config.txt should have the dirty value (non-conflicting stash change preserved)
+        let config = std::fs::read_to_string(source_repo.join("config.txt")).unwrap();
+        assert_eq!(
+            config, "key=dirty_value\n",
+            "non-conflicting dirty state should be preserved"
+        );
+    }
+
+    /// End-to-end integration test: full parallel worktree pipeline.
+    ///
+    /// Exercises the complete flow:
+    /// 1. Create a real git repo with tracked files
+    /// 2. Use `prepare_parallel_workspace_layout` to clone per-task workspaces
+    /// 3. Run actual shell commands in those workspaces that modify files
+    ///    (including potentially conflicting edits to the same file)
+    /// 4. Merge all workspace results back to the source repo
+    /// 5. Verify the merged result handles both clean merges and conflicts
+    #[test]
+    fn parallel_worktree_end_to_end_create_execute_merge() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Initialize a real git repo with tracked files
+        run_git_expect_ok(&repo, &["init"]);
+        run_git_expect_ok(&repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&repo, &["config", "user.name", "Yarli Test"]);
+
+        // Create files with enough content for non-overlapping hunk merges
+        let config_content = (1..=10)
+            .map(|i| format!("config_line_{i} = original"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(repo.join("config.txt"), &config_content).unwrap();
+        std::fs::write(repo.join("data.csv"), "id,name,value\n1,alpha,100\n2,beta,200\n").unwrap();
+        std::fs::write(repo.join("README.md"), "# Project\nOriginal readme.\n").unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn hello() { println!(\"hello\"); }\n").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "initial commit"]);
+
+        // Set up workspace layout via prepare_parallel_workspace_layout
+        let config_path = temp_dir.path().join("yarli.toml");
+        let worktree_root = temp_dir.path().join("workspaces");
+        let config_toml = format!(
+            r#"
+[features]
+parallel = true
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+            repo.display(),
+            worktree_root.display()
+        );
+        let loaded = write_test_config_at(&config_path, &config_toml);
+
+        // Plan 3 tasks that will make different changes
+        let tasks = vec![
+            PlannedTask {
+                task_key: "edit-config-top".to_string(),
+                command: "sed -i 's/config_line_1 = original/config_line_1 = modified_by_task1/' config.txt".to_string(),
+                command_class: CommandClass::Io,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
+            },
+            PlannedTask {
+                task_key: "edit-config-bottom".to_string(),
+                command: "sed -i 's/config_line_10 = original/config_line_10 = modified_by_task2/' config.txt".to_string(),
+                command_class: CommandClass::Io,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
+            },
+            PlannedTask {
+                task_key: "add-new-module".to_string(),
+                command: "echo 'pub fn greet() { println!(\"greet\"); }' > src/greet.rs && echo '3,gamma,300' >> data.csv".to_string(),
+                command_class: CommandClass::Io,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
+            },
+        ];
+
+        let plan = RunPlan {
+            objective: "e2e parallel workspace test".to_string(),
+            tasks: tasks.clone(),
+            task_catalog: tasks,
+            workdir: repo.display().to_string(),
+            timeout_secs: 60,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: Vec::new(),
+            current_tranche_index: None,
+        };
+
+        let layout = prepare_parallel_workspace_layout(&plan, &loaded)
+            .unwrap()
+            .expect("should create parallel workspace layout");
+        assert_eq!(layout.task_workspace_dirs.len(), 3);
+
+        // Verify each workspace was cloned correctly
+        for ws in &layout.task_workspace_dirs {
+            assert!(ws.join("config.txt").exists(), "workspace should have config.txt");
+            assert!(ws.join("src/lib.rs").exists(), "workspace should have src/lib.rs");
+            assert!(ws.join("data.csv").exists(), "workspace should have data.csv");
+        }
+
+        // Execute actual commands in each workspace (simulating scheduler execution)
+        for (i, planned_task) in plan.tasks.iter().enumerate() {
+            let ws = &layout.task_workspace_dirs[i];
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&planned_task.command)
+                .current_dir(ws)
+                .output()
+                .expect("command should run");
+            assert!(
+                output.status.success(),
+                "task {:?} command failed: {}",
+                planned_task.task_key,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        // Verify changes landed in their respective workspaces
+        let ws0_config = std::fs::read_to_string(layout.task_workspace_dirs[0].join("config.txt")).unwrap();
+        assert!(ws0_config.contains("config_line_1 = modified_by_task1"), "ws0 should have task1 edit");
+
+        let ws1_config = std::fs::read_to_string(layout.task_workspace_dirs[1].join("config.txt")).unwrap();
+        assert!(ws1_config.contains("config_line_10 = modified_by_task2"), "ws1 should have task2 edit");
+
+        assert!(
+            layout.task_workspace_dirs[2].join("src/greet.rs").exists(),
+            "ws2 should have new src/greet.rs"
+        );
+
+        // Build task_workspaces for merge
+        let task_workspaces: Vec<(String, PathBuf)> = plan
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.task_key.clone(), layout.task_workspace_dirs[i].clone()))
+            .collect();
+
+        let run_id = Uuid::now_v7();
+        let report = merge_parallel_workspace_results(
+            &repo,
+            run_id,
+            &layout.run_workspace_root,
+            &task_workspaces,
+        )
+        .unwrap();
+
+        // All 3 tasks should merge successfully (non-overlapping changes)
+        assert_eq!(
+            report.merged_task_keys.len(),
+            3,
+            "all 3 tasks should merge: {:?}",
+            report.merged_task_keys
+        );
+        assert!(report.skipped_task_keys.is_empty());
+
+        // Verify merged result in source repo
+        let merged_config = std::fs::read_to_string(repo.join("config.txt")).unwrap();
+        assert!(
+            merged_config.contains("config_line_1 = modified_by_task1"),
+            "source should have task1's edit to line 1: {merged_config}"
+        );
+        assert!(
+            merged_config.contains("config_line_10 = modified_by_task2"),
+            "source should have task2's edit to line 10: {merged_config}"
+        );
+        // Lines 2-9 should be untouched
+        assert!(
+            merged_config.contains("config_line_5 = original"),
+            "middle lines should be untouched: {merged_config}"
+        );
+
+        // New file should exist
+        assert!(
+            repo.join("src/greet.rs").exists(),
+            "src/greet.rs should be merged into source"
+        );
+        let greet = std::fs::read_to_string(repo.join("src/greet.rs")).unwrap();
+        assert!(greet.contains("greet"), "greet.rs should have content");
+
+        // data.csv should have the new row
+        let data = std::fs::read_to_string(repo.join("data.csv")).unwrap();
+        assert!(
+            data.contains("3,gamma,300"),
+            "data.csv should have the appended row: {data}"
+        );
+
+        // Original files that were not changed should be intact
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "# Project\nOriginal readme.\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+            "pub fn hello() { println!(\"hello\"); }\n"
+        );
+
+        // No conflict markers in any merged file
+        for path in ["config.txt", "data.csv", "src/greet.rs", "src/lib.rs"] {
+            let contents = std::fs::read_to_string(repo.join(path)).unwrap();
+            assert!(
+                !contents.contains("<<<<<<<"),
+                "no conflict markers expected in {path}"
+            );
+        }
+
+        // Patch files should exist for recovery
+        let merge_patches = layout.run_workspace_root.join("merge-patches");
+        assert!(
+            merge_patches.exists(),
+            "merge-patches dir should exist for recovery"
+        );
+    }
+
+    /// End-to-end test: parallel worktrees with conflicting edits to the same line.
+    ///
+    /// Two workspaces edit the exact same line in the same file.
+    /// This should produce a merge conflict error with recovery guidance.
+    #[test]
+    fn parallel_worktree_end_to_end_conflicting_edits() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        run_git_expect_ok(&repo, &["init"]);
+        run_git_expect_ok(&repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(repo.join("shared.txt"), "line1: original\nline2: original\n").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "initial"]);
+
+        // Set up workspace layout
+        let config_path = temp_dir.path().join("yarli.toml");
+        let worktree_root = temp_dir.path().join("workspaces");
+        let config_toml = format!(
+            r#"
+[features]
+parallel = true
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+            repo.display(),
+            worktree_root.display()
+        );
+        let loaded = write_test_config_at(&config_path, &config_toml);
+
+        let tasks = vec![
+            PlannedTask {
+                task_key: "task-A".to_string(),
+                command: "sed -i 's/line1: original/line1: edited by task A/' shared.txt".to_string(),
+                command_class: CommandClass::Io,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
+            },
+            PlannedTask {
+                task_key: "task-B".to_string(),
+                command: "sed -i 's/line1: original/line1: edited by task B/' shared.txt".to_string(),
+                command_class: CommandClass::Io,
+                tranche_key: None,
+                tranche_group: None,
+                allowed_paths: Vec::new(),
+            },
+        ];
+
+        let plan = RunPlan {
+            objective: "conflicting parallel workspace test".to_string(),
+            tasks: tasks.clone(),
+            task_catalog: tasks,
+            workdir: repo.display().to_string(),
+            timeout_secs: 60,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: Vec::new(),
+            current_tranche_index: None,
+        };
+
+        let layout = prepare_parallel_workspace_layout(&plan, &loaded)
+            .unwrap()
+            .expect("layout should be created");
+
+        // Execute commands in workspaces
+        for (i, t) in plan.tasks.iter().enumerate() {
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&t.command)
+                .current_dir(&layout.task_workspace_dirs[i])
+                .output()
+                .expect("command should run");
+            assert!(output.status.success(), "task {} failed", t.task_key);
+        }
+
+        // Verify both workspaces have conflicting edits
+        let ws0 = std::fs::read_to_string(layout.task_workspace_dirs[0].join("shared.txt")).unwrap();
+        assert!(ws0.contains("edited by task A"));
+        let ws1 = std::fs::read_to_string(layout.task_workspace_dirs[1].join("shared.txt")).unwrap();
+        assert!(ws1.contains("edited by task B"));
+
+        // Merge should fail with conflict
+        let task_workspaces: Vec<(String, PathBuf)> = plan
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.task_key.clone(), layout.task_workspace_dirs[i].clone()))
+            .collect();
+
+        let run_id = Uuid::now_v7();
+        let err = merge_parallel_workspace_results(
+            &repo,
+            run_id,
+            &layout.run_workspace_root,
+            &task_workspaces,
+        )
+        .unwrap_err();
+
+        let err_text = err.to_string();
+        // Should mention the failing task
+        assert!(
+            err_text.contains("task-B"),
+            "error should mention conflicting task: {err_text}"
+        );
+        // Should include recovery guidance
+        assert!(
+            err_text.contains("Operator recovery steps"),
+            "error should include recovery steps: {err_text}"
+        );
+        // First task's patch should have been applied successfully
+        let merged = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert!(
+            merged.contains("task A") || merged.contains("<<<<<<<"),
+            "source should have task A's edit or conflict markers: {merged}"
+        );
+        // Recovery note should exist
+        let note = layout.run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+        assert!(
+            note.exists(),
+            "recovery note should exist at {}",
+            note.display()
+        );
+    }
+
+    #[test]
     fn run_help_mentions_prompt_resolution_precedence() {
         let mut cmd = Cli::command();
         let run = cmd
@@ -8276,13 +12795,210 @@ mod tests {
         let mut help = Vec::new();
         run.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
+        let help_lower = help.to_ascii_lowercase();
         assert!(
             help.contains("--prompt-file")
                 && help.contains("[run].prompt_file")
                 && help.contains("PROMPT.md")
                 && help.contains("yarli run")
-                && help.contains("no subcommand"),
+                && help.contains("no subcommand")
+                && help_lower.contains("built-in yarli policy gates")
+                && help_lower.contains("verification command chain")
+                && help_lower.contains("observer events are telemetry only")
+                && help_lower.contains("pause|resume|cancel"),
             "run --help should mention prompt resolution precedence"
+        );
+    }
+
+    #[test]
+    fn run_config_has_run_spec_data_detects_configured_sections() {
+        let loaded_empty = write_test_config(
+            r#"
+[run]
+continue_wait_timeout_seconds = 0
+"#,
+        );
+        assert!(!run_config_has_run_spec_data(&loaded_empty.config().run));
+
+        let loaded_objective = write_test_config(
+            r#"
+[run]
+objective = "verify config"
+"#,
+        );
+        assert!(run_config_has_run_spec_data(&loaded_objective.config().run));
+
+        let loaded_tasks = write_test_config(
+            r#"
+[[run.tasks]]
+key = "lint"
+cmd = "cargo clippy --workspace -- -D warnings"
+"#,
+        );
+        assert!(run_config_has_run_spec_data(&loaded_tasks.config().run));
+    }
+
+    #[test]
+    fn run_spec_from_run_config_maps_tasks_tranches_and_plan_guard() {
+        let loaded = write_test_config(
+            r#"
+[run]
+objective = "verify all"
+
+[[run.tasks]]
+key = "lint"
+cmd = "cargo clippy --workspace -- -D warnings"
+class = "cpu"
+
+[[run.tasks]]
+key = "test"
+cmd = "cargo test --workspace"
+
+[[run.tranches]]
+key = "verify"
+objective = "verification tranche"
+task_keys = ["lint", "test"]
+
+[run.plan_guard]
+target = "I8B"
+mode = "verify-only"
+"#,
+        );
+
+        let run_spec = run_spec_from_run_config(&loaded.config().run);
+        assert_eq!(run_spec.objective.as_deref(), Some("verify all"));
+        assert_eq!(run_spec.tasks.items.len(), 2);
+        assert_eq!(run_spec.tasks.items[0].key, "lint");
+        assert_eq!(run_spec.tasks.items[0].class.as_deref(), Some("cpu"));
+        assert_eq!(
+            run_spec
+                .tranches
+                .as_ref()
+                .map(|tranches| tranches.items.len()),
+            Some(1)
+        );
+        let guard = run_spec.plan_guard.as_ref().expect("plan guard expected");
+        assert_eq!(guard.target, "I8B");
+        assert_eq!(guard.mode, prompt::RunSpecPlanGuardMode::VerifyOnly);
+    }
+
+    #[test]
+    fn merge_run_specs_applies_prompt_overrides_on_top_of_config_defaults() {
+        let base = prompt::RunSpec {
+            version: 1,
+            objective: Some("config objective".to_string()),
+            tasks: prompt::RunSpecTasks {
+                items: vec![
+                    prompt::RunSpecTask {
+                        key: "lint".to_string(),
+                        cmd: "cargo clippy --workspace -- -D warnings".to_string(),
+                        class: Some("cpu".to_string()),
+                    },
+                    prompt::RunSpecTask {
+                        key: "test".to_string(),
+                        cmd: "cargo test --workspace".to_string(),
+                        class: Some("io".to_string()),
+                    },
+                ],
+            },
+            tranches: Some(prompt::RunSpecTranches {
+                items: vec![prompt::RunSpecTranche {
+                    key: "verify".to_string(),
+                    objective: Some("config tranche".to_string()),
+                    task_keys: vec!["lint".to_string(), "test".to_string()],
+                }],
+            }),
+            plan_guard: Some(prompt::RunSpecPlanGuard {
+                target: "I8A".to_string(),
+                mode: prompt::RunSpecPlanGuardMode::Implement,
+            }),
+        };
+        let prompt_override = prompt::RunSpec {
+            version: 1,
+            objective: Some("prompt objective".to_string()),
+            tasks: prompt::RunSpecTasks {
+                items: vec![
+                    prompt::RunSpecTask {
+                        key: "lint".to_string(),
+                        cmd: "cargo clippy --workspace --all-targets -- -D warnings".to_string(),
+                        class: Some("cpu".to_string()),
+                    },
+                    prompt::RunSpecTask {
+                        key: "docs".to_string(),
+                        cmd: "make docs-build".to_string(),
+                        class: Some("io".to_string()),
+                    },
+                ],
+            },
+            tranches: Some(prompt::RunSpecTranches {
+                items: vec![prompt::RunSpecTranche {
+                    key: "prompt-verify".to_string(),
+                    objective: Some("prompt tranche".to_string()),
+                    task_keys: vec!["lint".to_string(), "docs".to_string()],
+                }],
+            }),
+            plan_guard: Some(prompt::RunSpecPlanGuard {
+                target: "I8B".to_string(),
+                mode: prompt::RunSpecPlanGuardMode::VerifyOnly,
+            }),
+        };
+
+        let merged = merge_run_specs(&base, Some(&prompt_override));
+        assert_eq!(merged.objective.as_deref(), Some("prompt objective"));
+        assert_eq!(merged.tasks.items.len(), 3);
+        assert_eq!(merged.tasks.items[0].key, "lint");
+        assert!(merged.tasks.items[0]
+            .cmd
+            .contains("--all-targets -- -D warnings"));
+        assert_eq!(merged.tasks.items[1].key, "test");
+        assert_eq!(merged.tasks.items[2].key, "docs");
+        assert_eq!(
+            merged
+                .tranches
+                .as_ref()
+                .map(|tranches| tranches.items[0].key.as_str()),
+            Some("prompt-verify")
+        );
+        assert_eq!(
+            merged
+                .plan_guard
+                .as_ref()
+                .map(|guard| guard.target.as_str()),
+            Some("I8B")
+        );
+    }
+
+    #[test]
+    fn resolve_render_mode_uses_configured_ui_mode_when_flags_absent() {
+        let tty_large = TerminalInfo {
+            is_tty: true,
+            cols: 120,
+            rows: 40,
+        };
+        assert_eq!(
+            resolve_render_mode(&tty_large, false, false, UiMode::Stream).unwrap(),
+            RenderMode::Stream
+        );
+        assert_eq!(
+            resolve_render_mode(&tty_large, false, false, UiMode::Tui).unwrap(),
+            RenderMode::Dashboard
+        );
+    }
+
+    #[test]
+    fn resolve_render_mode_cli_flags_override_configured_ui_mode() {
+        let tty_large = TerminalInfo {
+            is_tty: true,
+            cols: 120,
+            rows: 40,
+        };
+        assert_eq!(
+            resolve_render_mode(&tty_large, true, false, UiMode::Tui).unwrap(),
+            RenderMode::Stream
+        );
+        assert_eq!(
+            resolve_render_mode(&tty_large, false, true, UiMode::Stream).unwrap(),
+            RenderMode::Dashboard
         );
     }
 
@@ -8563,6 +13279,285 @@ prompt_mode = "arg"
         assert_eq!(tranches.len(), 1);
         assert_eq!(tranches[0].key, "verification");
         assert!(tasks[0].command.contains("verification"));
+    }
+
+    #[test]
+    fn plain_prompt_sequence_dispatches_expanded_prompt_text() {
+        let temp = TempDir::new().unwrap();
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt = prompt::LoadedPrompt {
+            entry_path: temp.path().join("PROMPT.md"),
+            expanded_text: "# plain prompt\nImplement step 2.3.\n".to_string(),
+            snapshot: prompt::PromptSnapshot {
+                entry_path: temp.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            },
+            run_spec: prompt::RunSpec {
+                version: 1,
+                objective: None,
+                tasks: prompt::RunSpecTasks::default(),
+                tranches: None,
+                plan_guard: None,
+            },
+        };
+
+        let (tasks, tranches) =
+            build_plain_prompt_run_sequence(&loaded_config, &loaded_prompt, "yarli run").unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tranches.len(), 1);
+        assert_eq!(tranches[0].key, "prompt");
+        assert_eq!(tasks[0].task_key, "prompt-001");
+        assert!(tasks[0].command.contains("plain prompt"));
+        assert!(tasks[0].command.contains("Implement step 2.3."));
+    }
+
+    #[test]
+    fn build_cli_command_applies_env_unset_prefix() {
+        let invocation = CliInvocationConfig {
+            command: "claude".to_string(),
+            args: vec!["--model".to_string(), "sonnet-4.5".to_string()],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec!["CLAUDECODE".to_string(), "FOO".to_string()],
+        };
+
+        let command = build_cli_command(&invocation, "hello");
+        assert!(
+            command.contains("'env' '-u' 'CLAUDECODE' '-u' 'FOO' 'claude' '--model' 'sonnet-4.5'")
+        );
+        assert!(command.ends_with(" 'hello'"));
+    }
+
+    #[test]
+    fn resolve_cli_invocation_config_rejects_invalid_env_unset_entries() {
+        let temp = TempDir::new().unwrap();
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "claude"
+args = ["--model", "sonnet-4.5"]
+env_unset = ["BAD-NAME"]
+"#,
+        );
+
+        let err = resolve_cli_invocation_config(&loaded_config).unwrap_err();
+        assert!(err.to_string().contains("invalid cli.env_unset entry"));
+    }
+
+    #[test]
+    fn plan_driven_sequence_ignores_stale_keys_in_non_header_evidence_lines() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement active plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            r#"
+## Next Work Tranches
+11. I9 `Runtime Contract`: complete. tranche_group=runtime-contract
+    Verification evidence:
+    1. Open-tranche dispatch evidence remains intact: `yarli run status 019c5308-e73b-7a23-8b7a-c4acc8b95e52` includes `I11` and `YARLI_DETERIORATION_REPORT_V1`.
+12. I10 `Follow-up`: complete. tranche_group=runtime-contract
+
+## Notes
+1. YARLI_DETERIORATION_REPORT_V1 incomplete in historical notes.
+"#,
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
+                .unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tranches.len(), 1);
+        assert_eq!(tranches[0].key, "verification");
+        assert!(tasks[0].command.contains("verification"));
+    }
+
+    #[test]
+    fn plan_driven_sequence_groups_adjacent_entries_by_tranche_group_when_enabled() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement grouped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A first tranche_group=core\n- [ ] I8B second tranche_group=core\n- [ ] I8C third tranche_group=ui\n- [ ] I8D fourth\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enable_plan_tranche_grouping = true
+max_grouped_tasks_per_tranche = 0
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) = build_plan_driven_run_sequence(
+            &loaded_config,
+            &loaded_prompt,
+            "implement grouped plan",
+        )
+        .unwrap();
+
+        assert_eq!(tasks.len(), 5);
+        assert_eq!(tranches.len(), 4);
+        assert_eq!(tranches[0].key, "group-001-core");
+        assert_eq!(tranches[0].tranche_group.as_deref(), Some("core"));
+        assert_eq!(tranches[0].task_keys.len(), 2);
+        assert_eq!(tranches[1].key, "group-003-ui");
+        assert_eq!(tranches[1].tranche_group.as_deref(), Some("ui"));
+        assert_eq!(tranches[1].task_keys.len(), 1);
+        assert_eq!(tranches[2].key, "I8D");
+        assert_eq!(tranches[2].task_keys.len(), 1);
+        assert_eq!(tranches[3].key, "verification");
+        assert!(tasks[0].command.contains("Tranche group: core."));
+        assert!(tasks[2].command.contains("Tranche group: ui."));
+    }
+
+    #[test]
+    fn plan_driven_sequence_grouping_respects_max_grouped_tasks_per_tranche_cap() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement grouped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A first tranche_group=core\n- [ ] I8B second tranche_group=core\n- [ ] I8C third tranche_group=core\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enable_plan_tranche_grouping = true
+max_grouped_tasks_per_tranche = 2
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (_tasks, tranches) = build_plan_driven_run_sequence(
+            &loaded_config,
+            &loaded_prompt,
+            "implement grouped plan",
+        )
+        .unwrap();
+
+        assert_eq!(tranches.len(), 3);
+        assert_eq!(tranches[0].key, "group-001-core");
+        assert_eq!(tranches[0].task_keys.len(), 2);
+        assert_eq!(tranches[1].key, "group-003-core");
+        assert_eq!(tranches[1].task_keys.len(), 1);
+        assert_eq!(tranches[2].key, "verification");
+    }
+
+    #[test]
+    fn plan_driven_sequence_surfaces_allowed_paths_scope_when_enforced() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement scoped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A scoped tranche allowed_paths=src/main.rs,docs/CLI.md,../reject\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enforce_plan_tranche_allowed_paths = true
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement scoped plan")
+                .unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tranches.len(), 2);
+        assert_eq!(
+            tasks[0].allowed_paths,
+            vec!["src/main.rs".to_string(), "docs/CLI.md".to_string()]
+        );
+        assert!(tasks[0]
+            .command
+            .contains("Allowed file scope: src/main.rs, docs/CLI.md."));
+        assert!(tasks[0]
+            .command
+            .contains("Restrict edits to the allowed file scope above."));
+        assert!(!tasks[0].command.contains("../reject"));
     }
 
     #[test]
@@ -9125,6 +14120,403 @@ cmds = ["echo ok"]
         assert!(output.contains("RunCompleted"));
         assert!(output.contains(&task_id.to_string()));
         assert!(!output.contains("requires a persistent store"));
+    }
+
+    #[test]
+    fn render_run_status_updated_tracks_latest_task_activity() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let base = Utc::now();
+
+        let mut run_event = make_event(
+            EntityType::Run,
+            run_id.to_string(),
+            "run.activated",
+            corr,
+            serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+        );
+        run_event.occurred_at = base;
+        store.append(run_event).unwrap();
+
+        let mut task_event = make_event(
+            EntityType::Task,
+            task_id.to_string(),
+            "task.executing",
+            corr,
+            serde_json::json!({ "from": "TaskReady", "to": "TaskExecuting" }),
+        );
+        task_event.occurred_at = base + chrono::Duration::seconds(42);
+        store.append(task_event).unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(output.contains("Last event: task.executing"));
+        assert!(output.contains(
+            &(base + chrono::Duration::seconds(42))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn list_runs_by_latest_state_ignores_non_transition_events() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.observer.progress",
+                corr,
+                serde_json::json!({
+                    "tick": 3,
+                    "summary": "heartbeat"
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.task_catalog",
+                corr,
+                serde_json::json!({
+                    "tasks": []
+                }),
+            ))
+            .unwrap();
+
+        let states = list_runs_by_latest_state(&store).unwrap();
+        assert_eq!(states.get(&run_id), Some(&RunState::RunActive));
+    }
+
+    #[test]
+    fn render_run_list_updated_tracks_latest_task_event() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let base = Utc::now();
+
+        let mut run_event = make_event(
+            EntityType::Run,
+            run_id.to_string(),
+            "run.activated",
+            corr,
+            serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+        );
+        run_event.occurred_at = base;
+        store.append(run_event).unwrap();
+
+        let mut task_event = make_event(
+            EntityType::Task,
+            task_id.to_string(),
+            "task.ready",
+            corr,
+            serde_json::json!({ "from": "TaskOpen", "to": "TaskReady" }),
+        );
+        task_event.occurred_at = base + chrono::Duration::minutes(3);
+        store.append(task_event).unwrap();
+
+        let output = render_run_list(&store).unwrap();
+        assert!(output.contains(
+            &(base + chrono::Duration::minutes(3))
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn render_run_status_surfaces_tranche_group_task_worker_mapping() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.config_snapshot",
+                corr,
+                serde_json::json!({
+                    "objective": "ship grouped tranche",
+                    "config_snapshot": {
+                        "runtime": {
+                            "tranche_plan": [
+                                {
+                                    "key": "group-001-core",
+                                    "objective": "core work",
+                                    "task_keys": ["core_task"],
+                                    "tranche_group": "core"
+                                }
+                            ]
+                        }
+                    }
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.task_catalog",
+                corr,
+                serde_json::json!({
+                    "tasks": [
+                        {
+                            "task_id": task_id,
+                            "task_key": "core_task",
+                            "tranche_key": "group-001-core",
+                            "tranche_group": "core",
+                            "allowed_paths": ["src/main.rs"]
+                        }
+                    ]
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.executing",
+                corr,
+                serde_json::json!({
+                    "from": "TaskReady",
+                    "to": "TaskExecuting",
+                    "task_key": "core_task",
+                    "worker": "worker-a"
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.completed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskVerifying",
+                    "to": "TaskComplete",
+                    "task_key": "core_task"
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(
+            output.contains("scope: tranche=group-001-core group=core allowed_paths=src/main.rs")
+        );
+        assert!(output.contains("Tranche mapping:"));
+        assert!(output.contains("tranche=group-001-core group=core"));
+        assert!(output.contains("task_key=core_task"));
+        assert!(output.contains(&task_id.to_string()));
+        assert!(output.contains("worker_actor=worker-a"));
+    }
+
+    #[test]
+    fn event_to_stream_event_maps_observer_progress_to_transient_status() {
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let event = make_event(
+            EntityType::Run,
+            run_id.to_string(),
+            "run.observer.progress",
+            corr,
+            serde_json::json!({
+                "summary": "heartbeat pending=1 leased=0"
+            }),
+        );
+
+        let mapped = event_to_stream_event(&event, &[]).expect("progress event should map");
+        match mapped {
+            StreamEvent::TransientStatus { message, .. } => {
+                assert_eq!(message, "heartbeat pending=1 leased=0");
+            }
+            other => panic!("expected transient status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_to_stream_event_maps_command_output_chunks_to_task_output() {
+        let corr = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let command_id = Uuid::now_v7();
+        let event = Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Command,
+            entity_id: command_id.to_string(),
+            event_type: "command.output".to_string(),
+            payload: serde_json::json!({
+                "chunk_count": 2,
+                "chunks": [
+                    { "seq": 1, "stream": "stdout", "data": "line one" },
+                    { "seq": 2, "stream": "stderr", "data": "line two" }
+                ]
+            }),
+            correlation_id: corr,
+            causation_id: None,
+            actor: "worker".to_string(),
+            idempotency_key: Some(format!("{task_id}:cmd:1:output")),
+        };
+
+        let mapped = event_to_stream_event(&event, &[(task_id, "tranche-001-i5".to_string())])
+            .expect("command output should map");
+        match mapped {
+            StreamEvent::CommandOutput {
+                task_id: mapped_task_id,
+                task_name,
+                line,
+            } => {
+                assert_eq!(mapped_task_id, task_id);
+                assert_eq!(task_name, "tranche-001-i5");
+                assert_eq!(line, "line one\nline two");
+            }
+            other => panic!("expected command output stream event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_to_stream_event_skips_empty_command_output_chunks() {
+        let corr = Uuid::now_v7();
+        let event = Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Command,
+            entity_id: Uuid::now_v7().to_string(),
+            event_type: "command.output".to_string(),
+            payload: serde_json::json!({
+                "chunk_count": 1,
+                "chunks": [
+                    { "seq": 1, "stream": "stdout", "data": "   " }
+                ]
+            }),
+            correlation_id: corr,
+            causation_id: None,
+            actor: "worker".to_string(),
+            idempotency_key: Some(format!("{}:cmd:1:output", Uuid::now_v7())),
+        };
+
+        assert!(
+            event_to_stream_event(&event, &[]).is_none(),
+            "empty command output should not emit stream event"
+        );
+    }
+
+    #[test]
+    fn stream_task_catalog_entries_extracts_task_ids_and_keys() {
+        let corr = Uuid::now_v7();
+        let task_a = Uuid::now_v7();
+        let task_b = Uuid::now_v7();
+        let event = make_event(
+            EntityType::Run,
+            Uuid::now_v7().to_string(),
+            "run.task_catalog",
+            corr,
+            serde_json::json!({
+                "tasks": [
+                    { "task_id": task_a, "task_key": "first" },
+                    { "task_id": task_b }
+                ]
+            }),
+        );
+
+        let entries = stream_task_catalog_entries(&event);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (task_a, "first".to_string()));
+        assert_eq!(entries[1].0, task_b);
+    }
+
+    #[test]
+    fn task_catalog_entries_from_event_extracts_workspace_dir() {
+        let corr = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let event = make_event(
+            EntityType::Run,
+            Uuid::now_v7().to_string(),
+            "run.task_catalog",
+            corr,
+            serde_json::json!({
+                "tasks": [
+                    {
+                        "task_id": task_id,
+                        "task_key": "first",
+                        "workspace_dir": "/tmp/yarli-ws/task-001"
+                    }
+                ]
+            }),
+        );
+
+        let entries = task_catalog_entries_from_event(&event);
+        let entry = entries.get(&task_id).expect("task should be present");
+        assert_eq!(
+            entry.workspace_dir.as_deref(),
+            Some("/tmp/yarli-ws/task-001")
+        );
+    }
+
+    #[test]
+    fn emit_initial_stream_state_emits_run_and_task_discovery() {
+        let run_id = Uuid::now_v7();
+        let task_a = Uuid::now_v7();
+        let task_b = Uuid::now_v7();
+        let task_names = vec![
+            (task_a, "tranche-001".to_string()),
+            (task_b, "tranche-002".to_string()),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+
+        emit_initial_stream_state(&tx, run_id, "objective", &task_names);
+
+        match rx.try_recv().expect("run started event") {
+            StreamEvent::RunStarted {
+                run_id: received_run_id,
+                objective,
+                ..
+            } => {
+                assert_eq!(received_run_id, run_id);
+                assert_eq!(objective, "objective");
+            }
+            other => panic!("expected run started event, got {other:?}"),
+        }
+
+        match rx.try_recv().expect("task A discovery") {
+            StreamEvent::TaskDiscovered { task_id, task_name } => {
+                assert_eq!(task_id, task_a);
+                assert_eq!(task_name, "tranche-001");
+            }
+            other => panic!("expected task discovered event, got {other:?}"),
+        }
+
+        match rx.try_recv().expect("task B discovery") {
+            StreamEvent::TaskDiscovered { task_id, task_name } => {
+                assert_eq!(task_id, task_b);
+                assert_eq!(task_name, "tranche-002");
+            }
+            other => panic!("expected task discovered event, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10417,6 +15809,130 @@ allow_in_memory_writes = true
     }
 
     #[test]
+    fn operator_control_signal_ignores_non_operator_actor() {
+        let run_id = Uuid::now_v7();
+        let event = Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: "run.blocked".to_string(),
+            payload: serde_json::json!({
+                "reason": "observer note"
+            }),
+            correlation_id: Uuid::now_v7(),
+            causation_id: None,
+            actor: "observer.progress".to_string(),
+            idempotency_key: None,
+        };
+        assert!(operator_control_signal_from_event(&event, run_id).is_none());
+    }
+
+    #[test]
+    fn execute_run_pause_and_resume_controls_append_operator_transitions() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+
+        let pause = execute_run_pause_control(&store, run_id, "maintenance window").unwrap();
+        assert!(pause.contains("RunBlocked"));
+        let paused = load_run_projection(&store, run_id).unwrap().unwrap();
+        assert_eq!(paused.state, RunState::RunBlocked);
+
+        let resume = execute_run_resume_control(&store, run_id, "maintenance complete").unwrap();
+        assert!(resume.contains("RunActive"));
+        let resumed = load_run_projection(&store, run_id).unwrap().unwrap();
+        assert_eq!(resumed.state, RunState::RunActive);
+
+        let run_events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        assert!(run_events.iter().any(|event| {
+            event.event_type == "run.blocked"
+                && event.actor == OPERATOR_CONTROL_ACTOR
+                && event.payload.get("reason").and_then(|v| v.as_str())
+                    == Some("maintenance window")
+        }));
+        assert!(run_events.iter().any(|event| {
+            event.event_type == "run.activated"
+                && event.actor == OPERATOR_CONTROL_ACTOR
+                && event.payload.get("reason").and_then(|v| v.as_str())
+                    == Some("maintenance complete")
+        }));
+    }
+
+    #[test]
+    fn execute_run_cancel_control_cancels_non_terminal_tasks_and_queue_entries() {
+        let store = InMemoryEventStore::new();
+        let queue = InMemoryTaskQueue::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let active_task_id = Uuid::now_v7();
+        let completed_task_id = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                active_task_id.to_string(),
+                "task.ready",
+                corr,
+                serde_json::json!({ "from": "TaskOpen", "to": "TaskReady", "attempt_no": 1 }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                completed_task_id.to_string(),
+                "task.completed",
+                corr,
+                serde_json::json!({ "from": "TaskVerifying", "to": "TaskComplete", "attempt_no": 1 }),
+            ))
+            .unwrap();
+
+        queue
+            .enqueue(active_task_id, run_id, 1, CommandClass::Io, None)
+            .unwrap();
+
+        let output = execute_run_cancel_control(&store, &queue, run_id, "operator stop").unwrap();
+        assert!(output.contains("RunCancelled"));
+        assert!(output.contains("cancelled 1 task(s)"));
+        assert!(output.contains("drained 1 queue entry(ies)"));
+
+        let run = load_run_projection(&store, run_id).unwrap().unwrap();
+        assert_eq!(run.state, RunState::RunCancelled);
+
+        let cancelled_task = load_task_projection(&store, active_task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled_task.state, TaskState::TaskCancelled);
+        let completed_task = load_task_projection(&store, completed_task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed_task.state, TaskState::TaskComplete);
+
+        let stats = queue.stats();
+        assert_eq!(stats.cancelled, 1);
+    }
+
+    #[test]
     fn render_run_status_surfaces_budget_exceeded_and_token_usage() {
         let store = InMemoryEventStore::new();
         let run_id = Uuid::now_v7();
@@ -11144,7 +16660,7 @@ allow_in_memory_writes = true
             kind: TrancheKind::PlannedNext,
             retry_task_keys: vec![],
             unfinished_task_keys: vec![],
-            planned_task_keys: vec!["two_task".into()],
+            planned_task_keys: vec!["two_task".into(), "three_task".into()],
             planned_tranche_key: Some("two".into()),
             cursor: Some(yarli_core::entities::continuation::TrancheCursor {
                 current_tranche_index: Some(0),
@@ -11159,11 +16675,12 @@ allow_in_memory_writes = true
                     ],
                     "task_catalog": [
                         {"task_key": "one_task", "command": "true", "command_class": "Io"},
-                        {"task_key": "two_task", "command": "true", "command_class": "Io"}
+                        {"task_key": "two_task", "command": "echo second", "command_class": "Io"},
+                        {"task_key": "three_task", "command": "echo third", "command_class": "Io"}
                     ],
                     "tranche_plan": [
                         {"key": "one", "objective": "first", "task_keys": ["one_task"]},
-                        {"key": "two", "objective": "second", "task_keys": ["two_task"]}
+                        {"key": "two", "objective": "second", "task_keys": ["two_task", "three_task"], "tranche_group": "core"}
                     ],
                     "current_tranche_index": 0
                 }
@@ -11171,9 +16688,12 @@ allow_in_memory_writes = true
         };
 
         let plan = build_plan_from_continuation_tranche(&tranche, &loaded).unwrap();
-        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks.len(), 2);
         assert_eq!(plan.tasks[0].task_key, "two_task");
-        assert_eq!(plan.tasks[0].command, "true");
+        assert_eq!(plan.tasks[0].command, "echo second");
+        assert_eq!(plan.tasks[1].task_key, "three_task");
+        assert_eq!(plan.tasks[1].command, "echo third");
+        assert_eq!(plan.tranche_plan[1].tranche_group.as_deref(), Some("core"));
         assert_eq!(plan.current_tranche_index, Some(1));
     }
 
@@ -11411,6 +16931,36 @@ allow_in_memory_writes = true
     }
 
     #[test]
+    fn verification_only_dispatch_detects_single_verification_tranche() {
+        let plan = vec![PlannedTranche {
+            key: "verification".to_string(),
+            objective: "verify".to_string(),
+            task_keys: vec!["verify-001".to_string()],
+            tranche_group: None,
+        }];
+        assert!(is_verification_only_dispatch(&plan));
+    }
+
+    #[test]
+    fn verification_only_dispatch_rejects_multi_tranche_plan() {
+        let plan = vec![
+            PlannedTranche {
+                key: "I9".to_string(),
+                objective: "i9".to_string(),
+                task_keys: vec!["tranche-001-i9".to_string()],
+                tranche_group: Some("runtime-contract".to_string()),
+            },
+            PlannedTranche {
+                key: "verification".to_string(),
+                objective: "verify".to_string(),
+                task_keys: vec!["verify-002".to_string()],
+                tranche_group: None,
+            },
+        ];
+        assert!(!is_verification_only_dispatch(&plan));
+    }
+
+    #[test]
     fn plan_target_completion_state_detects_status() {
         let plan = "- [x] CARD-R8-01\n- [ ] CARD-R8-02\n";
         assert_eq!(
@@ -11438,6 +16988,63 @@ allow_in_memory_writes = true
             plan_target_completion_state(plan, "I8B").unwrap(),
             Some(false)
         );
+    }
+
+    #[test]
+    fn discover_plan_entries_extracts_tranche_group_metadata() {
+        let entries = discover_plan_entries(
+            "- [ ] I8A first tranche_group=CORE\n- [x] I8B second [tranche_group=ui]\n",
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "I8A");
+        assert_eq!(entries[0].tranche_group.as_deref(), Some("core"));
+        assert!(!entries[0].summary.contains("tranche_group"));
+        assert_eq!(entries[1].tranche_group.as_deref(), Some("ui"));
+    }
+
+    #[test]
+    fn discover_plan_dispatch_entries_prefers_next_work_tranches_section() {
+        let plan = r#"
+## Next Work Tranches
+11. I9 `Runtime Contract`: complete. tranche_group=runtime-contract
+12. I10 `Remediation`: incomplete. tranche_group=runtime-contract
+    1. Evidence line references I11 and 019c5308-e73b-7a23-8b7a-c4acc8b95e52.
+
+## Notes
+1. YARLI_DETERIORATION_REPORT_V1 incomplete.
+"#;
+        let entries = discover_plan_dispatch_entries(plan);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "I9");
+        assert!(entries[0].is_complete);
+        assert_eq!(entries[1].key, "I10");
+        assert!(!entries[1].is_complete);
+    }
+
+    #[test]
+    fn discover_plan_dispatch_entries_falls_back_when_section_missing() {
+        let plan = "- [ ] I8A first\n- [x] I8B second\n";
+        let entries = discover_plan_dispatch_entries(plan);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "I8A");
+        assert!(!entries[0].is_complete);
+        assert_eq!(entries[1].key, "I8B");
+        assert!(entries[1].is_complete);
+    }
+
+    #[test]
+    fn discover_plan_entries_extracts_allowed_paths_metadata() {
+        let entries = discover_plan_entries(
+            "- [ ] I8A first allowed_paths=src/main.rs,docs/CLI.md,../reject\n- [x] I8B second [allowed_paths=src/lib.rs,SRC/lib.rs,/reject]\n",
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].allowed_paths,
+            vec!["src/main.rs".to_string(), "docs/CLI.md".to_string()]
+        );
+        assert_eq!(entries[1].allowed_paths, vec!["src/lib.rs".to_string()]);
+        assert!(!entries[0].summary.contains("allowed_paths"));
+        assert!(!entries[1].summary.contains("allowed_paths"));
     }
 
     #[test]

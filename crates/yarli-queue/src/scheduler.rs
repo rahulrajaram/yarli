@@ -323,6 +323,7 @@ pub struct Scheduler<Q: TaskQueue, S: EventStore, R: CommandRunner> {
     store: Arc<S>,
     runner: Arc<R>,
     registry: Arc<RwLock<TaskRegistry>>,
+    task_working_dirs: Arc<RwLock<HashMap<TaskId, String>>>,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     config: SchedulerConfig,
@@ -335,6 +336,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             store,
             runner,
             registry: Arc::new(RwLock::new(TaskRegistry::new())),
+            task_working_dirs: Arc::new(RwLock::new(HashMap::new())),
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             config,
@@ -354,6 +356,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             store,
             runner,
             registry: Arc::new(RwLock::new(registry)),
+            task_working_dirs: Arc::new(RwLock::new(HashMap::new())),
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             config,
@@ -375,6 +378,12 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     /// Get a reference to the registry for inspection.
     pub fn registry(&self) -> &Arc<RwLock<TaskRegistry>> {
         &self.registry
+    }
+
+    /// Bind a task ID to an explicit working directory for command execution.
+    pub async fn bind_task_working_dir(&self, task_id: TaskId, working_dir: impl Into<String>) {
+        let mut dirs = self.task_working_dirs.write().await;
+        dirs.insert(task_id, working_dir.into());
     }
 
     /// Register a new run and its tasks with the scheduler.
@@ -680,6 +689,12 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 run.safe_mode,
             )
         };
+        let working_dir = {
+            let dirs = self.task_working_dirs.read().await;
+            dirs.get(&task_id)
+                .cloned()
+                .unwrap_or_else(|| self.config.working_dir.clone())
+        };
 
         if self.config.enforce_policies {
             let action = classify_policy_action(&command);
@@ -693,7 +708,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     actor: self.config.worker_id.clone(),
                     action,
                     command_class: Some(command_class),
-                    repo_path: Some(self.config.working_dir.clone()),
+                    repo_path: Some(working_dir.clone()),
                     branch: None,
                     run_id: entry.run_id,
                     task_id: Some(task_id),
@@ -761,7 +776,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             task_id,
             run_id: entry.run_id,
             command,
-            working_dir: self.config.working_dir.clone(),
+            working_dir,
             command_class,
             correlation_id,
             idempotency_key: Some(format!("{task_id}:cmd:{attempt_no}")),
@@ -1090,6 +1105,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             );
             let transition =
                 task.transition(TaskState::TaskFailed, &reason, &self.config.worker_id, None)?;
+
+            // Mark as permanently failed so evaluate_runs recognises this task
+            // without requiring attempt_no < max_attempts retry gating.
+            task.attempt_no = task.max_attempts;
 
             self.store.append(Event {
                 event_id: transition.event_id,
@@ -2940,7 +2959,10 @@ mod tests {
         let reg = sched.registry().read().await;
         let task = reg.get_task(&task_id).unwrap();
         assert_eq!(task.state, TaskState::TaskFailed);
-        assert_eq!(task.attempt_no, 1, "budget failure should not retry");
+        assert_eq!(
+            task.attempt_no, task.max_attempts,
+            "budget failure should be marked permanently failed"
+        );
         drop(reg);
 
         let events = store.all().unwrap();
@@ -2951,6 +2973,44 @@ mod tests {
         assert_eq!(
             failed.payload.get("reason").and_then(|v| v.as_str()),
             Some("budget_exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_budget_exceeded_transitions_run_to_failed() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = SchedulerConfig {
+            budgets: ResourceBudgetConfig {
+                max_task_total_tokens: Some(1),
+                ..ResourceBudgetConfig::default()
+            },
+            ..test_config()
+        };
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = make_run("budget run fail");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        let mut task = make_task(run_id, "token-heavy", "echo budget run fail", corr_id);
+        task = task.with_max_attempts(3);
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        // Tick 1: promote + claim + execute (budget exceeded) → TaskFailed
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.failed, 1);
+
+        // Tick 2: evaluate_runs should detect permanently-failed task → RunFailed
+        let _result2 = sched.tick().await.unwrap();
+
+        let reg = sched.registry().read().await;
+        let run = reg.get_run(&run_id).expect("run should exist");
+        assert_eq!(
+            run.state,
+            RunState::RunFailed,
+            "run should transition to RunFailed after budget-exceeded task failure"
         );
     }
 

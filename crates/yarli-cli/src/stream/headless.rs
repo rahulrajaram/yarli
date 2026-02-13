@@ -6,6 +6,7 @@
 
 use std::io::{self, Write};
 
+use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -30,12 +31,14 @@ struct RunSummary {
 /// (no TTY, too small terminal, etc.).
 pub struct HeadlessRenderer {
     summary: RunSummary,
+    last_transient_status_emit_at: Option<DateTime<Utc>>,
 }
 
 impl HeadlessRenderer {
     pub fn new() -> Self {
         Self {
             summary: RunSummary::default(),
+            last_transient_status_emit_at: None,
         }
     }
 
@@ -50,6 +53,12 @@ impl HeadlessRenderer {
 
     fn handle_event(&mut self, event: StreamEvent) {
         match event {
+            StreamEvent::TaskDiscovered {
+                task_id: _,
+                task_name: _,
+            } => {
+                // Catalog/discovery event only; no terminal transition yet.
+            }
             StreamEvent::TaskTransition {
                 task_id,
                 task_name,
@@ -132,6 +141,18 @@ impl HeadlessRenderer {
             }
             StreamEvent::TransientStatus { message } => {
                 debug!(message = %message, "transient status");
+                let now = Utc::now();
+                let should_emit = message.starts_with("operator ")
+                    || self
+                        .last_transient_status_emit_at
+                        .map(|last| now.signed_duration_since(last).num_seconds() >= 30)
+                        .unwrap_or(true);
+                if should_emit {
+                    self.last_transient_status_emit_at = Some(now);
+                    let time_str = now.format("%H:%M:%S");
+                    let line = format!("{time_str} status {message}");
+                    let _ = writeln!(io::stderr(), "{line}");
+                }
             }
             StreamEvent::TaskWorker {
                 task_id: _,

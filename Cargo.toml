@@ -12,6 +12,7 @@ members = [
     "crates/yarli-observability",
     "crates/yarli-sw4rm",
     "crates/yarli-cli",
+    "tests/integration",
 ]
 
 [workspace.package]

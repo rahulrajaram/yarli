@@ -84,6 +84,10 @@ impl DashboardRenderer {
     /// Process a stream event and update internal state.
     pub fn handle_event(&mut self, event: StreamEvent) {
         match event {
+            StreamEvent::TaskDiscovered { task_id, task_name } => {
+                self.state
+                    .update_task(task_id, &task_name, TaskState::TaskOpen, None);
+            }
             StreamEvent::TaskTransition {
                 task_id,
                 task_name,
@@ -138,8 +142,8 @@ impl DashboardRenderer {
             StreamEvent::RunExited { payload } => {
                 self.state.continuation_payload = Some(payload);
             }
-            StreamEvent::TransientStatus { .. } => {
-                // Transient status is stream-mode only; dashboard ignores.
+            StreamEvent::TransientStatus { message } => {
+                self.state.transient_status = Some(message);
             }
             StreamEvent::Tick => {
                 for spinner in self.spinners.values_mut() {
@@ -493,6 +497,11 @@ pub fn build_explain_line<'a>(state: &PanelManager) -> Line<'a> {
             Span::styled(" WHY: ", Tier::Urgent.accent()),
             Span::styled(summary.clone(), Tier::Urgent.style()),
         ])
+    } else if let Some(ref status) = state.transient_status {
+        Line::from(vec![
+            Span::styled(" STATUS: ", Tier::Active.accent()),
+            Span::styled(status.clone(), Tier::Contextual.style()),
+        ])
     } else {
         let run_state_str = state
             .run_state
@@ -701,6 +710,16 @@ mod tests {
         let state = PanelManager::new();
         let line = build_explain_line(&state);
         assert!(!line.spans.is_empty());
+    }
+
+    #[test]
+    fn build_explain_line_with_transient_status() {
+        let mut state = PanelManager::new();
+        state.transient_status = Some("heartbeat pending=1 leased=0".into());
+        let line = build_explain_line(&state);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("STATUS"));
+        assert!(text.contains("heartbeat"));
     }
 
     #[test]

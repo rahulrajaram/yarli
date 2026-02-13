@@ -7,6 +7,20 @@ safe_mode = "execute"
 # Replace with your deployment DSN.
 database_url = "postgres://postgres:postgres@localhost:5432/yarli"
 
+[cli]
+# Optional backend alias (codex | claude | gemini | custom).
+# backend = "codex"
+# arg | stdin
+prompt_mode = "arg"
+command = "codex"
+args = ["exec", "--json"]
+# Unset selected variables before launching the CLI command.
+# env_unset = ["CLAUDECODE"]
+
+[features]
+# Parallel execution is enabled by default.
+parallel = true
+
 [queue]
 claim_batch_size = 4
 lease_ttl_seconds = 60
@@ -22,7 +36,15 @@ tool_cap = 2
 [execution]
 # native | overwatch
 runner = "native"
+# `~` and `$ENV_VAR` tokens are expanded for execution paths.
 working_dir = "."
+# Required when [features].parallel = true.
+# Leave unset to force an explicit per-project choice before `yarli run`.
+# Task workspaces are created under this root and auto-merged on RunCompleted.
+# worktree_root = ".yarl/workspaces"
+# Directory names or paths to exclude from per-task workspace copies.
+# Helps avoid copying large/generated trees in parallel mode.
+worktree_exclude_paths = [".yarl/workspaces", ".yarli", "target", "node_modules", ".venv", "venv", "__pycache__"]
 command_timeout_seconds = 900
 tick_interval_ms = 200
 
@@ -38,13 +60,42 @@ service_url = "http://127.0.0.1:8089"
 # Optional default prompt file for `yarli run`.
 # Resolution precedence: --prompt-file > run.prompt_file > PROMPT.md fallback.
 # prompt_file = "PROMPT.md"
+# Optional default objective when no prompt override is present.
+# objective = "verify workspace"
 continue_wait_timeout_seconds = 0
 # Legacy compatibility toggle; prefer run.auto_advance_policy.
 allow_stable_auto_advance = false
 # improving-only | stable-ok | always
-auto_advance_policy = "improving-only"
+auto_advance_policy = "stable-ok"
 # 0 = unlimited auto-advance tranches in one invocation.
 max_auto_advance_tranches = 0
+# Group adjacent open plan entries with matching `tranche_group=<name>` metadata.
+enable_plan_tranche_grouping = false
+# 0 = unlimited tasks per grouped tranche.
+max_grouped_tasks_per_tranche = 0
+# Surface `allowed_paths=...` plan metadata as explicit per-tranche scope constraints.
+enforce_plan_tranche_allowed_paths = false
+# Optional run-spec task catalog (project-level verification/work commands).
+# [[run.tasks]]
+# key = "lint"
+# cmd = "cargo clippy --workspace -- -D warnings"
+# class = "cpu"
+#
+# [[run.tasks]]
+# key = "test"
+# cmd = "cargo test --workspace"
+# class = "io"
+#
+# Optional explicit tranche ordering for run-spec execution.
+# [[run.tranches]]
+# key = "verify"
+# objective = "verification tranche"
+# task_keys = ["lint", "test"]
+#
+# Optional plan guard for run-spec execution.
+# [run.plan_guard]
+# target = "CARD-R8-01"
+# mode = "implement"
 
 [budgets]
 # Optional hard limits; unset values are unlimited.

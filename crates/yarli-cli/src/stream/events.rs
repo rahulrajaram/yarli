@@ -17,6 +17,9 @@ use yarli_core::fsm::task::TaskState;
 /// Events the stream renderer can consume.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// A task is known/planned for this run before transitions are emitted.
+    TaskDiscovered { task_id: TaskId, task_name: String },
+
     /// A task changed state (Section 33: single structured line per transition).
     TaskTransition {
         task_id: TaskId,

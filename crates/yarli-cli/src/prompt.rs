@@ -97,6 +97,14 @@ pub struct LoadedPrompt {
     pub run_spec: RunSpec,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadedPromptOptionalRunSpec {
+    pub entry_path: PathBuf,
+    pub expanded_text: String,
+    pub snapshot: PromptSnapshot,
+    pub run_spec: Option<RunSpec>,
+}
+
 pub fn load_prompt_and_run_spec_from_cwd() -> Result<LoadedPrompt> {
     let entry_path =
         find_prompt_upwards(std::env::current_dir()?).context("failed to resolve PROMPT.md")?;
@@ -119,6 +127,33 @@ pub fn find_prompt_upwards(mut dir: PathBuf) -> Result<PathBuf> {
 }
 
 pub fn load_prompt_and_run_spec(entry_prompt_path: &Path) -> Result<LoadedPrompt> {
+    let loaded = load_prompt_with_optional_run_spec(entry_prompt_path)?;
+    let Some(run_spec) = loaded.run_spec else {
+        bail!("PROMPT.md must contain exactly one ```yarli-run fenced block (found 0)");
+    };
+
+    Ok(LoadedPrompt {
+        entry_path: loaded.entry_path,
+        expanded_text: loaded.expanded_text,
+        snapshot: loaded.snapshot,
+        run_spec,
+    })
+}
+
+pub fn load_prompt_with_optional_run_spec(
+    entry_prompt_path: &Path,
+) -> Result<LoadedPromptOptionalRunSpec> {
+    let (entry_prompt_path, expanded, snapshot) = load_expanded_prompt(entry_prompt_path)?;
+    let run_spec = parse_run_spec_block(&expanded, false)?;
+    Ok(LoadedPromptOptionalRunSpec {
+        entry_path: entry_prompt_path,
+        expanded_text: expanded,
+        snapshot,
+        run_spec,
+    })
+}
+
+fn load_expanded_prompt(entry_prompt_path: &Path) -> Result<(PathBuf, String, PromptSnapshot)> {
     let entry_prompt_path = entry_prompt_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", entry_prompt_path.display()))?;
@@ -147,9 +182,34 @@ pub fn load_prompt_and_run_spec(entry_prompt_path: &Path) -> Result<LoadedPrompt
         );
     }
 
+    let expanded_sha256 = sha256_hex(expanded.as_bytes());
+    let entry_path_display = entry_prompt_path.display().to_string();
+    let included_files = included_hashes
+        .into_iter()
+        .map(|(path, sha)| PromptFileHash {
+            path: path.display().to_string(),
+            sha256: sha,
+        })
+        .collect::<Vec<_>>();
+
+    Ok((
+        entry_prompt_path,
+        expanded,
+        PromptSnapshot {
+            entry_path: entry_path_display,
+            expanded_sha256,
+            included_files,
+        },
+    ))
+}
+
+fn parse_run_spec_block(expanded: &str, require_block: bool) -> Result<Option<RunSpec>> {
     let run_spec_blocks = extract_fenced_blocks(&expanded, "yarli-run");
     if run_spec_blocks.is_empty() {
-        bail!("PROMPT.md must contain exactly one ```yarli-run fenced block (found 0)");
+        if require_block {
+            bail!("PROMPT.md must contain exactly one ```yarli-run fenced block (found 0)");
+        }
+        return Ok(None);
     }
     if run_spec_blocks.len() != 1 {
         bail!(
@@ -160,7 +220,11 @@ pub fn load_prompt_and_run_spec(entry_prompt_path: &Path) -> Result<LoadedPrompt
 
     let run_spec: RunSpec = toml::from_str(&run_spec_blocks[0])
         .context("failed to parse TOML in ```yarli-run block")?;
+    validate_run_spec(&run_spec)?;
+    Ok(Some(run_spec))
+}
 
+pub fn validate_run_spec(run_spec: &RunSpec) -> Result<()> {
     // Validate uniqueness and required fields.
     if run_spec.version != 1 {
         bail!(
@@ -226,26 +290,7 @@ pub fn load_prompt_and_run_spec(entry_prompt_path: &Path) -> Result<LoadedPrompt
             bail!("run spec plan_guard.target must be non-empty");
         }
     }
-
-    let expanded_sha256 = sha256_hex(expanded.as_bytes());
-    let included_files = included_hashes
-        .into_iter()
-        .map(|(path, sha)| PromptFileHash {
-            path: path.display().to_string(),
-            sha256: sha,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(LoadedPrompt {
-        entry_path: entry_prompt_path.clone(),
-        expanded_text: expanded,
-        snapshot: PromptSnapshot {
-            entry_path: entry_prompt_path.display().to_string(),
-            expanded_sha256,
-            included_files,
-        },
-        run_spec,
-    })
+    Ok(())
 }
 
 fn expand_file(
@@ -449,6 +494,29 @@ items = [{ key = "a", cmd = "echo ok" }]
         assert!(loaded.expanded_text.contains("BEGIN_INCLUDE"));
         assert_eq!(loaded.run_spec.tasks.items[0].key, "a");
         assert_eq!(loaded.snapshot.included_files.len(), 2);
+    }
+
+    #[test]
+    fn optional_loader_accepts_plain_prompt_without_run_spec_block() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join("PROMPT.md"), "# plain prompt\nDo the work.\n").unwrap();
+
+        let loaded = load_prompt_with_optional_run_spec(&root.join("PROMPT.md")).unwrap();
+        assert!(loaded.run_spec.is_none());
+        assert!(loaded.expanded_text.contains("plain prompt"));
+    }
+
+    #[test]
+    fn strict_loader_still_rejects_missing_run_spec_block() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join("PROMPT.md"), "# plain prompt\nNo fenced block.\n").unwrap();
+
+        let err = load_prompt_and_run_spec(&root.join("PROMPT.md")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must contain exactly one ```yarli-run fenced block (found 0)"));
     }
 
     #[test]

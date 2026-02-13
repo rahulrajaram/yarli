@@ -102,8 +102,23 @@ Execution behavior:
 
 - Discover incomplete tranches from `IMPLEMENTATION_PLAN.md` in plan order.
 - Dispatch each tranche as its own Yarli task via `[cli]` command settings.
+- Optional grouping: set `[run].enable_plan_tranche_grouping = true` and annotate related plan lines with `tranche_group=<name>` to dispatch shared tranches.
+- Optional per-tranche file-scope policy: annotate plan lines with `allowed_paths=path/a,path/b` and set `[run].enforce_plan_tranche_allowed_paths = true` to inject explicit scope constraints into tranche prompts.
+- Optional run-spec defaults can live in `yarli.toml` (`[run]`, `[[run.tasks]]`, `[[run.tranches]]`, `[run.plan_guard]`), with `PROMPT.md` `yarli-run` blocks used only for per-prompt overrides/backward compatibility.
+- Parallel mode defaults to enabled (`[features].parallel = true`) and requires `[execution].worktree_root`.
+- In parallel mode, YARLI prepares one workspace copy per task under `execution.worktree_root` before execution.
+- After `RunCompleted`, YARLI auto-merges task workspace changes into the source repo using `git apply --3way`.
+- If a workspace merge conflicts, YARLI emits `run.parallel_merge_failed`, exits non-zero, and leaves conflict markers for manual resolution.
 - Append a verification task automatically.
-- If no incomplete tranches are found, execute verification-only.
+- If no embedded run spec exists and no incomplete tranches are found, dispatch the full prompt text as one task.
+- `[cli].env_unset` can remove parent-session environment variables before CLI launch (for example `CLAUDECODE`).
+
+Control model clarifications:
+
+- `yarli run` is the authoritative execution entry point.
+- Built-in Yarli policy gates are code-defined checks; verification command chains come from plan/config/script content.
+- Observer integrations emit telemetry only and must not gate active run progression.
+- Use explicit operator controls for run state transitions: `yarli run pause`, `yarli run resume`, `yarli run cancel`.
 
 ```bash
 yarli run --stream
@@ -162,6 +177,7 @@ Operator-visible command surfaces for resource_usage and token_usage:
 
 YARLI emits rolling deterioration analysis events (`run.observer.deterioration`) during run execution.
 The observer consumes event deltas incrementally using event-store cursor reads (`after_event_id`), not full-history rescans.
+YARLI also emits heartbeat progress events (`run.observer.progress`) so stream output remains active during long-running tasks.
 
 Signals included in the score:
 

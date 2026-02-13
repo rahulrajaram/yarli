@@ -102,6 +102,8 @@ pub struct PanelManager {
     pub output_auto_scroll: bool,
     /// Current "Why Not Done?" summary.
     pub explain_summary: Option<String>,
+    /// Latest transient status (heartbeat/progress) from scheduler.
+    pub transient_status: Option<String>,
     /// Gate results (gate_name -> passed).
     pub gate_results: Vec<(String, bool, Option<String>)>,
     /// Whether copy mode is active (strips borders, disables mouse capture).
@@ -135,6 +137,7 @@ impl PanelManager {
             output_lines: Vec::new(),
             output_auto_scroll: true,
             explain_summary: None,
+            transient_status: None,
             gate_results: Vec::new(),
             copy_mode: false,
             run_id: None,

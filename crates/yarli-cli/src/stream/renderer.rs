@@ -25,6 +25,7 @@ use super::style::Tier;
 /// Default number of lines for the inline viewport.
 const DEFAULT_VIEWPORT_HEIGHT: u16 = 8;
 const RUN_ID_DISPLAY_LEN: usize = 12;
+const TRANSIENT_STATUS_EMIT_SECS: i64 = 30;
 
 /// Configuration for the stream renderer.
 #[derive(Debug, Clone)]
@@ -58,6 +59,8 @@ pub struct StreamRenderer {
     explain_summary: Option<String>,
     /// Transient status message (shown only in viewport).
     transient_status: Option<String>,
+    /// Last time we emitted a transient status line to scrollback.
+    last_transient_status_emit_at: Option<DateTime<Utc>>,
 }
 
 impl StreamRenderer {
@@ -78,12 +81,27 @@ impl StreamRenderer {
             spinners: HashMap::new(),
             explain_summary: None,
             transient_status: None,
+            last_transient_status_emit_at: None,
         })
     }
 
     /// Process a stream event: update state, push scrollback, refresh viewport.
     pub fn handle_event(&mut self, event: StreamEvent) -> io::Result<()> {
         match event {
+            StreamEvent::TaskDiscovered { task_id, task_name } => {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(task_id) {
+                    self.task_order.push(task_id);
+                    e.insert(TaskView {
+                        task_id,
+                        name: task_name,
+                        state: TaskState::TaskOpen,
+                        elapsed: None,
+                        last_output_line: None,
+                        blocked_by: None,
+                        worker_id: None,
+                    });
+                }
+            }
             StreamEvent::TaskTransition {
                 task_id,
                 task_name,
@@ -131,6 +149,13 @@ impl StreamRenderer {
                 }
             }
             StreamEvent::TransientStatus { message } => {
+                if should_emit_transient_status_line(
+                    self.last_transient_status_emit_at,
+                    &message,
+                    Utc::now(),
+                ) {
+                    self.push_transient_status_line(&message, Utc::now())?;
+                }
                 self.transient_status = Some(message);
             }
             StreamEvent::ExplainUpdate { summary } => {
@@ -478,6 +503,35 @@ impl StreamRenderer {
     pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
     }
+
+    fn push_transient_status_line(&mut self, message: &str, at: DateTime<Utc>) -> io::Result<()> {
+        self.last_transient_status_emit_at = Some(at);
+        let spans = vec![
+            Span::styled(at.format("%H:%M:%S").to_string(), Tier::Contextual.style()),
+            Span::styled(" ▸ ", Tier::Background.style()),
+            Span::styled("status", Tier::Active.style()),
+            Span::styled(format!(" {message}"), Tier::Contextual.style()),
+        ];
+        let line = Line::from(spans);
+        self.terminal.insert_before(1, |buf| {
+            Paragraph::new(line).render(buf.area, buf);
+        })?;
+        Ok(())
+    }
+}
+
+fn should_emit_transient_status_line(
+    last_emit_at: Option<DateTime<Utc>>,
+    message: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    if message.starts_with("operator ") {
+        return true;
+    }
+    let Some(last) = last_emit_at else {
+        return true;
+    };
+    now.signed_duration_since(last).num_seconds() >= TRANSIENT_STATUS_EMIT_SECS
 }
 
 /// Determine visual tier for a task state.
@@ -586,5 +640,30 @@ mod tests {
         let run_id =
             uuid::Uuid::parse_str("019c4f51-5f70-7d84-a0c8-2f5c6bb8ef12").expect("valid uuid");
         assert_eq!(display_run_id(run_id), "019c4f515f70");
+    }
+
+    #[test]
+    fn transient_status_line_throttles_regular_heartbeats() {
+        let now = Utc::now();
+        assert!(!should_emit_transient_status_line(
+            Some(now),
+            "heartbeat: pending=1 leased=1",
+            now + chrono::Duration::seconds(10),
+        ));
+        assert!(should_emit_transient_status_line(
+            Some(now),
+            "heartbeat: pending=1 leased=1",
+            now + chrono::Duration::seconds(31),
+        ));
+    }
+
+    #[test]
+    fn transient_status_line_always_emits_operator_messages() {
+        let now = Utc::now();
+        assert!(should_emit_transient_status_line(
+            Some(now),
+            "operator pause: maintenance",
+            now + chrono::Duration::seconds(1),
+        ));
     }
 }

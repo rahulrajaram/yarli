@@ -3894,6 +3894,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "yarli-integration-tests"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "yarli-core",
+ "yarli-exec",
+ "yarli-gates",
+ "yarli-observability",
+ "yarli-policy",
+ "yarli-queue",
+ "yarli-store",
+]
+
+[[package]]
 name = "yarli-memory"
 version = "0.1.0"
 dependencies = [
