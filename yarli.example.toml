@@ -113,6 +113,14 @@ audit_decisions = true
 [observability]
 audit_file = ".yarl/audit.jsonl"
 
+[ui]
+# auto | stream | tui
+mode = "auto"
+# Stream command output to terminal scrollback when true.
+verbose_output = false
+# Attach additional diagnostic context to cancellation provenance when true.
+cancellation_diagnostics = false
+
 # Explicit ephemeral override for local throwaway usage only.
 # Uncomment to allow write commands with core.backend = "in-memory".
 #

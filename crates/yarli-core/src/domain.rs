@@ -112,6 +112,99 @@ impl std::fmt::Display for ExitReason {
     }
 }
 
+/// Provenance for cancellation-triggered shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationSource {
+    Operator,
+    Sigint,
+    Sigterm,
+    Sw4rmPreemption,
+    Unknown,
+}
+
+impl std::fmt::Display for CancellationSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operator => write!(f, "operator"),
+            Self::Sigint => write!(f, "sigint"),
+            Self::Sigterm => write!(f, "sigterm"),
+            Self::Sw4rmPreemption => write!(f, "sw4rm_preemption"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Best-effort actor classification for cancellation origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationActorKind {
+    Operator,
+    System,
+    Supervisor,
+    Unknown,
+}
+
+impl std::fmt::Display for CancellationActorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operator => write!(f, "operator"),
+            Self::System => write!(f, "system"),
+            Self::Supervisor => write!(f, "supervisor"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Pipeline stage where cancellation was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationStage {
+    Executing,
+    Retrying,
+    Verifying,
+    Unknown,
+}
+
+impl std::fmt::Display for CancellationStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Executing => write!(f, "executing"),
+            Self::Retrying => write!(f, "retrying"),
+            Self::Verifying => write!(f, "verifying"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Structured cancellation provenance attached to cancellation terminal events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancellationProvenance {
+    pub cancellation_source: CancellationSource,
+    #[serde(default)]
+    pub signal_name: Option<String>,
+    #[serde(default)]
+    pub signal_number: Option<i32>,
+    #[serde(default)]
+    pub sender_pid: Option<u32>,
+    #[serde(default)]
+    pub receiver_pid: Option<u32>,
+    #[serde(default)]
+    pub parent_pid: Option<u32>,
+    #[serde(default)]
+    pub process_group_id: Option<u32>,
+    #[serde(default)]
+    pub session_id: Option<u32>,
+    #[serde(default)]
+    pub tty: Option<String>,
+    #[serde(default)]
+    pub actor_kind: Option<CancellationActorKind>,
+    #[serde(default)]
+    pub actor_detail: Option<String>,
+    #[serde(default)]
+    pub stage: Option<CancellationStage>,
+}
+
 /// Safe modes for the orchestrator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

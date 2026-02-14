@@ -39,6 +39,7 @@ fn test_config() -> SchedulerConfig {
         enforce_policies: true,
         audit_decisions: true,
         budgets: ResourceBudgetConfig::default(),
+        allow_recursive_run: false,
     }
 }
 
@@ -64,9 +65,7 @@ async fn event_trail_is_consistent_across_retries() {
 
     // Command: read counter, increment, fail if < 3
     // Using a simple bash approach: count lines in file
-    let b_cmd = format!(
-        "echo x >> {counter_path} && test $(wc -l < {counter_path}) -ge 3"
-    );
+    let b_cmd = format!("echo x >> {counter_path} && test $(wc -l < {counter_path}) -ge 3");
 
     let queue = Arc::new(InMemoryTaskQueue::new());
     let store = Arc::new(InMemoryEventStore::new());
@@ -119,7 +118,8 @@ async fn event_trail_is_consistent_across_retries() {
     assert_eq!(reg.get_task(&b_id).unwrap().state, TaskState::TaskComplete);
     assert_eq!(reg.get_task(&c_id).unwrap().state, TaskState::TaskComplete);
     assert_eq!(
-        reg.get_task(&b_id).unwrap().attempt_no, 3,
+        reg.get_task(&b_id).unwrap().attempt_no,
+        3,
         "B should be on attempt 3"
     );
     drop(reg);
@@ -162,7 +162,10 @@ async fn event_trail_is_consistent_across_retries() {
     let mut per_entity_state_events: std::collections::HashMap<&str, Vec<_>> =
         std::collections::HashMap::new();
     for event in &events {
-        if state_prefixes.iter().any(|p| event.event_type.starts_with(p)) {
+        if state_prefixes
+            .iter()
+            .any(|p| event.event_type.starts_with(p))
+        {
             per_entity_state_events
                 .entry(event.entity_id.as_str())
                 .or_default()

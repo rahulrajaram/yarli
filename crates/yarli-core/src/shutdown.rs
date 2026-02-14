@@ -15,6 +15,10 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::domain::{
+    CancellationActorKind, CancellationProvenance, CancellationSource, CancellationStage,
+};
+
 /// How long after the first Ctrl+C a second Ctrl+C triggers force exit.
 const FORCE_EXIT_WINDOW: Duration = Duration::from_secs(2);
 
@@ -61,6 +65,11 @@ struct ShutdownInner {
     /// Timestamp of first Ctrl+C (set once; 0 means not set).
     /// We use AtomicBool + Notify instead of storing Instant atomically.
     first_signal_received: AtomicBool,
+    /// Source of the first graceful shutdown request.
+    /// Encoded as u8; 0 means "unset".
+    cancellation_source: AtomicU8,
+    /// Best-effort cancellation provenance captured at graceful request time.
+    cancellation_provenance: std::sync::Mutex<Option<CancellationProvenance>>,
     /// Notifies waiters that graceful shutdown has started.
     graceful_notify: Notify,
     /// Notifies waiters that force shutdown was requested.
@@ -71,6 +80,34 @@ struct ShutdownInner {
 }
 
 impl ShutdownController {
+    const SOURCE_UNSET: u8 = 0;
+    const SOURCE_OPERATOR: u8 = 1;
+    const SOURCE_SIGINT: u8 = 2;
+    const SOURCE_SIGTERM: u8 = 3;
+    const SOURCE_SW4RM_PREEMPTION: u8 = 4;
+    const SOURCE_UNKNOWN: u8 = 5;
+
+    fn encode_source(source: CancellationSource) -> u8 {
+        match source {
+            CancellationSource::Operator => Self::SOURCE_OPERATOR,
+            CancellationSource::Sigint => Self::SOURCE_SIGINT,
+            CancellationSource::Sigterm => Self::SOURCE_SIGTERM,
+            CancellationSource::Sw4rmPreemption => Self::SOURCE_SW4RM_PREEMPTION,
+            CancellationSource::Unknown => Self::SOURCE_UNKNOWN,
+        }
+    }
+
+    fn decode_source(raw: u8) -> Option<CancellationSource> {
+        match raw {
+            Self::SOURCE_OPERATOR => Some(CancellationSource::Operator),
+            Self::SOURCE_SIGINT => Some(CancellationSource::Sigint),
+            Self::SOURCE_SIGTERM => Some(CancellationSource::Sigterm),
+            Self::SOURCE_SW4RM_PREEMPTION => Some(CancellationSource::Sw4rmPreemption),
+            Self::SOURCE_UNKNOWN => Some(CancellationSource::Unknown),
+            _ => None,
+        }
+    }
+
     /// Create a new controller in the `Running` phase.
     pub fn new() -> Self {
         Self {
@@ -78,6 +115,8 @@ impl ShutdownController {
                 token: CancellationToken::new(),
                 phase: AtomicU8::new(ShutdownPhase::Running as u8),
                 first_signal_received: AtomicBool::new(false),
+                cancellation_source: AtomicU8::new(Self::SOURCE_UNSET),
+                cancellation_provenance: std::sync::Mutex::new(None),
                 graceful_notify: Notify::new(),
                 force_notify: Notify::new(),
                 #[cfg(unix)]
@@ -103,11 +142,37 @@ impl ShutdownController {
         self.phase() != ShutdownPhase::Running
     }
 
+    /// Return the source that initiated graceful cancellation, if known.
+    pub fn cancellation_source(&self) -> Option<CancellationSource> {
+        Self::decode_source(self.inner.cancellation_source.load(Ordering::SeqCst))
+    }
+
+    /// Return structured provenance for the cancellation trigger, if captured.
+    pub fn cancellation_provenance(&self) -> Option<CancellationProvenance> {
+        self.inner
+            .cancellation_provenance
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
     /// Initiate graceful shutdown (first signal).
     ///
     /// Returns `true` if this call transitioned from Running → Graceful.
     /// Returns `false` if already shutting down (caller should escalate to force).
-    pub fn request_graceful(&self) -> bool {
+    pub fn request_graceful_with_source(&self, source: CancellationSource) -> bool {
+        self.request_graceful_with_provenance(source, None)
+    }
+
+    /// Initiate graceful shutdown and capture explicit provenance metadata.
+    ///
+    /// Returns `true` if this call transitioned from Running → Graceful.
+    /// Returns `false` if already shutting down.
+    pub fn request_graceful_with_provenance(
+        &self,
+        source: CancellationSource,
+        provenance: Option<CancellationProvenance>,
+    ) -> bool {
         let prev = self.inner.phase.compare_exchange(
             ShutdownPhase::Running as u8,
             ShutdownPhase::Graceful as u8,
@@ -119,13 +184,26 @@ impl ShutdownController {
             self.inner
                 .first_signal_received
                 .store(true, Ordering::SeqCst);
+            self.inner
+                .cancellation_source
+                .store(Self::encode_source(source), Ordering::SeqCst);
+            if let Ok(mut slot) = self.inner.cancellation_provenance.lock() {
+                let mut value = provenance.unwrap_or_else(|| fallback_provenance(source));
+                value.stage = None;
+                *slot = Some(value);
+            }
             self.inner.token.cancel();
             self.inner.graceful_notify.notify_waiters();
-            info!("graceful shutdown initiated");
+            info!(source = %source, "graceful shutdown initiated");
             true
         } else {
             false
         }
+    }
+
+    /// Initiate graceful shutdown with unknown source (legacy behavior).
+    pub fn request_graceful(&self) -> bool {
+        self.request_graceful_with_source(CancellationSource::Unknown)
     }
 
     /// Escalate to force shutdown (second signal).
@@ -153,7 +231,8 @@ impl ShutdownController {
     /// - First call → graceful shutdown.
     /// - Second call (while still in Graceful phase) → force exit.
     pub fn on_signal(&self) {
-        if !self.request_graceful() {
+        let provenance = signal_provenance(CancellationSource::Sigint, "SIGINT", 2);
+        if !self.request_graceful_with_provenance(CancellationSource::Sigint, Some(provenance)) {
             // Already in graceful or force — escalate.
             self.request_force();
         }
@@ -260,14 +339,15 @@ impl ShutdownController {
             let mut first_signal_time: Option<Instant> = None;
 
             loop {
-                tokio::select! {
-                    _ = sigint.recv() => {}
-                    _ = sigterm.recv() => {}
-                }
+                let (source, signal_name, signal_number) = tokio::select! {
+                    _ = sigint.recv() => (CancellationSource::Sigint, "SIGINT", libc::SIGINT),
+                    _ = sigterm.recv() => (CancellationSource::Sigterm, "SIGTERM", libc::SIGTERM),
+                };
 
                 match controller.phase() {
                     ShutdownPhase::Running => {
-                        controller.request_graceful();
+                        let provenance = signal_provenance(source, signal_name, signal_number);
+                        controller.request_graceful_with_provenance(source, Some(provenance));
                         first_signal_time = Some(Instant::now());
                     }
                     ShutdownPhase::Graceful => {
@@ -305,7 +385,12 @@ impl ShutdownController {
                 tokio::signal::ctrl_c()
                     .await
                     .expect("failed to install Ctrl+C handler");
-                controller.on_signal();
+                let provenance = fallback_provenance(CancellationSource::Sigint);
+                if !controller
+                    .request_graceful_with_provenance(CancellationSource::Sigint, Some(provenance))
+                {
+                    controller.request_force();
+                }
 
                 if controller.phase() == ShutdownPhase::Force {
                     std::process::exit(130);
@@ -313,6 +398,156 @@ impl ShutdownController {
             }
         });
     }
+}
+
+fn signal_provenance(
+    source: CancellationSource,
+    signal_name: &str,
+    signal_number: i32,
+) -> CancellationProvenance {
+    let mut provenance = fallback_provenance(source);
+    provenance.signal_name = Some(signal_name.to_string());
+    provenance.signal_number = Some(signal_number);
+    provenance
+}
+
+fn fallback_provenance(source: CancellationSource) -> CancellationProvenance {
+    let (receiver_pid, parent_pid, process_group_id, session_id, tty) = capture_process_context();
+    let actor_kind = infer_actor_kind(source, parent_pid, tty.as_deref());
+    let actor_detail = default_actor_detail(source, actor_kind);
+    CancellationProvenance {
+        cancellation_source: source,
+        signal_name: None,
+        signal_number: None,
+        sender_pid: None,
+        receiver_pid,
+        parent_pid,
+        process_group_id,
+        session_id,
+        tty,
+        actor_kind: Some(actor_kind),
+        actor_detail,
+        stage: Some(CancellationStage::Unknown),
+    }
+}
+
+fn infer_actor_kind(
+    source: CancellationSource,
+    parent_pid: Option<u32>,
+    tty: Option<&str>,
+) -> CancellationActorKind {
+    match source {
+        CancellationSource::Operator | CancellationSource::Sigint => {
+            CancellationActorKind::Operator
+        }
+        CancellationSource::Sw4rmPreemption => CancellationActorKind::Supervisor,
+        CancellationSource::Sigterm => {
+            if tty.is_some() {
+                CancellationActorKind::Operator
+            } else if parent_pid == Some(1) {
+                CancellationActorKind::Supervisor
+            } else {
+                CancellationActorKind::System
+            }
+        }
+        CancellationSource::Unknown => CancellationActorKind::Unknown,
+    }
+}
+
+fn default_actor_detail(
+    source: CancellationSource,
+    actor_kind: CancellationActorKind,
+) -> Option<String> {
+    match source {
+        CancellationSource::Operator => {
+            Some("operator control command requested cancellation".to_string())
+        }
+        CancellationSource::Sigint => Some("SIGINT observed by runtime signal handler".to_string()),
+        CancellationSource::Sigterm => match actor_kind {
+            CancellationActorKind::Supervisor => {
+                Some("SIGTERM likely originated from a supervisor-managed parent".to_string())
+            }
+            CancellationActorKind::Operator => {
+                Some("SIGTERM observed from interactive session context".to_string())
+            }
+            _ => Some("SIGTERM sender PID unavailable via tokio signal API".to_string()),
+        },
+        CancellationSource::Sw4rmPreemption => {
+            Some("sw4rm preemption bridge requested graceful shutdown".to_string())
+        }
+        CancellationSource::Unknown => {
+            Some("shutdown token cancellation source not attributed".to_string())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn capture_process_context() -> (
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<String>,
+) {
+    let receiver_pid = Some(std::process::id());
+
+    let parent_pid = {
+        let raw = unsafe { libc::getppid() };
+        if raw > 0 {
+            Some(raw as u32)
+        } else {
+            None
+        }
+    };
+
+    let process_group_id = {
+        let raw = unsafe { libc::getpgrp() };
+        if raw > 0 {
+            Some(raw as u32)
+        } else {
+            None
+        }
+    };
+
+    let session_id = {
+        let raw = unsafe { libc::getsid(0) };
+        if raw > 0 {
+            Some(raw as u32)
+        } else {
+            None
+        }
+    };
+
+    let tty = tty_name_for_fd(libc::STDIN_FILENO).or_else(|| tty_name_for_fd(libc::STDERR_FILENO));
+
+    (receiver_pid, parent_pid, process_group_id, session_id, tty)
+}
+
+#[cfg(unix)]
+fn tty_name_for_fd(fd: i32) -> Option<String> {
+    unsafe {
+        if libc::isatty(fd) != 1 {
+            return None;
+        }
+        let mut buf = [0u8; 256];
+        let rc = libc::ttyname_r(fd, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+        if rc != 0 {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char);
+        cstr.to_str().ok().map(ToString::to_string)
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_process_context() -> (
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<String>,
+) {
+    (Some(std::process::id()), None, None, None, None)
 }
 
 impl Default for ShutdownController {
@@ -414,6 +649,10 @@ mod tests {
         assert_eq!(ctrl.phase(), ShutdownPhase::Graceful);
         assert!(ctrl.is_shutting_down());
         assert!(ctrl.token().is_cancelled());
+        assert_eq!(
+            ctrl.cancellation_source(),
+            Some(CancellationSource::Unknown)
+        );
     }
 
     #[test]
@@ -447,6 +686,7 @@ mod tests {
         let ctrl = ShutdownController::new();
         ctrl.on_signal();
         assert_eq!(ctrl.phase(), ShutdownPhase::Graceful);
+        assert_eq!(ctrl.cancellation_source(), Some(CancellationSource::Sigint));
     }
 
     #[test]
@@ -541,5 +781,20 @@ mod tests {
         assert_eq!(ShutdownPhase::from_u8(2), ShutdownPhase::Force);
         // Out of range defaults to Force (safe fallback).
         assert_eq!(ShutdownPhase::from_u8(255), ShutdownPhase::Force);
+    }
+
+    #[test]
+    fn request_graceful_with_source_records_source() {
+        let ctrl = ShutdownController::new();
+        assert!(ctrl.request_graceful_with_source(CancellationSource::Sigterm));
+        assert_eq!(
+            ctrl.cancellation_source(),
+            Some(CancellationSource::Sigterm)
+        );
+        let provenance = ctrl
+            .cancellation_provenance()
+            .expect("expected cancellation provenance");
+        assert_eq!(provenance.cancellation_source, CancellationSource::Sigterm);
+        assert!(provenance.receiver_pid.is_some());
     }
 }

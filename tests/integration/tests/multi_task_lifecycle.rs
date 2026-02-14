@@ -17,7 +17,9 @@ use yarli_core::domain::{CommandClass, SafeMode};
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 use yarli_exec::LocalCommandRunner;
-use yarli_queue::{ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig};
+use yarli_queue::{
+    ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
+};
 use yarli_store::{EventStore, InMemoryEventStore};
 
 fn test_config() -> SchedulerConfig {
@@ -37,6 +39,7 @@ fn test_config() -> SchedulerConfig {
         enforce_policies: true,
         audit_decisions: true,
         budgets: ResourceBudgetConfig::default(),
+        allow_recursive_run: false,
     }
 }
 
@@ -106,9 +109,7 @@ async fn multi_task_lifecycle_with_dependencies_and_retry() {
 
     // Task B: depends on A, fails first attempt (file absent), succeeds on retry
     // Uses: test -f <sentinel> && echo ok || (touch <sentinel> && exit 1)
-    let b_cmd = format!(
-        "test -f {sentinel_path} && echo ok || (touch {sentinel_path} && exit 1)"
-    );
+    let b_cmd = format!("test -f {sentinel_path} && echo ok || (touch {sentinel_path} && exit 1)");
     let mut task_b = make_task(run_id, "task-b", &b_cmd, corr_id);
     task_b.depends_on(a_id);
     task_b = task_b.with_max_attempts(3);
@@ -130,7 +131,11 @@ async fn multi_task_lifecycle_with_dependencies_and_retry() {
 
     // Tick 1: A and C should promote (no deps), B blocked by A, D blocked by B
     let r1 = sched.tick().await.unwrap();
-    assert!(r1.promoted >= 2, "A and C should promote, got {}", r1.promoted);
+    assert!(
+        r1.promoted >= 2,
+        "A and C should promote, got {}",
+        r1.promoted
+    );
 
     let reg = sched.registry().read().await;
     // C should have started (it has no deps)

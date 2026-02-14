@@ -272,6 +272,11 @@ Notes:
 
 - For `yarli run status` and `yarli run explain-exit`, `<run-id>` can be either a full UUID or a unique short prefix from `yarli run list`.
 - `yarli run status` includes tranche mapping (`tranche -> group -> task_key -> task_id -> worker_actor`) plus scope metadata when available.
+- `ui.verbose_output` only controls command-output verbosity in stream mode; it does not enable or disable cancellation provenance capture.
+- Cancellation provenance (`signal`, PID context, actor/stage attribution) is emitted in run/task cancel events and persisted in `run.continuation` payloads.
+- Provenance inspection durability depends on backend:
+  - `core.backend = "postgres"` persists provenance across process restarts.
+  - `core.backend = "in-memory"` is ephemeral; `run status` / `run explain-exit` only reflect currently running process state unless `.yarli/continuation.json` is still present.
 
 Legacy prompt-run-spec tranche example (`PROMPT.md` `yarli-run` block):
 

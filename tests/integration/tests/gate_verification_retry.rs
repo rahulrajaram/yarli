@@ -43,6 +43,7 @@ fn base_config() -> SchedulerConfig {
         enforce_policies: true,
         audit_decisions: true,
         budgets: ResourceBudgetConfig::default(),
+        allow_recursive_run: false,
     }
 }
 

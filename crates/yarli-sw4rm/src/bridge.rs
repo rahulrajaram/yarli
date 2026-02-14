@@ -10,6 +10,7 @@ use sw4rm_sdk::{EnvelopeData, PreemptionManager};
 use tracing::info;
 use uuid::Uuid;
 
+use yarli_core::domain::CancellationSource;
 use yarli_core::domain::{EntityType, Event};
 use yarli_core::shutdown::ShutdownController;
 use yarli_store::EventStore;
@@ -34,7 +35,8 @@ impl ShutdownBridge {
     /// Trigger a graceful shutdown (equivalent to first Ctrl+C).
     pub fn trigger_graceful(&self) {
         info!("sw4rm preemption → yarli graceful shutdown");
-        self.shutdown.request_graceful();
+        self.shutdown
+            .request_graceful_with_source(CancellationSource::Sw4rmPreemption);
     }
 
     /// Spawn a background task that watches a `PreemptionManager` and

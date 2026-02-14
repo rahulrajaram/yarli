@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
+use yarli_core::domain::CancellationProvenance;
 use yarli_core::domain::TaskId;
 use yarli_core::fsm::task::TaskState;
 
@@ -151,10 +152,7 @@ impl StreamRenderer {
             } => {
                 if self.config.verbose_output {
                     let output_line = Line::from(vec![
-                        Span::styled(
-                            format!("  [{task_name}] "),
-                            Tier::Background.style(),
-                        ),
+                        Span::styled(format!("  [{task_name}] "), Tier::Background.style()),
                         Span::styled(line.clone(), Tier::Contextual.style()),
                     ]);
                     self.terminal.insert_before(1, |buf| {
@@ -392,6 +390,43 @@ impl StreamRenderer {
             Paragraph::new(counts_line).render(buf.area, buf);
         })?;
 
+        if let Some(reason) = payload.exit_reason {
+            let reason_line = Line::from(vec![Span::styled(
+                format!("  Exit reason: {reason}"),
+                Tier::Contextual.style(),
+            )]);
+            self.terminal.insert_before(1, |buf| {
+                Paragraph::new(reason_line).render(buf.area, buf);
+            })?;
+        }
+
+        let cancelled = payload.exit_state == yarli_core::fsm::run::RunState::RunCancelled;
+        if cancelled || payload.cancellation_source.is_some() {
+            let source = payload
+                .cancellation_source
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let source_line = Line::from(vec![Span::styled(
+                format!("  Cancel source: {source}"),
+                Tier::Contextual.style(),
+            )]);
+            self.terminal.insert_before(1, |buf| {
+                Paragraph::new(source_line).render(buf.area, buf);
+            })?;
+        }
+
+        if cancelled || payload.cancellation_provenance.is_some() {
+            let summary =
+                format_cancel_provenance_summary(payload.cancellation_provenance.as_ref());
+            let provenance_line = Line::from(vec![Span::styled(
+                format!("  Cancel provenance: {summary}"),
+                Tier::Contextual.style(),
+            )]);
+            self.terminal.insert_before(1, |buf| {
+                Paragraph::new(provenance_line).render(buf.area, buf);
+            })?;
+        }
+
         // Retry/next lines if there's a tranche.
         if let Some(tranche) = &payload.next_tranche {
             if !tranche.retry_task_keys.is_empty() {
@@ -549,6 +584,29 @@ fn should_emit_transient_status_line(
         return true;
     };
     now.signed_duration_since(last).num_seconds() >= TRANSIENT_STATUS_EMIT_SECS
+}
+
+fn format_cancel_provenance_summary(provenance: Option<&CancellationProvenance>) -> String {
+    let signal = provenance
+        .and_then(|p| p.signal_name.as_deref())
+        .unwrap_or("unknown");
+    let sender = provenance
+        .and_then(|p| p.sender_pid)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let receiver = provenance
+        .and_then(|p| p.receiver_pid)
+        .map(|pid| format!("yarli({pid})"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let actor = provenance
+        .and_then(|p| p.actor_kind)
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let stage = provenance
+        .and_then(|p| p.stage)
+        .map(|stage| stage.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("signal={signal} sender={sender} receiver={receiver} actor={actor} stage={stage}")
 }
 
 /// Determine visual tier for a task state.

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::events::StreamEvent;
+use yarli_core::domain::CancellationProvenance;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 
@@ -166,6 +167,13 @@ impl HeadlessRenderer {
                 self.summary.tasks_complete = payload.summary.completed;
                 self.summary.tasks_failed = payload.summary.failed;
                 self.summary.tasks_cancelled = payload.summary.cancelled;
+                if payload.exit_state == RunState::RunCancelled
+                    || payload.cancellation_provenance.is_some()
+                {
+                    let summary =
+                        format_cancel_provenance_summary(payload.cancellation_provenance.as_ref());
+                    let _ = writeln!(io::stderr(), "  Cancel provenance: {summary}");
+                }
                 // Print machine-readable JSON to stdout (not stderr).
                 if let Ok(json) = serde_json::to_string(&payload) {
                     let _ = writeln!(io::stdout(), "{json}");
@@ -209,6 +217,29 @@ fn display_run_id(run_id: uuid::Uuid) -> String {
     const RUN_ID_DISPLAY_LEN: usize = 12;
     let compact = run_id.simple().to_string();
     compact[..RUN_ID_DISPLAY_LEN.min(compact.len())].to_string()
+}
+
+fn format_cancel_provenance_summary(provenance: Option<&CancellationProvenance>) -> String {
+    let signal = provenance
+        .and_then(|p| p.signal_name.as_deref())
+        .unwrap_or("unknown");
+    let sender = provenance
+        .and_then(|p| p.sender_pid)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let receiver = provenance
+        .and_then(|p| p.receiver_pid)
+        .map(|pid| format!("yarli({pid})"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let actor = provenance
+        .and_then(|p| p.actor_kind)
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let stage = provenance
+        .and_then(|p| p.stage)
+        .map(|stage| stage.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("signal={signal} sender={sender} receiver={receiver} actor={actor} stage={stage}")
 }
 
 #[cfg(test)]
@@ -411,6 +442,8 @@ mod tests {
                 objective: "retry flow".into(),
                 exit_state: RunState::RunCompleted,
                 exit_reason: None,
+                cancellation_source: None,
+                cancellation_provenance: None,
                 completed_at: Utc::now(),
                 tasks: Vec::new(),
                 summary: RunSummary {

@@ -148,6 +148,9 @@ Behavior notes:
 - `runner = "native"` keeps current local process behavior unchanged.
 - `runner = "overwatch"` submits commands to Overwatch (`/run`), polls `/status/{task_id}`, reads final logs from `/output/{task_id}`, and maps terminal state into YARLI command transitions.
 - Scheduler shutdown cancellation propagates to command execution; Overwatch runner calls `/cancel/{task_id}` for in-flight tasks.
+- Cancellation transitions emit structured provenance (`run.cancel_provenance` / `task.cancel_provenance`) including signal identity, receiver/parent PID context, actor kind/detail, and stage attribution.
+- `ui.verbose_output` affects stream verbosity only. Provenance capture is independent; enable `ui.cancellation_diagnostics = true` to append extra diagnostic context in provenance `actor_detail`.
+- Durable provenance history requires Postgres backend. In-memory backend keeps provenance only for the lifetime of the current process (plus any existing `.yarli/continuation.json` artifact).
 
 ## Runtime Resource and Token Budgets
 

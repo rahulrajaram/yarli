@@ -507,6 +507,11 @@ pub struct RunConfig {
     /// in tranche task prompts.
     #[serde(default)]
     pub enforce_plan_tranche_allowed_paths: bool,
+    /// Allow recursive `yarli run` invocation from task commands.
+    ///
+    /// Defaults to false; recursive runs require explicit per-invocation opt-in.
+    #[serde(default)]
+    pub allow_recursive_run: bool,
     /// Optional project-level task catalog for run-spec execution.
     ///
     /// Serialized as `[[run.tasks]]`.
@@ -759,6 +764,9 @@ pub struct UiConfig {
     /// When true, command output lines are streamed to terminal scrollback.
     #[serde(default)]
     pub verbose_output: bool,
+    /// When true, cancellation events include extra diagnostic detail in provenance output.
+    #[serde(default)]
+    pub cancellation_diagnostics: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

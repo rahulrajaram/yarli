@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ExitReason, RunId, TaskId};
+use crate::domain::{CancellationProvenance, CancellationSource, ExitReason, RunId, TaskId};
 use crate::entities::run::Run;
 use crate::entities::task::{BlockerCode, Task};
 use crate::explain::DeteriorationTrend;
@@ -21,6 +21,10 @@ pub struct ContinuationPayload {
     pub objective: String,
     pub exit_state: RunState,
     pub exit_reason: Option<ExitReason>,
+    #[serde(default)]
+    pub cancellation_source: Option<CancellationSource>,
+    #[serde(default)]
+    pub cancellation_provenance: Option<CancellationProvenance>,
     pub completed_at: DateTime<Utc>,
     pub tasks: Vec<TaskOutcome>,
     pub summary: RunSummary,
@@ -198,6 +202,8 @@ impl ContinuationPayload {
             objective: run.objective.clone(),
             exit_state: run.state,
             exit_reason: run.exit_reason,
+            cancellation_source: run.cancellation_source,
+            cancellation_provenance: run.cancellation_provenance.clone(),
             completed_at: Utc::now(),
             tasks: task_outcomes,
             summary,

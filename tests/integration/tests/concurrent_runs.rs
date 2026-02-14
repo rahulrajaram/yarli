@@ -47,6 +47,7 @@ async fn concurrent_runs_respect_concurrency_caps() {
         enforce_policies: true,
         audit_decisions: true,
         budgets: ResourceBudgetConfig::default(),
+        allow_recursive_run: false,
     };
     let sched = Scheduler::new(queue, store.clone(), runner, config);
 
@@ -66,14 +67,8 @@ async fn concurrent_runs_respect_concurrency_caps() {
     let b2 = Task::new(run_b_id, "b2", "echo b2", CommandClass::Cpu, corr_b);
     let b3 = Task::new(run_b_id, "b3", "echo b3", CommandClass::Io, corr_b);
 
-    sched
-        .submit_run(run_a, vec![a1, a2, a3])
-        .await
-        .unwrap();
-    sched
-        .submit_run(run_b, vec![b1, b2, b3])
-        .await
-        .unwrap();
+    sched.submit_run(run_a, vec![a1, a2, a3]).await.unwrap();
+    sched.submit_run(run_b, vec![b1, b2, b3]).await.unwrap();
 
     // Track max concurrent IO and CPU claims per tick
     let mut max_io_per_tick = 0usize;
@@ -101,26 +96,15 @@ async fn concurrent_runs_respect_concurrency_caps() {
             break;
         }
 
-        assert!(
-            tick_num < 14,
-            "both runs should complete within 15 ticks"
-        );
+        assert!(tick_num < 14, "both runs should complete within 15 ticks");
     }
 
     // Both runs should be completed
     let reg = sched.registry().read().await;
     let run_a = reg.get_run(&run_a_id).unwrap();
     let run_b = reg.get_run(&run_b_id).unwrap();
-    assert_eq!(
-        run_a.state,
-        RunState::RunCompleted,
-        "run A should complete"
-    );
-    assert_eq!(
-        run_b.state,
-        RunState::RunCompleted,
-        "run B should complete"
-    );
+    assert_eq!(run_a.state, RunState::RunCompleted, "run A should complete");
+    assert_eq!(run_b.state, RunState::RunCompleted, "run B should complete");
 
     // Verify no task was assigned to the wrong run
     for task in reg.tasks_for_run(&run_a_id) {

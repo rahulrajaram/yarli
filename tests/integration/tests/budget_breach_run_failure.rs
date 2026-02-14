@@ -60,6 +60,7 @@ async fn budget_breach_fails_tasks_and_run() {
             max_run_total_tokens: Some(12),
             ..ResourceBudgetConfig::default()
         },
+        allow_recursive_run: false,
     };
     let sched = Scheduler::new(queue, store.clone(), runner, config);
 
@@ -73,10 +74,7 @@ async fn budget_breach_fails_tasks_and_run() {
     let t3 = make_task(run_id, "p3", "echo task3-output", corr_id);
     let t4 = make_task(run_id, "p4", "echo task4-output", corr_id);
 
-    sched
-        .submit_run(run, vec![t1, t2, t3, t4])
-        .await
-        .unwrap();
+    sched.submit_run(run, vec![t1, t2, t3, t4]).await.unwrap();
 
     // Tick until all tasks are processed
     let mut total_succeeded = 0usize;
@@ -140,9 +138,7 @@ async fn budget_breach_fails_tasks_and_run() {
         .iter()
         .filter(|e| {
             e.event_type == "task.retrying"
-                && budget_failures
-                    .iter()
-                    .any(|f| f.entity_id == e.entity_id)
+                && budget_failures.iter().any(|f| f.entity_id == e.entity_id)
         })
         .collect();
     assert!(

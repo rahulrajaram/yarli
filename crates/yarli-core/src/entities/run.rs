@@ -8,7 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{CorrelationId, EventId, ExitReason, RunId, SafeMode, TaskId};
+use crate::domain::{
+    CancellationProvenance, CancellationSource, CorrelationId, EventId, ExitReason, RunId,
+    SafeMode, TaskId,
+};
 use crate::error::TransitionError;
 use crate::fsm::run::RunState;
 
@@ -27,6 +30,12 @@ pub struct Run {
     pub safe_mode: SafeMode,
     /// Exit reason, set when the run reaches a terminal state.
     pub exit_reason: Option<ExitReason>,
+    /// Cancellation source, set when the run transitions to cancelled.
+    #[serde(default)]
+    pub cancellation_source: Option<CancellationSource>,
+    /// Structured cancellation provenance when run transitions to cancelled.
+    #[serde(default)]
+    pub cancellation_provenance: Option<CancellationProvenance>,
     /// Tasks belonging to this run (task IDs).
     pub task_ids: Vec<TaskId>,
     /// Correlation ID for all events in this run.
@@ -49,6 +58,8 @@ impl Run {
             state: RunState::RunOpen,
             safe_mode,
             exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
             task_ids: Vec::new(),
             correlation_id: Uuid::now_v7(),
             created_at: now,

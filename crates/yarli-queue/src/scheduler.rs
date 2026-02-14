@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use yarli_core::domain::{EntityType, Event, PolicyOutcome, RunId, TaskId};
+use yarli_core::domain::{EntityType, Event, PolicyDecision, PolicyOutcome, RunId, TaskId};
 use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::{BlockerCode, Task};
@@ -70,6 +70,8 @@ pub struct SchedulerConfig {
     pub audit_decisions: bool,
     /// Runtime resource and token budgets.
     pub budgets: ResourceBudgetConfig,
+    /// Allow task commands to recursively invoke `yarli run`.
+    pub allow_recursive_run: bool,
 }
 
 /// Per-task/per-run budgets used for explicit fail-fast policy behavior.
@@ -128,6 +130,7 @@ impl Default for SchedulerConfig {
             enforce_policies: true,
             audit_decisions: true,
             budgets: ResourceBudgetConfig::default(),
+            allow_recursive_run: false,
         }
     }
 }
@@ -378,6 +381,11 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     /// Get a reference to the registry for inspection.
     pub fn registry(&self) -> &Arc<RwLock<TaskRegistry>> {
         &self.registry
+    }
+
+    /// Get a clone of the configured audit sink, if any.
+    pub fn audit_sink(&self) -> Option<Arc<dyn AuditSink>> {
+        self.audit_sink.clone()
     }
 
     /// Bind a task ID to an explicit working directory for command execution.
@@ -695,6 +703,31 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 .cloned()
                 .unwrap_or_else(|| self.config.working_dir.clone())
         };
+
+        if !self.config.allow_recursive_run && command_invokes_recursive_yarli_run(&command) {
+            let decision = PolicyDecision {
+                decision_id: Uuid::now_v7(),
+                run_id: entry.run_id,
+                actor: self.config.worker_id.clone(),
+                action: ActionType::CommandExecute.as_str().to_string(),
+                outcome: PolicyOutcome::Deny,
+                rule_id: "deny-recursive-run".to_string(),
+                reason: "recursive `yarli run` is blocked by default; set [run].allow_recursive_run=true and pass --allow-recursive-run (or YARLI_ALLOW_RECURSIVE_RUN=1) to allow it".to_string(),
+                decided_at: chrono::Utc::now(),
+            };
+            self.persist_policy_decision(&decision, task_id, attempt_no, correlation_id, &command)?;
+            return self
+                .handle_policy_block(
+                    task_id,
+                    entry.run_id,
+                    queue_id,
+                    attempt_no,
+                    correlation_id,
+                    &decision,
+                    &command,
+                )
+                .await;
+        }
 
         if self.config.enforce_policies {
             let action = classify_policy_action(&command);
@@ -1654,6 +1687,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                                 "reason": transition.reason,
                                 "task_count": task_states.len(),
                                 "auto_verified": true,
+                                "exit_reason": run.exit_reason.map(|r| r.to_string()),
                             }),
                             correlation_id,
                             causation_id: None,
@@ -1694,6 +1728,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                                     "task_count": task_states.len(),
                                     "gates_evaluated": gate_names,
                                     "auto_verified": false,
+                                    "exit_reason": run.exit_reason.map(|r| r.to_string()),
                                 }),
                                 correlation_id,
                                 causation_id: None,
@@ -1740,6 +1775,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                                 payload: serde_json::json!({
                                     "reason": reason,
                                     "failures": failure_reasons,
+                                    "exit_reason": run.exit_reason.map(|r| r.to_string()),
                                 }),
                                 correlation_id,
                                 causation_id: None,
@@ -1771,6 +1807,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         "to": transition.to_state,
                         "reason": "task_permanently_failed",
                         "detail": transition.reason,
+                        "exit_reason": run.exit_reason.map(|r| r.to_string()),
                     }),
                     correlation_id,
                     causation_id: None,
@@ -1892,6 +1929,68 @@ fn classify_policy_action(command: &str) -> ActionType {
     ActionType::CommandExecute
 }
 
+fn trim_shell_token(token: &str) -> &str {
+    token.trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+}
+
+fn is_shell_separator_token(token: &str) -> bool {
+    matches!(token, "&&" | "||" | "|" | ";")
+}
+
+fn token_starts_command(tokens: &[&str], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let previous = trim_shell_token(tokens[idx - 1]);
+    if is_shell_separator_token(previous)
+        || previous.ends_with(';')
+        || previous.ends_with("&&")
+        || previous.ends_with("||")
+        || previous.ends_with('|')
+        || matches!(previous, "env" | "sudo" | "nohup" | "time")
+    {
+        return true;
+    }
+
+    if previous.contains('=') {
+        let mut cursor = idx;
+        while cursor > 0 && trim_shell_token(tokens[cursor - 1]).contains('=') {
+            cursor -= 1;
+        }
+        if cursor == 0 {
+            return true;
+        }
+        return is_shell_separator_token(trim_shell_token(tokens[cursor - 1]));
+    }
+
+    false
+}
+
+fn is_yarli_binary_token(token: &str) -> bool {
+    let trimmed = trim_shell_token(token);
+    let basename = trimmed
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed)
+        .rsplit('\\')
+        .next()
+        .unwrap_or(trimmed);
+    basename.eq_ignore_ascii_case("yarli") || basename.eq_ignore_ascii_case("yarli.exe")
+}
+
+fn command_invokes_recursive_yarli_run(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    for (idx, window) in tokens.windows(2).enumerate() {
+        if is_yarli_binary_token(window[0])
+            && token_starts_command(&tokens, idx)
+            && trim_shell_token(window[1]).eq_ignore_ascii_case("run")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn check_limit(
     violations: &mut Vec<BudgetViolation>,
     scope: &'static str,
@@ -1978,6 +2077,7 @@ mod tests {
             enforce_policies: true,
             audit_decisions: true,
             budgets: ResourceBudgetConfig::default(),
+            allow_recursive_run: false,
         }
     }
 
@@ -2895,6 +2995,84 @@ mod tests {
         assert!(events.iter().any(|e| e.event_type == "policy.decision"));
         assert!(events.iter().any(|e| e.event_type == "task.blocked"));
         assert!(events.iter().any(|e| e.event_type == "run.blocked"));
+    }
+
+    #[test]
+    fn recursive_yarli_detection_targets_command_start() {
+        assert!(command_invokes_recursive_yarli_run("yarli run"));
+        assert!(command_invokes_recursive_yarli_run("FOO=1 yarli run"));
+        assert!(command_invokes_recursive_yarli_run(
+            "cd /tmp && yarli run --stream"
+        ));
+        assert!(!command_invokes_recursive_yarli_run("echo yarli run"));
+    }
+
+    #[tokio::test]
+    async fn test_recursive_yarli_run_blocked_by_default() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let sched = Scheduler::new(queue.clone(), store.clone(), runner, test_config());
+
+        let run = Run::new("recursive blocked", SafeMode::Execute);
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        let task = make_task(run_id, "recursive", "yarli run || true", corr_id);
+        let task_id = task.id;
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.failed, 1, "recursive command should be blocked");
+
+        let reg = sched.registry().read().await;
+        assert_eq!(
+            reg.get_task(&task_id).unwrap().state,
+            TaskState::TaskBlocked
+        );
+        assert_eq!(reg.get_run(&run_id).unwrap().state, RunState::RunBlocked);
+        drop(reg);
+
+        let events = store.all().unwrap();
+        let policy = events
+            .iter()
+            .find(|event| {
+                event.event_type == "policy.decision"
+                    && event.payload.get("rule_id").and_then(|v| v.as_str())
+                        == Some("deny-recursive-run")
+            })
+            .expect("expected deny-recursive-run policy decision");
+        assert_eq!(
+            policy.payload.get("outcome").and_then(|v| v.as_str()),
+            Some("DENY")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recursive_yarli_run_allowed_when_enabled() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = SchedulerConfig {
+            allow_recursive_run: true,
+            ..test_config()
+        };
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = Run::new("recursive allowed", SafeMode::Execute);
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        let task = make_task(run_id, "recursive", "yarli run || true", corr_id);
+        let task_id = task.id;
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.succeeded, 1, "guard should be disabled when enabled");
+
+        let reg = sched.registry().read().await;
+        assert_eq!(
+            reg.get_task(&task_id).unwrap().state,
+            TaskState::TaskComplete
+        );
     }
 
     #[tokio::test]

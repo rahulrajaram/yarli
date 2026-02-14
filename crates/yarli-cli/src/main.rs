@@ -25,7 +25,10 @@ use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
 use yarli_cli::prompt;
 use yarli_cli::stream::{HeadlessRenderer, StreamConfig, StreamEvent, StreamRenderer};
-use yarli_core::domain::{CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode};
+use yarli_core::domain::{
+    CancellationActorKind, CancellationProvenance, CancellationSource, CancellationStage,
+    CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode,
+};
 use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use yarli_core::entities::merge_intent::{MergeIntent, MergeStrategy};
 use yarli_core::entities::run::Run;
@@ -229,6 +232,7 @@ commands unless `core.allow_in_memory_writes = true`.
 [ui]
 - ui.mode (default: "auto"; values: auto|stream|tui)
 - ui.verbose_output (default: false; stream command output to terminal scrollback)
+- ui.cancellation_diagnostics (default: false; include extra cancel provenance diagnostics)
 
 [sw4rm] (requires `--features sw4rm` at build time)
 - sw4rm.agent_name (default: "yarli-orchestrator")
@@ -429,6 +433,7 @@ audit_file = ".yarl/audit.jsonl"
 # auto | stream | tui
 mode = "auto"
 # verbose_output = false
+# cancellation_diagnostics = false
 "#;
 
 fn init_config_template(backend: Option<InitBackend>) -> String {
@@ -543,6 +548,9 @@ enum Commands {
         /// Override the prompt file used by default `yarli run` (no subcommand).
         #[arg(long)]
         prompt_file: Option<PathBuf>,
+        /// Allow recursive `yarli run` from task commands for this invocation.
+        #[arg(long, default_value_t = false)]
+        allow_recursive_run: bool,
         #[command(subcommand)]
         action: Option<RunAction>,
     },
@@ -991,11 +999,18 @@ async fn run() -> Result<()> {
     match cli.command {
         Commands::Run {
             prompt_file,
+            allow_recursive_run,
             action,
         } => match action {
             None => {
                 let render_mode = select_render_mode()?;
-                cmd_run_default(render_mode, &loaded_config, prompt_file).await
+                cmd_run_default(
+                    render_mode,
+                    &loaded_config,
+                    prompt_file,
+                    allow_recursive_run,
+                )
+                .await
             }
             Some(RunAction::Start {
                 objective,
@@ -1010,7 +1025,7 @@ async fn run() -> Result<()> {
                 let plan =
                     resolve_run_plan(&loaded_config, objective, cmd, pace, workdir, timeout, None)?;
                 let render_mode = select_render_mode()?;
-                cmd_run_start(plan, render_mode, &loaded_config).await
+                cmd_run_start(plan, render_mode, &loaded_config, allow_recursive_run).await
             }
             Some(RunAction::Batch {
                 objective,
@@ -1031,7 +1046,7 @@ async fn run() -> Result<()> {
                     Some("batch"),
                 )?;
                 let render_mode = select_render_mode()?;
-                cmd_run_start(plan, render_mode, &loaded_config).await
+                cmd_run_start(plan, render_mode, &loaded_config, allow_recursive_run).await
             }
             Some(RunAction::Status { run_id }) => {
                 if prompt_file.is_some() {
@@ -1056,7 +1071,7 @@ async fn run() -> Result<()> {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
                 let render_mode = select_render_mode()?;
-                cmd_run_continue(file, render_mode, &loaded_config).await
+                cmd_run_continue(file, render_mode, &loaded_config, allow_recursive_run).await
             }
             Some(RunAction::Pause {
                 run_id,
@@ -1862,10 +1877,7 @@ fn remove_conflicting_new_files_for_patch(
 
 /// After a patch is applied, compares backed-up file content with the newly created
 /// content. Logs a warning if they differ (the later workspace's version wins).
-fn warn_on_new_file_content_divergence(
-    source_workdir: &Path,
-    backed_up: &[(PathBuf, Vec<u8>)],
-) {
+fn warn_on_new_file_content_divergence(source_workdir: &Path, backed_up: &[(PathBuf, Vec<u8>)]) {
     for (rel_path, old_content) in backed_up {
         let full_path = source_workdir.join(rel_path);
         match fs::read(&full_path) {
@@ -2183,13 +2195,16 @@ fn merge_parallel_workspace_results(
     let has_stashed_dirty_state = if !pre_status_text.trim().is_empty() {
         info!("stashing pre-existing dirty state before parallel workspace merge");
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
-        let stash_result = run_git_capture(source_workdir, &[
-            "stash", "push", "-m",
-            "yarli: stash pre-existing workspace state before merge",
-        ]);
-        stash_result
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        let stash_result = run_git_capture(
+            source_workdir,
+            &[
+                "stash",
+                "push",
+                "-m",
+                "yarli: stash pre-existing workspace state before merge",
+            ],
+        );
+        stash_result.map(|o| o.status.success()).unwrap_or(false)
     } else {
         false
     };
@@ -2295,10 +2310,7 @@ Operator recovery steps:\n\
                         "DU" => {
                             // Deleted in workspace (ours), modified in stash (theirs).
                             // Keep it deleted — workspace decision wins.
-                            let _ = run_git_capture(
-                                source_workdir,
-                                &["rm", "-f", "--", path],
-                            );
+                            let _ = run_git_capture(source_workdir, &["rm", "-f", "--", path]);
                         }
                         _ => {}
                     }
@@ -2309,10 +2321,16 @@ Operator recovery steps:\n\
         }
         // Commit the reapplied dirty state (clean pop or resolved conflicts).
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
-        let _ = run_git_capture(source_workdir, &[
-            "commit", "--no-verify", "--allow-empty", "-m",
-            "yarli: reapply pre-existing workspace state after merge",
-        ]);
+        let _ = run_git_capture(
+            source_workdir,
+            &[
+                "commit",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "yarli: reapply pre-existing workspace state after merge",
+            ],
+        );
     }
 
     Ok(ParallelWorkspaceMergeReport {
@@ -3109,8 +3127,15 @@ async fn cmd_run_start(
     plan: RunPlan,
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
+    allow_recursive_run_override: bool,
 ) -> Result<()> {
-    let outcome = execute_run_plan(plan, render_mode, loaded_config).await?;
+    let outcome = execute_run_plan(
+        plan,
+        render_mode,
+        loaded_config,
+        allow_recursive_run_override,
+    )
+    .await?;
     finalize_run_outcome(&outcome)
 }
 
@@ -3118,6 +3143,7 @@ async fn execute_run_plan(
     plan: RunPlan,
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
+    allow_recursive_run_override: bool,
 ) -> Result<RunExecutionOutcome> {
     ensure_write_backend_guard(loaded_config, "run start")?;
     ensure_parallel_workspace_contract(loaded_config)?;
@@ -3127,7 +3153,15 @@ async fn execute_run_plan(
             println!("Using backend: in-memory");
             let store = Arc::new(InMemoryEventStore::new());
             let queue = Arc::new(InMemoryTaskQueue::new());
-            cmd_run_start_with_backend(plan.clone(), render_mode, loaded_config, store, queue).await
+            cmd_run_start_with_backend(
+                plan.clone(),
+                render_mode,
+                loaded_config,
+                store,
+                queue,
+                allow_recursive_run_override,
+            )
+            .await
         }
         BackendSelection::Postgres { database_url } => {
             println!("Using backend: postgres");
@@ -3139,7 +3173,15 @@ async fn execute_run_plan(
                 Arc::new(PostgresTaskQueue::new(&database_url).map_err(|e| {
                     anyhow::anyhow!("failed to initialize postgres task queue: {e}")
                 })?);
-            cmd_run_start_with_backend(plan, render_mode, loaded_config, store, queue).await
+            cmd_run_start_with_backend(
+                plan,
+                render_mode,
+                loaded_config,
+                store,
+                queue,
+                allow_recursive_run_override,
+            )
+            .await
         }
     }
 }
@@ -3187,6 +3229,10 @@ fn print_run_summary(outcome: &RunExecutionOutcome) {
         .exit_reason
         .map(|r| r.to_string())
         .unwrap_or_else(|| "none".to_string());
+    let cancellation_source_str = payload
+        .cancellation_source
+        .map(|source| source.to_string())
+        .unwrap_or_else(|| "none".to_string());
 
     let bar: String = "═".repeat(75);
     let suffix: String = "═".repeat(59);
@@ -3197,6 +3243,13 @@ fn print_run_summary(outcome: &RunExecutionOutcome) {
     println!("  Objective:   {}", payload.objective);
     println!("  Exit state:  {:?}", outcome.run_state);
     println!("  Exit reason: {exit_reason_str}");
+    println!("  Cancel src:  {cancellation_source_str}");
+    if outcome.run_state == RunState::RunCancelled || payload.cancellation_provenance.is_some() {
+        println!(
+            "  Cancel prov: {}",
+            format_cancel_provenance_summary(payload.cancellation_provenance.as_ref())
+        );
+    }
     println!(
         "  Tasks:       {} completed, {} failed, {} pending",
         summary.completed, summary.failed, summary.pending
@@ -3537,6 +3590,16 @@ fn is_truthy_env(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn recursive_run_execution_enabled(
+    loaded_config: &LoadedConfig,
+    allow_recursive_run_override: bool,
+) -> bool {
+    let env_override = std::env::var("YARLI_ALLOW_RECURSIVE_RUN")
+        .map(|raw| is_truthy_env(raw.trim()))
+        .unwrap_or(false);
+    loaded_config.config().run.allow_recursive_run && (allow_recursive_run_override || env_override)
 }
 
 fn parse_plan_checkbox_status(line: &str) -> Option<(bool, &str)> {
@@ -4168,6 +4231,7 @@ async fn cmd_run_continue(
     file: PathBuf,
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
+    allow_recursive_run_override: bool,
 ) -> Result<()> {
     let payload = load_continuation_payload_for_continue(&file, loaded_config).await?;
 
@@ -4187,7 +4251,13 @@ async fn cmd_run_continue(
             iteration,
             "continuing from previous run"
         );
-        let outcome = execute_run_plan(plan.clone(), render_mode, loaded_config).await?;
+        let outcome = execute_run_plan(
+            plan.clone(),
+            render_mode,
+            loaded_config,
+            allow_recursive_run_override,
+        )
+        .await?;
         if outcome.run_state != RunState::RunCompleted {
             return finalize_run_outcome(&outcome);
         }
@@ -4225,6 +4295,7 @@ async fn cmd_run_default(
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
     prompt_file_override: Option<PathBuf>,
+    allow_recursive_run_override: bool,
 ) -> Result<()> {
     let resolved_prompt =
         resolve_prompt_entry_path(loaded_config, prompt_file_override.as_deref())?;
@@ -4347,7 +4418,13 @@ async fn cmd_run_default(
             iteration,
             "running prompt-defined tranche"
         );
-        let outcome = execute_run_plan(plan.clone(), render_mode, loaded_config).await?;
+        let outcome = execute_run_plan(
+            plan.clone(),
+            render_mode,
+            loaded_config,
+            allow_recursive_run_override,
+        )
+        .await?;
         if outcome.run_state != RunState::RunCompleted {
             return finalize_run_outcome(&outcome);
         }
@@ -4403,6 +4480,7 @@ async fn cmd_run_start_with_backend<Q, S>(
     loaded_config: &LoadedConfig,
     store: Arc<S>,
     queue: Arc<Q>,
+    allow_recursive_run_override: bool,
 ) -> Result<RunExecutionOutcome>
 where
     Q: TaskQueue + 'static,
@@ -4483,6 +4561,8 @@ where
     }
     config.enforce_policies = loaded_config.config().policy.enforce_policies;
     config.audit_decisions = loaded_config.config().policy.audit_decisions;
+    config.allow_recursive_run =
+        recursive_run_execution_enabled(loaded_config, allow_recursive_run_override);
     config.budgets = ResourceBudgetConfig {
         max_task_rss_bytes: loaded_config.config().budgets.max_task_rss_bytes,
         max_task_cpu_user_ticks: loaded_config.config().budgets.max_task_cpu_user_ticks,
@@ -4645,12 +4725,14 @@ where
     let continuation_payload = drive_scheduler(
         &scheduler,
         &store,
+        shutdown.clone(),
         cancel,
         tx,
         run_id,
         correlation_id,
         &task_names,
         loaded_config.config().run.effective_auto_advance_policy(),
+        loaded_config.config().ui.cancellation_diagnostics,
         build_memory_observer(loaded_config, run_id, correlation_id, &plan, &task_names)?,
     )
     .await?;
@@ -5387,17 +5469,118 @@ fn build_continuation_payload(
     payload
 }
 
+fn cancellation_reason_for_source(source: CancellationSource) -> &'static str {
+    match source {
+        CancellationSource::Operator => "cancelled by operator",
+        CancellationSource::Sigint => "cancelled by SIGINT",
+        CancellationSource::Sigterm => "cancelled by SIGTERM",
+        CancellationSource::Sw4rmPreemption => "cancelled by sw4rm preemption",
+        CancellationSource::Unknown => "cancelled by shutdown token",
+    }
+}
+
+fn actor_kind_for_source(source: CancellationSource) -> CancellationActorKind {
+    match source {
+        CancellationSource::Operator | CancellationSource::Sigint => {
+            CancellationActorKind::Operator
+        }
+        CancellationSource::Sw4rmPreemption => CancellationActorKind::Supervisor,
+        CancellationSource::Sigterm => CancellationActorKind::System,
+        CancellationSource::Unknown => CancellationActorKind::Unknown,
+    }
+}
+
+fn default_cancellation_provenance(
+    source: CancellationSource,
+    actor_detail: Option<String>,
+) -> CancellationProvenance {
+    CancellationProvenance {
+        cancellation_source: source,
+        signal_name: None,
+        signal_number: None,
+        sender_pid: None,
+        receiver_pid: Some(std::process::id()),
+        parent_pid: None,
+        process_group_id: None,
+        session_id: None,
+        tty: None,
+        actor_kind: Some(actor_kind_for_source(source)),
+        actor_detail,
+        stage: Some(CancellationStage::Unknown),
+    }
+}
+
+fn cancellation_stage_for_task(task: &Task) -> CancellationStage {
+    match task.state {
+        TaskState::TaskExecuting => CancellationStage::Executing,
+        TaskState::TaskVerifying => CancellationStage::Verifying,
+        TaskState::TaskReady if task.attempt_no > 1 => CancellationStage::Retrying,
+        _ => CancellationStage::Unknown,
+    }
+}
+
+fn cancellation_stage_for_task_projection(task: &TaskProjection) -> CancellationStage {
+    match task.state {
+        TaskState::TaskExecuting => CancellationStage::Executing,
+        TaskState::TaskVerifying => CancellationStage::Verifying,
+        TaskState::TaskReady if task.attempt_no.unwrap_or(0) > 1 => CancellationStage::Retrying,
+        _ => CancellationStage::Unknown,
+    }
+}
+
+fn format_cancel_provenance_summary(provenance: Option<&CancellationProvenance>) -> String {
+    let signal = provenance
+        .and_then(|p| p.signal_name.as_deref())
+        .unwrap_or("unknown");
+    let sender = provenance
+        .and_then(|p| p.sender_pid)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let receiver = provenance
+        .and_then(|p| p.receiver_pid)
+        .map(|pid| format!("yarli({pid})"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let actor = provenance
+        .and_then(|p| p.actor_kind)
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let stage = provenance
+        .and_then(|p| p.stage)
+        .map(|stage| stage.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("signal={signal} sender={sender} receiver={receiver} actor={actor} stage={stage}")
+}
+
+fn with_cancellation_diagnostics(
+    mut provenance: CancellationProvenance,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    tick_count: u64,
+    note: &str,
+) -> CancellationProvenance {
+    let diagnostic = format!(
+        "diag(run_id={run_id}, correlation_id={correlation_id}, tick={tick_count}, note={note})"
+    );
+    provenance.actor_detail = Some(match provenance.actor_detail {
+        Some(existing) => format!("{existing}; {diagnostic}"),
+        None => diagnostic,
+    });
+    provenance
+}
+
 /// Drive the scheduler, emitting StreamEvents to the renderer channel.
 #[allow(clippy::too_many_arguments)]
 async fn drive_scheduler<Q, S, R>(
     scheduler: &Scheduler<Q, S, R>,
     store: &Arc<S>,
+    shutdown: ShutdownController,
     cancel: CancellationToken,
     tx: mpsc::UnboundedSender<StreamEvent>,
     run_id: Uuid,
     correlation_id: Uuid,
     task_names: &[(Uuid, String)],
     auto_advance_policy: AutoAdvancePolicy,
+    cancellation_diagnostics: bool,
     mut memory_observer: Option<MemoryObserver>,
 ) -> Result<yarli_core::entities::ContinuationPayload>
 where
@@ -5441,11 +5624,33 @@ where
             biased;
             _ = cancel.cancelled() => {
                 info!("scheduler cancelled");
+                let cancellation_source = shutdown
+                    .cancellation_source()
+                    .unwrap_or(CancellationSource::Unknown);
+                let reason = cancellation_reason_for_source(cancellation_source);
+                let provenance = if cancellation_diagnostics {
+                    Some(with_cancellation_diagnostics(
+                        shutdown.cancellation_provenance().unwrap_or_else(|| {
+                            default_cancellation_provenance(
+                                cancellation_source,
+                                Some("cancellation signal observed".to_string()),
+                            )
+                        }),
+                        run_id,
+                        correlation_id,
+                        tick_count,
+                        reason,
+                    ))
+                } else {
+                    shutdown.cancellation_provenance()
+                };
                 let _ = cancel_active_run(
                     scheduler,
                     store,
                     run_id,
-                    "cancelled by operator interrupt",
+                    reason,
+                    cancellation_source,
+                    provenance,
                 )
                 .await?;
                 let _new_events =
@@ -5601,7 +5806,32 @@ where
                     }
                     Some(OperatorControlSignal::Cancel { reason }) => {
                         info!(%reason, "received operator cancel signal");
-                        let _ = cancel_active_run(scheduler, store, run_id, &reason).await?;
+                        let operator_provenance = if cancellation_diagnostics {
+                            Some(with_cancellation_diagnostics(
+                                default_cancellation_provenance(
+                                    CancellationSource::Operator,
+                                    Some("operator control-plane cancel event".to_string()),
+                                ),
+                                run_id,
+                                correlation_id,
+                                tick_count,
+                                &reason,
+                            ))
+                        } else {
+                            Some(default_cancellation_provenance(
+                                CancellationSource::Operator,
+                                Some("operator control-plane cancel event".to_string()),
+                            ))
+                        };
+                        let _ = cancel_active_run(
+                            scheduler,
+                            store,
+                            run_id,
+                            &reason,
+                            CancellationSource::Operator,
+                            operator_provenance,
+                        )
+                        .await?;
                         let cancel_events =
                             emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
                         deterioration_observer.observe_store(store.as_ref())?;
@@ -5762,6 +5992,8 @@ async fn cancel_active_run<Q, S, R>(
     store: &Arc<S>,
     run_id: Uuid,
     reason: &str,
+    cancellation_source: CancellationSource,
+    provenance: Option<CancellationProvenance>,
 ) -> Result<bool>
 where
     Q: yarli_queue::TaskQueue,
@@ -5776,7 +6008,35 @@ where
         (run.correlation_id, run.task_ids.clone())
     };
 
+    let mut run_provenance =
+        provenance.unwrap_or_else(|| default_cancellation_provenance(cancellation_source, None));
+    run_provenance.cancellation_source = cancellation_source;
+    if run_provenance.signal_name.is_none() {
+        run_provenance.signal_name = match cancellation_source {
+            CancellationSource::Sigint => Some("SIGINT".to_string()),
+            CancellationSource::Sigterm => Some("SIGTERM".to_string()),
+            _ => None,
+        };
+    }
+    if run_provenance.signal_number.is_none() {
+        run_provenance.signal_number = match cancellation_source {
+            CancellationSource::Sigint => Some(2),
+            CancellationSource::Sigterm => Some(15),
+            _ => None,
+        };
+    }
+    if run_provenance.receiver_pid.is_none() {
+        run_provenance.receiver_pid = Some(std::process::id());
+    }
+    if run_provenance.actor_kind.is_none() {
+        run_provenance.actor_kind = Some(actor_kind_for_source(cancellation_source));
+    }
+    if run_provenance.stage.is_none() {
+        run_provenance.stage = Some(CancellationStage::Unknown);
+    }
+
     let mut events: Vec<Event> = Vec::new();
+    let mut first_cancelled_task_id: Option<Uuid> = None;
     let mut reg = scheduler.registry().write().await;
 
     for task_id in task_ids {
@@ -5787,8 +6047,17 @@ where
             continue;
         }
 
+        let stage = cancellation_stage_for_task(task);
+        let mut task_provenance = run_provenance.clone();
+        task_provenance.stage = Some(stage);
+
         let attempt_no = task.attempt_no;
         let transition = task.transition(TaskState::TaskCancelled, reason, "cli", None)?;
+
+        if first_cancelled_task_id.is_none() {
+            first_cancelled_task_id = Some(task_id);
+            run_provenance.stage = Some(stage);
+        }
 
         events.push(Event {
             event_id: transition.event_id,
@@ -5800,11 +6069,43 @@ where
                 "from": transition.from_state,
                 "to": transition.to_state,
                 "reason": transition.reason,
+                "detail": transition.reason,
+                "cancellation_source": cancellation_source.to_string(),
+                "cancellation_provenance": task_provenance,
             }),
             correlation_id,
             causation_id: None,
             actor: "cli".to_string(),
             idempotency_key: Some(format!("{task_id}:cancelled:{attempt_no}")),
+        });
+
+        events.push(Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: transition.occurred_at,
+            entity_type: EntityType::Task,
+            entity_id: task_id.to_string(),
+            event_type: "task.cancel_provenance".to_string(),
+            payload: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "task_id": task_id.to_string(),
+                "timestamp": transition.occurred_at,
+                "cancellation_source": cancellation_source.to_string(),
+                "signal_name": task_provenance.signal_name.clone(),
+                "signal_number": task_provenance.signal_number,
+                "sender_pid": task_provenance.sender_pid,
+                "receiver_pid": task_provenance.receiver_pid,
+                "parent_pid": task_provenance.parent_pid,
+                "process_group_id": task_provenance.process_group_id,
+                "session_id": task_provenance.session_id,
+                "tty": task_provenance.tty.clone(),
+                "actor_kind": task_provenance.actor_kind.map(|kind| kind.to_string()),
+                "actor_detail": task_provenance.actor_detail.clone(),
+                "stage": task_provenance.stage.map(|stage| stage.to_string()),
+            }),
+            correlation_id,
+            causation_id: Some(transition.event_id),
+            actor: "cli".to_string(),
+            idempotency_key: Some(format!("{task_id}:cancel_provenance:{attempt_no}")),
         });
     }
 
@@ -5813,6 +6114,8 @@ where
             false
         } else {
             let transition = run.transition(RunState::RunCancelled, reason, "cli", None)?;
+            run.cancellation_source = Some(cancellation_source);
+            run.cancellation_provenance = Some(run_provenance.clone());
 
             events.push(Event {
                 event_id: transition.event_id,
@@ -5824,11 +6127,43 @@ where
                     "from": transition.from_state,
                     "to": transition.to_state,
                     "reason": transition.reason,
+                    "detail": transition.reason,
+                    "exit_reason": run.exit_reason.map(|r| r.to_string()),
+                    "cancellation_source": cancellation_source.to_string(),
+                    "cancellation_provenance": run_provenance.clone(),
                 }),
                 correlation_id,
                 causation_id: None,
                 actor: "cli".to_string(),
                 idempotency_key: Some(format!("{run_id}:cancelled")),
+            });
+            events.push(Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: transition.occurred_at,
+                entity_type: EntityType::Run,
+                entity_id: run_id.to_string(),
+                event_type: "run.cancel_provenance".to_string(),
+                payload: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "task_id": first_cancelled_task_id.map(|id| id.to_string()),
+                    "timestamp": transition.occurred_at,
+                    "cancellation_source": cancellation_source.to_string(),
+                    "signal_name": run_provenance.signal_name.clone(),
+                    "signal_number": run_provenance.signal_number,
+                    "sender_pid": run_provenance.sender_pid,
+                    "receiver_pid": run_provenance.receiver_pid,
+                    "parent_pid": run_provenance.parent_pid,
+                    "process_group_id": run_provenance.process_group_id,
+                    "session_id": run_provenance.session_id,
+                    "tty": run_provenance.tty.clone(),
+                    "actor_kind": run_provenance.actor_kind.map(|kind| kind.to_string()),
+                    "actor_detail": run_provenance.actor_detail.clone(),
+                    "stage": run_provenance.stage.map(|stage| stage.to_string()),
+                }),
+                correlation_id,
+                causation_id: Some(transition.event_id),
+                actor: "cli".to_string(),
+                idempotency_key: Some(format!("{run_id}:cancel_provenance")),
             });
             true
         }
@@ -5853,6 +6188,30 @@ where
         store
             .append(event)
             .map_err(|e| anyhow::anyhow!("failed to persist cancellation event: {e}"))?;
+    }
+
+    if run_cancelled {
+        if let Some(sink) = scheduler.audit_sink() {
+            let entry = AuditEntry::destructive_attempt(
+                "yarli-cli",
+                "run.cancelled",
+                reason,
+                Some(run_id),
+                first_cancelled_task_id,
+                serde_json::json!({
+                    "cancellation_source": cancellation_source.to_string(),
+                    "cancellation_provenance": run_provenance.clone(),
+                    "summary": format_cancel_provenance_summary(Some(&run_provenance)),
+                }),
+            );
+            if let Err(err) = sink.append(&entry) {
+                warn!(
+                    run_id = %run_id,
+                    error = %err,
+                    "failed to append cancellation provenance audit entry"
+                );
+            }
+        }
     }
 
     Ok(run_cancelled)
@@ -7041,6 +7400,9 @@ struct TaskProjection {
 struct RunProjection {
     run_id: Uuid,
     state: RunState,
+    exit_reason: Option<String>,
+    cancellation_source: Option<CancellationSource>,
+    cancellation_provenance: Option<CancellationProvenance>,
     correlation_id: Uuid,
     updated_at: chrono::DateTime<chrono::Utc>,
     last_event_type: String,
@@ -7226,6 +7588,132 @@ fn event_reason(event: &Event) -> Option<String> {
         .get("reason")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn parse_cancellation_source(raw: &str) -> Option<CancellationSource> {
+    match raw {
+        "operator" => Some(CancellationSource::Operator),
+        "sigint" => Some(CancellationSource::Sigint),
+        "sigterm" => Some(CancellationSource::Sigterm),
+        "sw4rm_preemption" => Some(CancellationSource::Sw4rmPreemption),
+        "unknown" => Some(CancellationSource::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_cancellation_actor_kind(raw: &str) -> Option<CancellationActorKind> {
+    match raw {
+        "operator" => Some(CancellationActorKind::Operator),
+        "system" => Some(CancellationActorKind::System),
+        "supervisor" => Some(CancellationActorKind::Supervisor),
+        "unknown" => Some(CancellationActorKind::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_cancellation_stage(raw: &str) -> Option<CancellationStage> {
+    match raw {
+        "executing" => Some(CancellationStage::Executing),
+        "retrying" => Some(CancellationStage::Retrying),
+        "verifying" => Some(CancellationStage::Verifying),
+        "unknown" => Some(CancellationStage::Unknown),
+        _ => None,
+    }
+}
+
+fn event_exit_reason(event: &Event) -> Option<String> {
+    event
+        .payload
+        .get("exit_reason")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+fn event_cancellation_source(event: &Event) -> Option<CancellationSource> {
+    event
+        .payload
+        .get("cancellation_source")
+        .and_then(|v| v.as_str())
+        .and_then(parse_cancellation_source)
+}
+
+fn event_cancellation_provenance(event: &Event) -> Option<CancellationProvenance> {
+    if let Some(value) = event.payload.get("cancellation_provenance") {
+        if let Ok(parsed) = serde_json::from_value::<CancellationProvenance>(value.clone()) {
+            return Some(parsed);
+        }
+    }
+
+    if event.event_type == "run.cancel_provenance" {
+        let source = event
+            .payload
+            .get("cancellation_source")
+            .and_then(|v| v.as_str())
+            .and_then(parse_cancellation_source)
+            .unwrap_or(CancellationSource::Unknown);
+        let actor_kind = event
+            .payload
+            .get("actor_kind")
+            .and_then(|v| v.as_str())
+            .and_then(parse_cancellation_actor_kind);
+        let stage = event
+            .payload
+            .get("stage")
+            .and_then(|v| v.as_str())
+            .and_then(parse_cancellation_stage);
+        return Some(CancellationProvenance {
+            cancellation_source: source,
+            signal_name: event
+                .payload
+                .get("signal_name")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            signal_number: event
+                .payload
+                .get("signal_number")
+                .and_then(|v| v.as_i64())
+                .and_then(|v| i32::try_from(v).ok()),
+            sender_pid: event
+                .payload
+                .get("sender_pid")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            receiver_pid: event
+                .payload
+                .get("receiver_pid")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            parent_pid: event
+                .payload
+                .get("parent_pid")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            process_group_id: event
+                .payload
+                .get("process_group_id")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            session_id: event
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            tty: event
+                .payload
+                .get("tty")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            actor_kind,
+            actor_detail: event
+                .payload
+                .get("actor_detail")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            stage,
+        });
+    }
+
+    None
 }
 
 fn extract_entity_state(event: &Event) -> String {
@@ -7520,6 +8008,9 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
 
     let mut state = RunState::RunOpen;
     let mut objective = None;
+    let mut exit_reason = None;
+    let mut cancellation_source = None;
+    let mut cancellation_provenance = None;
     let mut correlation_id = run_events[0].correlation_id;
     let mut updated_at = run_events[0].occurred_at;
     let mut last_event_type = run_events[0].event_type.clone();
@@ -7536,6 +8027,15 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
 
         if let Some(next_state) = run_state_from_event(event) {
             state = next_state;
+        }
+        if let Some(next_exit_reason) = event_exit_reason(event) {
+            exit_reason = Some(next_exit_reason);
+        }
+        if let Some(next_source) = event_cancellation_source(event) {
+            cancellation_source = Some(next_source);
+        }
+        if let Some(next_provenance) = event_cancellation_provenance(event) {
+            cancellation_provenance = Some(next_provenance);
         }
 
         if event.event_type == "run.config_snapshot" {
@@ -7613,6 +8113,9 @@ fn load_run_projection(store: &dyn EventStore, run_id: Uuid) -> Result<Option<Ru
     Ok(Some(RunProjection {
         run_id,
         state,
+        exit_reason,
+        cancellation_source,
+        cancellation_provenance,
         correlation_id,
         updated_at,
         last_event_type,
@@ -8048,6 +8551,23 @@ fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
         &mut out,
         "Tasks: {total_tasks} total ({complete} complete, {failed} failed, {blocked} blocked, {active} active)"
     )?;
+    if run.state == RunState::RunCancelled
+        || run.cancellation_source.is_some()
+        || run.cancellation_provenance.is_some()
+    {
+        writeln!(
+            &mut out,
+            "Cancellation source: {}",
+            run.cancellation_source
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )?;
+        writeln!(
+            &mut out,
+            "Cancellation provenance: {}",
+            format_cancel_provenance_summary(run.cancellation_provenance.as_ref())
+        )?;
+    }
     if let Some(report) = run.deterioration.as_ref() {
         writeln!(&mut out)?;
         writeln!(
@@ -8240,6 +8760,31 @@ fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
     let mut out = String::new();
     writeln!(&mut out, "Run explain for {run_id}")?;
     writeln!(&mut out, "Status: {:?}", explain.status)?;
+    writeln!(
+        &mut out,
+        "Exit reason: {}",
+        run.exit_reason.as_deref().unwrap_or("none")
+    )?;
+    writeln!(
+        &mut out,
+        "Cancellation source: {}",
+        run.cancellation_source
+            .map(|source| source.to_string())
+            .unwrap_or_else(|| {
+                if run.state == RunState::RunCancelled {
+                    "unknown".to_string()
+                } else {
+                    "none".to_string()
+                }
+            })
+    )?;
+    if run.state == RunState::RunCancelled || run.cancellation_provenance.is_some() {
+        writeln!(
+            &mut out,
+            "Cancellation provenance: {}",
+            format_cancel_provenance_summary(run.cancellation_provenance.as_ref())
+        )?;
+    }
     writeln!(&mut out, "Blocking tasks: {}", explain.blocking_tasks.len())?;
     writeln!(&mut out, "Failed gates: {}", explain.failed_gates.len())?;
 
@@ -10138,10 +10683,80 @@ fn append_run_transition_event(
     )
 }
 
+fn append_run_cancelled_transition_event(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    from: RunState,
+    reason: &str,
+    cancellation_source: CancellationSource,
+    provenance: &CancellationProvenance,
+    task_id: Option<Uuid>,
+    idempotency_key: Option<String>,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: "run.cancelled".to_string(),
+            payload: serde_json::json!({
+                "from": format!("{:?}", from),
+                "to": format!("{:?}", RunState::RunCancelled),
+                "reason": reason,
+                "detail": reason,
+                "exit_reason": yarli_core::domain::ExitReason::CancelledByOperator.to_string(),
+                "cancellation_source": cancellation_source.to_string(),
+                "cancellation_provenance": provenance,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: OPERATOR_CONTROL_ACTOR.to_string(),
+            idempotency_key,
+        },
+    )?;
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: "run.cancel_provenance".to_string(),
+            payload: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "task_id": task_id.map(|id| id.to_string()),
+                "timestamp": chrono::Utc::now(),
+                "cancellation_source": cancellation_source.to_string(),
+                "signal_name": provenance.signal_name.clone(),
+                "signal_number": provenance.signal_number,
+                "sender_pid": provenance.sender_pid,
+                "receiver_pid": provenance.receiver_pid,
+                "parent_pid": provenance.parent_pid,
+                "process_group_id": provenance.process_group_id,
+                "session_id": provenance.session_id,
+                "tty": provenance.tty.clone(),
+                "actor_kind": provenance.actor_kind.map(|kind| kind.to_string()),
+                "actor_detail": provenance.actor_detail.clone(),
+                "stage": provenance.stage.map(|stage| stage.to_string()),
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: OPERATOR_CONTROL_ACTOR.to_string(),
+            idempotency_key: Some(format!("{run_id}:operator_cancel_provenance")),
+        },
+    )
+}
+
 fn append_task_cancelled_event(
     store: &dyn EventStore,
+    run_id: Uuid,
     task: &TaskProjection,
     reason: &str,
+    cancellation_source: CancellationSource,
+    provenance: &CancellationProvenance,
 ) -> Result<()> {
     append_event(
         store,
@@ -10157,12 +10772,49 @@ fn append_task_cancelled_event(
                 "reason": reason,
                 "detail": reason,
                 "attempt_no": task.attempt_no,
+                "cancellation_source": cancellation_source.to_string(),
+                "cancellation_provenance": provenance,
             }),
             correlation_id: task.correlation_id,
             causation_id: None,
             actor: "cli.operator".to_string(),
             idempotency_key: Some(format!(
                 "{}:operator_cancel:{}",
+                task.task_id,
+                task.attempt_no.unwrap_or(0)
+            )),
+        },
+    )?;
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Task,
+            entity_id: task.task_id.to_string(),
+            event_type: "task.cancel_provenance".to_string(),
+            payload: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "task_id": task.task_id.to_string(),
+                "timestamp": chrono::Utc::now(),
+                "cancellation_source": cancellation_source.to_string(),
+                "signal_name": provenance.signal_name.clone(),
+                "signal_number": provenance.signal_number,
+                "sender_pid": provenance.sender_pid,
+                "receiver_pid": provenance.receiver_pid,
+                "parent_pid": provenance.parent_pid,
+                "process_group_id": provenance.process_group_id,
+                "session_id": provenance.session_id,
+                "tty": provenance.tty.clone(),
+                "actor_kind": provenance.actor_kind.map(|kind| kind.to_string()),
+                "actor_detail": provenance.actor_detail.clone(),
+                "stage": provenance.stage.map(|stage| stage.to_string()),
+            }),
+            correlation_id: task.correlation_id,
+            causation_id: None,
+            actor: "cli.operator".to_string(),
+            idempotency_key: Some(format!(
+                "{}:operator_cancel_provenance:{}",
                 task.task_id,
                 task.attempt_no.unwrap_or(0)
             )),
@@ -10239,6 +10891,7 @@ fn execute_run_cancel_control(
     queue: &dyn TaskQueue,
     run_id: Uuid,
     reason: &str,
+    cancellation_diagnostics: bool,
 ) -> Result<String> {
     let run = match load_run_projection(store, run_id)? {
         Some(run) => run,
@@ -10258,22 +10911,46 @@ fn execute_run_cancel_control(
     }
 
     let mut cancelled_tasks = 0usize;
+    let mut first_cancelled_task_id: Option<Uuid> = None;
+    let mut run_provenance = default_cancellation_provenance(
+        CancellationSource::Operator,
+        Some("operator control-plane cancel command".to_string()),
+    );
+    if cancellation_diagnostics {
+        run_provenance =
+            with_cancellation_diagnostics(run_provenance, run_id, run.correlation_id, 0, reason);
+    }
     for task in &run.tasks {
         if task.state.is_terminal() || !task.state.can_transition_to(TaskState::TaskCancelled) {
             continue;
         }
-        append_task_cancelled_event(store, task, reason)?;
+        let stage = cancellation_stage_for_task_projection(task);
+        let mut task_provenance = run_provenance.clone();
+        task_provenance.stage = Some(stage);
+        append_task_cancelled_event(
+            store,
+            run_id,
+            task,
+            reason,
+            CancellationSource::Operator,
+            &task_provenance,
+        )?;
+        if first_cancelled_task_id.is_none() {
+            first_cancelled_task_id = Some(task.task_id);
+            run_provenance.stage = Some(stage);
+        }
         cancelled_tasks += 1;
     }
 
-    append_run_transition_event(
+    append_run_cancelled_transition_event(
         store,
         run_id,
         run.correlation_id,
         run.state,
-        RunState::RunCancelled,
-        "run.cancelled",
         reason,
+        CancellationSource::Operator,
+        &run_provenance,
+        first_cancelled_task_id,
         Some(format!("{run_id}:operator_cancelled")),
     )?;
     let queue_cancelled = queue.cancel_for_run(run_id)?;
@@ -10342,7 +11019,13 @@ fn cmd_run_cancel(run_id: Option<&str>, all_active: bool, reason: &str) -> Resul
         };
         let mut lines = Vec::new();
         for run_id in targets {
-            lines.push(execute_run_cancel_control(store, queue, run_id, reason)?);
+            lines.push(execute_run_cancel_control(
+                store,
+                queue,
+                run_id,
+                reason,
+                loaded_config.config().ui.cancellation_diagnostics,
+            )?);
         }
         Ok(lines.join("\n"))
     })?;
@@ -10606,8 +11289,7 @@ fn cmd_task_output(task_id_str: &str) -> Result<()> {
 }
 
 fn render_task_output(store: &dyn EventStore, task_id: Uuid) -> Result<String> {
-    let command_events =
-        query_events(store, &EventQuery::by_entity_type(EntityType::Command))?;
+    let command_events = query_events(store, &EventQuery::by_entity_type(EntityType::Command))?;
 
     let mut output_lines: Vec<(Uuid, String)> = Vec::new();
 
@@ -10634,9 +11316,7 @@ fn render_task_output(store: &dyn EventStore, task_id: Uuid) -> Result<String> {
     }
 
     if output_lines.is_empty() {
-        return Ok(format!(
-            "No command output found for task {task_id}.\n"
-        ));
+        return Ok(format!("No command output found for task {task_id}.\n"));
     }
 
     let mut out = String::new();
@@ -11174,6 +11854,7 @@ mod tests {
             "observability.log_level",
             "ui.mode",
             "ui.verbose_output",
+            "ui.cancellation_diagnostics",
         ] {
             assert!(
                 help.contains(key),
@@ -11924,9 +12605,18 @@ worktree_root = "{}"
         let ws2 = temp_dir.path().join("ws2");
         let ws3 = temp_dir.path().join("ws3");
         let source_str = source_repo.to_str().unwrap();
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws1.to_str().unwrap()]);
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws2.to_str().unwrap()]);
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws3.to_str().unwrap()]);
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws1.to_str().unwrap()],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws2.to_str().unwrap()],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws3.to_str().unwrap()],
+        );
 
         // ws1 edits alpha
         std::fs::write(ws1.join("alpha.txt"), "alpha modified by ws1\n").unwrap();
@@ -12025,8 +12715,14 @@ worktree_root = "{}"
         let ws1 = temp_dir.path().join("ws1");
         let ws2 = temp_dir.path().join("ws2");
         let source_str = source_repo.to_str().unwrap();
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws1.to_str().unwrap()]);
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws2.to_str().unwrap()]);
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws1.to_str().unwrap()],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws2.to_str().unwrap()],
+        );
 
         // ws1: edit main.rs lines 1-3 (top), delete test.rs
         main_rs_lines[0] = "line 1: ws1 edit".to_string();
@@ -12110,11 +12806,7 @@ worktree_root = "{}"
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_ne!(
-                lib_mode & 0o111,
-                0,
-                "lib.rs should have executable bit set"
-            );
+            assert_ne!(lib_mode & 0o111, 0, "lib.rs should have executable bit set");
         }
     }
 
@@ -12147,8 +12839,14 @@ worktree_root = "{}"
         let ws1 = temp_dir.path().join("ws1");
         let ws2 = temp_dir.path().join("ws2");
         let source_str = source_repo.to_str().unwrap();
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws1.to_str().unwrap()]);
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws2.to_str().unwrap()]);
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws1.to_str().unwrap()],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws2.to_str().unwrap()],
+        );
 
         // ws1: create .evidence/report.md + edit PLAN.md lines 1-3
         std::fs::create_dir_all(ws1.join(".evidence")).unwrap();
@@ -12264,7 +12962,10 @@ worktree_root = "{}"
         // --- Now simulate run 2: clone from HEAD (not the dirty state) ---
         let ws = temp_dir.path().join("ws-run2");
         let source_str = source_repo.to_str().unwrap();
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws.to_str().unwrap()]);
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws.to_str().unwrap()],
+        );
 
         // ws modifies lines 25-27 (non-overlapping with prior run's 1-3) and creates
         // a new version of .evidence/report.md. The workspace cloned from the committed
@@ -12354,7 +13055,10 @@ worktree_root = "{}"
         // --- Clone workspace from source HEAD (committed state, not dirty state) ---
         let ws = temp_dir.path().join("ws-new-run");
         let source_str = source_repo.to_str().unwrap();
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws.to_str().unwrap()]);
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws.to_str().unwrap()],
+        );
 
         // Workspace modifies lines 25-27 and creates .evidence/report.md
         let mut ws_plan = plan_lines.clone();
@@ -12455,7 +13159,10 @@ plan line 3: original
         // --- Clone workspace from HEAD (gets original, not dirty) ---
         let ws = temp_dir.path().join("ws");
         let source_str = source_repo.to_str().unwrap();
-        run_git_expect_ok(temp_dir.path(), &["clone", source_str, ws.to_str().unwrap()]);
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_str, ws.to_str().unwrap()],
+        );
 
         // Workspace appends DIFFERENT entries at the same spot
         let ws_plan = "\
@@ -12535,10 +13242,18 @@ plan line 3: original
             .join("\n")
             + "\n";
         std::fs::write(repo.join("config.txt"), &config_content).unwrap();
-        std::fs::write(repo.join("data.csv"), "id,name,value\n1,alpha,100\n2,beta,200\n").unwrap();
+        std::fs::write(
+            repo.join("data.csv"),
+            "id,name,value\n1,alpha,100\n2,beta,200\n",
+        )
+        .unwrap();
         std::fs::write(repo.join("README.md"), "# Project\nOriginal readme.\n").unwrap();
         std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(repo.join("src/lib.rs"), "pub fn hello() { println!(\"hello\"); }\n").unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn hello() { println!(\"hello\"); }\n",
+        )
+        .unwrap();
         run_git_expect_ok(&repo, &["add", "."]);
         run_git_expect_ok(&repo, &["commit", "-m", "initial commit"]);
 
@@ -12607,9 +13322,18 @@ worktree_root = "{}"
 
         // Verify each workspace was cloned correctly
         for ws in &layout.task_workspace_dirs {
-            assert!(ws.join("config.txt").exists(), "workspace should have config.txt");
-            assert!(ws.join("src/lib.rs").exists(), "workspace should have src/lib.rs");
-            assert!(ws.join("data.csv").exists(), "workspace should have data.csv");
+            assert!(
+                ws.join("config.txt").exists(),
+                "workspace should have config.txt"
+            );
+            assert!(
+                ws.join("src/lib.rs").exists(),
+                "workspace should have src/lib.rs"
+            );
+            assert!(
+                ws.join("data.csv").exists(),
+                "workspace should have data.csv"
+            );
         }
 
         // Execute actual commands in each workspace (simulating scheduler execution)
@@ -12630,11 +13354,19 @@ worktree_root = "{}"
         }
 
         // Verify changes landed in their respective workspaces
-        let ws0_config = std::fs::read_to_string(layout.task_workspace_dirs[0].join("config.txt")).unwrap();
-        assert!(ws0_config.contains("config_line_1 = modified_by_task1"), "ws0 should have task1 edit");
+        let ws0_config =
+            std::fs::read_to_string(layout.task_workspace_dirs[0].join("config.txt")).unwrap();
+        assert!(
+            ws0_config.contains("config_line_1 = modified_by_task1"),
+            "ws0 should have task1 edit"
+        );
 
-        let ws1_config = std::fs::read_to_string(layout.task_workspace_dirs[1].join("config.txt")).unwrap();
-        assert!(ws1_config.contains("config_line_10 = modified_by_task2"), "ws1 should have task2 edit");
+        let ws1_config =
+            std::fs::read_to_string(layout.task_workspace_dirs[1].join("config.txt")).unwrap();
+        assert!(
+            ws1_config.contains("config_line_10 = modified_by_task2"),
+            "ws1 should have task2 edit"
+        );
 
         assert!(
             layout.task_workspace_dirs[2].join("src/greet.rs").exists(),
@@ -12740,7 +13472,11 @@ worktree_root = "{}"
         run_git_expect_ok(&repo, &["config", "user.email", "test@yarli.dev"]);
         run_git_expect_ok(&repo, &["config", "user.name", "Yarli Test"]);
 
-        std::fs::write(repo.join("shared.txt"), "line1: original\nline2: original\n").unwrap();
+        std::fs::write(
+            repo.join("shared.txt"),
+            "line1: original\nline2: original\n",
+        )
+        .unwrap();
         run_git_expect_ok(&repo, &["add", "."]);
         run_git_expect_ok(&repo, &["commit", "-m", "initial"]);
 
@@ -12764,7 +13500,8 @@ worktree_root = "{}"
         let tasks = vec![
             PlannedTask {
                 task_key: "task-A".to_string(),
-                command: "sed -i 's/line1: original/line1: edited by task A/' shared.txt".to_string(),
+                command: "sed -i 's/line1: original/line1: edited by task A/' shared.txt"
+                    .to_string(),
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
@@ -12772,7 +13509,8 @@ worktree_root = "{}"
             },
             PlannedTask {
                 task_key: "task-B".to_string(),
-                command: "sed -i 's/line1: original/line1: edited by task B/' shared.txt".to_string(),
+                command: "sed -i 's/line1: original/line1: edited by task B/' shared.txt"
+                    .to_string(),
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
@@ -12809,9 +13547,11 @@ worktree_root = "{}"
         }
 
         // Verify both workspaces have conflicting edits
-        let ws0 = std::fs::read_to_string(layout.task_workspace_dirs[0].join("shared.txt")).unwrap();
+        let ws0 =
+            std::fs::read_to_string(layout.task_workspace_dirs[0].join("shared.txt")).unwrap();
         assert!(ws0.contains("edited by task A"));
-        let ws1 = std::fs::read_to_string(layout.task_workspace_dirs[1].join("shared.txt")).unwrap();
+        let ws1 =
+            std::fs::read_to_string(layout.task_workspace_dirs[1].join("shared.txt")).unwrap();
         assert!(ws1.contains("edited by task B"));
 
         // Merge should fail with conflict
@@ -12849,7 +13589,9 @@ worktree_root = "{}"
             "source should have task A's edit or conflict markers: {merged}"
         );
         // Recovery note should exist
-        let note = layout.run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+        let note = layout
+            .run_workspace_root
+            .join("PARALLEL_MERGE_RECOVERY.txt");
         assert!(
             note.exists(),
             "recovery note should exist at {}",
@@ -15848,6 +16590,11 @@ allow_in_memory_writes = true
             &store,
             run_id,
             "cancelled by operator interrupt",
+            CancellationSource::Operator,
+            Some(default_cancellation_provenance(
+                CancellationSource::Operator,
+                Some("operator interrupt".to_string()),
+            )),
         )
         .await
         .unwrap();
@@ -15877,6 +16624,286 @@ allow_in_memory_writes = true
         assert!(run_events
             .iter()
             .any(|event| event.event_type == "run.cancelled"));
+    }
+
+    async fn setup_drive_scheduler_fixture(
+        command: &str,
+    ) -> (
+        Scheduler<InMemoryTaskQueue, InMemoryEventStore, LocalCommandRunner>,
+        Arc<InMemoryEventStore>,
+        Uuid,
+        Uuid,
+        Vec<(Uuid, String)>,
+    ) {
+        let store = Arc::new(InMemoryEventStore::new());
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let scheduler = Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
+
+        let run = Run::new("drive cancel", yarli_core::domain::SafeMode::Execute);
+        let run_id = run.id;
+        let correlation_id = run.correlation_id;
+        let task = Task::new(run_id, "task-1", command, CommandClass::Io, correlation_id);
+        let task_names = vec![(task.id, "task-1".to_string())];
+        scheduler.submit_run(run, vec![task]).await.unwrap();
+
+        (scheduler, store, run_id, correlation_id, task_names)
+    }
+
+    #[tokio::test]
+    async fn drive_scheduler_captures_sigterm_cancellation_source() {
+        let (scheduler, store, run_id, correlation_id, task_names) =
+            setup_drive_scheduler_fixture("sleep 60").await;
+        let shutdown = ShutdownController::new();
+        let cancel = shutdown.token();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            shutdown_signal.request_graceful_with_source(CancellationSource::Sigterm);
+        });
+
+        let payload = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_scheduler(
+                &scheduler,
+                &store,
+                shutdown,
+                cancel,
+                tx,
+                run_id,
+                correlation_id,
+                &task_names,
+                AutoAdvancePolicy::StableOk,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("drive_scheduler timed out")
+        .unwrap();
+
+        assert_eq!(payload.exit_state, RunState::RunCancelled);
+        assert_eq!(
+            payload.cancellation_source,
+            Some(CancellationSource::Sigterm)
+        );
+        assert_eq!(
+            payload
+                .cancellation_provenance
+                .as_ref()
+                .and_then(|prov| prov.signal_name.as_deref()),
+            Some("SIGTERM")
+        );
+
+        let run_events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        let cancelled = run_events
+            .iter()
+            .find(|event| {
+                event.event_type == "run.cancelled"
+                    && event
+                        .payload
+                        .get("cancellation_source")
+                        .and_then(|value| value.as_str())
+                        == Some("sigterm")
+            })
+            .expect("expected run.cancelled with sigterm source");
+        assert_eq!(
+            cancelled
+                .payload
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some("cancelled by SIGTERM")
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_scheduler_captures_operator_cancellation_source() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let scheduler = Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
+        let run = Run::new(
+            "drive operator cancel",
+            yarli_core::domain::SafeMode::Execute,
+        );
+        let run_id = run.id;
+        let correlation_id = run.correlation_id;
+        let task_1 = Task::new(
+            run_id,
+            "task-1",
+            "sleep 1",
+            CommandClass::Io,
+            correlation_id,
+        );
+        let mut task_2 = Task::new(
+            run_id,
+            "task-2",
+            "echo done",
+            CommandClass::Io,
+            correlation_id,
+        );
+        task_2.depends_on(task_1.id);
+        let task_names = vec![
+            (task_1.id, "task-1".to_string()),
+            (task_2.id, "task-2".to_string()),
+        ];
+        scheduler
+            .submit_run(run, vec![task_1, task_2])
+            .await
+            .unwrap();
+        let shutdown = ShutdownController::new();
+        let cancel = shutdown.token();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let store_for_signal = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            store_for_signal
+                .append(Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: Utc::now(),
+                    entity_type: EntityType::Run,
+                    entity_id: run_id.to_string(),
+                    event_type: "run.cancelled".to_string(),
+                    payload: serde_json::json!({
+                        "reason": "operator stop",
+                    }),
+                    correlation_id,
+                    causation_id: None,
+                    actor: OPERATOR_CONTROL_ACTOR.to_string(),
+                    idempotency_key: None,
+                })
+                .unwrap();
+        });
+
+        let payload = tokio::time::timeout(
+            Duration::from_secs(8),
+            drive_scheduler(
+                &scheduler,
+                &store,
+                shutdown,
+                cancel,
+                tx,
+                run_id,
+                correlation_id,
+                &task_names,
+                AutoAdvancePolicy::StableOk,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("drive_scheduler timed out")
+        .unwrap();
+
+        assert_eq!(payload.exit_state, RunState::RunCancelled);
+        assert_eq!(
+            payload.cancellation_source,
+            Some(CancellationSource::Operator)
+        );
+        assert_eq!(
+            payload
+                .cancellation_provenance
+                .as_ref()
+                .and_then(|prov| prov.actor_kind),
+            Some(CancellationActorKind::Operator)
+        );
+
+        let run_events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        let cancelled = run_events
+            .iter()
+            .find(|event| {
+                event.event_type == "run.cancelled"
+                    && event
+                        .payload
+                        .get("cancellation_source")
+                        .and_then(|value| value.as_str())
+                        == Some("operator")
+            })
+            .expect("expected run.cancelled with operator source");
+        assert_eq!(
+            cancelled
+                .payload
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some("operator stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_scheduler_captures_sw4rm_preemption_cancellation_source() {
+        let (scheduler, store, run_id, correlation_id, task_names) =
+            setup_drive_scheduler_fixture("sleep 60").await;
+        let shutdown = ShutdownController::new();
+        let cancel = shutdown.token();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            shutdown_signal.request_graceful_with_source(CancellationSource::Sw4rmPreemption);
+        });
+
+        let payload = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_scheduler(
+                &scheduler,
+                &store,
+                shutdown,
+                cancel,
+                tx,
+                run_id,
+                correlation_id,
+                &task_names,
+                AutoAdvancePolicy::StableOk,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("drive_scheduler timed out")
+        .unwrap();
+
+        assert_eq!(payload.exit_state, RunState::RunCancelled);
+        assert_eq!(
+            payload.cancellation_source,
+            Some(CancellationSource::Sw4rmPreemption)
+        );
+        assert_eq!(
+            payload
+                .cancellation_provenance
+                .as_ref()
+                .and_then(|prov| prov.actor_kind),
+            Some(CancellationActorKind::Supervisor)
+        );
+
+        let run_events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        let cancelled = run_events
+            .iter()
+            .find(|event| {
+                event.event_type == "run.cancelled"
+                    && event
+                        .payload
+                        .get("cancellation_source")
+                        .and_then(|value| value.as_str())
+                        == Some("sw4rm_preemption")
+            })
+            .expect("expected run.cancelled with sw4rm source");
+        assert_eq!(
+            cancelled
+                .payload
+                .get("reason")
+                .and_then(|value| value.as_str()),
+            Some("cancelled by sw4rm preemption")
+        );
     }
 
     #[test]
@@ -15982,7 +17009,8 @@ allow_in_memory_writes = true
             .enqueue(active_task_id, run_id, 1, CommandClass::Io, None)
             .unwrap();
 
-        let output = execute_run_cancel_control(&store, &queue, run_id, "operator stop").unwrap();
+        let output =
+            execute_run_cancel_control(&store, &queue, run_id, "operator stop", false).unwrap();
         assert!(output.contains("RunCancelled"));
         assert!(output.contains("cancelled 1 task(s)"));
         assert!(output.contains("drained 1 queue entry(ies)"));
@@ -16479,6 +17507,76 @@ allow_in_memory_writes = true
         );
     }
 
+    #[test]
+    fn run_status_and_explain_surface_cancel_provenance_summary() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::new_v4();
+        let corr = Uuid::new_v4();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({
+                    "from": "RunOpen",
+                    "to": "RunActive",
+                    "reason": "scheduler start"
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.cancelled",
+                corr,
+                serde_json::json!({
+                    "from": "RunActive",
+                    "to": "RunCancelled",
+                    "reason": "cancelled by SIGTERM",
+                    "exit_reason": "cancelled_by_operator",
+                    "cancellation_source": "sigterm",
+                    "cancellation_provenance": {
+                        "cancellation_source": "sigterm",
+                        "signal_name": "SIGTERM",
+                        "signal_number": 15,
+                        "sender_pid": null,
+                        "receiver_pid": 4321,
+                        "parent_pid": 1,
+                        "process_group_id": 4321,
+                        "session_id": 4321,
+                        "tty": null,
+                        "actor_kind": "supervisor",
+                        "actor_detail": "SIGTERM likely originated from a supervisor",
+                        "stage": "executing"
+                    }
+                }),
+            ))
+            .unwrap();
+
+        let status = render_run_status(&store, run_id).unwrap();
+        assert!(
+            status.contains("Cancellation source: sigterm"),
+            "status must show cancellation source: {status}"
+        );
+        assert!(
+            status.contains(
+                "Cancellation provenance: signal=SIGTERM sender=unknown receiver=yarli(4321) actor=supervisor stage=executing"
+            ),
+            "status must show provenance summary: {status}"
+        );
+
+        let explain = render_run_explain(&store, run_id).unwrap();
+        assert!(
+            explain.contains(
+                "Cancellation provenance: signal=SIGTERM sender=unknown receiver=yarli(4321) actor=supervisor stage=executing"
+            ),
+            "explain must show provenance summary: {explain}"
+        );
+    }
+
     // ── Continuation payload tests ──
 
     fn sample_continuation_payload(
@@ -16492,6 +17590,8 @@ allow_in_memory_writes = true
             objective: objective.to_string(),
             exit_state: RunState::RunCompleted,
             exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
             completed_at: Utc::now(),
             tasks: Vec::new(),
             summary: RunSummary {
@@ -16613,6 +17713,8 @@ allow_in_memory_writes = true
             objective: "build everything".into(),
             exit_state: RunState::RunFailed,
             exit_reason: Some(yarli_core::domain::ExitReason::FailedRuntimeError),
+            cancellation_source: None,
+            cancellation_provenance: None,
             completed_at: Utc::now(),
             tasks: vec![
                 yarli_core::entities::continuation::TaskOutcome {
@@ -16813,6 +17915,8 @@ allow_in_memory_writes = true
             objective: "x".into(),
             exit_state: RunState::RunCompleted,
             exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
             completed_at: Utc::now(),
             tasks: Vec::new(),
             summary: RunSummary {
@@ -16862,6 +17966,8 @@ allow_in_memory_writes = true
             objective: "x".into(),
             exit_state: RunState::RunCompleted,
             exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
             completed_at: Utc::now(),
             tasks: Vec::new(),
             summary: RunSummary {
@@ -16912,6 +18018,8 @@ allow_in_memory_writes = true
             objective: "x".into(),
             exit_state: RunState::RunCompleted,
             exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
             completed_at: Utc::now(),
             tasks: Vec::new(),
             summary: RunSummary {
@@ -16962,6 +18070,8 @@ allow_in_memory_writes = true
             objective: "x".into(),
             exit_state: RunState::RunCompleted,
             exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
             completed_at: Utc::now(),
             tasks: Vec::new(),
             summary: RunSummary {
