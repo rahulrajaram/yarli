@@ -756,6 +756,9 @@ fn default_audit_file() -> String {
 pub struct UiConfig {
     #[serde(default)]
     pub mode: UiMode,
+    /// When true, command output lines are streamed to terminal scrollback.
+    #[serde(default)]
+    pub verbose_output: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

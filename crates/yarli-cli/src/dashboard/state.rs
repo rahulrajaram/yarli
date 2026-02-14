@@ -3,7 +3,7 @@
 //! `PanelManager` maintains retained state for focus, collapse/expand,
 //! scroll positions, and selected task across all panels (~300 LOC, Section 32).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use uuid::Uuid;
@@ -96,8 +96,10 @@ pub struct PanelManager {
     pub tasks: HashMap<TaskId, TaskView>,
     /// Selected task index in task_order (for cursor).
     pub selected_task_idx: usize,
-    /// Output lines for the selected task.
+    /// Output lines for the selected task (view into per-task buffer).
     pub output_lines: Vec<String>,
+    /// Per-task output ring buffers (capped at 1000 lines each).
+    task_output_buffers: HashMap<TaskId, VecDeque<String>>,
     /// Whether output auto-scrolls (true until user scrolls up).
     pub output_auto_scroll: bool,
     /// Current "Why Not Done?" summary.
@@ -135,6 +137,7 @@ impl PanelManager {
             tasks: HashMap::new(),
             selected_task_idx: 0,
             output_lines: Vec::new(),
+            task_output_buffers: HashMap::new(),
             output_auto_scroll: true,
             explain_summary: None,
             transient_status: None,
@@ -305,13 +308,26 @@ impl PanelManager {
 
     /// Append an output line for a task.
     pub fn append_output(&mut self, task_id: TaskId, line: String) {
+        const MAX_OUTPUT_LINES: usize = 1000;
+
         // Update last_output_line on task.
         if let Some(view) = self.tasks.get_mut(&task_id) {
             view.last_output_line = Some(line.clone());
         }
-        // Append to output buffer if this is the selected task.
+
+        // Always store in per-task ring buffer.
+        let buf = self.task_output_buffers.entry(task_id).or_default();
+        buf.push_back(line.clone());
+        if buf.len() > MAX_OUTPUT_LINES {
+            buf.pop_front();
+        }
+
+        // Append to visible output if this is the selected task.
         if self.task_order.get(self.selected_task_idx) == Some(&task_id) {
             self.output_lines.push(line);
+            if self.output_lines.len() > MAX_OUTPUT_LINES {
+                self.output_lines.remove(0);
+            }
             if self.output_auto_scroll {
                 let max = self.output_lines.len().saturating_sub(1) as u16;
                 self.scroll_offsets.insert(PanelId::Output, max);
@@ -321,12 +337,17 @@ impl PanelManager {
 
     /// Update output lines when selected task changes.
     fn update_output_for_selected_task(&mut self) {
-        // In the current implementation, we don't persist per-task output history.
-        // When switching tasks, we clear the output panel.
-        // A future enhancement could maintain per-task output buffers.
         self.output_lines.clear();
-        self.scroll_offsets.insert(PanelId::Output, 0);
+        if let Some(&task_id) = self.task_order.get(self.selected_task_idx) {
+            if let Some(buf) = self.task_output_buffers.get(&task_id) {
+                self.output_lines.extend(buf.iter().cloned());
+            }
+        }
         self.output_auto_scroll = true;
+        if self.output_auto_scroll {
+            let max = self.output_lines.len().saturating_sub(1) as u16;
+            self.scroll_offsets.insert(PanelId::Output, max);
+        }
     }
 
     /// Get total number of tasks in each state for the status bar.
@@ -528,6 +549,32 @@ mod tests {
         // Output for non-selected task is not appended to panel.
         mgr.append_output(id2, "other".into());
         assert_eq!(mgr.output_lines.len(), 2);
+    }
+
+    #[test]
+    fn output_persists_across_task_switch() {
+        let mut mgr = PanelManager::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        mgr.update_task(id1, "t1", TaskState::TaskExecuting, None);
+        mgr.update_task(id2, "t2", TaskState::TaskExecuting, None);
+
+        // Append output to t1 (selected).
+        mgr.append_output(id1, "t1-line1".into());
+        mgr.append_output(id1, "t1-line2".into());
+        assert_eq!(mgr.output_lines.len(), 2);
+
+        // Append output to t2 (not selected — goes to buffer only).
+        mgr.append_output(id2, "t2-lineA".into());
+        assert_eq!(mgr.output_lines.len(), 2); // still t1's output
+
+        // Switch to t2 — should restore t2's buffer.
+        mgr.select_next_task();
+        assert_eq!(mgr.output_lines, vec!["t2-lineA"]);
+
+        // Switch back to t1 — should restore t1's buffer.
+        mgr.select_prev_task();
+        assert_eq!(mgr.output_lines, vec!["t1-line1", "t1-line2"]);
     }
 
     #[test]

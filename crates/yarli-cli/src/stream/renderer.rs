@@ -32,12 +32,15 @@ const TRANSIENT_STATUS_EMIT_SECS: i64 = 30;
 pub struct StreamConfig {
     /// Height of the inline viewport in lines.
     pub viewport_height: u16,
+    /// When true, stream command output lines to scrollback.
+    pub verbose_output: bool,
 }
 
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+            verbose_output: false,
         }
     }
 }
@@ -49,6 +52,7 @@ impl Default for StreamConfig {
 /// to the native scrollback above.
 pub struct StreamRenderer {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    config: StreamConfig,
     /// Active tasks being tracked in the viewport.
     tasks: HashMap<TaskId, TaskView>,
     /// Insertion order of task IDs for stable rendering.
@@ -76,6 +80,7 @@ impl StreamRenderer {
 
         Ok(Self {
             terminal,
+            config,
             tasks: HashMap::new(),
             task_order: Vec::new(),
             spinners: HashMap::new(),
@@ -141,9 +146,21 @@ impl StreamRenderer {
             }
             StreamEvent::CommandOutput {
                 task_id,
-                task_name: _,
+                task_name,
                 line,
             } => {
+                if self.config.verbose_output {
+                    let output_line = Line::from(vec![
+                        Span::styled(
+                            format!("  [{task_name}] "),
+                            Tier::Background.style(),
+                        ),
+                        Span::styled(line.clone(), Tier::Contextual.style()),
+                    ]);
+                    self.terminal.insert_before(1, |buf| {
+                        Paragraph::new(output_line).render(buf.area, buf);
+                    })?;
+                }
                 if let Some(view) = self.tasks.get_mut(&task_id) {
                     view.last_output_line = Some(line);
                 }

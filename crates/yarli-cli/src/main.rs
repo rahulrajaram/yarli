@@ -228,6 +228,7 @@ commands unless `core.allow_in_memory_writes = true`.
 
 [ui]
 - ui.mode (default: "auto"; values: auto|stream|tui)
+- ui.verbose_output (default: false; stream command output to terminal scrollback)
 
 [sw4rm] (requires `--features sw4rm` at build time)
 - sw4rm.agent_name (default: "yarli-orchestrator")
@@ -427,6 +428,7 @@ audit_file = ".yarl/audit.jsonl"
 [ui]
 # auto | stream | tui
 mode = "auto"
+# verbose_output = false
 "#;
 
 fn init_config_template(backend: Option<InitBackend>) -> String {
@@ -777,6 +779,14 @@ enum TaskAction {
         #[arg(short, long)]
         detail: String,
     },
+    #[command(
+        about = "Show command output for a task",
+        long_about = "Show command output for a task.\n\nDumps all captured stdout/stderr from the task's command execution.\nRequires a durable backend (Postgres) to have output events persisted.\n\nExamples:\n  yarli task output 019577a3-...\n  yarli task output <task-id>"
+    )]
+    Output {
+        /// Task ID to show output for (UUID).
+        task_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1091,6 +1101,7 @@ async fn run() -> Result<()> {
             TaskAction::Explain { task_id } => cmd_task_explain(&task_id),
             TaskAction::Unblock { task_id, reason } => cmd_task_unblock(&task_id, &reason),
             TaskAction::Annotate { task_id, detail } => cmd_task_annotate(&task_id, &detail),
+            TaskAction::Output { task_id } => cmd_task_output(&task_id),
         },
         Commands::Gate { action } => match action {
             GateAction::List { run } => cmd_gate_list(run),
@@ -4625,8 +4636,10 @@ where
 
     // Spawn renderer task.
     let renderer_shutdown = shutdown.clone();
-    let renderer_handle =
-        tokio::task::spawn_blocking(move || run_renderer(rx, render_mode, renderer_shutdown));
+    let verbose_output = loaded_config.config().ui.verbose_output;
+    let renderer_handle = tokio::task::spawn_blocking(move || {
+        run_renderer(rx, render_mode, renderer_shutdown, verbose_output)
+    });
 
     // Drive scheduler loop, emitting events to renderer channel.
     let continuation_payload = drive_scheduler(
@@ -6096,10 +6109,14 @@ fn run_renderer(
     mut rx: mpsc::UnboundedReceiver<StreamEvent>,
     render_mode: RenderMode,
     shutdown: ShutdownController,
+    verbose_output: bool,
 ) -> Result<()> {
     match render_mode {
         RenderMode::Stream => {
-            let config = StreamConfig::default();
+            let config = StreamConfig {
+                verbose_output,
+                ..StreamConfig::default()
+            };
             let mut renderer = match StreamRenderer::new(config) {
                 Ok(renderer) => renderer,
                 Err(error) => {
@@ -10577,6 +10594,59 @@ fn cmd_task_explain(task_id_str: &str) -> Result<()> {
     Ok(())
 }
 
+/// `yarli task output` — dump captured command output for a task.
+fn cmd_task_output(task_id_str: &str) -> Result<()> {
+    let task_id: Uuid = task_id_str
+        .parse()
+        .context("invalid task ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| render_task_output(store, task_id))?;
+    print!("{output}");
+    Ok(())
+}
+
+fn render_task_output(store: &dyn EventStore, task_id: Uuid) -> Result<String> {
+    let command_events =
+        query_events(store, &EventQuery::by_entity_type(EntityType::Command))?;
+
+    let mut output_lines: Vec<(Uuid, String)> = Vec::new();
+
+    for event in &command_events {
+        if event.event_type != "command.output" {
+            continue;
+        }
+        if task_id_from_command_event(event) != Some(task_id) {
+            continue;
+        }
+        let chunks = event
+            .payload
+            .get("chunks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for chunk in &chunks {
+            if let Some(data) = chunk.get("data").and_then(|v| v.as_str()) {
+                if !data.trim().is_empty() {
+                    output_lines.push((event.event_id, data.to_string()));
+                }
+            }
+        }
+    }
+
+    if output_lines.is_empty() {
+        return Ok(format!(
+            "No command output found for task {task_id}.\n"
+        ));
+    }
+
+    let mut out = String::new();
+    for (_event_id, line) in &output_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// `yarli info` — show version and terminal capabilities.
 fn cmd_info(
     info: &TerminalInfo,
@@ -11103,6 +11173,7 @@ mod tests {
             "observability.audit_file",
             "observability.log_level",
             "ui.mode",
+            "ui.verbose_output",
         ] {
             assert!(
                 help.contains(key),
