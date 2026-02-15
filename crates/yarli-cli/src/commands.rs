@@ -1,0 +1,4633 @@
+//! Command handlers extracted from `main.rs`.
+
+use yarli_exec::{
+    CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
+    OverwatchRunnerConfig,
+};
+
+use super::*;
+use crate::events::*;
+use crate::persistence::RUN_CONTINUATION_EVENT_TYPE;
+use crate::render::*;
+
+#[derive(Clone)]
+enum SelectedCommandRunner {
+    Native(LocalCommandRunner),
+    Overwatch(OverwatchCommandRunner),
+}
+
+impl CommandRunner for SelectedCommandRunner {
+    async fn run(
+        &self,
+        request: CommandRequest,
+        cancel: CancellationToken,
+    ) -> Result<CommandResult, yarli_exec::ExecError> {
+        match self {
+            Self::Native(runner) => runner.run(request, cancel).await,
+            Self::Overwatch(runner) => runner.run(request, cancel).await,
+        }
+    }
+}
+
+pub(crate) fn resolve_render_mode(
+    term_info: &TerminalInfo,
+    cli_force_stream: bool,
+    cli_force_tui: bool,
+    configured_ui_mode: UiMode,
+) -> Result<RenderMode> {
+    let (force_stream, force_tui) = if cli_force_stream || cli_force_tui {
+        (cli_force_stream, cli_force_tui)
+    } else {
+        match configured_ui_mode {
+            UiMode::Auto => (false, false),
+            UiMode::Stream => (true, false),
+            UiMode::Tui => (false, true),
+        }
+    };
+    mode::select_render_mode(term_info, force_stream, force_tui).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+async fn load_continuation_payload_for_continue(
+    file: &Path,
+    loaded_config: &LoadedConfig,
+) -> Result<yarli_core::entities::ContinuationPayload> {
+    let wait_timeout_secs = loaded_config.config().run.continue_wait_timeout_seconds;
+    let deadline = (wait_timeout_secs > 0)
+        .then(|| tokio::time::Instant::now() + Duration::from_secs(wait_timeout_secs));
+    let mut waiting_logged = false;
+
+    loop {
+        if let Some(payload) =
+            crate::persistence::try_load_continuation_payload_for_continue(file, loaded_config)?
+        {
+            if waiting_logged {
+                info!(
+                    run_id = %payload.run_id,
+                    "continuation payload became available while waiting"
+                );
+            } else if file == Path::new(crate::persistence::DEFAULT_CONTINUATION_FILE) {
+                info!(
+                    run_id = %payload.run_id,
+                    "loaded continuation payload from event store or file artifact"
+                );
+            }
+            return Ok(payload);
+        }
+
+        let Some(deadline) = deadline else {
+            bail!(
+                "no continuation payload available at {} (set [run] continue_wait_timeout_seconds > 0 to wait)",
+                file.display()
+            );
+        };
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "no continuation payload became available within {}s at {}",
+                wait_timeout_secs,
+                file.display()
+            );
+        }
+        if !waiting_logged {
+            info!(
+                timeout_secs = wait_timeout_secs,
+                poll_interval_ms = CONTINUATION_WAIT_POLL_INTERVAL_MS,
+                "waiting for continuation payload availability"
+            );
+            waiting_logged = true;
+        }
+        tokio::time::sleep(Duration::from_millis(CONTINUATION_WAIT_POLL_INTERVAL_MS)).await;
+    }
+}
+
+/// `yarli run continue` — resume from a previous run's continuation payload.
+///
+/// When using the default file path, this prefers event-store-backed
+/// continuation (`run.continuation`) and falls back to `.yarli/continuation.json`.
+/// If continuation is temporarily unavailable, this polls until
+/// `[run] continue_wait_timeout_seconds` elapses.
+/// If subsequent runs complete and the continuation quality gate allows it,
+/// planned-next tranches auto-advance.
+pub(crate) async fn cmd_run_continue(
+    file: PathBuf,
+    render_mode: RenderMode,
+    loaded_config: &LoadedConfig,
+    allow_recursive_run_override: bool,
+) -> Result<()> {
+    let payload = load_continuation_payload_for_continue(&file, loaded_config).await?;
+
+    let tranche = payload
+        .next_tranche
+        .ok_or_else(|| anyhow::anyhow!("nothing to continue — all tasks completed successfully"))?;
+
+    let auto_advance = config::AutoAdvanceConfig::from_loaded(loaded_config);
+    let mut plan = build_plan_from_continuation_tranche(&tranche, loaded_config)?;
+    let mut iteration = 1usize;
+    let mut advances_taken = 0usize;
+    let mut iteration_metrics: Vec<IterationMetrics> = Vec::new();
+    loop {
+        info!(
+            objective = %plan.objective,
+            task_count = plan.tasks.len(),
+            tranche_index = ?plan.current_tranche_index,
+            iteration,
+            "continuing from previous run"
+        );
+        let iteration_started_at = Instant::now();
+        let outcome = execute_run_plan(
+            plan.clone(),
+            render_mode,
+            loaded_config,
+            allow_recursive_run_override,
+        )
+        .await?;
+        let duration = iteration_started_at.elapsed();
+        print_iteration_metrics(iteration, &outcome, duration);
+        iteration_metrics.push(IterationMetrics {
+            iteration,
+            run_id: outcome.run_id,
+            duration,
+            token_totals: outcome.token_totals,
+        });
+        if outcome.run_state != RunState::RunCompleted {
+            print_invocation_summary(&iteration_metrics);
+            return finalize_run_outcome(&outcome);
+        }
+
+        let (allow, reason) = should_auto_advance_planned_tranche(
+            &outcome.continuation_payload,
+            auto_advance,
+            advances_taken,
+        );
+        if !allow {
+            info!(reason = %reason, "stopping auto-advance");
+            if reason != "no next tranche available" {
+                println!("Auto-advance stopped: {reason}");
+            }
+            print_invocation_summary(&iteration_metrics);
+            return finalize_run_outcome(&outcome);
+        }
+
+        let Some(next) = outcome.continuation_payload.next_tranche.as_ref() else {
+            print_invocation_summary(&iteration_metrics);
+            return finalize_run_outcome(&outcome);
+        };
+
+        println!(
+            "Auto-advancing to planned tranche (iteration {}): {}",
+            iteration + 1,
+            next.suggested_objective
+        );
+        plan = build_plan_from_continuation_tranche(next, loaded_config)?;
+        iteration += 1;
+        advances_taken += 1;
+    }
+}
+
+/// `yarli run` — config-first entrypoint: resolve prompt context and execute plan-driven tranches.
+pub(crate) async fn cmd_run_default(
+    render_mode: RenderMode,
+    loaded_config: &LoadedConfig,
+    prompt_file_override: Option<PathBuf>,
+    allow_recursive_run_override: bool,
+) -> Result<()> {
+    let resolved_prompt =
+        resolve_prompt_entry_path(loaded_config, prompt_file_override.as_deref())?;
+    info!(
+        prompt_entry_path = %resolved_prompt.entry_path.display(),
+        prompt_source = resolved_prompt.source.as_str(),
+        "resolved prompt file for yarli run"
+    );
+    let loaded_optional = prompt::load_prompt_with_optional_run_spec(&resolved_prompt.entry_path)
+        .with_context(|| {
+        format!(
+            "failed to load prompt context from {}",
+            resolved_prompt.entry_path.display()
+        )
+    })?;
+    let has_prompt_run_spec = loaded_optional.run_spec.is_some();
+    let has_config_run_spec = run_config_has_run_spec_data(&loaded_config.config().run);
+    let config_run_spec = run_spec_from_run_config(&loaded_config.config().run);
+    if has_config_run_spec {
+        prompt::validate_run_spec(&config_run_spec)
+            .context("invalid [run] run-spec configuration in yarli.toml")?;
+    }
+    let run_spec = merge_run_specs(&config_run_spec, loaded_optional.run_spec.as_ref());
+    prompt::validate_run_spec(&run_spec).context(
+        "invalid effective run spec after merging yarli.toml [run] with optional PROMPT.md overrides",
+    )?;
+    let has_effective_run_spec = has_prompt_run_spec || has_config_run_spec;
+    let loaded = prompt::LoadedPrompt {
+        entry_path: loaded_optional.entry_path.clone(),
+        expanded_text: loaded_optional.expanded_text.clone(),
+        snapshot: loaded_optional.snapshot.clone(),
+        run_spec: run_spec.clone(),
+    };
+    let plan_guard_context = run_spec_plan_guard_preflight(&loaded)?;
+
+    let objective = run_spec
+        .objective
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "yarli run".to_string());
+    let auto_advance = config::AutoAdvanceConfig::from_loaded(loaded_config);
+
+    let (task_catalog, tranche_plan, execution_mode, plan_run_spec): (
+        Vec<PlannedTask>,
+        Vec<PlannedTranche>,
+        &'static str,
+        Option<prompt::RunSpec>,
+    ) = match build_plan_driven_run_sequence(loaded_config, &loaded, &objective) {
+        Ok((_tasks, tranches))
+            if !has_effective_run_spec && is_verification_only_dispatch(&tranches) =>
+        {
+            info!(
+                "no configured run spec and no open implementation tranches; dispatching plain prompt"
+            );
+            let (tasks, tranches) =
+                build_plain_prompt_run_sequence(loaded_config, &loaded, &objective)?;
+            (tasks, tranches, "plain-prompt", None)
+        }
+        Ok((tasks, tranches)) => (
+            tasks,
+            tranches,
+            "config-first-plan",
+            has_effective_run_spec.then_some(run_spec.clone()),
+        ),
+        Err(err) if !run_spec.tasks.items.is_empty() => {
+            warn!(
+                error = %err,
+                "falling back to legacy prompt-defined task orchestration"
+            );
+            let tasks = build_task_catalog_from_run_spec(&run_spec)?;
+            let tranches = build_tranche_plan_from_run_spec(&run_spec, &objective)?;
+            (tasks, tranches, "legacy-prompt", Some(run_spec.clone()))
+        }
+        Err(err) if !has_effective_run_spec => {
+            warn!(
+                error = %err,
+                "plan-driven dispatch unavailable for plain prompt; dispatching prompt text directly"
+            );
+            let (tasks, tranches) =
+                build_plain_prompt_run_sequence(loaded_config, &loaded, &objective)?;
+            (tasks, tranches, "plain-prompt", None)
+        }
+        Err(err) => {
+            return Err(err.context(
+                "failed to build plan-driven tranche execution (configure [cli] command/backend)",
+            ));
+        }
+    };
+
+    info!(mode = execution_mode, "resolved yarli run execution mode");
+
+    let first_tranche = tranche_plan
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("run spec resolved to no tranches"))?;
+    let first_tasks = tasks_for_tranche(&task_catalog, &first_tranche)?;
+
+    let mut plan = RunPlan {
+        objective: first_tranche.objective.clone(),
+        tasks: first_tasks,
+        task_catalog: task_catalog.clone(),
+        workdir: loaded_config.config().execution.working_dir.clone(),
+        timeout_secs: loaded_config.config().execution.command_timeout_seconds,
+        pace: None,
+        prompt_snapshot: Some(loaded.snapshot.clone()),
+        run_spec: plan_run_spec,
+        tranche_plan: tranche_plan.clone(),
+        current_tranche_index: Some(0),
+    };
+    let verification_only_dispatch =
+        execution_mode == "config-first-plan" && is_verification_only_dispatch(&plan.tranche_plan);
+
+    let mut iteration = 1usize;
+    let mut advances_taken = 0usize;
+    let mut iteration_metrics: Vec<IterationMetrics> = Vec::new();
+    loop {
+        info!(
+            objective = %plan.objective,
+            task_count = plan.tasks.len(),
+            tranche_index = ?plan.current_tranche_index,
+            iteration,
+            "running prompt-defined tranche"
+        );
+        let iteration_started_at = Instant::now();
+        let outcome = execute_run_plan(
+            plan.clone(),
+            render_mode,
+            loaded_config,
+            allow_recursive_run_override,
+        )
+        .await?;
+        let duration = iteration_started_at.elapsed();
+        print_iteration_metrics(iteration, &outcome, duration);
+        iteration_metrics.push(IterationMetrics {
+            iteration,
+            run_id: outcome.run_id,
+            duration,
+            token_totals: outcome.token_totals,
+        });
+        if outcome.run_state != RunState::RunCompleted {
+            print_invocation_summary(&iteration_metrics);
+            return finalize_run_outcome(&outcome);
+        }
+        if verification_only_dispatch && advances_taken == 0 {
+            if outcome.continuation_payload.next_tranche.is_some() {
+                warn!(
+                    run_id = %outcome.run_id,
+                    "ignoring continuation next_tranche for verification-only dispatch"
+                );
+            }
+            if let Some(context) = plan_guard_context.as_ref() {
+                enforce_plan_guard_post_run(&loaded, context)?;
+            }
+            print_invocation_summary(&iteration_metrics);
+            return finalize_run_outcome(&outcome);
+        }
+
+        let (allow, reason) = should_auto_advance_planned_tranche(
+            &outcome.continuation_payload,
+            auto_advance,
+            advances_taken,
+        );
+        if !allow {
+            info!(reason = %reason, "stopping auto-advance");
+            if reason != "no next tranche available" {
+                println!("Auto-advance stopped: {reason}");
+            }
+            if let Some(context) = plan_guard_context.as_ref() {
+                enforce_plan_guard_post_run(&loaded, context)?;
+            }
+            print_invocation_summary(&iteration_metrics);
+            return finalize_run_outcome(&outcome);
+        }
+
+        let Some(next) = outcome.continuation_payload.next_tranche.as_ref() else {
+            if let Some(context) = plan_guard_context.as_ref() {
+                enforce_plan_guard_post_run(&loaded, context)?;
+            }
+            print_invocation_summary(&iteration_metrics);
+            return finalize_run_outcome(&outcome);
+        };
+        println!(
+            "Auto-advancing to planned tranche (iteration {}): {}",
+            iteration + 1,
+            next.suggested_objective
+        );
+        plan = build_plan_from_continuation_tranche(next, loaded_config)?;
+        iteration += 1;
+        advances_taken += 1;
+    }
+}
+
+pub(crate) async fn cmd_run_start_with_backend<Q, S>(
+    plan: RunPlan,
+    render_mode: RenderMode,
+    loaded_config: &LoadedConfig,
+    store: Arc<S>,
+    queue: Arc<Q>,
+    allow_recursive_run_override: bool,
+) -> Result<RunExecutionOutcome>
+where
+    Q: TaskQueue + 'static,
+    S: EventStore + 'static,
+{
+    if plan.tasks.is_empty() {
+        bail!("at least one task is required");
+    }
+
+    let parallel_workspace_layout = prepare_parallel_workspace_layout(&plan, loaded_config)?;
+    if let Some(layout) = parallel_workspace_layout.as_ref() {
+        println!(
+            "Parallel workspaces prepared: {} task workspace(s) at {}",
+            layout.task_workspace_dirs.len(),
+            layout.run_workspace_root.display()
+        );
+    }
+
+    let runner = match loaded_config.config().execution.runner {
+        ExecutionRunner::Native => {
+            Arc::new(SelectedCommandRunner::Native(LocalCommandRunner::new()))
+        }
+        ExecutionRunner::Overwatch => {
+            let overwatch = &loaded_config.config().execution.overwatch;
+            let runner = OverwatchCommandRunner::new(OverwatchRunnerConfig {
+                service_url: overwatch.service_url.clone(),
+                profile: overwatch
+                    .profile
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                soft_timeout_seconds: overwatch.soft_timeout_seconds,
+                silent_timeout_seconds: overwatch.silent_timeout_seconds,
+                max_log_bytes: overwatch.max_log_bytes,
+                ..OverwatchRunnerConfig::default()
+            })
+            .map_err(|e| anyhow::anyhow!("failed to initialize overwatch runner: {e}"))?;
+            Arc::new(SelectedCommandRunner::Overwatch(runner))
+        }
+    };
+
+    let command_timeout = if plan.timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(plan.timeout_secs))
+    };
+
+    let scheduler_workdir =
+        config::resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+    let mut config = SchedulerConfig {
+        working_dir: scheduler_workdir.display().to_string(),
+        command_timeout,
+        ..SchedulerConfig::default()
+    };
+    config.claim_batch_size = loaded_config.config().queue.claim_batch_size;
+    config.lease_ttl = chrono::Duration::seconds(loaded_config.config().queue.lease_ttl_seconds);
+    config.heartbeat_interval =
+        Duration::from_secs(loaded_config.config().queue.heartbeat_interval_seconds);
+    config.reclaim_interval =
+        Duration::from_secs(loaded_config.config().queue.reclaim_interval_seconds);
+    config.reclaim_grace =
+        chrono::Duration::seconds(loaded_config.config().queue.reclaim_grace_seconds);
+    config.tick_interval = Duration::from_millis(loaded_config.config().execution.tick_interval_ms);
+    config.concurrency.per_run_cap = loaded_config.config().queue.per_run_cap;
+    config.concurrency.io_cap = loaded_config.config().queue.io_cap;
+    config.concurrency.cpu_cap = loaded_config.config().queue.cpu_cap;
+    config.concurrency.git_cap = loaded_config.config().queue.git_cap;
+    config.concurrency.tool_cap = loaded_config.config().queue.tool_cap;
+    if !loaded_config.config().features.parallel {
+        config.claim_batch_size = 1;
+        config.concurrency.per_run_cap = 1;
+        config.concurrency.io_cap = 1;
+        config.concurrency.cpu_cap = 1;
+        config.concurrency.git_cap = 1;
+        config.concurrency.tool_cap = 1;
+    }
+    if let Some(worker_id) = loaded_config.config().core.worker_id.as_ref() {
+        config.worker_id = worker_id.clone();
+    }
+    config.enforce_policies = loaded_config.config().policy.enforce_policies;
+    config.audit_decisions = loaded_config.config().policy.audit_decisions;
+    config.allow_recursive_run =
+        recursive_run_execution_enabled(loaded_config, allow_recursive_run_override);
+    config.budgets = ResourceBudgetConfig {
+        max_task_rss_bytes: loaded_config.config().budgets.max_task_rss_bytes,
+        max_task_cpu_user_ticks: loaded_config.config().budgets.max_task_cpu_user_ticks,
+        max_task_cpu_system_ticks: loaded_config.config().budgets.max_task_cpu_system_ticks,
+        max_task_io_read_bytes: loaded_config.config().budgets.max_task_io_read_bytes,
+        max_task_io_write_bytes: loaded_config.config().budgets.max_task_io_write_bytes,
+        max_task_total_tokens: loaded_config.config().budgets.max_task_total_tokens,
+        max_run_total_tokens: loaded_config.config().budgets.max_run_total_tokens,
+        max_run_peak_rss_bytes: loaded_config.config().budgets.max_run_peak_rss_bytes,
+        max_run_cpu_user_ticks: loaded_config.config().budgets.max_run_cpu_user_ticks,
+        max_run_cpu_system_ticks: loaded_config.config().budgets.max_run_cpu_system_ticks,
+        max_run_io_read_bytes: loaded_config.config().budgets.max_run_io_read_bytes,
+        max_run_io_write_bytes: loaded_config.config().budgets.max_run_io_write_bytes,
+    };
+
+    let mut scheduler = Scheduler::new(queue, store.clone(), runner, config);
+    if loaded_config.config().policy.audit_decisions {
+        let audit_path = PathBuf::from(&loaded_config.config().observability.audit_file);
+        if let Some(parent) = audit_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create audit directory {}", parent.display())
+                })?;
+            }
+        }
+        scheduler = scheduler.with_audit_sink(Arc::new(JsonlAuditSink::new(&audit_path)));
+    }
+
+    // Build run and tasks.
+    let run_snapshot = build_run_config_snapshot(
+        loaded_config,
+        &plan.workdir,
+        plan.timeout_secs,
+        &plan.tasks,
+        &plan.task_catalog,
+        plan.pace.as_deref(),
+        plan.prompt_snapshot.as_ref(),
+        plan.run_spec.as_ref(),
+        &plan.tranche_plan,
+        plan.current_tranche_index,
+    )
+    .context("failed to build run config snapshot")?;
+    let run = Run::with_config(
+        &plan.objective,
+        loaded_config.config().core.safe_mode,
+        run_snapshot.clone(),
+    );
+    let run_id = run.id;
+    let correlation_id = run.correlation_id;
+
+    let tasks: Vec<Task> = plan
+        .tasks
+        .iter()
+        .map(|t| {
+            Task::new(
+                run_id,
+                t.task_key.clone(),
+                &t.command,
+                t.command_class,
+                correlation_id,
+            )
+        })
+        .collect();
+
+    let mut task_workspace_by_id: HashMap<Uuid, String> = HashMap::new();
+    if let Some(layout) = parallel_workspace_layout.as_ref() {
+        if layout.task_workspace_dirs.len() != tasks.len() {
+            bail!(
+                "parallel workspace provisioning mismatch: {} workspaces for {} tasks",
+                layout.task_workspace_dirs.len(),
+                tasks.len()
+            );
+        }
+        for (task, workspace_dir) in tasks.iter().zip(layout.task_workspace_dirs.iter()) {
+            let workspace_dir = workspace_dir.display().to_string();
+            scheduler
+                .bind_task_working_dir(task.id, workspace_dir.clone())
+                .await;
+            task_workspace_by_id.insert(task.id, workspace_dir);
+        }
+    }
+
+    let task_names: Vec<(Uuid, String)> =
+        tasks.iter().map(|t| (t.id, t.task_key.clone())).collect();
+
+    seed_postgres_run_state_if_needed(loaded_config, &run, &tasks).await?;
+
+    store.append(Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Run,
+        entity_id: run_id.to_string(),
+        event_type: "run.config_snapshot".to_string(),
+        payload: serde_json::json!({
+            "objective": plan.objective.clone(),
+            "safe_mode": loaded_config.config().core.safe_mode,
+            "config_snapshot": run_snapshot,
+        }),
+        correlation_id,
+        causation_id: None,
+        actor: "cli".to_string(),
+        idempotency_key: Some(format!("{run_id}:config_snapshot")),
+    })?;
+
+    store.append(Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Run,
+        entity_id: run_id.to_string(),
+        event_type: "run.task_catalog".to_string(),
+        payload: serde_json::json!({
+            "tasks": plan
+                .tasks
+                .iter()
+                .zip(tasks.iter())
+                .map(|(planned, task)| serde_json::json!({
+                    "task_id": task.id,
+                    "task_key": planned.task_key,
+                    "tranche_key": planned.tranche_key,
+                    "tranche_group": planned.tranche_group,
+                    "allowed_paths": planned.allowed_paths,
+                    "workspace_dir": task_workspace_by_id.get(&task.id),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        correlation_id,
+        causation_id: None,
+        actor: "cli".to_string(),
+        idempotency_key: Some(format!("{run_id}:task_catalog")),
+    })?;
+
+    // Submit run.
+    scheduler
+        .submit_run(run, tasks)
+        .await
+        .context("failed to submit run")?;
+
+    info!(run_id = %run_id, objective = %plan.objective, "run started");
+
+    // Set up shutdown controller.
+    let shutdown = ShutdownController::new();
+    shutdown.install_signal_handler();
+    let cancel = shutdown.token();
+
+    // Set up event channel for renderer.
+    let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
+
+    // Emit known run/task identity immediately so the UI has deterministic
+    // startup state before the first scheduler tick/event-store poll.
+    emit_initial_stream_state(&tx, run_id, &plan.objective, &task_names);
+
+    // Spawn renderer task.
+    let renderer_shutdown = shutdown.clone();
+    let verbose_output = loaded_config.config().ui.verbose_output;
+    let renderer_handle = tokio::task::spawn_blocking(move || {
+        run_renderer(rx, render_mode, renderer_shutdown, verbose_output)
+    });
+
+    // Drive scheduler loop, emitting events to renderer channel.
+    let continuation_payload = drive_scheduler(
+        &scheduler,
+        &store,
+        shutdown.clone(),
+        cancel,
+        tx,
+        run_id,
+        correlation_id,
+        &task_names,
+        loaded_config.config().run.effective_auto_advance_policy(),
+        loaded_config.config().ui.cancellation_diagnostics,
+        observers::build_memory_observer(
+            loaded_config,
+            run_id,
+            correlation_id,
+            &plan,
+            &task_names,
+        )?,
+    )
+    .await?;
+
+    // Wait for renderer to finish.
+    renderer_handle
+        .await
+        .context("renderer task panicked")?
+        .context("renderer error")?;
+
+    let mut parallel_merge_error: Option<anyhow::Error> = None;
+    if continuation_payload.exit_state == RunState::RunCompleted {
+        if let Some(layout) = parallel_workspace_layout.as_ref() {
+            let source_workdir =
+                config::resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+            let source_workdir = source_workdir.canonicalize().with_context(|| {
+                format!(
+                    "failed to canonicalize execution working_dir {}",
+                    source_workdir.display()
+                )
+            })?;
+            let task_workspaces = plan
+                .tasks
+                .iter()
+                .zip(layout.task_workspace_dirs.iter())
+                .map(|(task, workspace_dir)| (task.task_key.clone(), workspace_dir.clone()))
+                .collect::<Vec<_>>();
+            match merge_parallel_workspace_results(
+                &source_workdir,
+                run_id,
+                &layout.run_workspace_root,
+                &task_workspaces,
+            ) {
+                Ok(report) => {
+                    let merged_count = report.merged_task_keys.len();
+                    let skipped_count = report.skipped_task_keys.len();
+                    println!(
+                        "Parallel workspace merge: merged {merged_count} task workspace(s), skipped {skipped_count} with no changes."
+                    );
+                    if let Err(err) = store.append(Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: run_id.to_string(),
+                        event_type: "run.parallel_merge_succeeded".to_string(),
+                        payload: serde_json::json!({
+                            "merged_task_keys": report.merged_task_keys,
+                            "skipped_task_keys": report.skipped_task_keys,
+                            "source_workdir": source_workdir.display().to_string(),
+                            "workspace_root": layout.run_workspace_root.display().to_string(),
+                        }),
+                        correlation_id,
+                        causation_id: None,
+                        actor: "cli".to_string(),
+                        idempotency_key: Some(format!("{run_id}:parallel_merge_succeeded")),
+                    }) {
+                        warn!(error = %err, "failed to persist parallel merge success event");
+                    }
+                }
+                Err(err) => {
+                    if let Err(append_err) = store.append(Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: run_id.to_string(),
+                        event_type: "run.parallel_merge_failed".to_string(),
+                        payload: serde_json::json!({
+                            "reason": err.to_string(),
+                            "source_workdir": source_workdir.display().to_string(),
+                            "workspace_root": layout.run_workspace_root.display().to_string(),
+                        }),
+                        correlation_id,
+                        causation_id: None,
+                        actor: "cli".to_string(),
+                        idempotency_key: Some(format!("{run_id}:parallel_merge_failed")),
+                    }) {
+                        warn!(error = %append_err, "failed to persist parallel merge failure event");
+                    }
+                    parallel_merge_error = Some(
+                        err.context(format!("parallel workspace merge failed for run {run_id}")),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(layout) = parallel_workspace_layout.as_ref() {
+        if parallel_merge_error.is_none() {
+            if let Err(err) = fs::remove_dir_all(&layout.run_workspace_root) {
+                warn!(
+                    error = %err,
+                    workspace_root = %layout.run_workspace_root.display(),
+                    "failed to clean parallel run workspace root"
+                );
+            }
+        } else {
+            warn!(
+                workspace_root = %layout.run_workspace_root.display(),
+                "preserving parallel run workspace root after merge failure for inspection"
+            );
+        }
+    }
+
+    // Sync materialized state columns in Postgres so `yarli run status` and
+    // direct DB queries reflect the actual terminal state, not the initial RUN_OPEN.
+    if let Err(e) = sync_postgres_state(&scheduler, loaded_config, run_id).await {
+        warn!(error = %e, "failed to sync postgres state on exit");
+    }
+
+    if let Err(e) =
+        persist_continuation_payload_event(store.as_ref(), &continuation_payload, correlation_id)
+    {
+        warn!(error = %e, "failed to persist continuation payload event");
+    }
+
+    let cont_dir = PathBuf::from(".yarli");
+    if let Err(e) = fs::create_dir_all(&cont_dir) {
+        warn!(error = %e, "failed to create .yarli directory");
+    } else {
+        let cont_path = cont_dir.join("continuation.json");
+        match serde_json::to_string_pretty(&continuation_payload) {
+            Ok(json) => {
+                if let Err(e) = fs::write(&cont_path, json) {
+                    warn!(error = %e, "failed to write continuation file");
+                } else {
+                    info!(path = %cont_path.display(), "wrote continuation file");
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to serialize continuation payload"),
+        }
+    }
+
+    if let Some(err) = parallel_merge_error {
+        return Err(err);
+    }
+
+    if continuation_payload.exit_state == RunState::RunCompleted {
+        if let Err(err) = maybe_mark_current_structured_tranche_complete(&plan) {
+            warn!(
+                run_id = %run_id,
+                error = %err,
+                "failed to auto-complete structured tranche status"
+            );
+        }
+    }
+
+    let token_totals = match collect_run_token_totals(store.as_ref(), correlation_id) {
+        Ok(totals) => totals,
+        Err(err) => {
+            warn!(
+                run_id = %run_id,
+                error = %err,
+                "failed to collect run token totals"
+            );
+            RunTokenTotals::default()
+        }
+    };
+
+    Ok(RunExecutionOutcome {
+        run_id,
+        run_state: continuation_payload.exit_state,
+        continuation_payload,
+        token_totals,
+    })
+}
+
+/// `yarli run sw4rm` — boot as a sw4rm orchestrator agent.
+///
+/// Reads `[sw4rm]` config from `yarli.toml`, creates the agent infrastructure,
+/// connects to the sw4rm runtime, and enters the agent message loop.
+#[cfg(feature = "sw4rm")]
+pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
+    use yarli_sw4rm::{
+        orchestrator::{VerificationCommand, VerificationSpec},
+        OrchestratorLoop, ShutdownBridge, YarliAgent,
+    };
+
+    let sw4rm_config = loaded_config.config().sw4rm.clone();
+    println!("Booting sw4rm agent: {}", sw4rm_config.agent_name);
+
+    // Build verification spec from merged run-spec configuration:
+    // yarli.toml [run] defaults + optional PROMPT.md override block.
+    let has_config_run_spec = run_config_has_run_spec_data(&loaded_config.config().run);
+    let mut base_run_spec = run_spec_from_run_config(&loaded_config.config().run);
+    if has_config_run_spec {
+        if let Err(err) = prompt::validate_run_spec(&base_run_spec) {
+            warn!(
+                error = %err,
+                "invalid [run] run-spec configuration for sw4rm; using fallback verification defaults"
+            );
+            base_run_spec = prompt::RunSpec {
+                version: 1,
+                objective: None,
+                tasks: prompt::RunSpecTasks::default(),
+                tranches: None,
+                plan_guard: None,
+            };
+        }
+    }
+    if let Ok(resolved) = resolve_prompt_entry_path(loaded_config, None) {
+        if let Ok(loaded_prompt) = prompt::load_prompt_with_optional_run_spec(&resolved.entry_path)
+        {
+            if let Some(prompt_run_spec) = loaded_prompt.run_spec.as_ref() {
+                base_run_spec = merge_run_specs(&base_run_spec, Some(prompt_run_spec));
+            }
+        }
+    }
+    if let Err(err) = prompt::validate_run_spec(&base_run_spec) {
+        warn!(
+            error = %err,
+            "invalid effective sw4rm run-spec after merge; using fallback verification defaults"
+        );
+        base_run_spec = prompt::RunSpec {
+            version: 1,
+            objective: None,
+            tasks: prompt::RunSpecTasks::default(),
+            tranches: None,
+            plan_guard: None,
+        };
+    }
+    let verification_tasks = base_run_spec.tasks.items;
+    let verification = if !verification_tasks.is_empty() {
+        let commands: Vec<VerificationCommand> = verification_tasks
+            .iter()
+            .map(|t| {
+                let class = match t.class.as_deref().unwrap_or("io") {
+                    "cpu" => yarli_core::domain::CommandClass::Cpu,
+                    "git" => yarli_core::domain::CommandClass::Git,
+                    "tool" => yarli_core::domain::CommandClass::Tool,
+                    _ => yarli_core::domain::CommandClass::Io,
+                };
+                VerificationCommand {
+                    task_key: t.key.clone(),
+                    command: t.cmd.clone(),
+                    class,
+                }
+            })
+            .collect();
+        VerificationSpec {
+            commands,
+            working_dir: loaded_config.config().execution.working_dir.clone(),
+            task_gates: None, // use defaults from yarli-gates
+            run_gates: None,
+        }
+    } else {
+        // No usable run-spec tasks — use a minimal verification spec.
+        VerificationSpec {
+            commands: vec![VerificationCommand {
+                task_key: "build".to_string(),
+                command: "cargo build".to_string(),
+                class: yarli_core::domain::CommandClass::Cpu,
+            }],
+            working_dir: loaded_config.config().execution.working_dir.clone(),
+            task_gates: None,
+            run_gates: None,
+        }
+    };
+
+    // NOTE: Using MockRouterSender — real RouterClient transport not yet implemented.
+    // The agent will boot and register but LLM dispatch will not function.
+    eprintln!("WARNING: using mock router sender — real sw4rm transport not yet implemented");
+    let router = std::sync::Arc::new(yarli_sw4rm::mock::MockRouterSender::new());
+    let orchestrator = std::sync::Arc::new(OrchestratorLoop::new(
+        router,
+        sw4rm_config.clone(),
+        verification,
+    ));
+
+    // Build sw4rm AgentConfig
+    let agent_config = sw4rm_sdk::AgentConfig::new(
+        sw4rm_config.agent_name.clone(),
+        format!("yarli-orchestrator/{}", env!("CARGO_PKG_VERSION")),
+    )
+    .with_capabilities(sw4rm_config.capabilities.clone())
+    .with_endpoints(sw4rm_sdk::Endpoints {
+        registry: sw4rm_config.registry_url.clone(),
+        router: sw4rm_config.router_url.clone(),
+        scheduler: sw4rm_config.scheduler_url.clone(),
+        ..sw4rm_sdk::Endpoints::default()
+    });
+
+    // Create shutdown bridge
+    let shutdown = ShutdownController::new();
+    shutdown.install_signal_handler();
+    let bridge = ShutdownBridge::new(shutdown.clone());
+
+    // Create agent
+    let agent = YarliAgent::new(agent_config.clone(), sw4rm_config, orchestrator)
+        .with_shutdown_bridge(bridge);
+
+    println!("Connecting to sw4rm services...");
+
+    // Boot the runtime
+    let mut runtime = sw4rm_sdk::AgentRuntime::new(agent_config);
+    runtime
+        .init()
+        .await
+        .context("failed to initialize sw4rm runtime")?;
+    runtime
+        .register()
+        .await
+        .context("failed to register with sw4rm registry")?;
+
+    println!("Agent registered. Entering message loop...");
+
+    runtime
+        .run(agent)
+        .await
+        .map_err(|e| anyhow::anyhow!("sw4rm agent runtime error: {e}"))?;
+
+    Ok(())
+}
+
+pub(crate) async fn seed_postgres_run_state_if_needed(
+    loaded_config: &LoadedConfig,
+    run: &Run,
+    tasks: &[Task],
+) -> Result<()> {
+    let BackendSelection::Postgres { database_url } = loaded_config.backend_selection()? else {
+        return Ok(());
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to postgres for run/task seeding at {}",
+                loaded_config.path().display()
+            )
+        })?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to begin run/task seed transaction")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO runs (
+            run_id, objective, state, safe_mode, exit_reason, correlation_id, config_snapshot, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (run_id) DO NOTHING
+        "#,
+    )
+    .bind(run.id)
+    .bind(&run.objective)
+    .bind(run_state_db(run.state))
+    .bind(safe_mode_db(run.safe_mode))
+    .bind(run.exit_reason.map(exit_reason_db))
+    .bind(run.correlation_id)
+    .bind(&run.config_snapshot)
+    .bind(run.created_at)
+    .bind(run.updated_at)
+    .execute(&mut *tx)
+    .await
+    .context("failed to seed runs table row for scheduler submission")?;
+
+    for task in tasks {
+        sqlx::query(
+            r#"
+            INSERT INTO tasks (
+                task_id, run_id, task_key, description, state, command_class, attempt_no, max_attempts,
+                blocker_code, correlation_id, priority, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ON CONFLICT (task_id) DO NOTHING
+            "#,
+        )
+        .bind(task.id)
+        .bind(task.run_id)
+        .bind(&task.task_key)
+        .bind(&task.description)
+        .bind(task_state_db(task.state))
+        .bind(command_class_db(task.command_class))
+        .bind(task.attempt_no as i32)
+        .bind(task.max_attempts as i32)
+        .bind(task.blocker.as_ref().map(task_blocker_db))
+        .bind(task.correlation_id)
+        .bind(task.priority as i32)
+        .bind(task.created_at)
+        .bind(task.updated_at)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to seed task row {}", task.id))?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit run/task seed transaction")?;
+    Ok(())
+}
+
+pub(crate) fn run_state_db(state: RunState) -> &'static str {
+    match state {
+        RunState::RunOpen => "RUN_OPEN",
+        RunState::RunActive => "RUN_ACTIVE",
+        RunState::RunBlocked => "RUN_BLOCKED",
+        RunState::RunVerifying => "RUN_VERIFYING",
+        RunState::RunCompleted => "RUN_COMPLETED",
+        RunState::RunFailed => "RUN_FAILED",
+        RunState::RunCancelled => "RUN_CANCELLED",
+    }
+}
+
+pub(crate) fn task_state_db(state: TaskState) -> &'static str {
+    match state {
+        TaskState::TaskOpen => "TASK_OPEN",
+        TaskState::TaskReady => "TASK_READY",
+        TaskState::TaskExecuting => "TASK_EXECUTING",
+        TaskState::TaskWaiting => "TASK_WAITING",
+        TaskState::TaskBlocked => "TASK_BLOCKED",
+        TaskState::TaskVerifying => "TASK_VERIFYING",
+        TaskState::TaskComplete => "TASK_COMPLETE",
+        TaskState::TaskFailed => "TASK_FAILED",
+        TaskState::TaskCancelled => "TASK_CANCELLED",
+    }
+}
+
+pub(crate) fn command_class_db(class: CommandClass) -> &'static str {
+    match class {
+        CommandClass::Io => "io",
+        CommandClass::Cpu => "cpu",
+        CommandClass::Git => "git",
+        CommandClass::Tool => "tool",
+    }
+}
+
+pub(crate) fn safe_mode_db(mode: SafeMode) -> &'static str {
+    match mode {
+        SafeMode::Observe => "observe",
+        SafeMode::Execute => "execute",
+        SafeMode::Restricted => "restricted",
+        SafeMode::Breakglass => "breakglass",
+    }
+}
+
+pub(crate) fn exit_reason_db(reason: yarli_core::domain::ExitReason) -> &'static str {
+    match reason {
+        yarli_core::domain::ExitReason::CompletedAllGates => "completed_all_gates",
+        yarli_core::domain::ExitReason::BlockedOpenTasks => "blocked_open_tasks",
+        yarli_core::domain::ExitReason::BlockedGateFailure => "blocked_gate_failure",
+        yarli_core::domain::ExitReason::FailedPolicyDenial => "failed_policy_denial",
+        yarli_core::domain::ExitReason::FailedRuntimeError => "failed_runtime_error",
+        yarli_core::domain::ExitReason::CancelledByOperator => "cancelled_by_operator",
+        yarli_core::domain::ExitReason::TimedOut => "timed_out",
+        yarli_core::domain::ExitReason::StalledNoProgress => "stalled_no_progress",
+    }
+}
+
+pub(crate) fn task_blocker_db(blocker: &yarli_core::entities::task::BlockerCode) -> String {
+    match blocker {
+        yarli_core::entities::task::BlockerCode::DependencyPending => "dependency_pending".into(),
+        yarli_core::entities::task::BlockerCode::MergeConflict => "merge_conflict".into(),
+        yarli_core::entities::task::BlockerCode::PolicyDenial => "policy_denial".into(),
+        yarli_core::entities::task::BlockerCode::GateFailure => "gate_failure".into(),
+        yarli_core::entities::task::BlockerCode::ManualHold => "manual_hold".into(),
+        yarli_core::entities::task::BlockerCode::Custom(value) => value.clone(),
+    }
+}
+
+/// Sync the materialized run and task states in Postgres to match in-memory registry.
+///
+/// The `runs.state` and `tasks.state` columns are seeded once at INSERT and never updated,
+/// leaving them stale (e.g. RUN_OPEN) while the event-sourced in-memory registry advances.
+/// This function writes the current in-memory state back to Postgres for observability.
+pub(crate) async fn sync_postgres_state<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    loaded_config: &LoadedConfig,
+    run_id: Uuid,
+) -> Result<()>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let BackendSelection::Postgres { database_url } = loaded_config.backend_selection()? else {
+        return Ok(());
+    };
+
+    let reg = scheduler.registry().read().await;
+    let run = match reg.get_run(&run_id) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let run_state = run_state_db(run.state);
+    let exit_reason = run.exit_reason.map(exit_reason_db);
+    let task_states: Vec<(Uuid, &'static str)> = reg
+        .tasks_for_run(&run_id)
+        .iter()
+        .map(|t| (t.id, task_state_db(t.state)))
+        .collect();
+    drop(reg);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .context("sync_postgres_state: failed to connect")?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("sync_postgres_state: begin tx")?;
+
+    sqlx::query(
+        r#"
+        UPDATE runs
+        SET state = $1,
+            exit_reason = $2,
+            updated_at = now()
+        WHERE run_id = $3
+        "#,
+    )
+    .bind(run_state)
+    .bind(exit_reason)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .context("sync_postgres_state: update runs")?;
+
+    for (task_id, state) in &task_states {
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET state = $1,
+                updated_at = now()
+            WHERE task_id = $2
+            "#,
+        )
+        .bind(*state)
+        .bind(*task_id)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("sync_postgres_state: update task {task_id}"))?;
+    }
+
+    tx.commit().await.context("sync_postgres_state: commit")?;
+
+    debug!(
+        run_id = %run_id,
+        run_state = run_state,
+        tasks = task_states.len(),
+        "synced postgres state"
+    );
+    Ok(())
+}
+
+pub(crate) fn build_run_config_snapshot(
+    loaded_config: &LoadedConfig,
+    working_dir: &str,
+    timeout_secs: u64,
+    tasks: &[PlannedTask],
+    task_catalog: &[PlannedTask],
+    pace: Option<&str>,
+    prompt_snapshot: Option<&yarli_cli::prompt::PromptSnapshot>,
+    run_spec: Option<&yarli_cli::prompt::RunSpec>,
+    tranche_plan: &[PlannedTranche],
+    current_tranche_index: Option<usize>,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "config_source": loaded_config.source().label(),
+        "config_path": loaded_config.path().display().to_string(),
+        "backend": loaded_config.config().core.backend.as_str(),
+        "config": loaded_config.snapshot()?,
+        "runtime": {
+            "pace": pace,
+            "working_dir": working_dir,
+            "timeout_secs": timeout_secs,
+            "task_count": tasks.len(),
+            "tasks": tasks.iter().map(|t| serde_json::json!({
+                "task_key": &t.task_key,
+                "command": &t.command,
+                "command_class": format!("{:?}", t.command_class),
+                "tranche_key": &t.tranche_key,
+                "tranche_group": &t.tranche_group,
+                "allowed_paths": &t.allowed_paths,
+            })).collect::<Vec<_>>(),
+            "task_catalog": task_catalog.iter().map(|t| serde_json::json!({
+                "task_key": &t.task_key,
+                "command": &t.command,
+                "command_class": format!("{:?}", t.command_class),
+                "tranche_key": &t.tranche_key,
+                "tranche_group": &t.tranche_group,
+                "allowed_paths": &t.allowed_paths,
+            })).collect::<Vec<_>>(),
+            "tranche_plan": tranche_plan.iter().map(|t| serde_json::json!({
+                "key": &t.key,
+                "objective": &t.objective,
+                "task_keys": &t.task_keys,
+                "tranche_group": &t.tranche_group,
+            })).collect::<Vec<_>>(),
+            "current_tranche_index": current_tranche_index,
+            "prompt": prompt_snapshot,
+            "run_spec": run_spec,
+        },
+    }))
+}
+
+pub(crate) fn compute_quality_gate(
+    report: Option<&DeteriorationReport>,
+    auto_advance_policy: AutoAdvancePolicy,
+) -> yarli_core::entities::continuation::ContinuationQualityGate {
+    match report {
+        Some(report) => {
+            let (allow_auto_advance, reason) = match report.trend {
+                DeteriorationTrend::Improving => {
+                    (true, "deterioration trend improving".to_string())
+                }
+                DeteriorationTrend::Stable => {
+                    if matches!(
+                        auto_advance_policy,
+                        AutoAdvancePolicy::StableOk | AutoAdvancePolicy::Always
+                    ) {
+                        (
+                            true,
+                            "deterioration trend stable (policy allows auto-advance)".to_string(),
+                        )
+                    } else {
+                        (
+                            false,
+                            "deterioration trend stable (stagnation blocked)".to_string(),
+                        )
+                    }
+                }
+                DeteriorationTrend::Deteriorating => {
+                    if auto_advance_policy == AutoAdvancePolicy::Always {
+                        (
+                            true,
+                            "deterioration trend deteriorating (always policy overrides gate)"
+                                .to_string(),
+                        )
+                    } else {
+                        (false, "deterioration trend deteriorating".to_string())
+                    }
+                }
+            };
+            yarli_core::entities::continuation::ContinuationQualityGate {
+                allow_auto_advance,
+                reason,
+                trend: Some(report.trend),
+                score: Some(report.score),
+            }
+        }
+        None => yarli_core::entities::continuation::ContinuationQualityGate {
+            allow_auto_advance: auto_advance_policy == AutoAdvancePolicy::Always,
+            reason: if auto_advance_policy == AutoAdvancePolicy::Always {
+                "no deterioration signal emitted (always policy overrides gate)".to_string()
+            } else {
+                "no deterioration signal emitted".to_string()
+            },
+            trend: None,
+            score: None,
+        },
+    }
+}
+
+pub(crate) fn persist_continuation_payload_event(
+    store: &dyn EventStore,
+    payload: &yarli_core::entities::ContinuationPayload,
+    correlation_id: Uuid,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: payload.run_id.to_string(),
+            event_type: RUN_CONTINUATION_EVENT_TYPE.to_string(),
+            payload: serde_json::json!({
+                "continuation_payload": payload,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: "yarli-cli".to_string(),
+            idempotency_key: Some(format!("{}:continuation_payload", payload.run_id)),
+        },
+    )
+}
+
+pub(crate) fn build_continuation_payload(
+    run: &Run,
+    tasks: &[&yarli_core::entities::Task],
+    report: Option<&DeteriorationReport>,
+    auto_advance_policy: AutoAdvancePolicy,
+) -> yarli_core::entities::ContinuationPayload {
+    let mut payload = yarli_core::entities::ContinuationPayload::build(run, tasks);
+    payload.quality_gate = Some(compute_quality_gate(report, auto_advance_policy));
+    payload
+}
+
+pub(crate) fn cancellation_reason_for_source(source: CancellationSource) -> &'static str {
+    match source {
+        CancellationSource::Operator => "cancelled by operator",
+        CancellationSource::Sigint => "cancelled by SIGINT",
+        CancellationSource::Sigterm => "cancelled by SIGTERM",
+        CancellationSource::Sw4rmPreemption => "cancelled by sw4rm preemption",
+        CancellationSource::Unknown => "cancelled by shutdown token",
+    }
+}
+
+pub(crate) fn actor_kind_for_source(source: CancellationSource) -> CancellationActorKind {
+    match source {
+        CancellationSource::Operator | CancellationSource::Sigint => {
+            CancellationActorKind::Operator
+        }
+        CancellationSource::Sw4rmPreemption => CancellationActorKind::Supervisor,
+        CancellationSource::Sigterm => CancellationActorKind::System,
+        CancellationSource::Unknown => CancellationActorKind::Unknown,
+    }
+}
+
+pub(crate) fn default_cancellation_provenance(
+    source: CancellationSource,
+    actor_detail: Option<String>,
+) -> CancellationProvenance {
+    CancellationProvenance {
+        cancellation_source: source,
+        signal_name: None,
+        signal_number: None,
+        sender_pid: None,
+        receiver_pid: Some(std::process::id()),
+        parent_pid: None,
+        process_group_id: None,
+        session_id: None,
+        tty: None,
+        actor_kind: Some(actor_kind_for_source(source)),
+        actor_detail,
+        stage: Some(CancellationStage::Unknown),
+    }
+}
+
+pub(crate) fn cancellation_stage_for_task(task: &Task) -> CancellationStage {
+    match task.state {
+        TaskState::TaskExecuting => CancellationStage::Executing,
+        TaskState::TaskVerifying => CancellationStage::Verifying,
+        TaskState::TaskReady if task.attempt_no > 1 => CancellationStage::Retrying,
+        _ => CancellationStage::Unknown,
+    }
+}
+
+pub(crate) fn format_cancel_provenance_summary(
+    provenance: Option<&CancellationProvenance>,
+) -> String {
+    let signal = provenance
+        .and_then(|p| p.signal_name.as_deref())
+        .unwrap_or("unknown");
+    let sender = provenance
+        .and_then(|p| p.sender_pid)
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let receiver = provenance
+        .and_then(|p| p.receiver_pid)
+        .map(|pid| format!("yarli({pid})"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let actor = provenance
+        .and_then(|p| p.actor_kind)
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let stage = provenance
+        .and_then(|p| p.stage)
+        .map(|stage| stage.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("signal={signal} sender={sender} receiver={receiver} actor={actor} stage={stage}")
+}
+
+pub(crate) fn with_cancellation_diagnostics(
+    mut provenance: CancellationProvenance,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    tick_count: u64,
+    note: &str,
+) -> CancellationProvenance {
+    let diagnostic = format!(
+        "diag(run_id={run_id}, correlation_id={correlation_id}, tick={tick_count}, note={note})"
+    );
+    provenance.actor_detail = Some(match provenance.actor_detail {
+        Some(existing) => format!("{existing}; {diagnostic}"),
+        None => diagnostic,
+    });
+    provenance
+}
+
+/// Drive the scheduler, emitting StreamEvents to the renderer channel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_scheduler<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    store: &Arc<S>,
+    shutdown: ShutdownController,
+    cancel: CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    task_names: &[(Uuid, String)],
+    auto_advance_policy: AutoAdvancePolicy,
+    cancellation_diagnostics: bool,
+    mut memory_observer: Option<observers::MemoryObserver>,
+) -> Result<yarli_core::entities::ContinuationPayload>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut reclaim_interval = tokio::time::interval(Duration::from_secs(10));
+    let mut tick_count: u64 = 0;
+    let mut stream_cursor = IncrementalEventCursor::new(
+        EventQuery::by_correlation(correlation_id),
+        STREAM_EVENT_BATCH_LIMIT,
+    );
+    let mut deterioration_observer = observers::DeteriorationObserver::new(
+        run_id,
+        correlation_id,
+        observers::OBSERVER_WINDOW_SIZE,
+    );
+
+    if let Some(observer) = memory_observer.as_mut() {
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            observer.observe_run_start(store.as_ref()),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => warn!("memory observer observe_run_start timed out after 15s, continuing"),
+        }
+    }
+
+    // Drain stale queue entries from prior runs before first tick.
+    if let Err(e) = scheduler.cleanup_stale_queue().await {
+        warn!(error = %e, "failed to clean up stale queue entries");
+    }
+
+    let mut zero_progress_ticks: u64 = 0;
+    let mut paused = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("scheduler cancelled");
+                let cancellation_source = shutdown
+                    .cancellation_source()
+                    .unwrap_or(CancellationSource::Unknown);
+                let reason = cancellation_reason_for_source(cancellation_source);
+                let provenance = if cancellation_diagnostics {
+                    Some(with_cancellation_diagnostics(
+                        shutdown.cancellation_provenance().unwrap_or_else(|| {
+                            default_cancellation_provenance(
+                                cancellation_source,
+                                Some("cancellation signal observed".to_string()),
+                            )
+                        }),
+                        run_id,
+                        correlation_id,
+                        tick_count,
+                        reason,
+                    ))
+                } else {
+                    shutdown.cancellation_provenance()
+                };
+                let _ = cancel_active_run(
+                    scheduler,
+                    store,
+                    run_id,
+                    reason,
+                    cancellation_source,
+                    provenance,
+                )
+                .await?;
+                let _new_events =
+                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                deterioration_observer.observe_store(store.as_ref())?;
+                if let Some(observer) = memory_observer.as_mut() {
+                    match tokio::time::timeout(
+                        Duration::from_secs(15),
+                        observer.observe_events(store.as_ref(), &_new_events),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => warn!("memory observer observe_events timed out after 15s on cancel"),
+                    }
+                }
+                let payload = {
+                    let reg = scheduler.registry().read().await;
+                    let run = reg.get_run(&run_id).ok_or_else(|| {
+                        anyhow::anyhow!("run {run_id} missing from registry after cancellation")
+                    })?;
+                    let tasks: Vec<&yarli_core::entities::Task> = run
+                        .task_ids
+                        .iter()
+                        .filter_map(|tid| reg.get_task(tid))
+                        .collect();
+                    build_continuation_payload(
+                        run,
+                        &tasks,
+                        deterioration_observer.latest_report(),
+                        auto_advance_policy,
+                    )
+                };
+                let _ = tx.send(StreamEvent::RunExited {
+                    payload: payload.clone(),
+                });
+                drop(tx);
+                return Ok(payload);
+            }
+            _ = heartbeat_interval.tick() => {
+                scheduler.heartbeat_active_leases().await;
+                let stats = scheduler.queue_stats();
+                let heartbeat_message = if paused {
+                    format!(
+                        "paused: pending={} leased={} tick={} zero_progress_ticks={}",
+                        stats.pending, stats.leased, tick_count, zero_progress_ticks
+                    )
+                } else {
+                    format!(
+                        "heartbeat: pending={} leased={} tick={} zero_progress_ticks={}",
+                        stats.pending, stats.leased, tick_count, zero_progress_ticks
+                    )
+                };
+                let _ = tx.send(StreamEvent::TransientStatus {
+                    message: heartbeat_message.clone(),
+                });
+                let _ = append_event(
+                    store.as_ref(),
+                    Event {
+                        event_id: Uuid::now_v7(),
+                        occurred_at: chrono::Utc::now(),
+                        entity_type: EntityType::Run,
+                        entity_id: run_id.to_string(),
+                        event_type: "run.observer.progress".to_string(),
+                        payload: serde_json::json!({
+                            "tick": tick_count,
+                            "queue_pending": stats.pending,
+                            "queue_leased": stats.leased,
+                            "paused": paused,
+                            "zero_progress_ticks": zero_progress_ticks,
+                            "summary": heartbeat_message,
+                        }),
+                        correlation_id,
+                        causation_id: None,
+                        actor: "observer.progress".to_string(),
+                        idempotency_key: None,
+                    },
+                );
+            }
+            _ = reclaim_interval.tick() => {
+                scheduler.reclaim_stale_leases().await;
+            }
+            _ = tick_interval.tick() => {
+                tick_count += 1;
+
+                if paused {
+                    zero_progress_ticks += 1;
+                } else {
+                    // Run a scheduler tick.
+                    let _result = scheduler
+                        .tick_with_cancel(cancel.child_token())
+                        .await
+                        .context("scheduler tick failed")?;
+
+                    debug!(
+                        tick = tick_count,
+                        promoted = _result.promoted,
+                        claimed = _result.claimed,
+                        executed = _result.executed,
+                        failed = _result.failed,
+                        errors = _result.errors,
+                        "drive_scheduler tick"
+                    );
+
+                    if _result.claimed == 0 && _result.executed == 0 {
+                        zero_progress_ticks += 1;
+                        if zero_progress_ticks >= 10 && zero_progress_ticks % 10 == 0 {
+                            let stats = scheduler.queue_stats();
+                            warn!(
+                                consecutive_zero_ticks = zero_progress_ticks,
+                                tick = tick_count,
+                                queue_pending = stats.pending,
+                                queue_leased = stats.leased,
+                                "no tasks claimed or executed for {zero_progress_ticks} consecutive ticks"
+                            );
+                        }
+                    } else {
+                        zero_progress_ticks = 0;
+                    }
+                }
+
+                // Emit events using incremental cursor reads.
+                let _new_events =
+                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                let control_signal = _new_events
+                    .iter()
+                    .filter_map(|event| operator_control_signal_from_event(event, run_id))
+                    .last();
+                deterioration_observer.observe_store(store.as_ref())?;
+                if let Some(observer) = memory_observer.as_mut() {
+                    match tokio::time::timeout(
+                        Duration::from_secs(15),
+                        observer.observe_events(store.as_ref(), &_new_events),
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(_) => warn!("memory observer observe_events timed out after 15s, continuing"),
+                    }
+                }
+                match control_signal {
+                    Some(OperatorControlSignal::Pause { reason }) => {
+                        paused = true;
+                        let _ = tx.send(StreamEvent::TransientStatus {
+                            message: format!("operator pause: {reason}"),
+                        });
+                    }
+                    Some(OperatorControlSignal::Resume { reason }) => {
+                        paused = false;
+                        let _ = tx.send(StreamEvent::TransientStatus {
+                            message: format!("operator resume: {reason}"),
+                        });
+                    }
+                    Some(OperatorControlSignal::Cancel { reason }) => {
+                        info!(%reason, "received operator cancel signal");
+                        let operator_provenance = if cancellation_diagnostics {
+                            Some(with_cancellation_diagnostics(
+                                default_cancellation_provenance(
+                                    CancellationSource::Operator,
+                                    Some("operator control-plane cancel event".to_string()),
+                                ),
+                                run_id,
+                                correlation_id,
+                                tick_count,
+                                &reason,
+                            ))
+                        } else {
+                            Some(default_cancellation_provenance(
+                                CancellationSource::Operator,
+                                Some("operator control-plane cancel event".to_string()),
+                            ))
+                        };
+                        let _ = cancel_active_run(
+                            scheduler,
+                            store,
+                            run_id,
+                            &reason,
+                            CancellationSource::Operator,
+                            operator_provenance,
+                        )
+                        .await?;
+                        let cancel_events =
+                            emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                        deterioration_observer.observe_store(store.as_ref())?;
+                        if let Some(observer) = memory_observer.as_mut() {
+                            match tokio::time::timeout(
+                                Duration::from_secs(15),
+                                observer.observe_events(store.as_ref(), &cancel_events),
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(_) => warn!("memory observer observe_events timed out after operator cancel"),
+                            }
+                        }
+                        let payload = {
+                            let reg = scheduler.registry().read().await;
+                            let run = reg.get_run(&run_id).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "run {run_id} missing from registry after operator cancel"
+                                )
+                            })?;
+                            let tasks: Vec<&yarli_core::entities::Task> = run
+                                .task_ids
+                                .iter()
+                                .filter_map(|tid| reg.get_task(tid))
+                                .collect();
+                            build_continuation_payload(
+                                run,
+                                &tasks,
+                                deterioration_observer.latest_report(),
+                                auto_advance_policy,
+                            )
+                        };
+                        let _ = tx.send(StreamEvent::RunExited {
+                            payload: payload.clone(),
+                        });
+                        drop(tx);
+                        return Ok(payload);
+                    }
+                    None => {}
+                }
+
+                // Send tick for spinner animation.
+                let _ = tx.send(StreamEvent::Tick);
+
+                // Check if the run is terminal.
+                let reg = scheduler.registry().read().await;
+                if let Some(run) = reg.get_run(&run_id) {
+                    if run.state.is_terminal() {
+                        info!(state = ?run.state, ticks = tick_count, "run reached terminal state");
+
+                        // Build and emit continuation payload before closing channel.
+                        let tasks: Vec<&yarli_core::entities::Task> = run
+                            .task_ids
+                            .iter()
+                            .filter_map(|tid| reg.get_task(tid))
+                            .collect();
+                        let payload = build_continuation_payload(
+                            run,
+                            &tasks,
+                            deterioration_observer.latest_report(),
+                            auto_advance_policy,
+                        );
+                        let _ = tx.send(StreamEvent::RunExited {
+                            payload: payload.clone(),
+                        });
+
+                        drop(tx);
+                        return Ok(payload);
+                    }
+                }
+
+                // Safety: bail after 10000 ticks (~16 min at 100ms) to prevent infinite loops.
+                if tick_count > 10_000 {
+                    drop(tx);
+                    bail!("scheduler exceeded max ticks (10000)");
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn emit_new_stream_events<S: EventStore>(
+    store: &Arc<S>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    task_names: &[(Uuid, String)],
+    cursor: &mut IncrementalEventCursor,
+) -> Result<Vec<Event>> {
+    let new_events = cursor.read_new_events(store.as_ref())?;
+
+    for event in &new_events {
+        for (task_id, task_name) in stream_task_catalog_entries(event) {
+            let _ = tx.send(StreamEvent::TaskDiscovered { task_id, task_name });
+        }
+        if let (Ok(task_id), Some(worker_id)) = (
+            event.entity_id.parse::<Uuid>(),
+            event.payload.get("worker").and_then(|v| v.as_str()),
+        ) {
+            let _ = tx.send(StreamEvent::TaskWorker {
+                task_id,
+                worker_id: worker_id.to_string(),
+            });
+        }
+        if let Some(se) = event_to_stream_event(event, task_names) {
+            let _ = tx.send(se);
+        }
+    }
+
+    Ok(new_events)
+}
+
+pub(crate) async fn cancel_active_run<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    store: &Arc<S>,
+    run_id: Uuid,
+    reason: &str,
+    cancellation_source: CancellationSource,
+    provenance: Option<CancellationProvenance>,
+) -> Result<bool>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let (correlation_id, task_ids) = {
+        let reg = scheduler.registry().read().await;
+        let Some(run) = reg.get_run(&run_id) else {
+            return Ok(false);
+        };
+        (run.correlation_id, run.task_ids.clone())
+    };
+
+    let mut run_provenance =
+        provenance.unwrap_or_else(|| default_cancellation_provenance(cancellation_source, None));
+    run_provenance.cancellation_source = cancellation_source;
+    if run_provenance.signal_name.is_none() {
+        run_provenance.signal_name = match cancellation_source {
+            CancellationSource::Sigint => Some("SIGINT".to_string()),
+            CancellationSource::Sigterm => Some("SIGTERM".to_string()),
+            _ => None,
+        };
+    }
+    if run_provenance.signal_number.is_none() {
+        run_provenance.signal_number = match cancellation_source {
+            CancellationSource::Sigint => Some(2),
+            CancellationSource::Sigterm => Some(15),
+            _ => None,
+        };
+    }
+    if run_provenance.receiver_pid.is_none() {
+        run_provenance.receiver_pid = Some(std::process::id());
+    }
+    if run_provenance.actor_kind.is_none() {
+        run_provenance.actor_kind = Some(actor_kind_for_source(cancellation_source));
+    }
+    if run_provenance.stage.is_none() {
+        run_provenance.stage = Some(CancellationStage::Unknown);
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    let mut first_cancelled_task_id: Option<Uuid> = None;
+    let mut reg = scheduler.registry().write().await;
+
+    for task_id in task_ids {
+        let Some(task) = reg.get_task_mut(&task_id) else {
+            continue;
+        };
+        if task.state.is_terminal() {
+            continue;
+        }
+
+        let stage = cancellation_stage_for_task(task);
+        let mut task_provenance = run_provenance.clone();
+        task_provenance.stage = Some(stage);
+
+        let attempt_no = task.attempt_no;
+        let transition = task.transition(TaskState::TaskCancelled, reason, "cli", None)?;
+
+        if first_cancelled_task_id.is_none() {
+            first_cancelled_task_id = Some(task_id);
+            run_provenance.stage = Some(stage);
+        }
+
+        events.push(Event {
+            event_id: transition.event_id,
+            occurred_at: transition.occurred_at,
+            entity_type: EntityType::Task,
+            entity_id: task_id.to_string(),
+            event_type: "task.cancelled".to_string(),
+            payload: serde_json::json!({
+                "from": transition.from_state,
+                "to": transition.to_state,
+                "reason": transition.reason,
+                "detail": transition.reason,
+                "cancellation_source": cancellation_source.to_string(),
+                "cancellation_provenance": task_provenance,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: "cli".to_string(),
+            idempotency_key: Some(format!("{task_id}:cancelled:{attempt_no}")),
+        });
+
+        events.push(Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: transition.occurred_at,
+            entity_type: EntityType::Task,
+            entity_id: task_id.to_string(),
+            event_type: "task.cancel_provenance".to_string(),
+            payload: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "task_id": task_id.to_string(),
+                "timestamp": transition.occurred_at,
+                "cancellation_source": cancellation_source.to_string(),
+                "signal_name": task_provenance.signal_name.clone(),
+                "signal_number": task_provenance.signal_number,
+                "sender_pid": task_provenance.sender_pid,
+                "receiver_pid": task_provenance.receiver_pid,
+                "parent_pid": task_provenance.parent_pid,
+                "process_group_id": task_provenance.process_group_id,
+                "session_id": task_provenance.session_id,
+                "tty": task_provenance.tty.clone(),
+                "actor_kind": task_provenance.actor_kind.map(|kind| kind.to_string()),
+                "actor_detail": task_provenance.actor_detail.clone(),
+                "stage": task_provenance.stage.map(|stage| stage.to_string()),
+            }),
+            correlation_id,
+            causation_id: Some(transition.event_id),
+            actor: "cli".to_string(),
+            idempotency_key: Some(format!("{task_id}:cancel_provenance:{attempt_no}")),
+        });
+    }
+
+    let run_cancelled = if let Some(run) = reg.get_run_mut(&run_id) {
+        if run.state.is_terminal() {
+            false
+        } else {
+            let transition = run.transition(RunState::RunCancelled, reason, "cli", None)?;
+            run.cancellation_source = Some(cancellation_source);
+            run.cancellation_provenance = Some(run_provenance.clone());
+
+            events.push(Event {
+                event_id: transition.event_id,
+                occurred_at: transition.occurred_at,
+                entity_type: EntityType::Run,
+                entity_id: run_id.to_string(),
+                event_type: "run.cancelled".to_string(),
+                payload: serde_json::json!({
+                    "from": transition.from_state,
+                    "to": transition.to_state,
+                    "reason": transition.reason,
+                    "detail": transition.reason,
+                    "exit_reason": run.exit_reason.map(|r| r.to_string()),
+                    "cancellation_source": cancellation_source.to_string(),
+                    "cancellation_provenance": run_provenance.clone(),
+                }),
+                correlation_id,
+                causation_id: None,
+                actor: "cli".to_string(),
+                idempotency_key: Some(format!("{run_id}:cancelled")),
+            });
+            events.push(Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: transition.occurred_at,
+                entity_type: EntityType::Run,
+                entity_id: run_id.to_string(),
+                event_type: "run.cancel_provenance".to_string(),
+                payload: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "task_id": first_cancelled_task_id.map(|id| id.to_string()),
+                    "timestamp": transition.occurred_at,
+                    "cancellation_source": cancellation_source.to_string(),
+                    "signal_name": run_provenance.signal_name.clone(),
+                    "signal_number": run_provenance.signal_number,
+                    "sender_pid": run_provenance.sender_pid,
+                    "receiver_pid": run_provenance.receiver_pid,
+                    "parent_pid": run_provenance.parent_pid,
+                    "process_group_id": run_provenance.process_group_id,
+                    "session_id": run_provenance.session_id,
+                    "tty": run_provenance.tty.clone(),
+                    "actor_kind": run_provenance.actor_kind.map(|kind| kind.to_string()),
+                    "actor_detail": run_provenance.actor_detail.clone(),
+                    "stage": run_provenance.stage.map(|stage| stage.to_string()),
+                }),
+                correlation_id,
+                causation_id: Some(transition.event_id),
+                actor: "cli".to_string(),
+                idempotency_key: Some(format!("{run_id}:cancel_provenance")),
+            });
+            true
+        }
+    } else {
+        false
+    };
+
+    drop(reg);
+
+    // Drain pending/leased queue entries for this run to prevent stalls.
+    match scheduler.cancel_run_queue(run_id) {
+        Ok(count) if count > 0 => {
+            info!(run_id = %run_id, cancelled_queue_entries = count, "drained queue entries for cancelled run");
+        }
+        Err(e) => {
+            warn!(run_id = %run_id, error = %e, "failed to drain queue entries for cancelled run");
+        }
+        _ => {}
+    }
+
+    for event in events {
+        store
+            .append(event)
+            .map_err(|e| anyhow::anyhow!("failed to persist cancellation event: {e}"))?;
+    }
+
+    if run_cancelled {
+        if let Some(sink) = scheduler.audit_sink() {
+            let entry = AuditEntry::destructive_attempt(
+                "yarli-cli",
+                "run.cancelled",
+                reason,
+                Some(run_id),
+                first_cancelled_task_id,
+                serde_json::json!({
+                    "cancellation_source": cancellation_source.to_string(),
+                    "cancellation_provenance": run_provenance.clone(),
+                    "summary": format_cancel_provenance_summary(Some(&run_provenance)),
+                }),
+            );
+            if let Err(err) = sink.append(&entry) {
+                warn!(
+                    run_id = %run_id,
+                    error = %err,
+                    "failed to append cancellation provenance audit entry"
+                );
+            }
+        }
+    }
+
+    Ok(run_cancelled)
+}
+
+/// Parse a WorktreeState from its serialized form.
+pub(crate) fn parse_worktree_state(s: &str) -> Option<WorktreeState> {
+    match s {
+        "WtUnbound" => Some(WorktreeState::WtUnbound),
+        "WtCreating" => Some(WorktreeState::WtCreating),
+        "WtBoundHome" => Some(WorktreeState::WtBoundHome),
+        "WtSwitchPending" => Some(WorktreeState::WtSwitchPending),
+        "WtBoundNonHome" => Some(WorktreeState::WtBoundNonHome),
+        "WtMerging" => Some(WorktreeState::WtMerging),
+        "WtConflict" => Some(WorktreeState::WtConflict),
+        "WtRecovering" => Some(WorktreeState::WtRecovering),
+        "WtCleanupPending" => Some(WorktreeState::WtCleanupPending),
+        "WtClosed" => Some(WorktreeState::WtClosed),
+        _ => None,
+    }
+}
+
+/// Parse a MergeState from its serialized form.
+pub(crate) fn parse_merge_state(s: &str) -> Option<MergeState> {
+    match s {
+        "MergeRequested" => Some(MergeState::MergeRequested),
+        "MergePrecheck" => Some(MergeState::MergePrecheck),
+        "MergeDryRun" => Some(MergeState::MergeDryRun),
+        "MergeApply" => Some(MergeState::MergeApply),
+        "MergeVerify" => Some(MergeState::MergeVerify),
+        "MergeDone" => Some(MergeState::MergeDone),
+        "MergeConflict" => Some(MergeState::MergeConflict),
+        "MergeAborted" => Some(MergeState::MergeAborted),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_submodule_mode(s: &str) -> Option<SubmoduleMode> {
+    match s {
+        "locked" | "Locked" => Some(SubmoduleMode::Locked),
+        "allow_fast_forward" | "AllowFastForward" => Some(SubmoduleMode::AllowFastForward),
+        "allow_any" | "AllowAny" => Some(SubmoduleMode::AllowAny),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_merge_strategy_value(value: &str) -> Option<MergeStrategy> {
+    match value {
+        "merge-no-ff" | "merge_no_ff" | "MergeNoFf" => Some(MergeStrategy::MergeNoFf),
+        "rebase-then-ff" | "rebase_then_ff" | "RebaseThenFf" => Some(MergeStrategy::RebaseThenFf),
+        "squash-merge" | "squash_merge" | "SquashMerge" => Some(MergeStrategy::SquashMerge),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_recovery_action(action: &str) -> RecoveryAction {
+    match action {
+        "abort" => RecoveryAction::Abort,
+        "resume" => RecoveryAction::Resume,
+        "manual-block" => RecoveryAction::ManualBlock,
+        _ => unreachable!("recovery action validated by caller"),
+    }
+}
+
+pub(crate) fn block_on_current_runtime<F>(future: F) -> Result<F::Output>
+where
+    F: Future,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        Ok(tokio::task::block_in_place(|| handle.block_on(future)))
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build tokio runtime for git orchestration")?;
+        Ok(runtime.block_on(future))
+    }
+}
+
+/// Run the renderer in a blocking context (requires raw terminal access).
+pub(crate) fn run_renderer(
+    mut rx: mpsc::UnboundedReceiver<StreamEvent>,
+    render_mode: RenderMode,
+    shutdown: ShutdownController,
+    verbose_output: bool,
+) -> Result<()> {
+    match render_mode {
+        RenderMode::Stream => {
+            let config = StreamConfig {
+                verbose_output,
+                ..StreamConfig::default()
+            };
+            let mut renderer = match StreamRenderer::new(config) {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    eprintln!(
+                        "warning: stream renderer unavailable ({error}); continuing in headless mode"
+                    );
+                    HeadlessRenderer::new().run(rx);
+                    return Ok(());
+                }
+            };
+
+            while let Some(event) = rx.blocking_recv() {
+                renderer
+                    .handle_event(event)
+                    .context("renderer handle_event failed")?;
+            }
+        }
+        RenderMode::Dashboard => {
+            let config = DashboardConfig::default();
+            let mut renderer = match DashboardRenderer::new(config) {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    eprintln!(
+                        "warning: dashboard renderer unavailable ({error}); continuing in headless mode"
+                    );
+                    HeadlessRenderer::new().run(rx);
+                    return Ok(());
+                }
+            };
+
+            loop {
+                // Process all pending stream events (non-blocking drain).
+                while let Ok(event) = rx.try_recv() {
+                    renderer.handle_event(event);
+                }
+
+                // Draw the dashboard.
+                renderer.draw().context("dashboard draw failed")?;
+
+                // Poll for keyboard input (blocks for tick_rate_ms).
+                let quit = renderer
+                    .poll_input()
+                    .context("dashboard input poll failed")?;
+                if quit {
+                    break;
+                }
+
+                // Check if the channel is closed (run finished).
+                if rx.is_closed() && rx.is_empty() {
+                    if !shutdown.is_shutting_down() {
+                        // Final draw to show terminal state.
+                        renderer.draw().context("dashboard final draw failed")?;
+                        // Wait for user to press q.
+                        loop {
+                            if renderer
+                                .poll_input()
+                                .context("dashboard input poll failed")?
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            renderer.restore().context("failed to restore terminal")?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) const STREAM_EVENT_BATCH_LIMIT: usize = 256;
+pub(crate) const CONTINUATION_WAIT_POLL_INTERVAL_MS: u64 = 250;
+pub(crate) const OPERATOR_CONTROL_ACTOR: &str = "cli.operator";
+
+#[derive(Debug, Clone)]
+pub(crate) enum OperatorControlSignal {
+    Pause { reason: String },
+    Resume { reason: String },
+    Cancel { reason: String },
+}
+
+pub(crate) fn operator_control_signal_from_event(
+    event: &Event,
+    run_id: Uuid,
+) -> Option<OperatorControlSignal> {
+    if event.entity_type != EntityType::Run {
+        return None;
+    }
+    if event.entity_id != run_id.to_string() || event.actor != OPERATOR_CONTROL_ACTOR {
+        return None;
+    }
+    let reason = event
+        .payload
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| event.payload.get("detail").and_then(|v| v.as_str()))
+        .unwrap_or("operator control action")
+        .to_string();
+    match event.event_type.as_str() {
+        "run.blocked" => Some(OperatorControlSignal::Pause { reason }),
+        "run.activated" => Some(OperatorControlSignal::Resume { reason }),
+        "run.cancelled" => Some(OperatorControlSignal::Cancel { reason }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IncrementalEventCursor {
+    query: EventQuery,
+    after_event_id: Option<Uuid>,
+    batch_limit: usize,
+}
+
+impl IncrementalEventCursor {
+    pub(crate) fn new(query: EventQuery, batch_limit: usize) -> Self {
+        Self {
+            query,
+            after_event_id: None,
+            batch_limit,
+        }
+    }
+
+    pub(crate) fn read_new_events(&mut self, store: &dyn EventStore) -> Result<Vec<Event>> {
+        let mut events = Vec::new();
+
+        loop {
+            let mut query = self.query.clone();
+            query.limit = Some(self.batch_limit);
+            query.after_event_id = self.after_event_id;
+
+            let batch = query_events(store, &query)?;
+            if batch.is_empty() {
+                break;
+            }
+            let batch_len = batch.len();
+
+            self.after_event_id = batch.last().map(|event| event.event_id);
+            events.extend(batch);
+
+            if batch_len < self.batch_limit {
+                break;
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+pub(crate) fn execute_task_unblock(
+    store: &dyn EventStore,
+    task_id: Uuid,
+    reason: &str,
+) -> Result<String> {
+    let task = match load_task_projection(store, task_id)? {
+        Some(task) => task,
+        None => return Ok(format!("Task {task_id} not found in persisted event log.")),
+    };
+
+    if task.state != TaskState::TaskBlocked {
+        return Ok(format!(
+            "Task {task_id} is {:?}; no unblock action taken.",
+            task.state
+        ));
+    }
+
+    let event = Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Task,
+        entity_id: task_id.to_string(),
+        event_type: "task.unblocked".to_string(),
+        payload: serde_json::json!({
+            "from": "TaskBlocked",
+            "to": "TaskReady",
+            "reason": reason,
+        }),
+        correlation_id: task.correlation_id,
+        causation_id: Some(task.last_event_id),
+        actor: "cli".to_string(),
+        idempotency_key: None,
+    };
+
+    append_event(store, event)?;
+    Ok(format!(
+        "Task {task_id} transitioned TaskBlocked -> TaskReady (reason: {reason})."
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_worktree_transition_event(
+    store: &dyn EventStore,
+    projection: &WorktreeProjection,
+    event_type: &str,
+    from: WorktreeState,
+    to: WorktreeState,
+    action: &str,
+    reason: &str,
+    causation_id: Option<Uuid>,
+    binding: Option<&WorktreeBinding>,
+    side_effect: bool,
+    git_error: Option<&str>,
+) -> Result<Event> {
+    let mut payload = serde_json::json!({
+        "from": format!("{from:?}"),
+        "to": format!("{to:?}"),
+        "action": action,
+        "reason": reason,
+        "run_id": projection.run_id,
+        "side_effect": side_effect,
+    });
+    if let Some(message) = git_error {
+        payload["git_error"] = serde_json::Value::String(message.to_string());
+    }
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(task_id) = projection.task_id {
+            map.insert(
+                "task_id".to_string(),
+                serde_json::Value::String(task_id.to_string()),
+            );
+        }
+        if let Some(mode) = projection.submodule_mode {
+            map.insert(
+                "submodule_mode".to_string(),
+                serde_json::Value::String(
+                    match mode {
+                        SubmoduleMode::Locked => "locked",
+                        SubmoduleMode::AllowFastForward => "allow_fast_forward",
+                        SubmoduleMode::AllowAny => "allow_any",
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+
+        if let Some(binding) = binding {
+            map.insert(
+                "repo_root".to_string(),
+                serde_json::Value::String(binding.repo_root.display().to_string()),
+            );
+            map.insert(
+                "worktree_path".to_string(),
+                serde_json::Value::String(binding.worktree_path.display().to_string()),
+            );
+            map.insert(
+                "branch_name".to_string(),
+                serde_json::Value::String(binding.branch_name.clone()),
+            );
+            map.insert(
+                "base_ref".to_string(),
+                serde_json::Value::String(binding.base_ref.clone()),
+            );
+            map.insert(
+                "head_ref".to_string(),
+                serde_json::Value::String(binding.head_ref.clone()),
+            );
+            map.insert(
+                "submodule_mode".to_string(),
+                serde_json::Value::String(
+                    match binding.submodule_mode {
+                        SubmoduleMode::Locked => "locked",
+                        SubmoduleMode::AllowFastForward => "allow_fast_forward",
+                        SubmoduleMode::AllowAny => "allow_any",
+                    }
+                    .to_string(),
+                ),
+            );
+            if let Some(task_id) = binding.task_id {
+                map.insert(
+                    "task_id".to_string(),
+                    serde_json::Value::String(task_id.to_string()),
+                );
+            }
+        } else {
+            if let Some(repo_root) = projection.repo_root.as_ref() {
+                map.insert(
+                    "repo_root".to_string(),
+                    serde_json::Value::String(repo_root.display().to_string()),
+                );
+            }
+            if let Some(worktree_path) = projection.worktree_path.as_ref() {
+                map.insert(
+                    "worktree_path".to_string(),
+                    serde_json::Value::String(worktree_path.display().to_string()),
+                );
+            }
+            if let Some(branch_name) = projection.branch_name.as_ref() {
+                map.insert(
+                    "branch_name".to_string(),
+                    serde_json::Value::String(branch_name.clone()),
+                );
+            }
+            if let Some(base_ref) = projection.base_ref.as_ref() {
+                map.insert(
+                    "base_ref".to_string(),
+                    serde_json::Value::String(base_ref.clone()),
+                );
+            }
+            if let Some(head_ref) = projection.head_ref.as_ref() {
+                map.insert(
+                    "head_ref".to_string(),
+                    serde_json::Value::String(head_ref.clone()),
+                );
+            }
+        }
+    }
+
+    let event = Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Worktree,
+        entity_id: projection.worktree_id.to_string(),
+        event_type: event_type.to_string(),
+        payload,
+        correlation_id: projection.correlation_id,
+        causation_id,
+        actor: "cli".to_string(),
+        idempotency_key: Some(worktree_recovery_idempotency_key(
+            projection.worktree_id,
+            action,
+            event_type,
+        )),
+    };
+    append_event(store, event.clone())?;
+    Ok(event)
+}
+
+pub(crate) fn execute_worktree_recover(
+    store: &dyn EventStore,
+    worktree_id: Uuid,
+    action: &str,
+) -> Result<String> {
+    let projection = match load_worktree_projection(store, worktree_id)? {
+        Some(worktree) => worktree,
+        None => {
+            return Ok(format!(
+                "Worktree {worktree_id} not found in persisted event log."
+            ))
+        }
+    };
+
+    let mut current_state = projection.state;
+    let mut causation_id = Some(projection.last_event_id);
+    let mut persisted_events = 0usize;
+
+    if current_state != WorktreeState::WtRecovering {
+        if !current_state.can_transition_to(WorktreeState::WtRecovering) {
+            return Ok(format!(
+                "Worktree {worktree_id} is {current_state:?}; cannot enter WtRecovering from this state."
+            ));
+        }
+
+        let reason = format!("recovery action `{action}` requested by operator");
+        let started = append_worktree_transition_event(
+            store,
+            &projection,
+            "worktree.recovery_started",
+            current_state,
+            WorktreeState::WtRecovering,
+            action,
+            &reason,
+            causation_id,
+            None,
+            false,
+            None,
+        )?;
+        current_state = WorktreeState::WtRecovering;
+        causation_id = Some(started.event_id);
+        persisted_events += 1;
+    }
+
+    let mut side_effect_status = "executed";
+    let mut failure_reason = None::<String>;
+    let mut binding = match build_worktree_binding(&projection) {
+        Ok(binding) => binding,
+        Err(err) => {
+            let reason = format!("recovery orchestration context error: {err}");
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovery_failed",
+                WorktreeState::WtRecovering,
+                WorktreeState::WtRecovering,
+                action,
+                &reason,
+                causation_id,
+                None,
+                false,
+                Some(&reason),
+            )?;
+            persisted_events += 1;
+            let mut output = String::new();
+            writeln!(&mut output, "Worktree recovery for {worktree_id}")?;
+            writeln!(&mut output, "Action: {action}")?;
+            writeln!(
+                &mut output,
+                "Resulting state: {:?}",
+                WorktreeState::WtRecovering
+            )?;
+            writeln!(&mut output, "Persisted events: {persisted_events}")?;
+            writeln!(&mut output, "Side effect: failed")?;
+            writeln!(&mut output, "Failure: {reason}")?;
+            return Ok(output.trim_end().to_string());
+        }
+    };
+    binding.state = current_state;
+    let manager = LocalWorktreeManager::new();
+    let recover_action = parse_recovery_action(action);
+    let recover_result = block_on_current_runtime(manager.recover(
+        &mut binding,
+        recover_action,
+        CancellationToken::new(),
+    ))?;
+
+    match recover_result {
+        Ok(()) => {
+            current_state = binding.state;
+            let recovered_reason = match action {
+                "abort" => "aborted interrupted operation and restored bound home state",
+                "resume" => "resumed interrupted operation and restored bound home state",
+                "manual-block" => "manual intervention required before recovery can continue",
+                _ => unreachable!("action validated by caller"),
+            };
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovered",
+                WorktreeState::WtRecovering,
+                current_state,
+                action,
+                recovered_reason,
+                causation_id,
+                Some(&binding),
+                true,
+                None,
+            )?;
+            persisted_events += 1;
+        }
+        Err(GitError::InterruptedOperation { operation, .. })
+            if matches!(recover_action, RecoveryAction::ManualBlock) =>
+        {
+            current_state = WorktreeState::WtRecovering;
+            side_effect_status = "blocked";
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovery_blocked",
+                WorktreeState::WtRecovering,
+                WorktreeState::WtRecovering,
+                action,
+                &format!("manual intervention required for interrupted {operation}"),
+                causation_id,
+                Some(&binding),
+                true,
+                None,
+            )?;
+            persisted_events += 1;
+        }
+        Err(err) => {
+            current_state = binding.state;
+            side_effect_status = "failed";
+            let reason = format!("recovery orchestration failed: {err}");
+            failure_reason = Some(reason.clone());
+            append_worktree_transition_event(
+                store,
+                &projection,
+                "worktree.recovery_failed",
+                WorktreeState::WtRecovering,
+                current_state,
+                action,
+                &reason,
+                causation_id,
+                Some(&binding),
+                true,
+                Some(&reason),
+            )?;
+            persisted_events += 1;
+        }
+    }
+
+    let mut output = String::new();
+    writeln!(&mut output, "Worktree recovery for {worktree_id}")?;
+    writeln!(&mut output, "Action: {action}")?;
+    writeln!(&mut output, "Resulting state: {current_state:?}")?;
+    writeln!(&mut output, "Persisted events: {persisted_events}")?;
+    writeln!(&mut output, "Side effect: {side_effect_status}")?;
+    if let Some(reason) = failure_reason.as_ref() {
+        writeln!(&mut output, "Failure: {reason}")?;
+    }
+    writeln!(
+        &mut output,
+        "Previous state: {:?} (event: {}, updated: {})",
+        projection.state,
+        projection.last_event_type,
+        projection.updated_at.format("%Y-%m-%d %H:%M:%S")
+    )?;
+    if let Some(reason) = projection.reason.as_ref() {
+        writeln!(&mut output, "Previous reason: {reason}")?;
+    }
+    Ok(output.trim_end().to_string())
+}
+
+pub(crate) fn gate_result_status(result: &GateResult) -> &'static str {
+    match result {
+        GateResult::Passed { .. } => "passed",
+        GateResult::Failed { .. } => "failed",
+        GateResult::Pending => "pending",
+    }
+}
+
+pub(crate) fn parse_command_class_value(value: &serde_json::Value) -> Option<CommandClass> {
+    serde_json::from_value::<CommandClass>(value.clone())
+        .ok()
+        .or_else(|| {
+            value.as_str().and_then(|raw| match raw {
+                "io" | "Io" => Some(CommandClass::Io),
+                "cpu" | "Cpu" => Some(CommandClass::Cpu),
+                "git" | "Git" => Some(CommandClass::Git),
+                "tool" | "Tool" => Some(CommandClass::Tool),
+                _ => None,
+            })
+        })
+}
+
+pub(crate) fn is_command_event_for_task(event: &Event, task_id: Uuid) -> bool {
+    if event.entity_type != EntityType::Command {
+        return false;
+    }
+    let Some(idempotency_key) = event.idempotency_key.as_deref() else {
+        return false;
+    };
+    idempotency_key.starts_with(&format!("{task_id}:cmd:"))
+}
+
+pub(crate) fn collect_task_command_evidence(
+    events: &[Event],
+    task_id: Uuid,
+    run_id: Uuid,
+) -> (Vec<Evidence>, Option<CommandClass>) {
+    let mut started_meta: HashMap<String, (String, Option<CommandClass>)> = HashMap::new();
+    let mut terminal_events: Vec<&Event> = Vec::new();
+
+    for event in events
+        .iter()
+        .filter(|event| is_command_event_for_task(event, task_id))
+    {
+        match event.event_type.as_str() {
+            "command.started" => {
+                let command = event
+                    .payload
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let command_class = event
+                    .payload
+                    .get("command_class")
+                    .and_then(parse_command_class_value);
+                started_meta.insert(event.entity_id.clone(), (command, command_class));
+            }
+            "command.exited" | "command.timed_out" | "command.killed" => {
+                terminal_events.push(event);
+            }
+            _ => {}
+        }
+    }
+
+    let Some(terminal) = terminal_events.last() else {
+        return (Vec::new(), None);
+    };
+
+    let (command, command_class) = started_meta
+        .get(&terminal.entity_id)
+        .map(|(command, class)| (command.clone(), *class))
+        .unwrap_or_else(|| ("unknown".to_string(), None));
+    let exit_code = terminal
+        .payload
+        .get("exit_code")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(-1);
+    let duration_ms = terminal
+        .payload
+        .get("duration_ms")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+        .max(0) as u64;
+
+    let evidence = Evidence {
+        evidence_id: terminal.event_id,
+        task_id,
+        run_id,
+        evidence_type: "command_result".to_string(),
+        payload: serde_json::json!({
+            "command": command,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "timed_out": terminal.event_type == "command.timed_out",
+            "killed": terminal.event_type == "command.killed",
+        }),
+        created_at: terminal.occurred_at,
+    };
+
+    (vec![evidence], command_class)
+}
+
+pub(crate) fn policy_outcome_is_allowed(payload: &serde_json::Value) -> bool {
+    payload
+        .get("outcome")
+        .and_then(|value| value.as_str())
+        .map(|outcome| outcome.eq_ignore_ascii_case("ALLOW"))
+        .unwrap_or(false)
+}
+
+pub(crate) fn build_task_gate_context(
+    store: &dyn EventStore,
+    task: &TaskProjection,
+) -> Result<Option<(Uuid, GateContext)>> {
+    let events = query_events(store, &EventQuery::by_correlation(task.correlation_id))?;
+    let run_id = events
+        .iter()
+        .find(|event| event.entity_type == EntityType::Run)
+        .and_then(|event| event.entity_id.parse::<Uuid>().ok());
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+
+    let task_events: Vec<Event> = events
+        .iter()
+        .filter(|event| event.entity_type == EntityType::Task)
+        .cloned()
+        .collect();
+    let task_snapshots = collect_task_projections(&task_events);
+    let task_states = task_snapshots
+        .iter()
+        .map(|task| (task.task_id, task.task_id.to_string(), task.state))
+        .collect::<Vec<_>>();
+    let all_tasks_complete = !task_states.is_empty()
+        && task_states
+            .iter()
+            .all(|(_, _, state)| *state == TaskState::TaskComplete);
+
+    let worktree_events: Vec<Event> = events
+        .iter()
+        .filter(|event| event.entity_type == EntityType::Worktree)
+        .cloned()
+        .collect();
+    let worktrees = collect_entity_projections(&worktree_events);
+    let has_unresolved_conflicts = worktrees.iter().any(|worktree| {
+        worktree.state == "WtConflict"
+            || worktree
+                .last_event_type
+                .to_ascii_lowercase()
+                .contains("conflict")
+    });
+
+    let mut policy_violations = Vec::new();
+    let mut has_unapproved_git_ops = false;
+    for event in events
+        .iter()
+        .filter(|event| event.entity_type == EntityType::Policy)
+    {
+        if policy_outcome_is_allowed(&event.payload) {
+            continue;
+        }
+        if let Some(reason) = event.payload.get("reason").and_then(|value| value.as_str()) {
+            policy_violations.push(reason.to_string());
+        }
+        if let Some(action) = event.payload.get("action").and_then(|value| value.as_str()) {
+            let action = action.to_ascii_lowercase();
+            if action.contains("git")
+                || action.contains("push")
+                || action.contains("merge")
+                || action.contains("rebase")
+            {
+                has_unapproved_git_ops = true;
+            }
+        }
+    }
+
+    let (evidence, command_class) = collect_task_command_evidence(&events, task.task_id, run_id);
+
+    let mut gate_ctx = GateContext::for_task(run_id, task.task_id, task.task_id.to_string());
+    gate_ctx.evidence = evidence;
+    gate_ctx.task_states = task_states;
+    gate_ctx.all_tasks_complete = all_tasks_complete;
+    gate_ctx.has_unresolved_conflicts = has_unresolved_conflicts;
+    gate_ctx.has_unapproved_git_ops = has_unapproved_git_ops;
+    gate_ctx.worktree_consistent = !has_unresolved_conflicts;
+    gate_ctx.policy_violations = policy_violations;
+    gate_ctx.command_class = command_class;
+
+    Ok(Some((run_id, gate_ctx)))
+}
+
+pub(crate) fn execute_gate_rerun(
+    store: &dyn EventStore,
+    task_id: Uuid,
+    gate_name: Option<&str>,
+) -> Result<String> {
+    let task = match load_task_projection(store, task_id)? {
+        Some(task) => task,
+        None => return Ok(format!("Task {task_id} not found in persisted event log.")),
+    };
+    let selected_gates = if let Some(name) = gate_name {
+        vec![parse_gate_type(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown gate: {name}. Valid gates: {}",
+                all_gate_names().join(", ")
+            )
+        })?]
+    } else {
+        default_task_gates()
+    };
+
+    let Some((run_id, gate_ctx)) = build_task_gate_context(store, &task)? else {
+        return Ok(format!(
+            "Task {task_id} has no associated run context in persisted event log."
+        ));
+    };
+
+    let evaluations = evaluate_all(&selected_gates, &gate_ctx);
+    for evaluation in &evaluations {
+        append_event(
+            store,
+            Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: chrono::Utc::now(),
+                entity_type: EntityType::Gate,
+                entity_id: task_id.to_string(),
+                event_type: "gate.evaluated".to_string(),
+                payload: serde_json::json!({
+                    "scope": "task",
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "gate": evaluation.gate_type.label(),
+                    "status": gate_result_status(&evaluation.result),
+                    "result": evaluation.result,
+                    "inspected_evidence": evaluation.inspected_evidence,
+                    "remediation": evaluation.remediation,
+                    "rerun": true,
+                }),
+                correlation_id: task.correlation_id,
+                causation_id: Some(task.last_event_id),
+                actor: "cli".to_string(),
+                idempotency_key: Some(gate_rerun_idempotency_key(
+                    task_id,
+                    evaluation.gate_type.label(),
+                )),
+            },
+        )?;
+    }
+
+    render_gate_rerun_output(task_id, run_id, selected_gates.len(), &evaluations)
+}
+
+pub(crate) fn policy_outcome_label(outcome: PolicyOutcome) -> &'static str {
+    match outcome {
+        PolicyOutcome::Allow => "allow",
+        PolicyOutcome::Deny => "deny",
+        PolicyOutcome::RequireApproval => "require_approval",
+    }
+}
+
+pub(crate) fn gate_rerun_idempotency_key(task_id: Uuid, gate_label: &str) -> String {
+    format!("{task_id}:gate_rerun:{gate_label}")
+}
+
+pub(crate) fn worktree_recovery_idempotency_key(
+    worktree_id: Uuid,
+    action: &str,
+    event_type: &str,
+) -> String {
+    format!("{worktree_id}:worktree_recover:{action}:{event_type}")
+}
+
+pub(crate) fn merge_request_idempotency_key(
+    run_id: Uuid,
+    source: &str,
+    target: &str,
+    strategy: &str,
+) -> String {
+    format!("{run_id}:merge_request:{source}:{target}:{strategy}")
+}
+
+pub(crate) fn merge_operation_idempotency_key(
+    merge_id: Uuid,
+    operation: &str,
+    event_type: &str,
+) -> String {
+    format!("{merge_id}:{operation}:{event_type}")
+}
+
+pub(crate) fn persist_merge_policy_decision(
+    store: &dyn EventStore,
+    merge: &MergeProjection,
+    decision: &yarli_core::domain::PolicyDecision,
+    operation: &str,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: decision.decision_id,
+            occurred_at: decision.decided_at,
+            entity_type: EntityType::Policy,
+            entity_id: decision.decision_id.to_string(),
+            event_type: "policy.decision".to_string(),
+            payload: serde_json::json!({
+                "run_id": decision.run_id,
+                "merge_id": merge.merge_id,
+                "operation": operation,
+                "action": decision.action,
+                "outcome": decision.outcome,
+                "rule_id": decision.rule_id,
+                "reason": decision.reason,
+            }),
+            correlation_id: merge.correlation_id,
+            causation_id: Some(merge.last_event_id),
+            actor: decision.actor.clone(),
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge.merge_id,
+                operation,
+                "policy.decision",
+            )),
+        },
+    )
+}
+
+pub(crate) fn append_merge_policy_audit(
+    sink: Option<&dyn AuditSink>,
+    decision: &yarli_core::domain::PolicyDecision,
+    merge: &MergeProjection,
+    operation: &str,
+) -> Result<()> {
+    if let Some(sink) = sink {
+        let mut entry = AuditEntry::from_policy_decision(decision);
+        entry.details = serde_json::json!({
+            "decision_id": decision.decision_id,
+            "decided_at": decision.decided_at,
+            "merge_id": merge.merge_id,
+            "merge_state": format!("{:?}", merge.state),
+            "operation": operation,
+            "source": merge.source_ref.clone(),
+            "target": merge.target_ref.clone(),
+            "strategy": merge.strategy.clone(),
+        });
+        sink.append(&entry)
+            .map_err(|e| anyhow::anyhow!("failed to append policy audit entry: {e}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn evaluate_merge_policy(
+    merge: &MergeProjection,
+    safe_mode: SafeMode,
+    actor: &str,
+) -> Result<yarli_core::domain::PolicyDecision> {
+    let run_id = merge
+        .run_id
+        .ok_or_else(|| anyhow::anyhow!("merge intent {} missing run context", merge.merge_id))?;
+    let request = PolicyRequest {
+        actor: actor.to_string(),
+        action: ActionType::Merge,
+        command_class: Some(CommandClass::Git),
+        repo_path: None,
+        branch: merge.target_ref.clone(),
+        run_id,
+        task_id: None,
+        safe_mode,
+    };
+    let mut engine = PolicyEngine::with_defaults();
+    engine
+        .evaluate(&request)
+        .map_err(|e| anyhow::anyhow!("policy evaluation failed: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_merge_execution_event(
+    store: &dyn EventStore,
+    merge: &MergeProjection,
+    operation: &str,
+    event_type: &str,
+    from: MergeState,
+    to: MergeState,
+    reason: &str,
+    causation_id: Option<Uuid>,
+    worktree: Option<&WorktreeBinding>,
+    merge_sha: Option<&str>,
+    conflict_count: Option<usize>,
+) -> Result<()> {
+    let mut payload = serde_json::json!({
+        "operation": operation,
+        "from": format!("{from:?}"),
+        "to": format!("{to:?}"),
+        "state": format!("{to:?}"),
+        "run_id": merge.run_id,
+        "worktree_id": merge.worktree_id.or(worktree.map(|binding| binding.id)),
+        "source": merge.source_ref.clone(),
+        "target": merge.target_ref.clone(),
+        "strategy": merge.strategy.clone(),
+        "reason": reason,
+    });
+    if let Some(sha) = merge_sha {
+        payload["merge_sha"] = serde_json::Value::String(sha.to_string());
+    }
+    if let Some(count) = conflict_count {
+        payload["conflict_count"] = serde_json::json!(count);
+    }
+    if let Some(binding) = worktree {
+        payload["worktree_state"] = serde_json::Value::String(format!("{:?}", binding.state));
+        payload["worktree_head"] = serde_json::Value::String(binding.head_ref.clone());
+        payload["repo_root"] = serde_json::Value::String(binding.repo_root.display().to_string());
+        payload["worktree_path"] =
+            serde_json::Value::String(binding.worktree_path.display().to_string());
+    }
+
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge.merge_id.to_string(),
+            event_type: event_type.to_string(),
+            payload,
+            correlation_id: merge.correlation_id,
+            causation_id,
+            actor: "cli".to_string(),
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge.merge_id,
+                operation,
+                event_type,
+            )),
+        },
+    )
+}
+
+pub(crate) fn execute_merge_request(
+    store: &dyn EventStore,
+    source: &str,
+    target: &str,
+    run_id: Uuid,
+    strategy: &str,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    let worktree_id = load_latest_worktree_projection_for_run(store, run_id, run.correlation_id)?
+        .map(|worktree| worktree.worktree_id);
+
+    let merge_id = Uuid::now_v7();
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge_id.to_string(),
+            event_type: "merge.requested".to_string(),
+            payload: serde_json::json!({
+                "from": "MergeRequested",
+                "to": "MergeRequested",
+                "state": "MergeRequested",
+                "run_id": run_id,
+                "worktree_id": worktree_id,
+                "source": source,
+                "target": target,
+                "strategy": strategy,
+                "reason": "pending approval",
+            }),
+            correlation_id: run.correlation_id,
+            causation_id: None,
+            actor: "cli".to_string(),
+            idempotency_key: Some(merge_request_idempotency_key(
+                run_id, source, target, strategy,
+            )),
+        },
+    )?;
+
+    let mut out = String::new();
+    writeln!(&mut out, "Merge intent requested")?;
+    writeln!(&mut out, "Merge ID: {merge_id}")?;
+    writeln!(&mut out, "Run: {run_id}")?;
+    if let Some(worktree_id) = worktree_id {
+        writeln!(&mut out, "Worktree: {worktree_id}")?;
+    }
+    writeln!(&mut out, "Source: {source}")?;
+    writeln!(&mut out, "Target: {target}")?;
+    writeln!(&mut out, "Strategy: {strategy}")?;
+    writeln!(&mut out, "State: MergeRequested")?;
+    Ok(out.trim_end().to_string())
+}
+
+pub(crate) fn execute_merge_approve(
+    store: &dyn EventStore,
+    merge_id: Uuid,
+    safe_mode: SafeMode,
+    enforce_policies: bool,
+    audit_sink: Option<&dyn AuditSink>,
+) -> Result<String> {
+    let merge = match load_merge_projection(store, merge_id)? {
+        Some(merge) => merge,
+        None => {
+            return Ok(format!(
+                "Merge intent {merge_id} not found in persisted event log."
+            ))
+        }
+    };
+
+    if merge.state != MergeState::MergeRequested {
+        return Ok(format!(
+            "Merge intent {merge_id} is {:?}; approval allowed only from MergeRequested.",
+            merge.state
+        ));
+    }
+
+    let mut causation_id = Some(merge.last_event_id);
+    if enforce_policies {
+        let decision = evaluate_merge_policy(&merge, safe_mode, "cli")?;
+        persist_merge_policy_decision(store, &merge, &decision, "merge.approve")?;
+        append_merge_policy_audit(audit_sink, &decision, &merge, "merge.approve")?;
+
+        if decision.outcome != PolicyOutcome::Allow {
+            append_event(
+                store,
+                Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: chrono::Utc::now(),
+                    entity_type: EntityType::Merge,
+                    entity_id: merge_id.to_string(),
+                    event_type: "merge.policy_blocked".to_string(),
+                    payload: serde_json::json!({
+                        "from": format!("{:?}", merge.state),
+                        "to": format!("{:?}", merge.state),
+                        "state": format!("{:?}", merge.state),
+                        "run_id": merge.run_id,
+                        "reason": format!("approval blocked by policy: {}", decision.reason),
+                        "policy": {
+                            "action": decision.action,
+                            "outcome": decision.outcome,
+                            "rule_id": decision.rule_id,
+                        },
+                    }),
+                    correlation_id: merge.correlation_id,
+                    causation_id: Some(decision.decision_id),
+                    actor: "cli".to_string(),
+                    idempotency_key: Some(merge_operation_idempotency_key(
+                        merge_id,
+                        "merge.approve",
+                        "merge.policy_blocked",
+                    )),
+                },
+            )?;
+            if let Some(sink) = audit_sink {
+                sink.append(&AuditEntry::destructive_attempt(
+                    "cli",
+                    "merge.approve",
+                    format!("blocked by policy: {}", decision.reason),
+                    merge.run_id,
+                    None,
+                    serde_json::json!({
+                        "merge_id": merge_id,
+                        "outcome": decision.outcome,
+                        "rule_id": decision.rule_id,
+                    }),
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to append policy-block audit entry: {e}"))?;
+            }
+
+            return Ok(format!(
+                "Merge intent {merge_id} approval blocked by policy ({})",
+                policy_outcome_label(decision.outcome)
+            ));
+        }
+
+        causation_id = Some(decision.decision_id);
+    }
+
+    let approved_event_id = Uuid::now_v7();
+    append_event(
+        store,
+        Event {
+            event_id: approved_event_id,
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge_id.to_string(),
+            event_type: "merge.approved".to_string(),
+            payload: serde_json::json!({
+                "from": "MergeRequested",
+                "to": "MergePrecheck",
+                "state": "MergePrecheck",
+                "run_id": merge.run_id,
+                "worktree_id": merge.worktree_id,
+                "source": merge.source_ref,
+                "target": merge.target_ref,
+                "strategy": merge.strategy,
+                "reason": "approved by operator",
+            }),
+            correlation_id: merge.correlation_id,
+            causation_id,
+            actor: "cli".to_string(),
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge_id,
+                "merge.approve",
+                "merge.approved",
+            )),
+        },
+    )?;
+
+    let worktree_projection = match resolve_merge_worktree_projection(store, &merge) {
+        Ok(worktree) => worktree,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                MergeState::MergePrecheck,
+                &format!("merge orchestration context error: {err}"),
+                Some(approved_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but execution failed (missing git context): {err}"
+            ));
+        }
+    };
+
+    let mut binding = match build_worktree_binding(&worktree_projection) {
+        Ok(binding) => binding,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                MergeState::MergePrecheck,
+                &format!("merge orchestration context error: {err}"),
+                Some(approved_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but execution failed (invalid worktree context): {err}"
+            ));
+        }
+    };
+    let mut intent = match build_merge_intent(&merge, binding.id) {
+        Ok(intent) => intent,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                MergeState::MergePrecheck,
+                &format!("merge orchestration context error: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but execution failed (invalid merge context): {err}"
+            ));
+        }
+    };
+
+    let orchestrator = LocalMergeOrchestrator::new(LocalWorktreeManager::new());
+    let cancel = CancellationToken::new();
+    let precheck = match block_on_current_runtime(orchestrator.precheck(
+        &mut intent,
+        &binding,
+        cancel.clone(),
+    ))? {
+        Ok(precheck) => precheck,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                intent.state,
+                &format!("merge precheck failed: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but precheck failed: {err}"
+            ));
+        }
+    };
+
+    let dry_run = match block_on_current_runtime(orchestrator.dry_run(
+        &mut intent,
+        &binding,
+        cancel.clone(),
+    ))? {
+        Ok(result) => result,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergePrecheck,
+                intent.state,
+                &format!("merge dry-run failed: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but dry-run failed: {err}"
+            ));
+        }
+    };
+
+    if !dry_run.clean {
+        append_merge_execution_event(
+            store,
+            &merge,
+            "merge.approve",
+            "merge.execution_failed",
+            MergeState::MergePrecheck,
+            MergeState::MergeConflict,
+            "merge dry-run detected conflicts",
+            Some(approved_event_id),
+            Some(&binding),
+            None,
+            Some(dry_run.conflicts.len()),
+        )?;
+        return Ok(format!(
+            "Merge intent {merge_id} approved but dry-run found {} conflict(s).",
+            dry_run.conflicts.len()
+        ));
+    }
+
+    let apply = match block_on_current_runtime(orchestrator.apply(
+        &mut intent,
+        &mut binding,
+        cancel.clone(),
+    ))? {
+        Ok(apply) => apply,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.approve",
+                "merge.execution_failed",
+                MergeState::MergeApply,
+                intent.state,
+                &format!("merge apply failed: {err}"),
+                Some(approved_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} approved but apply failed: {err}"
+            ));
+        }
+    };
+
+    if let Err(err) = block_on_current_runtime(orchestrator.verify(
+        &mut intent,
+        &binding,
+        &precheck.submodule_snapshot,
+        cancel,
+    ))? {
+        append_merge_execution_event(
+            store,
+            &merge,
+            "merge.approve",
+            "merge.execution_failed",
+            MergeState::MergeVerify,
+            intent.state,
+            &format!("merge verify failed: {err}"),
+            Some(approved_event_id),
+            Some(&binding),
+            apply.merge_sha.as_str().into(),
+            None,
+        )?;
+        return Ok(format!(
+            "Merge intent {merge_id} approved but verify failed: {err}"
+        ));
+    }
+
+    append_merge_execution_event(
+        store,
+        &merge,
+        "merge.approve",
+        "merge.execution_succeeded",
+        MergeState::MergePrecheck,
+        intent.state,
+        "merge orchestration completed successfully",
+        Some(approved_event_id),
+        Some(&binding),
+        Some(apply.merge_sha.as_str()),
+        None,
+    )?;
+
+    Ok(format!(
+        "Merge intent {merge_id} approved and executed to {:?} (merge_sha: {}).",
+        intent.state, apply.merge_sha
+    ))
+}
+
+pub(crate) fn execute_merge_reject(
+    store: &dyn EventStore,
+    merge_id: Uuid,
+    reason: &str,
+    safe_mode: SafeMode,
+    enforce_policies: bool,
+    audit_sink: Option<&dyn AuditSink>,
+) -> Result<String> {
+    let merge = match load_merge_projection(store, merge_id)? {
+        Some(merge) => merge,
+        None => {
+            return Ok(format!(
+                "Merge intent {merge_id} not found in persisted event log."
+            ))
+        }
+    };
+
+    if merge.state != MergeState::MergeRequested {
+        return Ok(format!(
+            "Merge intent {merge_id} is {:?}; rejection allowed only from MergeRequested.",
+            merge.state
+        ));
+    }
+
+    let mut causation_id = Some(merge.last_event_id);
+    if enforce_policies {
+        let decision = evaluate_merge_policy(&merge, safe_mode, "cli")?;
+        persist_merge_policy_decision(store, &merge, &decision, "merge.reject")?;
+        append_merge_policy_audit(audit_sink, &decision, &merge, "merge.reject")?;
+
+        if decision.outcome != PolicyOutcome::Allow {
+            append_event(
+                store,
+                Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: chrono::Utc::now(),
+                    entity_type: EntityType::Merge,
+                    entity_id: merge_id.to_string(),
+                    event_type: "merge.policy_blocked".to_string(),
+                    payload: serde_json::json!({
+                        "from": format!("{:?}", merge.state),
+                        "to": format!("{:?}", merge.state),
+                        "state": format!("{:?}", merge.state),
+                        "run_id": merge.run_id,
+                        "reason": format!("rejection blocked by policy: {}", decision.reason),
+                        "policy": {
+                            "action": decision.action,
+                            "outcome": decision.outcome,
+                            "rule_id": decision.rule_id,
+                        },
+                    }),
+                    correlation_id: merge.correlation_id,
+                    causation_id: Some(decision.decision_id),
+                    actor: "cli".to_string(),
+                    idempotency_key: Some(merge_operation_idempotency_key(
+                        merge_id,
+                        "merge.reject",
+                        "merge.policy_blocked",
+                    )),
+                },
+            )?;
+            if let Some(sink) = audit_sink {
+                sink.append(&AuditEntry::destructive_attempt(
+                    "cli",
+                    "merge.reject",
+                    format!("blocked by policy: {}", decision.reason),
+                    merge.run_id,
+                    None,
+                    serde_json::json!({
+                        "merge_id": merge_id,
+                        "outcome": decision.outcome,
+                        "rule_id": decision.rule_id,
+                    }),
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to append policy-block audit entry: {e}"))?;
+            }
+
+            return Ok(format!(
+                "Merge intent {merge_id} rejection blocked by policy ({})",
+                policy_outcome_label(decision.outcome)
+            ));
+        }
+
+        causation_id = Some(decision.decision_id);
+    }
+
+    let rejected_event_id = Uuid::now_v7();
+    append_event(
+        store,
+        Event {
+            event_id: rejected_event_id,
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Merge,
+            entity_id: merge_id.to_string(),
+            event_type: "merge.rejected".to_string(),
+            payload: serde_json::json!({
+                "from": "MergeRequested",
+                "to": "MergeAborted",
+                "state": "MergeAborted",
+                "run_id": merge.run_id,
+                "worktree_id": merge.worktree_id,
+                "source": merge.source_ref,
+                "target": merge.target_ref,
+                "strategy": merge.strategy,
+                "reason": reason,
+            }),
+            correlation_id: merge.correlation_id,
+            causation_id,
+            actor: "cli".to_string(),
+            idempotency_key: Some(merge_operation_idempotency_key(
+                merge_id,
+                "merge.reject",
+                "merge.rejected",
+            )),
+        },
+    )?;
+
+    let worktree_projection = match resolve_merge_worktree_projection(store, &merge) {
+        Ok(worktree) => worktree,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.reject",
+                "merge.execution_failed",
+                MergeState::MergeRequested,
+                MergeState::MergeRequested,
+                &format!("merge abort context error: {err}"),
+                Some(rejected_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} rejected but abort execution failed (missing git context): {err}"
+            ));
+        }
+    };
+
+    let mut binding = match build_worktree_binding(&worktree_projection) {
+        Ok(binding) => binding,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.reject",
+                "merge.execution_failed",
+                MergeState::MergeRequested,
+                MergeState::MergeRequested,
+                &format!("merge abort context error: {err}"),
+                Some(rejected_event_id),
+                None,
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} rejected but abort execution failed (invalid worktree context): {err}"
+            ));
+        }
+    };
+    let mut intent = match build_merge_intent(&merge, binding.id) {
+        Ok(intent) => intent,
+        Err(err) => {
+            append_merge_execution_event(
+                store,
+                &merge,
+                "merge.reject",
+                "merge.execution_failed",
+                MergeState::MergeRequested,
+                MergeState::MergeRequested,
+                &format!("merge abort context error: {err}"),
+                Some(rejected_event_id),
+                Some(&binding),
+                None,
+                None,
+            )?;
+            return Ok(format!(
+                "Merge intent {merge_id} rejected but abort execution failed (invalid merge context): {err}"
+            ));
+        }
+    };
+
+    let orchestrator = LocalMergeOrchestrator::new(LocalWorktreeManager::new());
+    let cancel = CancellationToken::new();
+    if let Err(err) =
+        block_on_current_runtime(orchestrator.abort(&mut intent, &mut binding, reason, cancel))?
+    {
+        append_merge_execution_event(
+            store,
+            &merge,
+            "merge.reject",
+            "merge.execution_failed",
+            MergeState::MergeRequested,
+            intent.state,
+            &format!("merge abort failed: {err}"),
+            Some(rejected_event_id),
+            Some(&binding),
+            None,
+            None,
+        )?;
+        return Ok(format!(
+            "Merge intent {merge_id} rejected but abort execution failed: {err}"
+        ));
+    }
+
+    append_merge_execution_event(
+        store,
+        &merge,
+        "merge.reject",
+        "merge.execution_succeeded",
+        MergeState::MergeRequested,
+        intent.state,
+        "merge abort orchestration completed successfully",
+        Some(rejected_event_id),
+        Some(&binding),
+        intent.result_sha.as_deref(),
+        None,
+    )?;
+
+    Ok(format!(
+        "Merge intent {merge_id} transitioned MergeRequested -> MergeAborted (reason: {reason})."
+    ))
+}
+
+/// `yarli run status` — print current run/task state.
+pub(crate) fn cmd_run_status(run_id_str: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| {
+        let run_id = resolve_run_id_input(store, run_id_str)?;
+        render_run_status(store, run_id)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli run list` — list all known runs.
+pub(crate) fn cmd_run_list() -> Result<()> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, render_run_list)?;
+    println!("{output}");
+    Ok(())
+}
+
+pub(crate) fn list_runs_by_latest_state(
+    store: &dyn EventStore,
+) -> Result<BTreeMap<Uuid, RunState>> {
+    let run_events = query_events(store, &EventQuery::by_entity_type(EntityType::Run))?;
+    let mut runs: BTreeMap<Uuid, RunState> = BTreeMap::new();
+    for event in run_events {
+        let Ok(run_id) = Uuid::parse_str(&event.entity_id) else {
+            continue;
+        };
+        let entry = runs.entry(run_id).or_insert(RunState::RunOpen);
+        if let Some(state) = run_state_from_event(&event) {
+            *entry = state;
+        }
+    }
+    Ok(runs)
+}
+
+pub(crate) fn render_run_candidates(run_ids: &[Uuid]) -> String {
+    let strings = run_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let prefixes = unique_run_id_prefixes(strings.clone(), 10);
+    strings
+        .iter()
+        .map(|id| {
+            prefixes
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| compact_run_id(id))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn select_run_targets_for_control(
+    store: &dyn EventStore,
+    run_id_input: Option<&str>,
+    all_selected: bool,
+    eligible_states: &[RunState],
+    all_flag_name: &str,
+    action_name: &str,
+) -> Result<Vec<Uuid>> {
+    let runs = list_runs_by_latest_state(store)?;
+    if let Some(raw_run_id) = run_id_input {
+        let run_id = resolve_run_id_input(store, raw_run_id)?;
+        let state = runs
+            .get(&run_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Run {run_id} not found in persisted event log."))?;
+        if !eligible_states.contains(&state) {
+            bail!(
+                "run {run_id} is {:?}; cannot {action_name}. Eligible states: {}",
+                state,
+                eligible_states
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(vec![run_id]);
+    }
+
+    let eligible = runs
+        .iter()
+        .filter_map(|(run_id, state)| eligible_states.contains(state).then_some(*run_id))
+        .collect::<Vec<_>>();
+
+    if all_selected {
+        if eligible.is_empty() {
+            bail!("no eligible runs found for `{action_name}`");
+        }
+        return Ok(eligible);
+    }
+
+    match eligible.len() {
+        0 => bail!("no eligible runs found for `{action_name}`"),
+        1 => Ok(eligible),
+        _ => bail!(
+            "multiple eligible runs found for `{action_name}`; pass <run-id> or --{all_flag_name}. Candidates: {}",
+            render_run_candidates(&eligible)
+        ),
+    }
+}
+
+pub(crate) fn append_run_transition_event(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    from: RunState,
+    to: RunState,
+    event_type: &str,
+    reason: &str,
+    idempotency_key: Option<String>,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: event_type.to_string(),
+            payload: serde_json::json!({
+                "from": format!("{:?}", from),
+                "to": format!("{:?}", to),
+                "reason": reason,
+                "detail": reason,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: "cli.operator".to_string(),
+            idempotency_key,
+        },
+    )
+}
+
+pub(crate) fn append_run_cancelled_transition_event(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    from: RunState,
+    reason: &str,
+    cancellation_source: CancellationSource,
+    provenance: &CancellationProvenance,
+    task_id: Option<Uuid>,
+    idempotency_key: Option<String>,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: "run.cancelled".to_string(),
+            payload: serde_json::json!({
+                "from": format!("{:?}", from),
+                "to": format!("{:?}", RunState::RunCancelled),
+                "reason": reason,
+                "detail": reason,
+                "exit_reason": yarli_core::domain::ExitReason::CancelledByOperator.to_string(),
+                "cancellation_source": cancellation_source.to_string(),
+                "cancellation_provenance": provenance,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: OPERATOR_CONTROL_ACTOR.to_string(),
+            idempotency_key,
+        },
+    )?;
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: "run.cancel_provenance".to_string(),
+            payload: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "task_id": task_id.map(|id| id.to_string()),
+                "timestamp": chrono::Utc::now(),
+                "cancellation_source": cancellation_source.to_string(),
+                "signal_name": provenance.signal_name.clone(),
+                "signal_number": provenance.signal_number,
+                "sender_pid": provenance.sender_pid,
+                "receiver_pid": provenance.receiver_pid,
+                "parent_pid": provenance.parent_pid,
+                "process_group_id": provenance.process_group_id,
+                "session_id": provenance.session_id,
+                "tty": provenance.tty.clone(),
+                "actor_kind": provenance.actor_kind.map(|kind| kind.to_string()),
+                "actor_detail": provenance.actor_detail.clone(),
+                "stage": provenance.stage.map(|stage| stage.to_string()),
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: OPERATOR_CONTROL_ACTOR.to_string(),
+            idempotency_key: Some(format!("{run_id}:operator_cancel_provenance")),
+        },
+    )
+}
+
+pub(crate) fn append_task_cancelled_event(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    task: &TaskProjection,
+    reason: &str,
+    cancellation_source: CancellationSource,
+    provenance: &CancellationProvenance,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Task,
+            entity_id: task.task_id.to_string(),
+            event_type: "task.cancelled".to_string(),
+            payload: serde_json::json!({
+                "from": format!("{:?}", task.state),
+                "to": format!("{:?}", TaskState::TaskCancelled),
+                "reason": reason,
+                "detail": reason,
+                "attempt_no": task.attempt_no,
+                "cancellation_source": cancellation_source.to_string(),
+                "cancellation_provenance": provenance,
+            }),
+            correlation_id: task.correlation_id,
+            causation_id: None,
+            actor: "cli.operator".to_string(),
+            idempotency_key: Some(format!(
+                "{}:operator_cancel:{}",
+                task.task_id,
+                task.attempt_no.unwrap_or(0)
+            )),
+        },
+    )?;
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Task,
+            entity_id: task.task_id.to_string(),
+            event_type: "task.cancel_provenance".to_string(),
+            payload: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "task_id": task.task_id.to_string(),
+                "timestamp": chrono::Utc::now(),
+                "cancellation_source": cancellation_source.to_string(),
+                "signal_name": provenance.signal_name.clone(),
+                "signal_number": provenance.signal_number,
+                "sender_pid": provenance.sender_pid,
+                "receiver_pid": provenance.receiver_pid,
+                "parent_pid": provenance.parent_pid,
+                "process_group_id": provenance.process_group_id,
+                "session_id": provenance.session_id,
+                "tty": provenance.tty.clone(),
+                "actor_kind": provenance.actor_kind.map(|kind| kind.to_string()),
+                "actor_detail": provenance.actor_detail.clone(),
+                "stage": provenance.stage.map(|stage| stage.to_string()),
+            }),
+            correlation_id: task.correlation_id,
+            causation_id: None,
+            actor: "cli.operator".to_string(),
+            idempotency_key: Some(format!(
+                "{}:operator_cancel_provenance:{}",
+                task.task_id,
+                task.attempt_no.unwrap_or(0)
+            )),
+        },
+    )
+}
+
+pub(crate) fn execute_run_pause_control(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    reason: &str,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    if run.state == RunState::RunBlocked {
+        return Ok(format!("Run {run_id} is already paused (RunBlocked)."));
+    }
+    if !run.state.can_transition_to(RunState::RunBlocked) {
+        return Ok(format!(
+            "Run {run_id} is {:?}; pause is not valid from this state.",
+            run.state
+        ));
+    }
+    append_run_transition_event(
+        store,
+        run_id,
+        run.correlation_id,
+        run.state,
+        RunState::RunBlocked,
+        "run.blocked",
+        reason,
+        Some(format!("{run_id}:operator_pause")),
+    )?;
+    Ok(format!(
+        "Run {run_id} transitioned {:?} -> RunBlocked (reason: {reason}).",
+        run.state
+    ))
+}
+
+pub(crate) fn execute_run_resume_control(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    reason: &str,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    if run.state == RunState::RunActive {
+        return Ok(format!("Run {run_id} is already active."));
+    }
+    if !run.state.can_transition_to(RunState::RunActive) {
+        return Ok(format!(
+            "Run {run_id} is {:?}; resume is not valid from this state.",
+            run.state
+        ));
+    }
+    append_run_transition_event(
+        store,
+        run_id,
+        run.correlation_id,
+        run.state,
+        RunState::RunActive,
+        "run.activated",
+        reason,
+        Some(format!("{run_id}:operator_resume")),
+    )?;
+    Ok(format!(
+        "Run {run_id} transitioned {:?} -> RunActive (reason: {reason}).",
+        run.state
+    ))
+}
+
+pub(crate) fn execute_run_cancel_control(
+    store: &dyn EventStore,
+    queue: &dyn TaskQueue,
+    run_id: Uuid,
+    reason: &str,
+    cancellation_diagnostics: bool,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    if run.state.is_terminal() {
+        return Ok(format!(
+            "Run {run_id} is already terminal ({:?}).",
+            run.state
+        ));
+    }
+    if !run.state.can_transition_to(RunState::RunCancelled) {
+        return Ok(format!(
+            "Run {run_id} is {:?}; cancel is not valid from this state.",
+            run.state
+        ));
+    }
+
+    let mut cancelled_tasks = 0usize;
+    let mut first_cancelled_task_id: Option<Uuid> = None;
+    let mut run_provenance = default_cancellation_provenance(
+        CancellationSource::Operator,
+        Some("operator control-plane cancel command".to_string()),
+    );
+    if cancellation_diagnostics {
+        run_provenance =
+            with_cancellation_diagnostics(run_provenance, run_id, run.correlation_id, 0, reason);
+    }
+    for task in &run.tasks {
+        if task.state.is_terminal() || !task.state.can_transition_to(TaskState::TaskCancelled) {
+            continue;
+        }
+        let stage = cancellation_stage_for_task_projection(task);
+        let mut task_provenance = run_provenance.clone();
+        task_provenance.stage = Some(stage);
+        append_task_cancelled_event(
+            store,
+            run_id,
+            task,
+            reason,
+            CancellationSource::Operator,
+            &task_provenance,
+        )?;
+        if first_cancelled_task_id.is_none() {
+            first_cancelled_task_id = Some(task.task_id);
+            run_provenance.stage = Some(stage);
+        }
+        cancelled_tasks += 1;
+    }
+
+    append_run_cancelled_transition_event(
+        store,
+        run_id,
+        run.correlation_id,
+        run.state,
+        reason,
+        CancellationSource::Operator,
+        &run_provenance,
+        first_cancelled_task_id,
+        Some(format!("{run_id}:operator_cancelled")),
+    )?;
+    let queue_cancelled = queue.cancel_for_run(run_id)?;
+    Ok(format!(
+        "Run {run_id} transitioned {:?} -> RunCancelled (reason: {reason}); cancelled {cancelled_tasks} task(s), drained {queue_cancelled} queue entry(ies).",
+        run.state
+    ))
+}
+
+pub(crate) fn cmd_run_pause(run_id: Option<&str>, all_active: bool, reason: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_writes("run pause")?;
+    let output = with_event_store_and_queue(&loaded_config, |store, _queue| {
+        let targets = select_run_targets_for_control(
+            store,
+            run_id,
+            all_active,
+            &[RunState::RunActive, RunState::RunVerifying],
+            "all-active",
+            "pause",
+        )?;
+        let mut lines = Vec::new();
+        for run_id in targets {
+            lines.push(execute_run_pause_control(store, run_id, reason)?);
+        }
+        Ok(lines.join("\n"))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+pub(crate) fn cmd_run_resume(run_id: Option<&str>, all_paused: bool, reason: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_writes("run resume")?;
+    let output = with_event_store_and_queue(&loaded_config, |store, _queue| {
+        let targets = select_run_targets_for_control(
+            store,
+            run_id,
+            all_paused,
+            &[RunState::RunBlocked],
+            "all-paused",
+            "resume",
+        )?;
+        let mut lines = Vec::new();
+        for run_id in targets {
+            lines.push(execute_run_resume_control(store, run_id, reason)?);
+        }
+        Ok(lines.join("\n"))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+pub(crate) fn cmd_run_cancel(run_id: Option<&str>, all_active: bool, reason: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_writes("run cancel")?;
+    let output = with_event_store_and_queue(&loaded_config, |store, queue| {
+        let targets = if let Some(raw_run_id) = run_id {
+            vec![resolve_run_id_input(store, raw_run_id)?]
+        } else {
+            select_run_targets_for_control(
+                store,
+                None,
+                all_active,
+                &[RunState::RunActive, RunState::RunVerifying],
+                "all-active",
+                "cancel",
+            )?
+        };
+        let mut lines = Vec::new();
+        for run_id in targets {
+            lines.push(execute_run_cancel_control(
+                store,
+                queue,
+                run_id,
+                reason,
+                loaded_config.config().ui.cancellation_diagnostics,
+            )?);
+        }
+        Ok(lines.join("\n"))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+pub(crate) fn resolve_run_id_input(store: &dyn EventStore, run_id_input: &str) -> Result<Uuid> {
+    let trimmed = run_id_input.trim();
+    if trimmed.is_empty() {
+        bail!("invalid run ID (expected UUID or unique run-list prefix)");
+    }
+
+    if let Ok(parsed) = Uuid::parse_str(trimmed) {
+        return Ok(parsed);
+    }
+
+    let compact_input = trimmed
+        .chars()
+        .filter(|c| *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if compact_input.is_empty() {
+        bail!("invalid run ID (expected UUID or unique run-list prefix)");
+    }
+
+    let run_events = query_events(store, &EventQuery::by_entity_type(EntityType::Run))?;
+    let mut unique = HashSet::new();
+    let mut run_ids = Vec::new();
+    for event in &run_events {
+        let Ok(run_id) = Uuid::parse_str(&event.entity_id) else {
+            continue;
+        };
+        if unique.insert(run_id) {
+            run_ids.push(run_id);
+        }
+    }
+
+    let matches: Vec<Uuid> = run_ids
+        .iter()
+        .copied()
+        .filter(|run_id| run_id.simple().to_string().starts_with(&compact_input))
+        .collect();
+
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => bail!(
+            "invalid run ID {:?} (expected UUID or unique run-list prefix)",
+            run_id_input
+        ),
+        _ => {
+            let sample = matches
+                .iter()
+                .take(5)
+                .map(|run_id| run_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "ambiguous run ID prefix {:?}; matches multiple runs: {}",
+                run_id_input,
+                sample
+            );
+        }
+    }
+}
+
+/// `yarli run explain-exit` — run the Why Not Done? engine.
+pub(crate) fn cmd_run_explain(run_id_str: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| {
+        let run_id = resolve_run_id_input(store, run_id_str)?;
+        render_run_explain(store, run_id)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli task list` — list tasks for a run.
+pub(crate) fn cmd_task_list(run_id_str: &str) -> Result<()> {
+    let run_id: Uuid = run_id_str
+        .parse()
+        .context("invalid run ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| render_task_list(store, run_id))?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli task explain` — run the Why Not Done? engine for one task.
+pub(crate) fn cmd_task_explain(task_id_str: &str) -> Result<()> {
+    let task_id: Uuid = task_id_str
+        .parse()
+        .context("invalid task ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| render_task_explain(store, task_id))?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli task output` — dump captured command output for a task.
+pub(crate) fn cmd_task_output(task_id_str: &str) -> Result<()> {
+    let task_id: Uuid = task_id_str
+        .parse()
+        .context("invalid task ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| render_task_output(store, task_id))?;
+    print!("{output}");
+    Ok(())
+}
+
+/// `yarli info` — show version and terminal capabilities.
+pub(crate) fn cmd_info(
+    info: &TerminalInfo,
+    render_mode: RenderMode,
+    loaded_config: &LoadedConfig,
+) -> Result<()> {
+    println!("yarli v{}", YARLI_VERSION);
+    println!("  commit: {}", BUILD_COMMIT);
+    println!("  date:   {}", BUILD_DATE);
+    println!("  build:  {}", BUILD_ID);
+    println!();
+    println!("Terminal:");
+    println!("  TTY:     {}", info.is_tty);
+    println!("  Size:    {}x{}", info.cols, info.rows);
+    println!("  Dashboard capable: {}", info.supports_dashboard());
+    println!();
+    println!("Render mode: {:?}", render_mode);
+    println!("Backend: {}", loaded_config.config().core.backend.as_str());
+    println!(
+        "Execution runner: {:?}",
+        loaded_config.config().execution.runner
+    );
+    println!(
+        "Config:  {} ({})",
+        loaded_config.path().display(),
+        loaded_config.source().label()
+    );
+    Ok(())
+}
+
+/// `yarli task unblock` — clear a task's blocker.
+pub(crate) fn cmd_task_unblock(task_id_str: &str, reason: &str) -> Result<()> {
+    let task_id: Uuid = task_id_str
+        .parse()
+        .context("invalid task ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_writes("task unblock")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_task_unblock(store, task_id, reason)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli task annotate` — add blocker detail to a task.
+pub(crate) fn cmd_task_annotate(task_id_str: &str, detail: &str) -> Result<()> {
+    let task_id: Uuid = task_id_str
+        .parse()
+        .context("invalid task ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_writes("task annotate")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_task_annotate(store, task_id, detail)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// Execute the task annotate operation.
+pub(crate) fn execute_task_annotate(
+    store: &dyn EventStore,
+    task_id: Uuid,
+    detail: &str,
+) -> Result<String> {
+    use yarli_core::domain::EntityType;
+
+    // Verify the task exists.
+    let task_events = query_events(
+        store,
+        &EventQuery::by_entity(EntityType::Task, task_id.to_string()),
+    )?;
+    if task_events.is_empty() {
+        return Ok(format!("Task {task_id} not found in persisted event log."));
+    }
+
+    // Persist the annotation event.
+    let event = Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: chrono::Utc::now(),
+        entity_type: EntityType::Task,
+        entity_id: task_id.to_string(),
+        event_type: "task.annotated".to_string(),
+        payload: serde_json::json!({
+            "blocker_detail": detail,
+        }),
+        correlation_id: task_events
+            .last()
+            .map(|e| e.correlation_id)
+            .unwrap_or_else(Uuid::now_v7),
+        causation_id: None,
+        actor: "operator".to_string(),
+        idempotency_key: None,
+    };
+
+    store
+        .append(event)
+        .context("failed to persist annotation event")?;
+
+    Ok(format!(
+        "Task {task_id} annotated with blocker detail: {detail}"
+    ))
+}
+
+/// `yarli gate list` — show configured gate types.
+pub(crate) fn cmd_gate_list(run_level: bool) -> Result<()> {
+    if run_level {
+        println!("Run-level verification gates:");
+        for gate in default_run_gates() {
+            println!("  {} {}", gate_status_glyph(), gate.label());
+        }
+    } else {
+        println!("Task-level verification gates:");
+        for gate in default_task_gates() {
+            println!("  {} {}", gate_status_glyph(), gate.label());
+        }
+    }
+    println!();
+    println!("All gates must pass for verification to succeed.");
+    println!("Use `yarli gate rerun <task-id>` to re-evaluate gates for a specific task.");
+    Ok(())
+}
+
+/// `yarli gate rerun` — re-run gate evaluation for a task.
+pub(crate) fn cmd_gate_rerun(task_id_str: &str, gate_name: Option<&str>) -> Result<()> {
+    let task_id: Uuid = task_id_str
+        .parse()
+        .context("invalid task ID (expected UUID)")?;
+    if let Some(name) = gate_name {
+        // Validate the gate name.
+        if parse_gate_type(name).is_none() {
+            bail!(
+                "unknown gate: {name}. Valid gates: {}",
+                all_gate_names().join(", ")
+            );
+        }
+    }
+
+    let loaded_config = load_runtime_config_for_writes("gate rerun")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_gate_rerun(store, task_id, gate_name)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli worktree status` — show worktree state.
+pub(crate) fn cmd_worktree_status(run_id_str: &str) -> Result<()> {
+    let run_id: Uuid = run_id_str
+        .parse()
+        .context("invalid run ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| {
+        render_worktree_status(store, run_id)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli worktree recover` — recover from interrupted git operation.
+pub(crate) fn cmd_worktree_recover(worktree_id_str: &str, action: &str) -> Result<()> {
+    let worktree_id: Uuid = worktree_id_str
+        .parse()
+        .context("invalid worktree ID (expected UUID)")?;
+    match action {
+        "abort" | "resume" | "manual-block" => {}
+        _ => bail!("invalid recovery action: {action}. Use: abort, resume, or manual-block"),
+    }
+    let loaded_config = load_runtime_config_for_writes("worktree recover")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_worktree_recover(store, worktree_id, action)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli merge request` — create a merge intent.
+pub(crate) fn cmd_merge_request(
+    source: &str,
+    target: &str,
+    run_id_str: &str,
+    strategy: &str,
+) -> Result<()> {
+    let run_id: Uuid = run_id_str
+        .parse()
+        .context("invalid run ID (expected UUID)")?;
+    let strategy = parse_merge_strategy(strategy).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid merge strategy: {strategy}. Use: merge-no-ff, rebase-then-ff, or squash-merge"
+        )
+    })?;
+
+    let loaded_config = load_runtime_config_for_writes("merge request")?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_merge_request(store, source, target, run_id, strategy)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli merge approve` — approve a merge intent.
+pub(crate) fn cmd_merge_approve(merge_id_str: &str) -> Result<()> {
+    let merge_id: Uuid = merge_id_str
+        .parse()
+        .context("invalid merge intent ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_writes("merge approve")?;
+    let audit_sink = prepare_audit_sink(&loaded_config)?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_merge_approve(
+            store,
+            merge_id,
+            loaded_config.config().core.safe_mode,
+            loaded_config.config().policy.enforce_policies,
+            audit_sink.as_ref().map(|sink| sink as &dyn AuditSink),
+        )
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli merge reject` — reject a merge intent.
+pub(crate) fn cmd_merge_reject(merge_id_str: &str, reason: &str) -> Result<()> {
+    let merge_id: Uuid = merge_id_str
+        .parse()
+        .context("invalid merge intent ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_writes("merge reject")?;
+    let audit_sink = prepare_audit_sink(&loaded_config)?;
+    let output = with_event_store(&loaded_config, |store| {
+        execute_merge_reject(
+            store,
+            merge_id,
+            reason,
+            loaded_config.config().core.safe_mode,
+            loaded_config.config().policy.enforce_policies,
+            audit_sink.as_ref().map(|sink| sink as &dyn AuditSink),
+        )
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli merge status` — show merge intent status.
+pub(crate) fn cmd_merge_status(merge_id_str: &str) -> Result<()> {
+    let merge_id: Uuid = merge_id_str
+        .parse()
+        .context("invalid merge intent ID (expected UUID)")?;
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| render_merge_status(store, merge_id))?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli audit tail` — tail the JSONL audit log.
+pub(crate) fn cmd_audit_tail(file: &str, lines: usize, category: Option<&str>) -> Result<()> {
+    let path = PathBuf::from(file);
+    let sink = JsonlAuditSink::new(&path);
+
+    let entries = match sink.read_all() {
+        Ok(entries) => entries,
+        Err(e) => {
+            if path.exists() {
+                bail!("failed to read audit log {}: {e}", path.display());
+            }
+            println!("No audit log found at {}.", path.display());
+            println!("Audit entries are written during `yarli run start` when policy decisions are made.");
+            return Ok(());
+        }
+    };
+
+    // Filter by category if requested.
+    let filtered: Vec<_> = if let Some(cat) = category {
+        entries
+            .into_iter()
+            .filter(|e| {
+                let cat_str = format!("{:?}", e.category);
+                cat_str.eq_ignore_ascii_case(cat)
+            })
+            .collect()
+    } else {
+        entries
+    };
+
+    if filtered.is_empty() {
+        println!("No audit entries found.");
+        return Ok(());
+    }
+
+    // Take the last N entries.
+    let display: &[_] = if lines == 0 || lines >= filtered.len() {
+        &filtered
+    } else {
+        &filtered[filtered.len() - lines..]
+    };
+
+    println!(
+        "Audit log: {} entries (showing {})",
+        filtered.len(),
+        display.len()
+    );
+    println!();
+
+    for entry in display {
+        let ts = entry.timestamp.format("%Y-%m-%d %H:%M:%S");
+        let cat = format!("{:?}", entry.category);
+        let outcome_str = entry
+            .outcome
+            .as_ref()
+            .map(|o| format!(" [{o:?}]"))
+            .unwrap_or_default();
+        println!("{ts}  {cat:<24}{outcome_str}");
+        println!("  actor:  {}", entry.actor);
+        println!("  action: {}", entry.action);
+        if !entry.reason.is_empty() {
+            println!("  reason: {}", entry.reason);
+        }
+        if let Some(ref rule_id) = entry.rule_id {
+            println!("  rule:   {rule_id}");
+        }
+        if let Some(ref run_id) = entry.run_id {
+            println!("  run:    {run_id}");
+        }
+        if let Some(ref task_id) = entry.task_id {
+            println!("  task:   {task_id}");
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn gate_status_glyph() -> &'static str {
+    "○"
+}
+
+pub(crate) fn all_gate_names() -> Vec<&'static str> {
+    vec![
+        "required_tasks_closed",
+        "required_evidence_present",
+        "tests_passed",
+        "no_unapproved_git_ops",
+        "no_unresolved_conflicts",
+        "worktree_consistent",
+        "policy_clean",
+    ]
+}
+
+pub(crate) fn parse_gate_type(name: &str) -> Option<GateType> {
+    match name {
+        "required_tasks_closed" => Some(GateType::RequiredTasksClosed),
+        "required_evidence_present" => Some(GateType::RequiredEvidencePresent),
+        "tests_passed" => Some(GateType::TestsPassed),
+        "no_unapproved_git_ops" => Some(GateType::NoUnapprovedGitOps),
+        "no_unresolved_conflicts" => Some(GateType::NoUnresolvedConflicts),
+        "worktree_consistent" => Some(GateType::WorktreeConsistent),
+        "policy_clean" => Some(GateType::PolicyClean),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_merge_strategy(name: &str) -> Option<&'static str> {
+    match name {
+        "merge-no-ff" => Some("merge-no-ff"),
+        "rebase-then-ff" => Some("rebase-then-ff"),
+        "squash-merge" => Some("squash-merge"),
+        _ => None,
+    }
+}

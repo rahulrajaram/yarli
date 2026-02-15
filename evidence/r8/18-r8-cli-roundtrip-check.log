@@ -1,0 +1,4 @@
+150:thread 'run_start_and_status_roundtrip_against_postgres' panicked at crates/yarli-cli/tests/postgres_integration.rs:117:5:
+162:test run_start_and_status_roundtrip_against_postgres ... FAILED
+163:test merge_request_and_status_roundtrip_against_postgres ... ok
+168:    run_start_and_status_roundtrip_against_postgres

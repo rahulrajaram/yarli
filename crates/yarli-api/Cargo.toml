@@ -22,4 +22,5 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+sqlx = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

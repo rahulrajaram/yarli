@@ -1,0 +1,31 @@
+   Compiling yarli-api v0.1.0 (/home/rahul/Documents/yarl/crates/yarli-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.56s
+     Running unittests src/lib.rs (target/debug/deps/yarli_api-85fd6985f64f261e)
+
+running 6 tests
+test server::tests::task_status_endpoint_rejects_invalid_task_id ... ok
+test server::tests::health_endpoint_returns_ok ... ok
+test server::tests::run_status_endpoint_returns_not_found_for_unknown_run ... ok
+test server::tests::task_status_endpoint_returns_not_found_for_unknown_task ... ok
+test server::tests::task_status_endpoint_replays_persisted_task_events ... ok
+test server::tests::run_status_endpoint_replays_persisted_events ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-f7194f23638b2ae2)
+
+running 1 test
+
+thread 'run_and_task_status_reflect_writes_from_postgres' panicked at crates/yarli-api/tests/postgres_integration.rs:26:13:
+postgres integration tests require YARLI_TEST_DATABASE_URL when YARLI_REQUIRE_POSTGRES_TESTS=1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test run_and_task_status_reflect_writes_from_postgres ... FAILED
+
+failures:
+
+failures:
+    run_and_task_status_reflect_writes_from_postgres
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p yarli-api --test postgres_integration`

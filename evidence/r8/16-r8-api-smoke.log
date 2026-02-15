@@ -1,0 +1,38 @@
+   Compiling tower v0.5.3
+   Compiling serde_path_to_error v0.1.17
+   Compiling axum v0.7.9
+   Compiling tower-http v0.6.8
+   Compiling reqwest v0.12.28
+   Compiling tonic v0.12.3
+   Compiling opentelemetry-proto v0.27.0
+   Compiling opentelemetry-otlp v0.27.0
+   Compiling yarli-observability v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-observability)
+   Compiling yarli-exec v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-exec)
+   Compiling yarli-queue v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-queue)
+   Compiling yarli-api v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.61s
+     Running unittests src/lib.rs (target/debug/deps/yarli_api-85fd6985f64f261e)
+
+running 6 tests
+test server::tests::health_endpoint_returns_ok ... ok
+test server::tests::task_status_endpoint_returns_not_found_for_unknown_task ... ok
+test server::tests::task_status_endpoint_rejects_invalid_task_id ... ok
+test server::tests::run_status_endpoint_returns_not_found_for_unknown_run ... ok
+test server::tests::task_status_endpoint_replays_persisted_task_events ... ok
+test server::tests::run_status_endpoint_replays_persisted_events ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-f7194f23638b2ae2)
+
+running 1 test
+test run_and_task_status_reflect_writes_from_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.98s
+
+   Doc-tests yarli_api
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

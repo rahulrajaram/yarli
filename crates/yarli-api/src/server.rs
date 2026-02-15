@@ -38,6 +38,7 @@ pub fn router(store: Arc<dyn EventStore>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/runs/:run_id/status", get(run_status))
+        .route("/v1/tasks/:task_id", get(task_status))
         .with_state(ApiState::new(store))
 }
 
@@ -74,6 +75,15 @@ pub struct RunStatusResponse {
     task_summary: TaskStatusSummary,
 }
 
+#[derive(Debug, Serialize)]
+pub struct TaskStatusResponse {
+    task_id: Uuid,
+    state: String,
+    last_event_type: String,
+    updated_at: DateTime<Utc>,
+    correlation_id: Uuid,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct TaskStatusSummary {
     total: usize,
@@ -95,6 +105,18 @@ async fn run_status(
     let run_id = run_id.parse::<Uuid>().map_err(|_| ApiError::InvalidRunId)?;
     let status =
         load_run_status(state.store.as_ref(), run_id)?.ok_or(ApiError::RunNotFound(run_id))?;
+    Ok(Json(status))
+}
+
+async fn task_status(
+    Path(task_id): Path<String>,
+    State(state): State<ApiState>,
+) -> Result<Json<TaskStatusResponse>, ApiError> {
+    let task_id = task_id
+        .parse::<Uuid>()
+        .map_err(|_| ApiError::InvalidTaskId)?;
+    let status =
+        load_task_status(state.store.as_ref(), task_id)?.ok_or(ApiError::TaskNotFound(task_id))?;
     Ok(Json(status))
 }
 
@@ -152,6 +174,54 @@ fn load_run_status(
         objective,
         deterioration,
         task_summary,
+    }))
+}
+
+fn load_task_status(
+    store: &dyn EventStore,
+    task_id: Uuid,
+) -> Result<Option<TaskStatusResponse>, ApiError> {
+    let task_events = store
+        .query(&EventQuery::by_entity(
+            EntityType::Task,
+            task_id.to_string(),
+        ))
+        .map_err(ApiError::Store)?;
+    if task_events.is_empty() {
+        return Ok(None);
+    }
+
+    let mut state = TaskState::TaskOpen;
+    let mut updated_at = task_events[0].occurred_at;
+    let mut last_event_type = task_events[0].event_type.clone();
+    let mut correlation_id = task_events[0].correlation_id;
+
+    for event in &task_events {
+        correlation_id = event.correlation_id;
+        updated_at = event.occurred_at;
+        last_event_type = event.event_type.clone();
+
+        if let Some(next_state) = task_state_from_event(event) {
+            state = next_state;
+        }
+    }
+
+    let run_events = store
+        .query(&EventQuery::by_correlation(correlation_id))
+        .map_err(ApiError::Store)?;
+    if run_events
+        .iter()
+        .all(|event| event.entity_type != EntityType::Run)
+    {
+        return Err(ApiError::CorrelatedRunMissing(task_id));
+    }
+
+    Ok(Some(TaskStatusResponse {
+        task_id,
+        state: format!("{state:?}"),
+        last_event_type,
+        updated_at,
+        correlation_id,
     }))
 }
 
@@ -262,8 +332,14 @@ fn parse_task_state(value: &str) -> Option<TaskState> {
 enum ApiError {
     #[error("invalid run ID (expected UUID)")]
     InvalidRunId,
+    #[error("invalid task ID (expected UUID)")]
+    InvalidTaskId,
     #[error("run {0} not found")]
     RunNotFound(Uuid),
+    #[error("task {0} not found")]
+    TaskNotFound(Uuid),
+    #[error("task {0} has no correlated run events")]
+    CorrelatedRunMissing(Uuid),
     #[error("failed to read persisted state")]
     Store(StoreError),
 }
@@ -277,7 +353,12 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::InvalidRunId => (StatusCode::BAD_REQUEST, self.to_string()),
+            ApiError::InvalidTaskId => (StatusCode::BAD_REQUEST, self.to_string()),
             ApiError::RunNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            ApiError::TaskNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            ApiError::CorrelatedRunMissing(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+            }
             ApiError::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
         (status, Json(ErrorResponse { error: message })).into_response()
@@ -417,6 +498,104 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(payload["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn task_status_endpoint_replays_persisted_task_events() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let correlation_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.config_snapshot",
+                correlation_id,
+                now,
+                json!({"objective":"read task surface"}),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.ready",
+                correlation_id,
+                now + Duration::seconds(1),
+                json!({"to":"TaskReady"}),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.completed",
+                correlation_id,
+                now + Duration::seconds(2),
+                json!({"to":"TaskComplete"}),
+            ))
+            .unwrap();
+
+        let response = router(store)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["task_id"], json!(task_id));
+        assert_eq!(payload["state"], json!("TaskComplete"));
+        assert_eq!(payload["last_event_type"], json!("task.completed"));
+        assert_eq!(payload["correlation_id"], json!(correlation_id));
+    }
+
+    #[tokio::test]
+    async fn task_status_endpoint_returns_not_found_for_unknown_task() {
+        let task_id = Uuid::now_v7();
+        let response = router(Arc::new(InMemoryEventStore::new()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn task_status_endpoint_rejects_invalid_task_id() {
+        let response = router(Arc::new(InMemoryEventStore::new()))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/tasks/not-a-task-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid task ID"));
     }
 
     fn make_event(

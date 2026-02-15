@@ -1,0 +1,16 @@
+docs/ACCEPTANCE_RUBRIC.md:15:- `PASS`: every required check below is proven with tracked evidence.
+docs/ACCEPTANCE_RUBRIC.md:16:- `UNVERIFIED`: any required check is missing, fails, or is not evidenced.
+docs/ACCEPTANCE_RUBRIC.md:86:  - `rg -n "health|run_id|not-found|read-your-writes|PASS|UNVERIFIED" docs/API_CONTRACT.md docs/ACCEPTANCE_RUBRIC.md`
+docs/ACCEPTANCE_RUBRIC.md:88:  - `cargo test -p yarli-api health_endpoint_returns_ok -- --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:89:  - `cargo test -p yarli-api run_status_endpoint_replays_persisted_events -- --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:90:  - `cargo test -p yarli-api run_status_endpoint_returns_not_found_for_unknown_run -- --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:92:  - PASS if all loop-8 checks above exit `0`.
+docs/ACCEPTANCE_RUBRIC.md:93:  - UNVERIFIED if any route or field contract is undocumented or test command fails.
+docs/ACCEPTANCE_RUBRIC.md:97:- Mark `PASS` only if all required checks are satisfied with tracked evidence.
+docs/ACCEPTANCE_RUBRIC.md:98:- Otherwise mark `UNVERIFIED`, add a blocker note, and stop.
+docs/API_CONTRACT.md:10:`yarli-api` currently exposes one health probe and one durable run-status read endpoint. These are the only in-scope API routes for Loop-8.
+docs/API_CONTRACT.md:14:| `/health` | `GET` | Liveness endpoint with static payload. No auth required. | `200 OK`, JSON `{ "status": "ok" }`. | Not documented as an error domain; endpoint should not fail under normal healthy service startup. | Purely in-process response, always computed from handler function state. | `cargo test -p yarli-api health_endpoint_returns_ok -- --nocapture` |
+docs/API_CONTRACT.md:15:| `/v1/runs/{run_id}/status` | `GET` | Read-only query for a run aggregate status projection reconstructed from persisted events. `run_id` MUST be a UUID string. | `200 OK`, JSON object `RunStatusResponse` with fields:<br> - `run_id` (UUID)<br> - `state` (string)<br> - `last_event_type` (string)<br> - `updated_at` (RFC 3339 timestamp)<br> - `correlation_id` (UUID)<br> - `objective` (optional string)<br> - `deterioration` (optional object, latest `DeteriorationReport`)<br> - `task_summary` (counts by task state) | `400 Bad Request`, `{"error":"invalid run ID (expected UUID)"}` when `run_id` is not parseable as UUID.<br>`404 Not Found`, `{"error":"run <run_id> not found"}` when no events exist for `run_id`.<br>`500 Internal Server Error` when store reads fail. | Reads from `EventStore` directly, reconstructing state by replaying run events and task events by correlation id. Read-your-writes is expected for the same store instance/path used by the serving process. No external caching layer is involved in this endpoint. | `cargo test -p yarli-api run_status_endpoint_replays_persisted_events -- --nocapture`<br>`cargo test -p yarli-api run_status_endpoint_returns_not_found_for_unknown_run -- --nocapture` |
+docs/API_CONTRACT.md:20:- `run status` row is covered by Loop-8 contract checks for success projection replay and not-found failure semantics.
+docs/API_CONTRACT.md:25:- Mutation endpoints (write/read-write) are not yet part of this API contract.
+docs/API_CONTRACT.md:26:- No request bodies are defined for current endpoints.

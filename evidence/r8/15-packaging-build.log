@@ -1,0 +1,442 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.44
+   Compiling unicode-ident v1.0.22
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.180
+   Compiling serde v1.0.228
+   Compiling cfg-if v1.0.4
+   Compiling parking_lot_core v0.9.12
+   Compiling log v0.4.29
+   Compiling pin-project-lite v0.2.16
+   Compiling futures-core v0.3.31
+   Compiling once_cell v1.21.3
+   Compiling scopeguard v1.2.0
+   Compiling itoa v1.0.17
+   Compiling bytes v1.11.1
+   Compiling futures-sink v0.3.31
+   Compiling memchr v2.8.0
+   Compiling autocfg v1.5.0
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling lock_api v0.4.14
+   Compiling typenum v1.19.0
+   Compiling futures-task v0.3.31
+   Compiling cc v1.2.55
+   Compiling futures-io v0.3.31
+   Compiling pin-utils v0.1.0
+   Compiling version_check v0.9.5
+   Compiling slab v0.4.12
+   Compiling zmij v1.0.19
+   Compiling tracing-core v0.1.36
+   Compiling serde_json v1.0.149
+   Compiling equivalent v1.0.2
+   Compiling zerocopy v0.8.39
+   Compiling icu_normalizer_data v2.1.1
+   Compiling icu_properties_data v2.1.2
+   Compiling getrandom v0.3.4
+   Compiling hashbrown v0.16.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling subtle v2.6.1
+   Compiling zeroize v1.8.2
+   Compiling generic-array v0.14.7
+   Compiling percent-encoding v2.3.2
+   Compiling anyhow v1.0.101
+   Compiling num-traits v0.2.19
+   Compiling thiserror v2.0.18
+   Compiling rustls-pki-types v1.14.0
+   Compiling futures-channel v0.3.31
+   Compiling untrusted v0.9.0
+   Compiling rustls v0.23.36
+   Compiling http v1.4.0
+   Compiling heck v0.5.0
+   Compiling base64 v0.22.1
+   Compiling syn v2.0.114
+   Compiling form_urlencoded v1.2.2
+   Compiling litemap v0.8.1
+   Compiling indexmap v2.13.0
+   Compiling writeable v0.6.2
+   Compiling rustversion v1.0.22
+   Compiling errno v0.3.14
+   Compiling mio v1.1.1
+   Compiling socket2 v0.6.2
+   Compiling getrandom v0.2.17
+   Compiling tower-service v0.3.3
+   Compiling signal-hook-registry v1.4.8
+   Compiling rand_core v0.6.4
+   Compiling bitflags v2.10.0
+   Compiling httparse v1.10.1
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling ring v0.17.14
+   Compiling http-body v1.0.1
+   Compiling try-lock v0.2.5
+   Compiling fnv v1.0.7
+   Compiling atomic-waker v1.1.2
+   Compiling crossbeam-utils v0.8.21
+   Compiling want v0.3.1
+   Compiling digest v0.10.7
+   Compiling tower-layer v0.3.3
+   Compiling signal-hook v0.3.18
+   Compiling iana-time-zone v0.1.65
+   Compiling httpdate v1.0.3
+   Compiling uuid v1.20.0
+   Compiling sync_wrapper v1.0.2
+   Compiling rustix v0.38.44
+   Compiling ryu v1.0.22
+   Compiling ipnet v2.11.0
+   Compiling foldhash v0.1.5
+   Compiling allocator-api2 v0.2.21
+   Compiling linux-raw-sys v0.4.15
+   Compiling tinyvec_macros v0.1.1
+   Compiling utf8_iter v1.0.4
+   Compiling tokio v1.49.0
+   Compiling hashbrown v0.15.5
+   Compiling tinyvec v1.10.0
+   Compiling signal-hook-mio v0.2.5
+   Compiling concurrent-queue v2.5.0
+   Compiling webpki-roots v1.0.6
+   Compiling http-body-util v0.1.3
+   Compiling indexmap v1.9.3
+   Compiling thiserror v1.0.69
+   Compiling parking v2.2.1
+   Compiling crc32fast v1.5.0
+   Compiling crc-catalog v2.4.0
+   Compiling cpufeatures v0.2.17
+   Compiling sha2 v0.10.9
+   Compiling crc v3.4.0
+   Compiling chrono v0.4.43
+   Compiling unicode-normalization v0.1.25
+   Compiling futures-util v0.3.31
+   Compiling hashlink v0.10.0
+   Compiling event-listener v5.4.1
+   Compiling webpki-roots v0.26.11
+   Compiling crossbeam-queue v0.3.12
+   Compiling hmac v0.12.1
+   Compiling unicode-properties v0.1.4
+   Compiling adler2 v2.0.1
+   Compiling simd-adler32 v0.3.8
+   Compiling mime v0.3.17
+   Compiling hashbrown v0.12.3
+   Compiling unicode-bidi v0.3.18
+   Compiling hkdf v0.12.4
+   Compiling synstructure v0.13.2
+   Compiling miniz_oxide v0.8.9
+   Compiling ppv-lite86 v0.2.21
+   Compiling atoi v2.0.0
+   Compiling stringprep v0.1.5
+   Compiling md-5 v0.10.6
+   Compiling matchit v0.7.3
+   Compiling rand_chacha v0.3.1
+   Compiling home v0.5.11
+   Compiling byteorder v1.5.0
+   Compiling dotenvy v0.15.7
+   Compiling whoami v1.6.1
+   Compiling hex v0.4.3
+   Compiling rand v0.8.5
+   Compiling flate2 v1.1.9
+   Compiling socket2 v0.5.10
+   Compiling rustls-pemfile v2.2.0
+   Compiling regex-syntax v0.8.9
+   Compiling glob v0.3.3
+   Compiling lazy_static v1.5.0
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling prometheus-client v0.23.1
+   Compiling serde_derive v1.0.228
+   Compiling zerofrom-derive v0.1.6
+   Compiling yoke-derive v0.8.1
+   Compiling tracing-attributes v0.1.31
+   Compiling zerovec-derive v0.11.2
+   Compiling displaydoc v0.2.5
+   Compiling futures-macro v0.3.31
+   Compiling tokio-macros v2.6.0
+   Compiling thiserror-impl v2.0.18
+   Compiling rustls-webpki v0.103.9
+   Compiling async-trait v0.1.89
+   Compiling tokio-stream v0.1.18
+   Compiling thiserror-impl v1.0.69
+   Compiling pin-project-internal v1.1.10
+   Compiling async-stream-impl v0.3.6
+   Compiling regex-automata v0.4.14
+   Compiling nu-ansi-term v0.50.3
+   Compiling prometheus-client-derive-encode v0.4.2
+   Compiling dtoa v1.0.11
+   Compiling rustix v1.1.3
+   Compiling zerofrom v0.1.6
+   Compiling iri-string v0.7.10
+   Compiling tracing v0.1.44
+   Compiling linux-raw-sys v0.11.0
+   Compiling prettyplease v0.2.37
+   Compiling yoke v0.8.1
+   Compiling async-stream v0.3.6
+   Compiling zerovec v0.11.5
+   Compiling zerotrie v0.2.3
+   Compiling fixedbitset v0.5.7
+   Compiling ident_case v1.0.1
+   Compiling fastrand v2.3.0
+   Compiling strsim v0.11.1
+   Compiling pin-project v1.1.10
+   Compiling opentelemetry v0.27.1
+   Compiling petgraph v0.7.1
+   Compiling utf8parse v0.2.2
+   Compiling darling_core v0.20.11
+   Compiling multimap v0.10.1
+   Compiling anstyle-parse v0.2.7
+   Compiling protoc-bin-vendored-macos-aarch_64 v3.2.0
+   Compiling protoc-bin-vendored-linux-x86_64 v3.2.0
+   Compiling protoc-bin-vendored-macos-x86_64 v3.2.0
+   Compiling tinystr v0.8.2
+   Compiling potential_utf v0.1.4
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling protoc-bin-vendored-linux-aarch_64 v3.2.0
+   Compiling protoc-bin-vendored-linux-ppcle_64 v3.2.0
+   Compiling icu_collections v2.1.1
+   Compiling anstyle v1.0.13
+   Compiling icu_locale_core v2.1.1
+   Compiling colorchoice v1.0.4
+   Compiling protoc-bin-vendored-linux-s390_64 v3.2.0
+   Compiling protoc-bin-vendored-win32 v3.2.0
+   Compiling anstyle-query v1.1.5
+   Compiling paste v1.0.15
+   Compiling protoc-bin-vendored-linux-x86_32 v3.2.0
+   Compiling anstream v0.6.21
+   Compiling protoc-bin-vendored v3.2.0
+   Compiling strum_macros v0.26.4
+   Compiling castaway v0.2.4
+   Compiling static_assertions v1.1.0
+   Compiling icu_provider v2.1.1
+   Compiling icu_properties v2.1.2
+   Compiling matchers v0.2.0
+   Compiling winnow v0.7.14
+   Compiling toml_write v0.1.2
+   Compiling axum-core v0.4.5
+   Compiling futures-executor v0.3.31
+   Compiling smallvec v1.15.1
+   Compiling either v1.15.0
+   Compiling icu_normalizer v2.1.1
+   Compiling itertools v0.14.0
+   Compiling parking_lot v0.12.5
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling futures-intrusive v0.5.0
+   Compiling crossterm v0.28.1
+   Compiling url v2.5.8
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_path_to_error v0.1.17
+   Compiling opentelemetry_sdk v0.27.1
+   Compiling prost-derive v0.13.5
+   Compiling sqlx-core v0.8.6
+   Compiling tracing-serde v0.2.0
+   Compiling regex v1.12.3
+   Compiling tempfile v3.24.0
+   Compiling tracing-subscriber v0.3.22
+   Compiling darling_macro v0.20.11
+   Compiling itertools v0.13.0
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling unicode-width v0.1.14
+   Compiling indoc v2.0.7
+   Compiling darling v0.20.11
+   Compiling clap_lex v0.7.7
+   Compiling option-ext v0.2.0
+   Compiling unicode-segmentation v1.12.0
+   Compiling owo-colors v4.2.3
+   Compiling clap_builder v4.5.57
+   Compiling instability v0.3.7
+   Compiling dirs-sys v0.4.1
+   Compiling toml_edit v0.22.27
+   Compiling prost v0.13.5
+   Compiling unicode-truncate v1.1.0
+   Compiling prost-types v0.13.5
+   Compiling strum v0.26.3
+   Compiling compact_str v0.8.1
+   Compiling clap_derive v4.5.55
+   Compiling lru v0.12.5
+   Compiling cassowary v0.3.0
+   Compiling yarli-cli v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-cli)
+   Compiling hashbrown v0.14.5
+   Compiling sqlx-postgres v0.8.6
+   Compiling unicode-width v0.2.0
+   Compiling prost-build v0.13.5
+   Compiling ratatui v0.29.0
+   Compiling dashmap v6.1.0
+   Compiling directories v5.0.1
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling tonic-build v0.12.3
+   Compiling toml v0.8.23
+   Compiling h2 v0.4.13
+   Compiling tokio-rustls v0.26.4
+   Compiling yarli-core v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-core)
+   Compiling tower v0.4.13
+   Compiling tower-http v0.6.8
+   Compiling clap v4.5.57
+   Compiling yarli-integration-tests v0.0.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/tests/integration)
+   Compiling sw4rm-sdk v0.4.0
+   Compiling sqlx-macros-core v0.8.6
+   Compiling yarli-policy v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-policy)
+   Compiling yarli-memory v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-memory)
+   Compiling hyper v1.8.1
+   Compiling sqlx-macros v0.8.6
+   Compiling hyper-util v0.1.20
+   Compiling sqlx v0.8.6
+   Compiling yarli-store v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-store)
+   Compiling axum v0.7.9
+   Compiling hyper-timeout v0.5.2
+   Compiling hyper-rustls v0.27.7
+   Compiling yarli-gates v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-gates)
+   Compiling reqwest v0.12.28
+   Compiling tonic v0.12.3
+   Compiling opentelemetry-proto v0.27.0
+   Compiling opentelemetry-otlp v0.27.0
+   Compiling yarli-observability v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-observability)
+   Compiling yarli-exec v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-exec)
+   Compiling yarli-queue v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-queue)
+   Compiling yarli-git v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-git)
+   Compiling yarli-api v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-api)
+   Compiling yarli-sw4rm v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-sw4rm)
+warning: constant `INIT_CONFIG_TEMPLATE` is never used
+   --> crates/yarli-cli/src/cli.rs:186:7
+    |
+186 | const INIT_CONFIG_TEMPLATE: &str = r#"# YARLI runtime configuration
+    |       ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: function `init_config_template` is never used
+   --> crates/yarli-cli/src/cli.rs:368:15
+    |
+368 | pub(crate) fn init_config_template(backend: Option<InitBackend>) -> String {
+    |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `replace_between` is never used
+   --> crates/yarli-cli/src/cli.rs:452:15
+    |
+452 | pub(crate) fn replace_between(haystack: &str, begin: &str, end: &str, replacement: &str) -> String {
+    |               ^^^^^^^^^^^^^^^
+
+warning: function `cmd_init` is never used
+  --> crates/yarli-cli/src/config.rs:15:15
+   |
+15 | pub(crate) fn cmd_init(
+   |               ^^^^^^^^
+
+warning: struct `CliInvocationConfig` is never constructed
+  --> crates/yarli-cli/src/config.rs:51:19
+   |
+51 | pub(crate) struct CliInvocationConfig {
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `AutoAdvanceConfig` is never constructed
+  --> crates/yarli-cli/src/config.rs:59:19
+   |
+59 | pub(crate) struct AutoAdvanceConfig {
+   |                   ^^^^^^^^^^^^^^^^^
+
+warning: associated items `from_loaded` and `max_reached` are never used
+  --> crates/yarli-cli/src/config.rs:65:19
+   |
+64 | impl AutoAdvanceConfig {
+   | ---------------------- associated items in this implementation
+65 |     pub(crate) fn from_loaded(loaded_config: &LoadedConfig) -> Self {
+   |                   ^^^^^^^^^^^
+...
+72 |     pub(crate) fn max_reached(self, advances_taken: usize) -> bool {
+   |                   ^^^^^^^^^^^
+
+warning: function `configured_parallel_worktree_root` is never used
+  --> crates/yarli-cli/src/config.rs:77:15
+   |
+77 | pub(crate) fn configured_parallel_worktree_root(loaded_config: &LoadedConfig) -> Option<String> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_path_from_cwd` is never used
+  --> crates/yarli-cli/src/config.rs:88:4
+   |
+88 | fn resolve_path_from_cwd(path: &Path) -> Result<PathBuf> {
+   |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `home_directory_for_expansion` is never used
+  --> crates/yarli-cli/src/config.rs:98:4
+   |
+98 | fn home_directory_for_expansion() -> Option<PathBuf> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_env_var_name_start` is never used
+   --> crates/yarli-cli/src/config.rs:111:4
+    |
+111 | fn is_env_var_name_start(ch: char) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_env_var_name_continue` is never used
+   --> crates/yarli-cli/src/config.rs:115:4
+    |
+115 | fn is_env_var_name_continue(ch: char) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `expand_env_variables` is never used
+   --> crates/yarli-cli/src/config.rs:119:4
+    |
+119 | fn expand_env_variables(raw: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `expand_home_prefix` is never used
+   --> crates/yarli-cli/src/config.rs:213:4
+    |
+213 | fn expand_home_prefix(path: &str) -> Result<PathBuf> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_execution_path_from_cwd` is never used
+   --> crates/yarli-cli/src/config.rs:232:15
+    |
+232 | pub(crate) fn resolve_execution_path_from_cwd(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_parallel_workspace_contract` is never used
+   --> crates/yarli-cli/src/config.rs:256:15
+    |
+256 | pub(crate) fn ensure_parallel_workspace_contract(loaded_config: &LoadedConfig) -> Result<()> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `default_cli_command_for_backend` is never used
+   --> crates/yarli-cli/src/config.rs:271:4
+    |
+271 | fn default_cli_command_for_backend(backend: &str) -> Option<String> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_cli_invocation_config` is never used
+   --> crates/yarli-cli/src/config.rs:280:15
+    |
+280 | pub(crate) fn resolve_cli_invocation_config(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_valid_env_var_name` is never used
+   --> crates/yarli-cli/src/config.rs:320:4
+    |
+320 | fn is_valid_env_var_name(name: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `shell_quote` is never used
+   --> crates/yarli-cli/src/config.rs:331:4
+    |
+331 | fn shell_quote(value: &str) -> String {
+    |    ^^^^^^^^^^^
+
+warning: function `build_cli_command` is never used
+   --> crates/yarli-cli/src/config.rs:339:15
+    |
+339 | pub(crate) fn build_cli_command(invocation: &CliInvocationConfig, prompt_text: &str) -> String {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: `yarli-cli` (lib) generated 21 warnings
+warning: unused import: `CommandFactory`
+  --> crates/yarli-cli/src/main.rs:64:12
+   |
+64 | use clap::{CommandFactory, Parser};
+   |            ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: `yarli-cli` (bin "yarli") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 1m 07s

@@ -1,0 +1,64 @@
+   Compiling log v0.4.29
+   Compiling serde_core v1.0.228
+   Compiling crossbeam-utils v0.8.21
+   Compiling tracing-core v0.1.36
+   Compiling crypto-common v0.1.7
+   Compiling form_urlencoded v1.2.2
+   Compiling rustls v0.23.36
+   Compiling base64 v0.22.1
+   Compiling tokio-stream v0.1.18
+   Compiling rand v0.8.5
+   Compiling futures-channel v0.3.31
+   Compiling bitflags v2.10.0
+   Compiling digest v0.10.7
+   Compiling mio v1.1.1
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling md-5 v0.10.6
+   Compiling hkdf v0.12.4
+   Compiling tracing v0.1.44
+   Compiling signal-hook-mio v0.2.5
+   Compiling concurrent-queue v2.5.0
+   Compiling crossbeam-queue v0.3.12
+   Compiling event-listener v5.4.1
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling uuid v1.20.0
+   Compiling smallvec v1.15.1
+   Compiling either v1.15.0
+   Compiling chrono v0.4.43
+   Compiling parking_lot_core v0.9.12
+   Compiling icu_normalizer v2.1.1
+   Compiling parking_lot v0.12.5
+   Compiling futures-intrusive v0.5.0
+   Compiling tokio v1.49.0
+   Compiling crossterm v0.28.1
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling sqlx-core v0.8.6
+   Compiling sqlx-postgres v0.8.6
+   Compiling tokio-util v0.7.18
+   Compiling yarli-core v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-core)
+   Compiling sqlx-macros-core v0.8.6
+   Compiling sqlx-macros v0.8.6
+   Compiling sqlx v0.8.6
+   Compiling yarli-store v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-store)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.39s
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-92f440da3c0dd47c)
+
+running 1 test
+
+thread 'append_and_query_roundtrip_against_postgres' panicked at crates/yarli-store/tests/postgres_integration.rs:19:13:
+postgres integration tests require YARLI_TEST_DATABASE_URL when YARLI_REQUIRE_POSTGRES_TESTS=1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test append_and_query_roundtrip_against_postgres ... FAILED
+
+failures:
+
+failures:
+    append_and_query_roundtrip_against_postgres
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p yarli-store --test postgres_integration`

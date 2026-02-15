@@ -6,6 +6,22 @@
 //! - **CLI commands**: `yarli run`, `yarli task`, etc.
 //! - **Mode detection**: auto-detect rendering mode from terminal capabilities
 
+pub const BUILD_COMMIT: &str = env!("YARLI_BUILD_COMMIT");
+pub const BUILD_DATE: &str = env!("YARLI_BUILD_DATE");
+pub const BUILD_ID: &str = env!("YARLI_BUILD_ID");
+pub const YARLI_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("YARLI_BUILD_COMMIT"),
+    ", date ",
+    env!("YARLI_BUILD_DATE"),
+    ", build ",
+    env!("YARLI_BUILD_ID"),
+    ")"
+);
+pub const DEFAULT_CONTINUATION_FILE: &str = ".yarli/continuation.json";
+
+pub mod cli;
 pub mod config;
 pub mod dashboard;
 pub mod mode;

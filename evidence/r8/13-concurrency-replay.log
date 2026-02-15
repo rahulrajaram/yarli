@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-42ed4aac12230258)
+
+running 3 tests
+test replay_idempotency_no_duplicate_terminal_transition_postgres ... ok
+test concurrent_claim_no_duplicate_lease_postgres ... ok
+test enqueue_and_claim_lease_roundtrip_against_postgres ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+

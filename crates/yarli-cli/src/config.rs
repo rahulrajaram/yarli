@@ -2,14 +2,452 @@
 //!
 //! Loop-2 requires explicit backend selection and typed config sections.
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use yarli_core::domain::SafeMode;
+use yarli_observability::JsonlAuditSink;
+use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, TaskQueue};
+use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
 
 pub const DEFAULT_CONFIG_PATH: &str = "yarli.toml";
+
+pub(crate) fn cmd_init(
+    path: PathBuf,
+    force: bool,
+    print: bool,
+    backend: Option<crate::cli::InitBackend>,
+) -> Result<()> {
+    let template = crate::cli::init_config_template(backend);
+    if print {
+        print!("{template}");
+        return Ok(());
+    }
+
+    if path.exists() && !force {
+        bail!(
+            "refusing to overwrite existing config at {} (use --force to overwrite)",
+            path.display()
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+    }
+
+    fs::write(&path, template)
+        .with_context(|| format!("failed to write config file {}", path.display()))?;
+
+    println!("Initialized config at {}", path.display());
+    println!("Review [core], [postgres], and [budgets] before first durable run.");
+    println!("Tip: run `yarli init --help` for the full list of tunable properties.");
+    Ok(())
+}
+
+pub(crate) fn load_runtime_config_for_reads() -> Result<LoadedConfig> {
+    LoadedConfig::load_default().context("failed to load runtime config")
+}
+
+pub(crate) fn ensure_write_backend_guard(
+    loaded_config: &LoadedConfig,
+    command_name: &str,
+) -> Result<()> {
+    if matches!(
+        loaded_config.backend_selection()?,
+        BackendSelection::InMemory
+    ) && !loaded_config.config().core.allow_in_memory_writes
+    {
+        bail!(
+            "`{command_name}` refuses in-memory write mode. Configure durable storage with [core] backend = \"postgres\" and [postgres] database_url, or explicitly opt in with [core] allow_in_memory_writes = true."
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn load_runtime_config_for_writes(command_name: &str) -> Result<LoadedConfig> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    ensure_write_backend_guard(&loaded_config, command_name)?;
+    Ok(loaded_config)
+}
+
+pub(crate) fn prepare_audit_sink(loaded_config: &LoadedConfig) -> Result<Option<JsonlAuditSink>> {
+    if !loaded_config.config().policy.audit_decisions {
+        return Ok(None);
+    }
+
+    let audit_path = PathBuf::from(&loaded_config.config().observability.audit_file);
+    if let Some(parent) = audit_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create audit directory {}", parent.display())
+            })?;
+        }
+    }
+
+    Ok(Some(JsonlAuditSink::new(audit_path)))
+}
+
+pub(crate) fn with_event_store<T>(
+    loaded_config: &LoadedConfig,
+    operation: impl FnOnce(&dyn EventStore) -> Result<T>,
+) -> Result<T> {
+    match loaded_config.backend_selection()? {
+        BackendSelection::InMemory => {
+            let store = InMemoryEventStore::new();
+            operation(&store)
+        }
+        BackendSelection::Postgres { database_url } => {
+            let store = PostgresEventStore::new(&database_url)
+                .map_err(|e| anyhow::anyhow!("failed to initialize postgres event store: {e}"))?;
+            operation(&store)
+        }
+    }
+}
+
+pub(crate) fn with_event_store_and_queue<T>(
+    loaded_config: &LoadedConfig,
+    operation: impl FnOnce(&dyn EventStore, &dyn TaskQueue) -> Result<T>,
+) -> Result<T> {
+    match loaded_config.backend_selection()? {
+        BackendSelection::InMemory => {
+            let store = InMemoryEventStore::new();
+            let queue = InMemoryTaskQueue::new();
+            operation(&store, &queue)
+        }
+        BackendSelection::Postgres { database_url } => {
+            let store = PostgresEventStore::new(&database_url)
+                .map_err(|e| anyhow::anyhow!("failed to initialize postgres event store: {e}"))?;
+            let queue = PostgresTaskQueue::new(&database_url)
+                .map_err(|e| anyhow::anyhow!("failed to initialize postgres task queue: {e}"))?;
+            operation(&store, &queue)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CliInvocationConfig {
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) prompt_mode: PromptMode,
+    pub(crate) env_unset: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AutoAdvanceConfig {
+    pub(crate) policy: AutoAdvancePolicy,
+    pub(crate) max_tranches: u32,
+}
+
+impl AutoAdvanceConfig {
+    pub(crate) fn from_loaded(loaded_config: &LoadedConfig) -> Self {
+        Self {
+            policy: loaded_config.config().run.effective_auto_advance_policy(),
+            max_tranches: loaded_config.config().run.max_auto_advance_tranches,
+        }
+    }
+
+    pub(crate) fn max_reached(self, advances_taken: usize) -> bool {
+        self.max_tranches != 0 && advances_taken >= self.max_tranches as usize
+    }
+}
+
+pub(crate) fn configured_parallel_worktree_root(loaded_config: &LoadedConfig) -> Option<String> {
+    loaded_config
+        .config()
+        .execution
+        .worktree_root
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn resolve_path_from_cwd(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()
+            .context("failed to read current working directory")?
+            .join(path))
+    }
+}
+
+fn home_directory_for_expansion() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .or_else(|| {
+            let drive = env::var_os("HOMEDRIVE")?;
+            let home_path = env::var_os("HOMEPATH")?;
+            let mut combined = PathBuf::from(drive);
+            combined.push(home_path);
+            Some(combined.into_os_string())
+        })
+        .map(PathBuf::from)
+}
+
+fn is_env_var_name_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_env_var_name_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn expand_env_variables(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        let ch = raw[index..]
+            .chars()
+            .next()
+            .expect("index should be in bounds");
+        if ch != '$' {
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let token_start = index;
+        index += ch.len_utf8();
+        if index >= raw.len() {
+            out.push('$');
+            break;
+        }
+
+        let next = raw[index..]
+            .chars()
+            .next()
+            .expect("index should be in bounds");
+        if next == '{' {
+            let mut cursor = index + next.len_utf8();
+            let name_start = cursor;
+            while cursor < raw.len() {
+                let c = raw[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor should be in bounds");
+                if c == '}' {
+                    break;
+                }
+                cursor += c.len_utf8();
+            }
+
+            if cursor >= raw.len() {
+                out.push_str(&raw[token_start..]);
+                break;
+            }
+
+            let name = &raw[name_start..cursor];
+            index = cursor + 1;
+            let valid_name = !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .map(is_env_var_name_start)
+                    .unwrap_or(false)
+                && name.chars().skip(1).all(is_env_var_name_continue);
+            if valid_name {
+                if let Ok(value) = env::var(name) {
+                    out.push_str(&value);
+                } else {
+                    out.push_str(&raw[token_start..index]);
+                }
+            } else {
+                out.push_str(&raw[token_start..index]);
+            }
+            continue;
+        }
+
+        if is_env_var_name_start(next) {
+            let name_start = index;
+            index += next.len_utf8();
+            while index < raw.len() {
+                let c = raw[index..]
+                    .chars()
+                    .next()
+                    .expect("index should be in bounds");
+                if !is_env_var_name_continue(c) {
+                    break;
+                }
+                index += c.len_utf8();
+            }
+            let name = &raw[name_start..index];
+            if let Ok(value) = env::var(name) {
+                out.push_str(&value);
+            } else {
+                out.push('$');
+                out.push_str(name);
+            }
+            continue;
+        }
+
+        out.push('$');
+    }
+
+    out
+}
+
+fn expand_home_prefix(path: &str) -> Result<PathBuf> {
+    if path == "~" {
+        let home = home_directory_for_expansion().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~` because HOME/USERPROFILE is unset")
+        })?;
+        return Ok(home);
+    }
+
+    if path.starts_with("~/") || path.starts_with("~\\") {
+        let home = home_directory_for_expansion().ok_or_else(|| {
+            anyhow::anyhow!("cannot expand `~` because HOME/USERPROFILE is unset")
+        })?;
+        let suffix = &path[2..];
+        return Ok(home.join(suffix));
+    }
+
+    Ok(PathBuf::from(path))
+}
+
+pub(crate) fn resolve_execution_path_from_cwd(
+    raw_path: &str,
+    setting_name: &str,
+) -> Result<PathBuf> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        bail!("{setting_name} path is empty");
+    }
+
+    let env_expanded = expand_env_variables(trimmed);
+    let home_expanded = expand_home_prefix(&env_expanded).with_context(|| {
+        format!(
+            "failed to expand {setting_name} from configured value {:?}",
+            raw_path
+        )
+    })?;
+    resolve_path_from_cwd(&home_expanded).with_context(|| {
+        format!(
+            "failed to resolve {setting_name} from configured value {:?}",
+            raw_path
+        )
+    })
+}
+
+pub(crate) fn ensure_parallel_workspace_contract(loaded_config: &LoadedConfig) -> Result<()> {
+    if !loaded_config.config().features.parallel {
+        return Ok(());
+    }
+
+    if configured_parallel_worktree_root(loaded_config).is_some() {
+        return Ok(());
+    }
+
+    bail!(
+        "`yarli run` requires `[execution].worktree_root` when `[features].parallel = true`.\nUpdate {} with:\n\n[execution]\nworktree_root = \".yarl/workspaces\"",
+        loaded_config.path().display()
+    );
+}
+
+fn default_cli_command_for_backend(backend: &str) -> Option<String> {
+    match backend.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some("codex".to_string()),
+        "claude" => Some("claude".to_string()),
+        "gemini" => Some("gemini".to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_cli_invocation_config(
+    loaded_config: &LoadedConfig,
+) -> Result<CliInvocationConfig> {
+    let cli = &loaded_config.config().cli;
+    let command = cli
+        .command
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            cli.backend
+                .as_deref()
+                .and_then(default_cli_command_for_backend)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "yarli run requires [cli].command (or a known [cli].backend) in {}",
+                loaded_config.path().display()
+            )
+        })?;
+    let mut env_unset = Vec::with_capacity(cli.env_unset.len());
+    for name in &cli.env_unset {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            bail!("cli.env_unset entries must be non-empty environment variable names");
+        }
+        if !is_valid_env_var_name(trimmed) {
+            bail!("invalid cli.env_unset entry {trimmed:?}: must match [A-Za-z_][A-Za-z0-9_]*");
+        }
+        env_unset.push(trimmed.to_string());
+    }
+
+    Ok(CliInvocationConfig {
+        command,
+        args: cli.args.clone(),
+        prompt_mode: cli.prompt_mode,
+        env_unset,
+    })
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        "''".to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r#"'"'"'"#))
+    }
+}
+
+pub(crate) fn build_cli_command(invocation: &CliInvocationConfig, prompt_text: &str) -> String {
+    let mut parts =
+        Vec::with_capacity(2 + invocation.env_unset.len() * 2 + invocation.args.len() + 1);
+    if !invocation.env_unset.is_empty() {
+        parts.push("env".to_string());
+        for name in &invocation.env_unset {
+            parts.push("-u".to_string());
+            parts.push(name.clone());
+        }
+    }
+    parts.push(invocation.command.clone());
+    parts.extend(invocation.args.iter().cloned());
+    let base = parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    match invocation.prompt_mode {
+        PromptMode::Arg => {
+            let prompt = shell_quote(prompt_text);
+            format!("{base} {prompt}")
+        }
+        PromptMode::Stdin => {
+            let prompt = shell_quote(prompt_text);
+            format!("printf %s {prompt} | {base}")
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
@@ -781,8 +1219,254 @@ pub enum UiMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Cli;
+    use clap::CommandFactory;
     use std::io::Write;
+    use std::path::Path;
     use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn write_test_config(contents: &str) -> LoadedConfig {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        std::fs::write(&path, contents).unwrap();
+        LoadedConfig::load(path).unwrap()
+    }
+
+    fn write_test_config_at(path: &Path, contents: &str) -> LoadedConfig {
+        std::fs::write(path, contents).unwrap();
+        LoadedConfig::load(path).unwrap()
+    }
+
+    #[test]
+    fn cmd_init_writes_documented_config_template() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+
+        cmd_init(path.clone(), false, false, None).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[core]"));
+        assert!(raw.contains("backend = \"in-memory\""));
+        assert!(raw.contains("[budgets]"));
+        assert!(raw.contains("max_task_total_tokens"));
+        assert!(raw.contains("[ui]"));
+        assert!(raw.contains("mode = \"auto\""));
+        assert!(raw.contains("[features]"));
+        assert!(raw.contains("parallel = true"));
+        assert!(raw.contains("worktree_root"));
+    }
+
+    #[test]
+    fn cmd_init_refuses_overwrite_without_force() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        std::fs::write(&path, "existing = true\n").unwrap();
+
+        let err = cmd_init(path.clone(), false, false, None).unwrap_err();
+        assert!(err.to_string().contains("use --force"));
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("existing = true"));
+    }
+
+    #[test]
+    fn cmd_init_force_overwrites_existing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        std::fs::write(&path, "existing = true\n").unwrap();
+
+        cmd_init(path.clone(), true, false, None).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("existing = true"));
+        assert!(raw.contains("[execution]"));
+    }
+
+    #[test]
+    fn init_help_lists_all_tunable_properties() {
+        let mut cmd = Cli::command();
+        let init = cmd
+            .find_subcommand_mut("init")
+            .expect("init subcommand should exist");
+        let mut help = Vec::new();
+        init.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        for key in [
+            "core.backend",
+            "core.allow_in_memory_writes",
+            "core.safe_mode",
+            "core.worker_id",
+            "postgres.database_url",
+            "cli.backend",
+            "cli.prompt_mode",
+            "cli.command",
+            "cli.args",
+            "event_loop.max_iterations",
+            "event_loop.max_runtime_seconds",
+            "event_loop.idle_timeout_secs",
+            "event_loop.checkpoint_interval",
+            "features.parallel",
+            "queue.claim_batch_size",
+            "queue.lease_ttl_seconds",
+            "queue.heartbeat_interval_seconds",
+            "queue.reclaim_interval_seconds",
+            "queue.reclaim_grace_seconds",
+            "queue.per_run_cap",
+            "queue.io_cap",
+            "queue.cpu_cap",
+            "queue.git_cap",
+            "queue.tool_cap",
+            "execution.working_dir",
+            "execution.worktree_root",
+            "execution.worktree_exclude_paths",
+            "execution.command_timeout_seconds",
+            "execution.tick_interval_ms",
+            "execution.runner",
+            "execution.overwatch.service_url",
+            "execution.overwatch.profile",
+            "execution.overwatch.soft_timeout_seconds",
+            "execution.overwatch.silent_timeout_seconds",
+            "execution.overwatch.max_log_bytes",
+            "run.prompt_file",
+            "run.objective",
+            "run.continue_wait_timeout_seconds",
+            "run.allow_stable_auto_advance",
+            "run.auto_advance_policy",
+            "run.max_auto_advance_tranches",
+            "run.enable_plan_tranche_grouping",
+            "run.max_grouped_tasks_per_tranche",
+            "run.enforce_plan_tranche_allowed_paths",
+            "run.tasks",
+            "run.tranches",
+            "run.plan_guard.target",
+            "run.plan_guard.mode",
+            "run.default_pace",
+            "run.paces.<name>.cmds",
+            "run.paces.<name>.working_dir",
+            "run.paces.<name>.command_timeout_seconds",
+            "budgets.max_task_rss_bytes",
+            "budgets.max_task_cpu_user_ticks",
+            "budgets.max_task_cpu_system_ticks",
+            "budgets.max_task_io_read_bytes",
+            "budgets.max_task_io_write_bytes",
+            "budgets.max_task_total_tokens",
+            "budgets.max_run_total_tokens",
+            "budgets.max_run_peak_rss_bytes",
+            "budgets.max_run_cpu_user_ticks",
+            "budgets.max_run_cpu_system_ticks",
+            "budgets.max_run_io_read_bytes",
+            "budgets.max_run_io_write_bytes",
+            "git.default_target_branch",
+            "git.destructive_default_deny",
+            "policy.enforce_policies",
+            "policy.audit_decisions",
+            "memory.backend.enabled",
+            "memory.backend.endpoint",
+            "memory.backend.command",
+            "memory.backend.project_dir",
+            "memory.backend.query_limit",
+            "memory.backend.inject_on_run_start",
+            "memory.backend.inject_on_failure",
+            "memory.enabled",
+            "memory.project_id",
+            "observability.audit_file",
+            "observability.log_level",
+            "ui.mode",
+            "ui.verbose_output",
+            "ui.cancellation_diagnostics",
+        ] {
+            assert!(
+                help.contains(key),
+                "init --help should mention config property {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_workspace_contract_requires_worktree_root_when_parallel_enabled() {
+        let loaded = write_test_config(
+            r#"
+[features]
+parallel = true
+
+[execution]
+working_dir = "."
+"#,
+        );
+
+        let err = ensure_parallel_workspace_contract(&loaded).unwrap_err();
+        assert!(err.to_string().contains("execution].worktree_root"));
+    }
+
+    #[test]
+    fn parallel_workspace_contract_allows_parallel_disabled_without_worktree_root() {
+        let loaded = write_test_config(
+            r#"
+[features]
+parallel = false
+"#,
+        );
+
+        ensure_parallel_workspace_contract(&loaded).unwrap();
+    }
+
+    #[test]
+    fn resolve_execution_path_from_cwd_expands_env_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let env_key = format!("YARLI_TEST_EXEC_PATH_{}", Uuid::now_v7().simple());
+        std::env::set_var(&env_key, temp_dir.path());
+        let tokenized = format!("${{{env_key}}}/nested");
+        let resolved =
+            resolve_execution_path_from_cwd(&tokenized, "execution.worktree_root").unwrap();
+        std::env::remove_var(&env_key);
+        assert_eq!(resolved, temp_dir.path().join("nested"));
+    }
+
+    #[test]
+    fn resolve_execution_path_from_cwd_expands_tilde_prefix() {
+        let Some(home) = home_directory_for_expansion() else {
+            return;
+        };
+
+        let resolved = resolve_execution_path_from_cwd("~/yarli-tmp", "execution.working_dir")
+            .expect("tilde expansion should succeed when HOME/USERPROFILE is set");
+        assert_eq!(resolved, home.join("yarli-tmp"));
+    }
+
+    #[test]
+    fn build_cli_command_applies_env_unset_prefix() {
+        let invocation = CliInvocationConfig {
+            command: "claude".to_string(),
+            args: vec!["--model".to_string(), "sonnet-4.5".to_string()],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec!["CLAUDECODE".to_string(), "FOO".to_string()],
+        };
+
+        let command = build_cli_command(&invocation, "hello");
+        assert!(
+            command.contains("'env' '-u' 'CLAUDECODE' '-u' 'FOO' 'claude' '--model' 'sonnet-4.5'")
+        );
+        assert!(command.ends_with(" 'hello'"));
+    }
+
+    #[test]
+    fn resolve_cli_invocation_config_rejects_invalid_env_unset_entries() {
+        let temp = TempDir::new().unwrap();
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "claude"
+args = ["--model", "sonnet-4.5"]
+env_unset = ["BAD-NAME"]
+"#,
+        );
+
+        let err = resolve_cli_invocation_config(&loaded_config).unwrap_err();
+        assert!(err.to_string().contains("invalid cli.env_unset entry"));
+    }
 
     #[test]
     fn missing_file_uses_defaults() {

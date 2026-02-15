@@ -1,0 +1,59 @@
+   Compiling smallvec v1.15.1
+   Compiling either v1.15.0
+   Compiling anyhow v1.0.101
+   Compiling axum-core v0.4.5
+   Compiling tracing-serde v0.2.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling opentelemetry_sdk v0.27.1
+   Compiling parking_lot_core v0.9.12
+   Compiling icu_normalizer v2.1.1
+   Compiling tracing-subscriber v0.3.22
+   Compiling itertools v0.14.0
+   Compiling parking_lot v0.12.5
+   Compiling tokio v1.49.0
+   Compiling futures-intrusive v0.5.0
+   Compiling crossterm v0.28.1
+   Compiling prometheus-client v0.23.1
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling sqlx-core v0.8.6
+   Compiling prost-derive v0.13.5
+   Compiling prost v0.13.5
+   Compiling sqlx-postgres v0.8.6
+   Compiling tokio-util v0.7.18
+   Compiling tokio-stream v0.1.18
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
+   Compiling axum v0.7.9
+   Compiling tower-http v0.6.8
+   Compiling h2 v0.4.13
+   Compiling yarli-core v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-core)
+   Compiling tower v0.4.13
+   Compiling sqlx-macros-core v0.8.6
+   Compiling yarli-policy v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-policy)
+   Compiling hyper v1.8.1
+   Compiling sqlx-macros v0.8.6
+   Compiling hyper-util v0.1.20
+   Compiling sqlx v0.8.6
+   Compiling yarli-store v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-store)
+   Compiling hyper-timeout v0.5.2
+   Compiling hyper-rustls v0.27.7
+   Compiling reqwest v0.12.28
+   Compiling tonic v0.12.3
+   Compiling yarli-gates v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-gates)
+   Compiling opentelemetry-proto v0.27.0
+   Compiling opentelemetry-otlp v0.27.0
+   Compiling yarli-observability v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-observability)
+   Compiling yarli-exec v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-exec)
+   Compiling yarli-queue v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-queue)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.80s
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-42ed4aac12230258)
+
+running 3 tests
+test replay_idempotency_no_duplicate_terminal_transition_postgres ... ok
+test concurrent_claim_no_duplicate_lease_postgres ... ok
+test enqueue_and_claim_lease_roundtrip_against_postgres ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+

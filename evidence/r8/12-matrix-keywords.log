@@ -1,0 +1,35 @@
+docs/ACCEPTANCE_RUBRIC.md:49:5. Governance and budget enforcement verification
+docs/ACCEPTANCE_RUBRIC.md:50:- Run budget enforcement unit tests:
+docs/ACCEPTANCE_RUBRIC.md:51:  - `cargo test -p yarli-queue -- test_budget_exceeded --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:53:  - `cargo test -p yarli-core -- budget_exceeded_task --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:55:  - `cargo test -p yarli-cli -- budget --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:63:7. Scale-consistency: Postgres concurrency/replay invariant tests (Loop R7)
+docs/ACCEPTANCE_RUBRIC.md:64:- Run Postgres-backed concurrency and replay tests:
+docs/ACCEPTANCE_RUBRIC.md:67:- Must prove: concurrent lease claims under Postgres produce no duplicate leases; replay from persisted state is deterministic.
+docs/ACCEPTANCE_RUBRIC.md:69:8. Scale-consistency: capacity/budget stress proofs (Loop R7)
+docs/ACCEPTANCE_RUBRIC.md:70:- Run budget enforcement stress tests:
+docs/ACCEPTANCE_RUBRIC.md:71:  - `cargo test -p yarli-queue -- test_budget_exceeded_fails_task_without_retry --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:72:  - `cargo test -p yarli-queue -- test_run_token_budget_exceeded_across_tasks --nocapture`
+docs/ACCEPTANCE_RUBRIC.md:74:- Must prove: budget governance under parallel workload transitions to explicit failure, no silent continuation.
+docs/ACCEPTANCE_RUBRIC.md:78:  - `rg -n "single-active-lease|duplicate terminal|restart|replay|budget" docs/CONSISTENCY_CONTRACT.md`
+docs/ACCEPTANCE_RUBRIC.md:104:  - `run_status_endpoint_replays_persisted_events`
+docs/CONSISTENCY_CONTRACT.md:4:Baseline provenance: commit `7b8f5c2` (runtime: enforce resource budgets and surface usage telemetry)
+docs/CONSISTENCY_CONTRACT.md:25:- This guarantees that replaying the event log always produces an accurate picture of what was attempted.
+docs/CONSISTENCY_CONTRACT.md:36:- Budget violation events set an idempotency key to prevent retry after a budget-exceeded failure.
+docs/CONSISTENCY_CONTRACT.md:66:Resource usage is accumulated per-run in `RunUsageTotals` for aggregate budget enforcement.
+docs/CONSISTENCY_CONTRACT.md:81:Token counts are currently produced by the deterministic `char_count_div4_estimate_v1` estimator and accumulated across tasks within a run for run-level budget enforcement.
+docs/CONSISTENCY_CONTRACT.md:87:Budget violations follow a `budget_exceeded` fail-fast path with no silent continuation:
+docs/CONSISTENCY_CONTRACT.md:89:1. After each command completes, the scheduler checks all configured budgets against observed resource and token usage.
+docs/CONSISTENCY_CONTRACT.md:90:2. If any budget is exceeded, the task transitions immediately to `TaskFailed` with `reason = "budget_exceeded"`.
+docs/CONSISTENCY_CONTRACT.md:93:   - `reason`: `"budget_exceeded"`
+docs/CONSISTENCY_CONTRACT.md:101:5. If any task fails due to a run-level budget breach, the run itself is prevented from reaching `RunCompleted`.
+docs/CONSISTENCY_CONTRACT.md:103:Configurable budgets (all `Option<u64>`, enforcement only when set):
+docs/CONSISTENCY_CONTRACT.md:120:Implementation: `yarli-queue::scheduler::ResourceBudgetConfig`, `check_budget_violations()`, `handle_command_success()`.
+docs/CONSISTENCY_CONTRACT.md:131:| SC-3 | No duplicate terminal transition per task attempt | `cargo test -p yarli-core -- terminal_state_rejects --nocapture` | Exit 0, `test result: ok` | All 5 entity types reject transition from terminal state |
+docs/CONSISTENCY_CONTRACT.md:132:| SC-4 | Durable-state-before-side-effects on restart/replay | `cargo test -p yarli-queue -- scheduler --nocapture` | Exit 0, scheduler lifecycle tests pass | Events persisted before command spawn; replay produces consistent state |
+docs/CONSISTENCY_CONTRACT.md:133:| SC-5 | Idempotency key replay prevents duplicate events | `cargo test -p yarli-store -- idempotency --nocapture` | Exit 0, `test result: ok` | Duplicate idempotency keys rejected; unique keys accepted |
+docs/CONSISTENCY_CONTRACT.md:135:| SC-7 | Budget breach → immediate TaskFailed, no retry | `cargo test -p yarli-queue -- test_budget_exceeded_fails_task_without_retry --nocapture` | Exit 0, `test result: ok` | Task transitions to TaskFailed with reason="budget_exceeded", not retried |
+docs/CONSISTENCY_CONTRACT.md:136:| SC-8 | Run-level budget enforcement across tasks | `cargo test -p yarli-queue -- test_run_token_budget_exceeded_across_tasks --nocapture` | Exit 0, `test result: ok` | Cumulative token budget enforced, run cannot complete after breach |
+docs/CONSISTENCY_CONTRACT.md:144:- `bash scripts/verify_acceptance_rubric.sh <loop-id>` runs workspace tests, strict Postgres positive/negative paths, governance/budget checks, and evidence integrity checks.
+docs/CONSISTENCY_CONTRACT.md:145:- Loop-7 adds Postgres-backed concurrency/replay invariant tests (SC-2) and capacity/budget stress proofs (SC-7, SC-8) to the verifier.
+docs/CONSISTENCY_CONTRACT.md:153:- **Scheduler tests**: `cargo test -p yarli-queue` (budget enforcement, lease lifecycle, idempotency).

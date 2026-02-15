@@ -2,4 +2,5 @@ target/
 .agent/
 .orchestrator/
 .yarl/
+.code-index/
 yarli.toml

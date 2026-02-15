@@ -74,6 +74,11 @@ append_summary_entry() {
   } >>"$summary_file"
 }
 
+is_loop_r8=0
+if [[ "$loop_id" == "r8" ]]; then
+  is_loop_r8=1
+fi
+
 run_check() {
   local log_file="$1"
   local command_string="$2"
@@ -161,6 +166,55 @@ else
   append_summary_entry "$no_skip_cmd" "$no_skip_ec" "$no_skip_log"
   if [[ "$no_skip_ec" -ne 1 ]]; then
     failures=$((failures + 1))
+  fi
+
+  if [[ "$is_loop_r8" -eq 1 ]]; then
+    packaging_build_log="${evidence_dir}/15-packaging-build.log"
+    packaging_build_cmd='cargo build --workspace --release'
+    run_check "$packaging_build_log" "$packaging_build_cmd"
+    packaging_build_ec=$?
+    append_summary_entry "$packaging_build_cmd" "$packaging_build_ec" "$packaging_build_log"
+    if [[ "$packaging_build_ec" -ne 0 ]]; then
+      failures=$((failures + 1))
+    fi
+
+    loop8_api_smoke_log="${evidence_dir}/16-r8-api-smoke.log"
+    loop8_api_smoke_cmd='cargo test -p yarli-api -- --nocapture'
+    run_check "$loop8_api_smoke_log" "$loop8_api_smoke_cmd"
+    loop8_api_smoke_ec=$?
+    append_summary_entry "$loop8_api_smoke_cmd" "$loop8_api_smoke_ec" "$loop8_api_smoke_log"
+    if [[ "$loop8_api_smoke_ec" -ne 0 ]]; then
+      failures=$((failures + 1))
+    fi
+
+    if ! rg -q "test health_endpoint_returns_ok" "$loop8_api_smoke_log"; then
+      failures=$((failures + 1))
+    fi
+
+    if ! rg -q "test run_status_endpoint_replays_persisted_events" "$loop8_api_smoke_log"; then
+      failures=$((failures + 1))
+    fi
+
+    loop8_api_deploy_smoke_log="${evidence_dir}/17-r8-loop-id-api-deploy.log"
+    loop8_api_deploy_smoke_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-api --test postgres_integration -- --nocapture'
+    run_check "$loop8_api_deploy_smoke_log" "$loop8_api_deploy_smoke_cmd"
+    loop8_api_deploy_smoke_ec=$?
+    append_summary_entry "$loop8_api_deploy_smoke_cmd" "$loop8_api_deploy_smoke_ec" "$loop8_api_deploy_smoke_log"
+    if [[ "$loop8_api_deploy_smoke_ec" -ne 0 ]]; then
+      failures=$((failures + 1))
+    fi
+
+    if ! rg -q "test run_and_task_status_reflect_writes_from_postgres" "$loop8_api_deploy_smoke_log"; then
+      failures=$((failures + 1))
+    fi
+
+    if ! rg -q "test merge_request_and_status_roundtrip_against_postgres" "$strict_cli_log"; then
+      failures=$((failures + 1))
+    fi
+
+    if ! rg -q "test run_start_and_status_roundtrip_against_postgres" "$strict_cli_log"; then
+      failures=$((failures + 1))
+    fi
   fi
 fi
 

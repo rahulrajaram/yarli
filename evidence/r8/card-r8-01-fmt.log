@@ -1,0 +1,158 @@
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/cli.rs:2:
+ 
+ use clap::{Parser, Subcommand};
+ 
+[31m-use crate::YARLI_VERSION;
+(B[m[31m-use crate::DEFAULT_CONTINUATION_FILE;
+(B[m use crate::config::DEFAULT_CONFIG_PATH;
+[32m+use crate::DEFAULT_CONTINUATION_FILE;
+(B[m[32m+use crate::YARLI_VERSION;
+(B[m 
+ /// YARLI — Yet Another Orchestrator Loop Implementation.
+ ///
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/config.rs:2:
+ //!
+ //! Loop-2 requires explicit backend selection and typed config sections.
+ 
+[31m-use std::fs;
+(B[m use std::env;
+[32m+use std::fs;
+(B[m use std::path::{Path, PathBuf};
+ 
+ use anyhow::{bail, Context, Result};
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/config.rs:74:
+     }
+ }
+ 
+[31m-pub(crate) fn configured_parallel_worktree_root(
+(B[m[31m-    loaded_config: &LoadedConfig,
+(B[m[31m-) -> Option<String> {
+(B[m[32m+pub(crate) fn configured_parallel_worktree_root(loaded_config: &LoadedConfig) -> Option<String> {
+(B[m     loaded_config
+         .config()
+         .execution
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/config.rs:288:
+         .as_ref()
+         .map(|value| value.trim().to_string())
+         .filter(|value| !value.is_empty())
+[31m-        .or_else(|| cli.backend.as_deref().and_then(default_cli_command_for_backend))
+(B[m[32m+        .or_else(|| {
+(B[m[32m+            cli.backend
+(B[m[32m+                .as_deref()
+(B[m[32m+                .and_then(default_cli_command_for_backend)
+(B[m[32m+        })
+(B[m         .ok_or_else(|| {
+             anyhow::anyhow!(
+                 "yarli run requires [cli].command (or a known [cli].backend) in {}",
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/cli.rs:2:
+ 
+ use clap::{Parser, Subcommand};
+ 
+[31m-use crate::YARLI_VERSION;
+(B[m[31m-use crate::DEFAULT_CONTINUATION_FILE;
+(B[m use crate::config::DEFAULT_CONFIG_PATH;
+[32m+use crate::DEFAULT_CONTINUATION_FILE;
+(B[m[32m+use crate::YARLI_VERSION;
+(B[m 
+ /// YARLI — Yet Another Orchestrator Loop Implementation.
+ ///
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/config.rs:2:
+ //!
+ //! Loop-2 requires explicit backend selection and typed config sections.
+ 
+[31m-use std::fs;
+(B[m use std::env;
+[32m+use std::fs;
+(B[m use std::path::{Path, PathBuf};
+ 
+ use anyhow::{bail, Context, Result};
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/config.rs:74:
+     }
+ }
+ 
+[31m-pub(crate) fn configured_parallel_worktree_root(
+(B[m[31m-    loaded_config: &LoadedConfig,
+(B[m[31m-) -> Option<String> {
+(B[m[32m+pub(crate) fn configured_parallel_worktree_root(loaded_config: &LoadedConfig) -> Option<String> {
+(B[m     loaded_config
+         .config()
+         .execution
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/config.rs:288:
+         .as_ref()
+         .map(|value| value.trim().to_string())
+         .filter(|value| !value.is_empty())
+[31m-        .or_else(|| cli.backend.as_deref().and_then(default_cli_command_for_backend))
+(B[m[32m+        .or_else(|| {
+(B[m[32m+            cli.backend
+(B[m[32m+                .as_deref()
+(B[m[32m+                .and_then(default_cli_command_for_backend)
+(B[m[32m+        })
+(B[m         .ok_or_else(|| {
+             anyhow::anyhow!(
+                 "yarli run requires [cli].command (or a known [cli].backend) in {}",
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/main.rs:17:
+ use uuid::Uuid;
+ 
+ use crate::config::{
+[31m-    AutoAdvancePolicy, BackendSelection, ExecutionRunner, LoadedConfig,
+(B[m[31m-    RunPlanGuardModeConfig, UiMode,
+(B[m[32m+    AutoAdvancePolicy, BackendSelection, ExecutionRunner, LoadedConfig, RunPlanGuardModeConfig,
+(B[m[32m+    UiMode,
+(B[m };
+ use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
+ use yarli_cli::mode::{self, RenderMode, TerminalInfo};
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/main.rs:63:
+ 
+ use clap::{CommandFactory, Parser};
+ 
+[31m-mod config;
+(B[m mod cli;
+[32m+mod config;
+(B[m use cli::{
+[31m-    AuditAction, Cli, Commands, GateAction, MergeAction, PlanAction,
+(B[m[31m-    RunAction, TaskAction, TrancheAction, WorktreeAction,
+(B[m[32m+    AuditAction, Cli, Commands, GateAction, MergeAction, PlanAction, RunAction, TaskAction,
+(B[m[32m+    TrancheAction, WorktreeAction,
+(B[m };
+ 
+[31m-
+(B[m const BUILD_COMMIT: &str = env!("YARLI_BUILD_COMMIT");
+ const BUILD_DATE: &str = env!("YARLI_BUILD_DATE");
+ const BUILD_ID: &str = env!("YARLI_BUILD_ID");
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/main.rs:677:
+         return Ok(None);
+     }
+ 
+[31m-    let configured_root = config::configured_parallel_worktree_root(loaded_config).ok_or_else(|| {
+(B[m[31m-        anyhow::anyhow!(
+(B[m[32m+    let configured_root =
+(B[m[32m+        config::configured_parallel_worktree_root(loaded_config).ok_or_else(|| {
+(B[m[32m+            anyhow::anyhow!(
+(B[m             "`yarli run` requires `[execution].worktree_root` when `[features].parallel = true`"
+         )
+[31m-    })?;
+(B[m[31m-    let source_workdir = config::resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+(B[m[32m+        })?;
+(B[m[32m+    let source_workdir =
+(B[m[32m+        config::resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+(B[m     if !source_workdir.is_dir() {
+         bail!(
+             "execution working_dir is not a directory: {}",
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/main.rs:696:
+         )
+     })?;
+ 
+[31m-    let worktree_root = config::resolve_execution_path_from_cwd(&configured_root, "execution.worktree_root")?;
+(B[m[32m+    let worktree_root =
+(B[m[32m+        config::resolve_execution_path_from_cwd(&configured_root, "execution.worktree_root")?;
+(B[m     fs::create_dir_all(&worktree_root).with_context(|| {
+         format!(
+             "failed to create execution.worktree_root {}",
+Diff in /home/rahul/Documents/yarl/crates/yarli-cli/src/main.rs:11157:
+         std::fs::write(path, contents).unwrap();
+         LoadedConfig::load(path).unwrap()
+     }
+[31m-
+(B[m 
+     #[test]
+     fn prepare_parallel_workspace_layout_creates_task_workspaces() {

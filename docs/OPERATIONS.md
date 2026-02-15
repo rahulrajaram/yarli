@@ -67,6 +67,35 @@ Expected verification signals:
 - Exit code is `0`.
 - `evidence/r8/README.md` records command blocks with `Exit Code:` and `Key Output:`.
 
+## Packaging and Deployment Smoke Verification (Loop-8)
+
+This sequence is the deterministic "can we deploy" proof path for API and durable CLI behavior:
+
+```bash
+export YARLI_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55432/postgres
+export YARLI_REQUIRE_POSTGRES_TESTS=1
+
+# Packaging/build step
+cargo build --workspace --release
+
+# API smoke checks (in-process and persistent read paths)
+cargo test -p yarli-api -- --nocapture
+cargo test -p yarli-api --test postgres_integration -- --nocapture
+
+# Durable CLI write/read roundtrip
+cargo test -p yarli-cli --test postgres_integration -- --nocapture
+```
+
+Expected smoke signals:
+
+- Release build command exits `0`.
+- API logs contain `health_endpoint_returns_ok` and `run_status_endpoint_replays_persisted_events`.
+- API deploy check log contains `run_and_task_status_reflect_writes_from_postgres`.
+- CLI strict-postgres smoke log contains both:
+  - `run_start_and_status_roundtrip_against_postgres`
+  - `merge_request_and_status_roundtrip_against_postgres`
+- These commands are tracked in `evidence/<loop-id>/` when run via `scripts/verify_acceptance_rubric.sh`.
+
 ## Durable Local Configuration
 
 Create `yarli.toml` using `yarli.example.toml` as a starting point. Durable write commands require:

@@ -1,0 +1,198 @@
+   Compiling either v1.15.0
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling yarli-memory v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-memory)
+   Compiling toml_edit v0.22.27
+   Compiling itertools v0.14.0
+   Compiling sqlx-core v0.8.6
+   Compiling itertools v0.13.0
+   Compiling unicode-truncate v1.1.0
+   Compiling prost-derive v0.13.5
+   Compiling ratatui v0.29.0
+   Compiling toml v0.8.23
+   Compiling sqlx-postgres v0.8.6
+   Compiling prost v0.13.5
+   Compiling tonic v0.12.3
+   Compiling opentelemetry-proto v0.27.0
+   Compiling opentelemetry-otlp v0.27.0
+   Compiling sqlx-macros-core v0.8.6
+   Compiling yarli-observability v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-observability)
+   Compiling sqlx-macros v0.8.6
+   Compiling sqlx v0.8.6
+   Compiling yarli-store v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-store)
+   Compiling yarli-exec v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-exec)
+   Compiling yarli-gates v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-gates)
+   Compiling yarli-queue v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-queue)
+   Compiling yarli-git v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-git)
+   Compiling yarli-cli v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c634e-cd7e-7aa3-ac4b-d8ddeff4d643/001-tranche-005-card-r8-05/crates/yarli-cli)
+warning: constant `INIT_CONFIG_TEMPLATE` is never used
+   --> crates/yarli-cli/src/cli.rs:186:7
+    |
+186 | const INIT_CONFIG_TEMPLATE: &str = r#"# YARLI runtime configuration
+    |       ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: function `init_config_template` is never used
+   --> crates/yarli-cli/src/cli.rs:368:15
+    |
+368 | pub(crate) fn init_config_template(backend: Option<InitBackend>) -> String {
+    |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `replace_between` is never used
+   --> crates/yarli-cli/src/cli.rs:452:15
+    |
+452 | pub(crate) fn replace_between(haystack: &str, begin: &str, end: &str, replacement: &str) -> String {
+    |               ^^^^^^^^^^^^^^^
+
+warning: function `cmd_init` is never used
+  --> crates/yarli-cli/src/config.rs:15:15
+   |
+15 | pub(crate) fn cmd_init(
+   |               ^^^^^^^^
+
+warning: struct `CliInvocationConfig` is never constructed
+  --> crates/yarli-cli/src/config.rs:51:19
+   |
+51 | pub(crate) struct CliInvocationConfig {
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `AutoAdvanceConfig` is never constructed
+  --> crates/yarli-cli/src/config.rs:59:19
+   |
+59 | pub(crate) struct AutoAdvanceConfig {
+   |                   ^^^^^^^^^^^^^^^^^
+
+warning: associated items `from_loaded` and `max_reached` are never used
+  --> crates/yarli-cli/src/config.rs:65:19
+   |
+64 | impl AutoAdvanceConfig {
+   | ---------------------- associated items in this implementation
+65 |     pub(crate) fn from_loaded(loaded_config: &LoadedConfig) -> Self {
+   |                   ^^^^^^^^^^^
+...
+72 |     pub(crate) fn max_reached(self, advances_taken: usize) -> bool {
+   |                   ^^^^^^^^^^^
+
+warning: function `configured_parallel_worktree_root` is never used
+  --> crates/yarli-cli/src/config.rs:77:15
+   |
+77 | pub(crate) fn configured_parallel_worktree_root(loaded_config: &LoadedConfig) -> Option<String> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_path_from_cwd` is never used
+  --> crates/yarli-cli/src/config.rs:88:4
+   |
+88 | fn resolve_path_from_cwd(path: &Path) -> Result<PathBuf> {
+   |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `home_directory_for_expansion` is never used
+  --> crates/yarli-cli/src/config.rs:98:4
+   |
+98 | fn home_directory_for_expansion() -> Option<PathBuf> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_env_var_name_start` is never used
+   --> crates/yarli-cli/src/config.rs:111:4
+    |
+111 | fn is_env_var_name_start(ch: char) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_env_var_name_continue` is never used
+   --> crates/yarli-cli/src/config.rs:115:4
+    |
+115 | fn is_env_var_name_continue(ch: char) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `expand_env_variables` is never used
+   --> crates/yarli-cli/src/config.rs:119:4
+    |
+119 | fn expand_env_variables(raw: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `expand_home_prefix` is never used
+   --> crates/yarli-cli/src/config.rs:213:4
+    |
+213 | fn expand_home_prefix(path: &str) -> Result<PathBuf> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_execution_path_from_cwd` is never used
+   --> crates/yarli-cli/src/config.rs:232:15
+    |
+232 | pub(crate) fn resolve_execution_path_from_cwd(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `ensure_parallel_workspace_contract` is never used
+   --> crates/yarli-cli/src/config.rs:256:15
+    |
+256 | pub(crate) fn ensure_parallel_workspace_contract(loaded_config: &LoadedConfig) -> Result<()> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `default_cli_command_for_backend` is never used
+   --> crates/yarli-cli/src/config.rs:271:4
+    |
+271 | fn default_cli_command_for_backend(backend: &str) -> Option<String> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_cli_invocation_config` is never used
+   --> crates/yarli-cli/src/config.rs:280:15
+    |
+280 | pub(crate) fn resolve_cli_invocation_config(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_valid_env_var_name` is never used
+   --> crates/yarli-cli/src/config.rs:320:4
+    |
+320 | fn is_valid_env_var_name(name: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `shell_quote` is never used
+   --> crates/yarli-cli/src/config.rs:331:4
+    |
+331 | fn shell_quote(value: &str) -> String {
+    |    ^^^^^^^^^^^
+
+warning: function `build_cli_command` is never used
+   --> crates/yarli-cli/src/config.rs:339:15
+    |
+339 | pub(crate) fn build_cli_command(invocation: &CliInvocationConfig, prompt_text: &str) -> String {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: `yarli-cli` (lib) generated 21 warnings
+warning: unused import: `CommandFactory`
+  --> crates/yarli-cli/src/main.rs:64:12
+   |
+64 | use clap::{CommandFactory, Parser};
+   |            ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: `yarli-cli` (bin "yarli") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.07s
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-5b0c0a3f5d757cfe)
+
+running 2 tests
+
+thread 'run_start_and_status_roundtrip_against_postgres' panicked at crates/yarli-cli/tests/postgres_integration.rs:117:5:
+run start command failed
+stdout:
+2026-02-15T21:59:25.236671Z ERROR `yarli run` requires `[execution].worktree_root` when `[features].parallel = true`.
+Update yarli.toml with:
+
+[execution]
+worktree_root = ".yarl/workspaces"
+
+stderr:
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test run_start_and_status_roundtrip_against_postgres ... FAILED
+test merge_request_and_status_roundtrip_against_postgres ... ok
+
+failures:
+
+failures:
+    run_start_and_status_roundtrip_against_postgres
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.41s
+
+error: test failed, to rerun pass `-p yarli-cli --test postgres_integration`

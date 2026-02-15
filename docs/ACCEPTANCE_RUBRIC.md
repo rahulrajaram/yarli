@@ -79,7 +79,37 @@ No partial pass state is allowed.
 - Require all matrix invariant keywords present.
 - See `docs/CONSISTENCY_CONTRACT.md` Section 3 for the full verification matrix.
 
+10. Loop-8 API contract publication checks
+- Contract artifact existence:
+  - `test -s docs/API_CONTRACT.md`
+- Contract keyword coverage in rubric and matrix:
+  - `rg -n "health|run_id|not-found|read-your-writes|endpoint|PASS|UNVERIFIED" docs/API_CONTRACT.md docs/ACCEPTANCE_RUBRIC.md`
+- Route-to-implementation traceability:
+  - `rg -n "/health|/v1/runs/\\{run_id\\}/status|RunStatusResponse|invalid run ID|run not found" crates/yarli-api/src/server.rs`
+- Decision:
+  - PASS if all loop-8 checks above exit `0`.
+  - UNVERIFIED if any route or field contract is undocumented or test command fails.
+
+11. Loop-8 packaging/deployment smoke checks
+- Run release build for deterministic packaging signal:
+  - `cargo build --workspace --release`
+- Run API smoke surface checks in strict Postgres mode:
+  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-api -- --nocapture`
+- Run API/deploy-style read-your-writes smoke:
+  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-api --test postgres_integration -- --nocapture`
+- Run CLI write/read smoke with durable Postgres:
+  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-cli --test postgres_integration -- --nocapture`
+- Each command must exit `0` in strict mode and the logs must contain:
+  - `health_endpoint_returns_ok`
+  - `run_status_endpoint_replays_persisted_events`
+  - `run_and_task_status_reflect_writes_from_postgres`
+  - `run_start_and_status_roundtrip_against_postgres`
+  - `merge_request_and_status_roundtrip_against_postgres`
+- Decision:
+  - PASS for Loop-8 package/deploy smoke if all commands and required output are present.
+  - UNVERIFIED if any command fails or required smoke evidence is missing.
+
 ## Decision Rule
 
-- Mark `PASS` only if all nine required checks are satisfied with tracked evidence.
+- Mark `PASS` only if all required checks are satisfied with tracked evidence.
 - Otherwise mark `UNVERIFIED`, add a blocker note, and stop.
