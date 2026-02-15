@@ -56,6 +56,8 @@ pub struct StreamRenderer {
     config: StreamConfig,
     /// Active tasks being tracked in the viewport.
     tasks: HashMap<TaskId, TaskView>,
+    /// Latest known lifecycle state for each known task in the run.
+    task_states: HashMap<TaskId, TaskState>,
     /// Insertion order of task IDs for stable rendering.
     task_order: Vec<TaskId>,
     /// Per-task spinners.
@@ -83,6 +85,7 @@ impl StreamRenderer {
             terminal,
             config,
             tasks: HashMap::new(),
+            task_states: HashMap::new(),
             task_order: Vec::new(),
             spinners: HashMap::new(),
             explain_summary: None,
@@ -107,6 +110,9 @@ impl StreamRenderer {
                         worker_id: None,
                     });
                 }
+                self.task_states
+                    .entry(task_id)
+                    .or_insert(TaskState::TaskOpen);
             }
             StreamEvent::TaskTransition {
                 task_id,
@@ -136,7 +142,8 @@ impl StreamRenderer {
                 reason,
                 at,
             } => {
-                self.push_run_transition(run_id, from, to, reason.as_deref(), at)?;
+                let progress = self.progress_snapshot();
+                self.push_run_transition(run_id, from, to, reason.as_deref(), at, progress)?;
             }
             StreamEvent::RunStarted {
                 run_id,
@@ -169,7 +176,8 @@ impl StreamRenderer {
                     &message,
                     Utc::now(),
                 ) {
-                    self.push_transient_status_line(&message, Utc::now())?;
+                    let progress = self.progress_snapshot();
+                    self.push_transient_status_line(&message, Utc::now(), progress)?;
                 }
                 self.transient_status = Some(message);
             }
@@ -210,8 +218,13 @@ impl StreamRenderer {
         detail: Option<&str>,
         at: DateTime<Utc>,
     ) -> io::Result<()> {
+        self.task_states.insert(task_id, to);
+        let progress = self.progress_snapshot();
+
         // Push transition line to scrollback (permanent, copy-pasteable).
-        self.push_task_transition(task_id, task_name, from, to, elapsed, exit_code, detail, at)?;
+        self.push_task_transition(
+            task_id, task_name, from, to, elapsed, exit_code, detail, at, progress,
+        )?;
 
         if to.is_terminal() {
             // Remove from active viewport.
@@ -260,6 +273,7 @@ impl StreamRenderer {
         exit_code: Option<i32>,
         detail: Option<&str>,
         at: DateTime<Utc>,
+        progress: ProgressSnapshot,
     ) -> io::Result<()> {
         let tier = tier_for_task_state(to);
         let time_str = at.format("%H:%M:%S").to_string();
@@ -290,6 +304,10 @@ impl StreamRenderer {
                 Tier::Contextual.style(),
             ));
         }
+        spans.push(Span::styled(
+            format!("  progress {}", format_ascii_progress(progress, 20)),
+            Tier::Contextual.style(),
+        ));
 
         let line = Line::from(spans);
 
@@ -334,6 +352,7 @@ impl StreamRenderer {
         to: yarli_core::fsm::run::RunState,
         reason: Option<&str>,
         at: DateTime<Utc>,
+        progress: ProgressSnapshot,
     ) -> io::Result<()> {
         let tier = tier_for_run_state(to);
         let time_str = at.format("%H:%M:%S").to_string();
@@ -354,6 +373,10 @@ impl StreamRenderer {
                 Tier::Contextual.style(),
             ));
         }
+        spans.push(Span::styled(
+            format!("  progress {}", format_ascii_progress(progress, 20)),
+            Tier::Contextual.style(),
+        ));
 
         let line = Line::from(spans);
 
@@ -556,13 +579,24 @@ impl StreamRenderer {
         &mut self.terminal
     }
 
-    fn push_transient_status_line(&mut self, message: &str, at: DateTime<Utc>) -> io::Result<()> {
+    fn push_transient_status_line(
+        &mut self,
+        message: &str,
+        at: DateTime<Utc>,
+        progress: ProgressSnapshot,
+    ) -> io::Result<()> {
         self.last_transient_status_emit_at = Some(at);
         let spans = vec![
             Span::styled(at.format("%H:%M:%S").to_string(), Tier::Contextual.style()),
             Span::styled(" ▸ ", Tier::Background.style()),
             Span::styled("status", Tier::Active.style()),
-            Span::styled(format!(" {message}"), Tier::Contextual.style()),
+            Span::styled(
+                format!(
+                    " {message}  progress {}",
+                    format_ascii_progress(progress, 20)
+                ),
+                Tier::Contextual.style(),
+            ),
         ];
         let line = Line::from(spans);
         self.terminal.insert_before(1, |buf| {
@@ -570,6 +604,50 @@ impl StreamRenderer {
         })?;
         Ok(())
     }
+
+    fn progress_snapshot(&self) -> ProgressSnapshot {
+        let mut snapshot = ProgressSnapshot {
+            total: self.task_states.len() as u32,
+            ..ProgressSnapshot::default()
+        };
+        for state in self.task_states.values() {
+            match state {
+                TaskState::TaskComplete => snapshot.completed += 1,
+                TaskState::TaskFailed => snapshot.failed += 1,
+                TaskState::TaskCancelled => snapshot.cancelled += 1,
+                _ => {}
+            }
+        }
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProgressSnapshot {
+    total: u32,
+    completed: u32,
+    failed: u32,
+    cancelled: u32,
+}
+
+impl ProgressSnapshot {
+    fn terminal_count(self) -> u32 {
+        self.completed + self.failed + self.cancelled
+    }
+}
+
+fn format_ascii_progress(snapshot: ProgressSnapshot, width: usize) -> String {
+    let done = snapshot.terminal_count();
+    let total = snapshot.total;
+    let (filled, percent) = if total == 0 {
+        (0usize, 0u32)
+    } else {
+        let filled = ((done as f64 / total as f64) * width as f64).round() as usize;
+        let percent = ((done as f64 / total as f64) * 100.0).round() as u32;
+        (filled.min(width), percent.min(100))
+    };
+    let bar = format!("{}{}", "#".repeat(filled), ".".repeat(width - filled));
+    format!("[{bar}] {done}/{total} ({percent}%)")
 }
 
 fn should_emit_transient_status_line(
@@ -740,5 +818,39 @@ mod tests {
             "operator pause: maintenance",
             now + chrono::Duration::seconds(1),
         ));
+    }
+
+    #[test]
+    fn ascii_progress_formats_empty_snapshot() {
+        let snapshot = ProgressSnapshot::default();
+        assert_eq!(format_ascii_progress(snapshot, 10), "[..........] 0/0 (0%)");
+    }
+
+    #[test]
+    fn ascii_progress_formats_partial_completion() {
+        let snapshot = ProgressSnapshot {
+            total: 5,
+            completed: 2,
+            failed: 0,
+            cancelled: 0,
+        };
+        assert_eq!(
+            format_ascii_progress(snapshot, 10),
+            "[####......] 2/5 (40%)"
+        );
+    }
+
+    #[test]
+    fn ascii_progress_counts_all_terminal_states() {
+        let snapshot = ProgressSnapshot {
+            total: 4,
+            completed: 1,
+            failed: 1,
+            cancelled: 1,
+        };
+        assert_eq!(
+            format_ascii_progress(snapshot, 10),
+            "[########..] 3/4 (75%)"
+        );
     }
 }

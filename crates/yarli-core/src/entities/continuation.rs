@@ -76,6 +76,9 @@ pub struct TrancheSpec {
 pub enum TrancheKind {
     RetryUnfinished,
     PlannedNext,
+    /// All tasks completed but run-level gates failed. Re-run the same tranche
+    /// so gates can be re-evaluated after the operator addresses the gate issue.
+    GateRetry,
 }
 
 impl Default for TrancheKind {
@@ -166,6 +169,27 @@ impl ContinuationPayload {
                 kind: TrancheKind::RetryUnfinished,
                 retry_task_keys,
                 unfinished_task_keys,
+                planned_task_keys: Vec::new(),
+                planned_tranche_key: None,
+                cursor: Some(TrancheCursor {
+                    current_tranche_index,
+                    next_tranche_index: current_tranche_index,
+                }),
+                config_snapshot: run.config_snapshot.clone(),
+            })
+        } else if run.state == RunState::RunFailed
+            && run.exit_reason == Some(crate::domain::ExitReason::BlockedGateFailure)
+        {
+            // All tasks completed but run-level gates failed. Emit a GateRetry
+            // tranche so the operator can re-verify after addressing the gate issue.
+            let all_task_keys: Vec<String> =
+                task_outcomes.iter().map(|o| o.task_key.clone()).collect();
+            Some(TrancheSpec {
+                suggested_objective: "Re-verify after gate failure (all tasks completed)"
+                    .to_string(),
+                kind: TrancheKind::GateRetry,
+                retry_task_keys: all_task_keys,
+                unfinished_task_keys: Vec::new(),
                 planned_task_keys: Vec::new(),
                 planned_tranche_key: None,
                 cursor: Some(TrancheCursor {
@@ -453,5 +477,77 @@ mod tests {
         assert_eq!(tranche.planned_tranche_key.as_deref(), Some("two"));
         assert!(tranche.retry_task_keys.is_empty());
         assert!(tranche.unfinished_task_keys.is_empty());
+    }
+
+    #[test]
+    fn build_payload_gate_retry_when_all_tasks_completed_but_run_failed_gate() {
+        let mut run = make_run();
+        run.state = RunState::RunFailed;
+        run.exit_reason = Some(ExitReason::BlockedGateFailure);
+        let mut t1 = make_task(&run, "build");
+        t1.state = TaskState::TaskComplete;
+        let mut t2 = make_task(&run, "test");
+        t2.state = TaskState::TaskComplete;
+
+        let payload = ContinuationPayload::build(&run, &[&t1, &t2]);
+
+        assert_eq!(payload.exit_state, RunState::RunFailed);
+        assert_eq!(payload.exit_reason, Some(ExitReason::BlockedGateFailure));
+        let tranche = payload
+            .next_tranche
+            .as_ref()
+            .expect("gate retry tranche expected");
+        assert_eq!(tranche.kind, TrancheKind::GateRetry);
+        assert_eq!(tranche.retry_task_keys, vec!["build", "test"]);
+        assert!(tranche.unfinished_task_keys.is_empty());
+        assert!(tranche.suggested_objective.contains("gate failure"));
+    }
+
+    #[test]
+    fn build_payload_no_gate_retry_when_tasks_also_failed() {
+        let mut run = make_run();
+        run.state = RunState::RunFailed;
+        run.exit_reason = Some(ExitReason::BlockedGateFailure);
+        let mut t1 = make_task(&run, "build");
+        t1.state = TaskState::TaskComplete;
+        let mut t2 = make_task(&run, "test");
+        t2.state = TaskState::TaskFailed;
+
+        let payload = ContinuationPayload::build(&run, &[&t1, &t2]);
+
+        // When tasks are failed, RetryUnfinished takes precedence over GateRetry
+        let tranche = payload.next_tranche.as_ref().unwrap();
+        assert_eq!(tranche.kind, TrancheKind::RetryUnfinished);
+        assert_eq!(tranche.retry_task_keys, vec!["test"]);
+    }
+
+    #[test]
+    fn build_payload_no_gate_retry_when_run_failed_for_other_reason() {
+        let mut run = make_run();
+        run.state = RunState::RunFailed;
+        run.exit_reason = Some(ExitReason::FailedRuntimeError);
+        let mut t1 = make_task(&run, "build");
+        t1.state = TaskState::TaskComplete;
+
+        let payload = ContinuationPayload::build(&run, &[&t1]);
+
+        // Non-gate failures with all tasks complete → no next_tranche
+        assert!(payload.next_tranche.is_none());
+    }
+
+    #[test]
+    fn gate_retry_tranche_round_trips_through_json() {
+        let mut run = make_run();
+        run.state = RunState::RunFailed;
+        run.exit_reason = Some(ExitReason::BlockedGateFailure);
+        let mut t1 = make_task(&run, "build");
+        t1.state = TaskState::TaskComplete;
+
+        let payload = ContinuationPayload::build(&run, &[&t1]);
+        let json = serde_json::to_string(&payload).unwrap();
+        let roundtrip: ContinuationPayload = serde_json::from_str(&json).unwrap();
+
+        let tranche = roundtrip.next_tranche.as_ref().unwrap();
+        assert_eq!(tranche.kind, TrancheKind::GateRetry);
     }
 }

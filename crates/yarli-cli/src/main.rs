@@ -6,7 +6,7 @@ use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -595,6 +595,14 @@ enum Commands {
         action: AuditAction,
     },
     #[command(
+        about = "Manage the structured plan (tranches file)",
+        long_about = "Manage the structured plan in .yarli/tranches.toml.\n\nExamples:\n  yarli plan tranche add --key TP-05 --summary \"Config loader\"\n  yarli plan tranche complete --key TP-05\n  yarli plan tranche list\n  yarli plan tranche remove --key TP-05\n  yarli plan validate"
+    )]
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+    #[command(
         about = "Initialize yarli.toml with a documented template",
         long_about = INIT_LONG_ABOUT
     )]
@@ -910,6 +918,56 @@ enum AuditAction {
     },
 }
 
+#[derive(Subcommand)]
+enum PlanAction {
+    #[command(
+        about = "Manage structured tranches",
+        long_about = "Manage structured tranches in .yarli/tranches.toml.\n\nExamples:\n  yarli plan tranche add --key TP-05 --summary \"Config loader\"\n  yarli plan tranche complete --key TP-05\n  yarli plan tranche list\n  yarli plan tranche remove --key TP-05"
+    )]
+    Tranche {
+        #[command(subcommand)]
+        action: TrancheAction,
+    },
+    #[command(
+        about = "Validate the structured tranches file",
+        long_about = "Validate the structured tranches file (.yarli/tranches.toml).\n\nChecks all tranche keys for validity, detects duplicates, and reports errors.\n\nExamples:\n  yarli plan validate"
+    )]
+    Validate,
+}
+
+#[derive(Subcommand)]
+enum TrancheAction {
+    #[command(about = "Add a new tranche definition")]
+    Add {
+        /// Tranche key (e.g. TP-05, M3A, CARD-001).
+        #[arg(short, long)]
+        key: String,
+        /// Short summary describing the tranche objective.
+        #[arg(short, long)]
+        summary: String,
+        /// Optional tranche group for grouped dispatch.
+        #[arg(short, long)]
+        group: Option<String>,
+        /// Optional comma-separated allowed paths for scope enforcement.
+        #[arg(short, long, value_delimiter = ',')]
+        allowed_paths: Vec<String>,
+    },
+    #[command(about = "Mark a tranche as complete")]
+    Complete {
+        /// Tranche key to mark complete.
+        #[arg(short, long)]
+        key: String,
+    },
+    #[command(about = "List all tranches")]
+    List,
+    #[command(about = "Remove a tranche definition")]
+    Remove {
+        /// Tranche key to remove.
+        #[arg(short, long)]
+        key: String,
+    },
+}
+
 #[derive(Clone)]
 enum SelectedCommandRunner {
     Native(LocalCommandRunner),
@@ -1147,6 +1205,20 @@ async fn run() -> Result<()> {
                 category,
             } => cmd_audit_tail(&file, lines, category.as_deref()),
         },
+        Commands::Plan { action } => match action {
+            PlanAction::Tranche { action } => match action {
+                TrancheAction::Add {
+                    key,
+                    summary,
+                    group,
+                    allowed_paths,
+                } => cmd_plan_tranche_add(&key, &summary, group.as_deref(), &allowed_paths),
+                TrancheAction::Complete { key } => cmd_plan_tranche_complete(&key),
+                TrancheAction::List => cmd_plan_tranche_list(),
+                TrancheAction::Remove { key } => cmd_plan_tranche_remove(&key),
+            },
+            PlanAction::Validate => cmd_plan_validate(),
+        },
         Commands::Init { .. } => unreachable!("init command handled before runtime config load"),
         Commands::Info => {
             // `info` should report capabilities even if the current terminal
@@ -1228,6 +1300,22 @@ struct RunExecutionOutcome {
     run_id: Uuid,
     run_state: RunState,
     continuation_payload: yarli_core::entities::ContinuationPayload,
+    token_totals: RunTokenTotals,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RunTokenTotals {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IterationMetrics {
+    iteration: usize,
+    run_id: Uuid,
+    duration: Duration,
+    token_totals: RunTokenTotals,
 }
 
 #[derive(Debug, Clone)]
@@ -1257,6 +1345,51 @@ struct ImplementationPlanEntry {
     is_complete: bool,
     tranche_group: Option<String>,
     allowed_paths: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Structured tranches file (.yarli/tranches.toml)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TrancheStatus {
+    Incomplete,
+    Complete,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TrancheDefinition {
+    key: String,
+    summary: String,
+    status: TrancheStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TranchesFile {
+    version: u32,
+    #[serde(default)]
+    tranches: Vec<TrancheDefinition>,
+}
+
+impl TranchesFile {
+    fn to_entries(&self) -> Vec<ImplementationPlanEntry> {
+        self.tranches
+            .iter()
+            .map(|def| ImplementationPlanEntry {
+                key: def.key.clone(),
+                summary: def.summary.clone(),
+                is_complete: def.status == TrancheStatus::Complete,
+                tranche_group: def.group.clone(),
+                allowed_paths: def.allowed_paths.clone(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2702,12 +2835,56 @@ fn build_plan_driven_run_sequence(
     objective: &str,
 ) -> Result<(Vec<PlannedTask>, Vec<PlannedTranche>)> {
     let plan_path = plan_path_for_prompt_entry(&loaded_prompt.entry_path)?;
+    let tranches_base_dir = plan_path
+        .parent()
+        .context("plan file has no parent directory")?;
     let plan_text = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read plan file {}", plan_path.display()))?;
-    let open_tranches: Vec<ImplementationPlanEntry> = discover_plan_dispatch_entries(&plan_text)
-        .into_iter()
-        .filter(|entry| !entry.is_complete)
-        .collect();
+
+    let open_tranches: Vec<ImplementationPlanEntry> = match read_tranches_file_in(tranches_base_dir)
+    {
+        Ok(Some(tf)) => {
+            info!(
+                count = tf.tranches.len(),
+                tranches_file = %tranches_file_path(tranches_base_dir).display(),
+                "using structured tranches file"
+            );
+            tf.to_entries()
+                .into_iter()
+                .filter(|e| !e.is_complete)
+                .collect()
+        }
+        Ok(None) => {
+            debug!(
+                tranches_file = %tranches_file_path(tranches_base_dir).display(),
+                "no structured tranches file, falling back to markdown parsing"
+            );
+            discover_plan_dispatch_entries(&plan_text)
+                .into_iter()
+                .filter(|e| !e.is_complete)
+                .collect()
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                tranches_file = %tranches_file_path(tranches_base_dir).display(),
+                "malformed tranches file, falling back to markdown parsing"
+            );
+            discover_plan_dispatch_entries(&plan_text)
+                .into_iter()
+                .filter(|e| !e.is_complete)
+                .collect()
+        }
+    };
+
+    if open_tranches.is_empty() && plan_text.len() > 50 {
+        let total_parsed = discover_plan_dispatch_entries(&plan_text).len();
+        warn!(
+            plan_lines = plan_text.lines().count(),
+            parsed_entries = total_parsed,
+            "no open tranches found in plan — dispatch will be verification-only"
+        );
+    }
 
     let cli_invocation = resolve_cli_invocation_config(loaded_config)?;
     let mut task_catalog = Vec::new();
@@ -2983,7 +3160,54 @@ fn build_tranche_plan_from_run_spec(
         bail!("run spec must resolve to at least one tranche");
     }
 
+    validate_tranche_keys(&tranches)?;
+
     Ok(tranches)
+}
+
+/// Reject tranche keys that look like stale legacy artifacts leaked from handoff docs.
+///
+/// Stale patterns:
+/// - UUID-formatted keys (e.g. `550e8400-e29b-41d4-a716-446655440000`)
+/// - `run-*`, `app-*`, `Target-*` prefixed keys
+/// - Empty or whitespace-only keys
+fn validate_tranche_keys(tranches: &[PlannedTranche]) -> Result<()> {
+    for tranche in tranches {
+        let key = tranche.key.trim();
+        if key.is_empty() {
+            bail!("tranche key must not be empty");
+        }
+        if looks_like_uuid(key) {
+            bail!(
+                "tranche key '{}' looks like a stale UUID — use a descriptive key instead",
+                key
+            );
+        }
+        let lower = key.to_ascii_lowercase();
+        for prefix in &["run-", "app-", "target-"] {
+            if lower.starts_with(prefix) {
+                bail!(
+                    "tranche key '{}' uses reserved prefix '{}' — use a descriptive key instead",
+                    key,
+                    prefix.trim_end_matches('-')
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check if a string looks like a UUID (8-4-4-4-12 hex pattern).
+fn looks_like_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let expected_lens = [8, 4, 4, 4, 12];
+    parts
+        .iter()
+        .zip(expected_lens.iter())
+        .all(|(part, &len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn tasks_for_tranche(
@@ -3123,6 +3347,16 @@ fn parse_current_tranche_index_from_snapshot(config_snapshot: &serde_json::Value
     usize::try_from(value).ok()
 }
 
+fn parse_prompt_snapshot_from_snapshot(
+    config_snapshot: &serde_json::Value,
+) -> Option<prompt::PromptSnapshot> {
+    let prompt_value = config_snapshot.get("runtime")?.get("prompt")?;
+    if prompt_value.is_null() {
+        return None;
+    }
+    serde_json::from_value(prompt_value.clone()).ok()
+}
+
 async fn cmd_run_start(
     plan: RunPlan,
     render_mode: RenderMode,
@@ -3194,7 +3428,22 @@ fn finalize_run_outcome(outcome: &RunExecutionOutcome) -> Result<()> {
             println!("Run {} completed successfully.", outcome.run_id);
             Ok(())
         }
-        RunState::RunFailed => bail!("Run {} failed.", outcome.run_id),
+        RunState::RunFailed => {
+            if outcome
+                .continuation_payload
+                .next_tranche
+                .as_ref()
+                .is_some_and(|t| {
+                    t.kind == yarli_core::entities::continuation::TrancheKind::GateRetry
+                })
+            {
+                eprintln!(
+                    "Hint: all tasks completed but run-level gates failed. \
+                     Use `yarli run continue` to re-verify after addressing the gate issue."
+                );
+            }
+            bail!("Run {} failed.", outcome.run_id)
+        }
         RunState::RunCancelled => {
             println!("Run {} cancelled.", outcome.run_id);
             process::exit(130);
@@ -3254,6 +3503,12 @@ fn print_run_summary(outcome: &RunExecutionOutcome) {
         "  Tasks:       {} completed, {} failed, {} pending",
         summary.completed, summary.failed, summary.pending
     );
+    println!(
+        "  Tokens:      total={} (prompt={} completion={})",
+        outcome.token_totals.total_tokens,
+        outcome.token_totals.prompt_tokens,
+        outcome.token_totals.completion_tokens
+    );
     println!("  Duration:    {duration_str}");
 
     // Show failed tasks with their blocker/error
@@ -3273,6 +3528,76 @@ fn print_run_summary(outcome: &RunExecutionOutcome) {
 
     println!("{bar}");
     println!();
+}
+
+fn format_wall_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins > 0 {
+        format!("{mins}m {secs:02}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn print_iteration_metrics(iteration: usize, outcome: &RunExecutionOutcome, duration: Duration) {
+    let tokens = outcome.token_totals;
+    println!(
+        "Iteration {iteration} metrics: run_id={} tokens total={} (prompt={} completion={}), duration={}",
+        outcome.run_id,
+        tokens.total_tokens,
+        tokens.prompt_tokens,
+        tokens.completion_tokens,
+        format_wall_duration(duration)
+    );
+}
+
+fn print_invocation_summary(iterations: &[IterationMetrics]) {
+    if iterations.is_empty() {
+        return;
+    }
+
+    let tranche_count = iterations.len();
+    let first_iteration = iterations.first().map(|item| item.iteration).unwrap_or(1);
+    let last_iteration = iterations.last().map(|item| item.iteration).unwrap_or(1);
+    let last_run_id = iterations
+        .last()
+        .map(|item| item.run_id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let total_prompt_tokens: u64 = iterations
+        .iter()
+        .map(|item| item.token_totals.prompt_tokens)
+        .sum();
+    let total_completion_tokens: u64 = iterations
+        .iter()
+        .map(|item| item.token_totals.completion_tokens)
+        .sum();
+    let total_tokens: u64 = iterations
+        .iter()
+        .map(|item| item.token_totals.total_tokens)
+        .sum();
+    let total_duration = iterations.iter().fold(Duration::ZERO, |acc, item| {
+        acc.saturating_add(item.duration)
+    });
+    let avg_duration = if tranche_count == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(total_duration.as_secs_f64() / tranche_count as f64)
+    };
+
+    println!(
+        "Final invocation summary: iterations={}..{} tranches={} total_tokens={} (prompt={} completion={}) total_duration={} avg_per_tranche={} last_run={}",
+        first_iteration,
+        last_iteration,
+        tranche_count,
+        total_tokens,
+        total_prompt_tokens,
+        total_completion_tokens,
+        format_wall_duration(total_duration),
+        format_wall_duration(avg_duration),
+        last_run_id,
+    );
 }
 
 fn uuid_v7_timestamp(id: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -3374,9 +3699,20 @@ fn build_plan_from_continuation_tranche(
         workdir,
         timeout_secs,
         pace: None,
-        prompt_snapshot: None,
+        prompt_snapshot: parse_prompt_snapshot_from_snapshot(&tranche.config_snapshot),
         run_spec: None,
-        tranche_plan: parse_tranche_plan_from_snapshot(&tranche.config_snapshot),
+        tranche_plan: {
+            let parsed = parse_tranche_plan_from_snapshot(&tranche.config_snapshot);
+            if let Err(e) = validate_tranche_keys(&parsed) {
+                warn!(error = %e, "continuation snapshot contains invalid tranche keys; filtering");
+                parsed
+                    .into_iter()
+                    .filter(|t| !t.key.trim().is_empty())
+                    .collect()
+            } else {
+                parsed
+            }
+        },
         current_tranche_index,
     })
 }
@@ -3883,14 +4219,7 @@ fn parse_plan_tranche_header_line(line: &str) -> Option<ImplementationPlanEntry>
         .next()
         .unwrap_or_default()
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
-    // Contract: `<ordinal>. I<id> ...: <status>.`
-    if key_token.is_empty()
-        || !key_token
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.eq_ignore_ascii_case(&'I'))
-        || !token_has_alpha_and_digit(key_token)
-    {
+    if key_token.is_empty() || !token_has_alpha_and_digit(key_token) || looks_like_uuid(key_token) {
         return None;
     }
 
@@ -3903,6 +4232,257 @@ fn parse_plan_tranche_header_line(line: &str) -> Option<ImplementationPlanEntry>
     })
 }
 
+// ---------------------------------------------------------------------------
+// Structured tranches file I/O
+// ---------------------------------------------------------------------------
+
+const TRANCHES_FILE: &str = ".yarli/tranches.toml";
+
+fn tranches_file_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(TRANCHES_FILE)
+}
+
+fn read_tranches_file_in(base_dir: &Path) -> Result<Option<TranchesFile>> {
+    let path = tranches_file_path(base_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let tf: TranchesFile =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    if tf.version != 1 {
+        bail!(
+            "{}: unsupported version {} (expected 1)",
+            path.display(),
+            tf.version
+        );
+    }
+    Ok(Some(tf))
+}
+
+fn read_tranches_file() -> Result<Option<TranchesFile>> {
+    let cwd = std::env::current_dir().context("failed to read current working directory")?;
+    read_tranches_file_in(&cwd)
+}
+
+fn write_tranches_file_in(base_dir: &Path, tf: &TranchesFile) -> Result<()> {
+    let path = tranches_file_path(base_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    let content = toml::to_string_pretty(tf).context("failed to serialize tranches file")?;
+    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn write_tranches_file(tf: &TranchesFile) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to read current working directory")?;
+    write_tranches_file_in(&cwd, tf)
+}
+
+fn maybe_mark_current_structured_tranche_complete(plan: &RunPlan) -> Result<bool> {
+    let Some(current_index) = plan.current_tranche_index else {
+        return Ok(false);
+    };
+    let Some(current_tranche) = plan.tranche_plan.get(current_index) else {
+        return Ok(false);
+    };
+    if current_tranche.key.eq_ignore_ascii_case("verification") {
+        return Ok(false);
+    }
+
+    let Some(prompt_snapshot) = plan.prompt_snapshot.as_ref() else {
+        return Ok(false);
+    };
+    let prompt_entry_path = PathBuf::from(&prompt_snapshot.entry_path);
+    let plan_path = plan_path_for_prompt_entry(&prompt_entry_path)?;
+    let tranches_base_dir = plan_path
+        .parent()
+        .context("plan file has no parent directory")?;
+    let tranches_path = tranches_file_path(tranches_base_dir);
+
+    let Some(mut tf) = read_tranches_file_in(tranches_base_dir)? else {
+        return Ok(false);
+    };
+    let Some(def) = tf
+        .tranches
+        .iter_mut()
+        .find(|def| def.key.eq_ignore_ascii_case(&current_tranche.key))
+    else {
+        debug!(
+            tranche_key = %current_tranche.key,
+            tranches_file = %tranches_path.display(),
+            "current tranche key not found in structured tranches file"
+        );
+        return Ok(false);
+    };
+    if def.status == TrancheStatus::Complete {
+        return Ok(false);
+    }
+
+    def.status = TrancheStatus::Complete;
+    let completed_key = def.key.clone();
+    write_tranches_file_in(tranches_base_dir, &tf)?;
+    info!(
+        tranche_key = %completed_key,
+        tranches_file = %tranches_path.display(),
+        "auto-marked structured tranche as complete"
+    );
+    Ok(true)
+}
+
+fn validate_tranche_definition(def: &TrancheDefinition) -> Result<()> {
+    let key = def.key.trim();
+    if key.is_empty() {
+        bail!("tranche key must not be empty");
+    }
+    if looks_like_uuid(key) {
+        bail!(
+            "tranche key '{}' looks like a stale UUID — use a descriptive key instead",
+            key
+        );
+    }
+    let lower = key.to_ascii_lowercase();
+    for prefix in &["run-", "app-", "target-"] {
+        if lower.starts_with(prefix) {
+            bail!(
+                "tranche key '{}' uses reserved prefix '{}' — use a descriptive key instead",
+                key,
+                prefix.trim_end_matches('-')
+            );
+        }
+    }
+    if !token_has_alpha_and_digit(key) {
+        bail!("tranche key '{}' must contain both letters and digits", key);
+    }
+    if def.summary.trim().is_empty() {
+        bail!("tranche summary must not be empty");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `yarli plan` command handlers
+// ---------------------------------------------------------------------------
+
+fn cmd_plan_tranche_add(
+    key: &str,
+    summary: &str,
+    group: Option<&str>,
+    allowed_paths: &[String],
+) -> Result<()> {
+    let def = TrancheDefinition {
+        key: key.to_string(),
+        summary: summary.to_string(),
+        status: TrancheStatus::Incomplete,
+        group: group.map(|g| g.to_string()),
+        allowed_paths: allowed_paths.to_vec(),
+    };
+    validate_tranche_definition(&def)?;
+
+    let mut tf = read_tranches_file()?.unwrap_or(TranchesFile {
+        version: 1,
+        tranches: Vec::new(),
+    });
+
+    if tf.tranches.iter().any(|t| t.key == key) {
+        bail!("tranche with key '{}' already exists", key);
+    }
+
+    tf.tranches.push(def);
+    write_tranches_file(&tf)?;
+    println!("Added tranche '{key}'");
+    Ok(())
+}
+
+fn cmd_plan_tranche_complete(key: &str) -> Result<()> {
+    let mut tf = read_tranches_file()?
+        .ok_or_else(|| anyhow::anyhow!("no tranches file found at {TRANCHES_FILE}"))?;
+
+    let entry = tf
+        .tranches
+        .iter_mut()
+        .find(|t| t.key == key)
+        .ok_or_else(|| anyhow::anyhow!("tranche with key '{}' not found", key))?;
+
+    entry.status = TrancheStatus::Complete;
+    write_tranches_file(&tf)?;
+    println!("Marked tranche '{key}' as complete");
+    Ok(())
+}
+
+fn cmd_plan_tranche_list() -> Result<()> {
+    let tf = read_tranches_file()?
+        .ok_or_else(|| anyhow::anyhow!("no tranches file found at {TRANCHES_FILE}"))?;
+
+    if tf.tranches.is_empty() {
+        println!("No tranches defined.");
+        return Ok(());
+    }
+
+    for def in &tf.tranches {
+        let marker = match def.status {
+            TrancheStatus::Complete => "[x]",
+            TrancheStatus::Incomplete => "[ ]",
+            TrancheStatus::Blocked => "[~]",
+        };
+        let group_suffix = def
+            .group
+            .as_ref()
+            .map(|g| format!("  (group: {g})"))
+            .unwrap_or_default();
+        println!("{marker} {}: {}{group_suffix}", def.key, def.summary);
+    }
+    Ok(())
+}
+
+fn cmd_plan_tranche_remove(key: &str) -> Result<()> {
+    let mut tf = read_tranches_file()?
+        .ok_or_else(|| anyhow::anyhow!("no tranches file found at {TRANCHES_FILE}"))?;
+
+    let before = tf.tranches.len();
+    tf.tranches.retain(|t| t.key != key);
+    if tf.tranches.len() == before {
+        bail!("tranche with key '{}' not found", key);
+    }
+
+    write_tranches_file(&tf)?;
+    println!("Removed tranche '{key}'");
+    Ok(())
+}
+
+fn cmd_plan_validate() -> Result<()> {
+    let tf = read_tranches_file()?
+        .ok_or_else(|| anyhow::anyhow!("no tranches file found at {TRANCHES_FILE}"))?;
+
+    let mut errors = Vec::new();
+    let mut seen_keys = HashSet::new();
+
+    for (i, def) in tf.tranches.iter().enumerate() {
+        if let Err(e) = validate_tranche_definition(def) {
+            errors.push(format!("tranches[{}] (key='{}'): {}", i, def.key, e));
+        }
+        if !seen_keys.insert(&def.key) {
+            errors.push(format!("tranches[{}]: duplicate key '{}'", i, def.key));
+        }
+    }
+
+    if errors.is_empty() {
+        println!(
+            "Tranches file is valid ({} tranches defined).",
+            tf.tranches.len()
+        );
+        Ok(())
+    } else {
+        for err in &errors {
+            eprintln!("  error: {err}");
+        }
+        bail!("{TRANCHES_FILE} has {} validation error(s)", errors.len());
+    }
+}
+
 fn discover_plan_dispatch_entries(plan_text: &str) -> Vec<ImplementationPlanEntry> {
     let mut in_next_work_tranches = false;
     let mut saw_next_work_tranches_header = false;
@@ -3911,7 +4491,10 @@ fn discover_plan_dispatch_entries(plan_text: &str) -> Vec<ImplementationPlanEntr
     for line in plan_text.lines() {
         let trimmed = line.trim();
         if !in_next_work_tranches {
-            if trimmed.eq_ignore_ascii_case("## Next Work Tranches") {
+            let header_text = trimmed.trim_start_matches('#').trim();
+            if header_text.eq_ignore_ascii_case("Next Work Tranches")
+                || header_text.eq_ignore_ascii_case("Next Priority Actions")
+            {
                 in_next_work_tranches = true;
                 saw_next_work_tranches_header = true;
             }
@@ -4243,6 +4826,7 @@ async fn cmd_run_continue(
     let mut plan = build_plan_from_continuation_tranche(&tranche, loaded_config)?;
     let mut iteration = 1usize;
     let mut advances_taken = 0usize;
+    let mut iteration_metrics: Vec<IterationMetrics> = Vec::new();
     loop {
         info!(
             objective = %plan.objective,
@@ -4251,6 +4835,7 @@ async fn cmd_run_continue(
             iteration,
             "continuing from previous run"
         );
+        let iteration_started_at = Instant::now();
         let outcome = execute_run_plan(
             plan.clone(),
             render_mode,
@@ -4258,7 +4843,16 @@ async fn cmd_run_continue(
             allow_recursive_run_override,
         )
         .await?;
+        let duration = iteration_started_at.elapsed();
+        print_iteration_metrics(iteration, &outcome, duration);
+        iteration_metrics.push(IterationMetrics {
+            iteration,
+            run_id: outcome.run_id,
+            duration,
+            token_totals: outcome.token_totals,
+        });
         if outcome.run_state != RunState::RunCompleted {
+            print_invocation_summary(&iteration_metrics);
             return finalize_run_outcome(&outcome);
         }
 
@@ -4272,10 +4866,12 @@ async fn cmd_run_continue(
             if reason != "no next tranche available" {
                 println!("Auto-advance stopped: {reason}");
             }
+            print_invocation_summary(&iteration_metrics);
             return finalize_run_outcome(&outcome);
         }
 
         let Some(next) = outcome.continuation_payload.next_tranche.as_ref() else {
+            print_invocation_summary(&iteration_metrics);
             return finalize_run_outcome(&outcome);
         };
 
@@ -4410,6 +5006,7 @@ async fn cmd_run_default(
 
     let mut iteration = 1usize;
     let mut advances_taken = 0usize;
+    let mut iteration_metrics: Vec<IterationMetrics> = Vec::new();
     loop {
         info!(
             objective = %plan.objective,
@@ -4418,6 +5015,7 @@ async fn cmd_run_default(
             iteration,
             "running prompt-defined tranche"
         );
+        let iteration_started_at = Instant::now();
         let outcome = execute_run_plan(
             plan.clone(),
             render_mode,
@@ -4425,7 +5023,16 @@ async fn cmd_run_default(
             allow_recursive_run_override,
         )
         .await?;
+        let duration = iteration_started_at.elapsed();
+        print_iteration_metrics(iteration, &outcome, duration);
+        iteration_metrics.push(IterationMetrics {
+            iteration,
+            run_id: outcome.run_id,
+            duration,
+            token_totals: outcome.token_totals,
+        });
         if outcome.run_state != RunState::RunCompleted {
+            print_invocation_summary(&iteration_metrics);
             return finalize_run_outcome(&outcome);
         }
         if verification_only_dispatch && advances_taken == 0 {
@@ -4438,6 +5045,7 @@ async fn cmd_run_default(
             if let Some(context) = plan_guard_context.as_ref() {
                 enforce_plan_guard_post_run(&loaded, context)?;
             }
+            print_invocation_summary(&iteration_metrics);
             return finalize_run_outcome(&outcome);
         }
 
@@ -4454,6 +5062,7 @@ async fn cmd_run_default(
             if let Some(context) = plan_guard_context.as_ref() {
                 enforce_plan_guard_post_run(&loaded, context)?;
             }
+            print_invocation_summary(&iteration_metrics);
             return finalize_run_outcome(&outcome);
         }
 
@@ -4461,6 +5070,7 @@ async fn cmd_run_default(
             if let Some(context) = plan_guard_context.as_ref() {
                 enforce_plan_guard_post_run(&loaded, context)?;
             }
+            print_invocation_summary(&iteration_metrics);
             return finalize_run_outcome(&outcome);
         };
         println!(
@@ -4869,10 +5479,33 @@ where
         return Err(err);
     }
 
+    if continuation_payload.exit_state == RunState::RunCompleted {
+        if let Err(err) = maybe_mark_current_structured_tranche_complete(&plan) {
+            warn!(
+                run_id = %run_id,
+                error = %err,
+                "failed to auto-complete structured tranche status"
+            );
+        }
+    }
+
+    let token_totals = match collect_run_token_totals(store.as_ref(), correlation_id) {
+        Ok(totals) => totals,
+        Err(err) => {
+            warn!(
+                run_id = %run_id,
+                error = %err,
+                "failed to collect run token totals"
+            );
+            RunTokenTotals::default()
+        }
+    };
+
     Ok(RunExecutionOutcome {
         run_id,
         run_state: continuation_payload.exit_state,
         continuation_payload,
+        token_totals,
     })
 }
 
@@ -7545,6 +8178,44 @@ fn append_event(store: &dyn EventStore, event: Event) -> Result<()> {
     store
         .append(event)
         .map_err(|e| anyhow::anyhow!("failed to append event: {e}"))
+}
+
+fn collect_run_token_totals(
+    store: &dyn EventStore,
+    correlation_id: Uuid,
+) -> Result<RunTokenTotals> {
+    let events = query_events(store, &EventQuery::by_correlation(correlation_id))?;
+    let mut totals = RunTokenTotals::default();
+    let mut seen_command_ids: HashSet<String> = HashSet::new();
+
+    for event in events {
+        if event.entity_type != EntityType::Command {
+            continue;
+        }
+        if !matches!(
+            event.event_type.as_str(),
+            "command.exited" | "command.timed_out" | "command.killed" | "command.completed"
+        ) {
+            continue;
+        }
+        if !seen_command_ids.insert(event.entity_id.clone()) {
+            continue;
+        }
+
+        let Some(raw_usage) = event.payload.get("token_usage").cloned() else {
+            continue;
+        };
+        let Ok(usage) = serde_json::from_value::<TokenUsage>(raw_usage) else {
+            continue;
+        };
+        totals.prompt_tokens = totals.prompt_tokens.saturating_add(usage.prompt_tokens);
+        totals.completion_tokens = totals
+            .completion_tokens
+            .saturating_add(usage.completion_tokens);
+        totals.total_tokens = totals.total_tokens.saturating_add(usage.total_tokens);
+    }
+
+    Ok(totals)
 }
 
 fn run_state_from_event(event: &Event) -> Option<RunState> {
@@ -14055,6 +14726,78 @@ prompt_mode = "arg"
     }
 
     #[test]
+    fn plan_driven_sequence_uses_tranches_file_near_resolved_plan_not_cwd() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement active plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] MD-99 markdown tranche\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "ST-01"
+summary = "Structured tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let decoy_cwd = TempDir::new().unwrap();
+        std::fs::create_dir_all(decoy_cwd.path().join(".yarli")).unwrap();
+        std::fs::write(
+            decoy_cwd.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "WRONG-99"
+summary = "Decoy tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &repo.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&repo.path().join("PROMPT.md")).unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(decoy_cwd.path()).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
+                .unwrap();
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tranches.len(), 2);
+        assert_eq!(tranches[0].key, "ST-01");
+        assert_eq!(tranches[1].key, "verification");
+    }
+
+    #[test]
     fn plan_driven_sequence_runs_verification_only_when_no_open_tranches() {
         let temp = TempDir::new().unwrap();
         std::fs::write(
@@ -17828,6 +18571,7 @@ allow_in_memory_writes = true
         use yarli_core::entities::continuation::{TrancheKind, TrancheSpec};
 
         let loaded = write_test_config("");
+        let prompt_entry_path = "/tmp/project/PROMPT.md";
         let tranche = TrancheSpec {
             suggested_objective: "planned-next".into(),
             kind: TrancheKind::PlannedNext,
@@ -17855,7 +18599,12 @@ allow_in_memory_writes = true
                         {"key": "one", "objective": "first", "task_keys": ["one_task"]},
                         {"key": "two", "objective": "second", "task_keys": ["two_task", "three_task"], "tranche_group": "core"}
                     ],
-                    "current_tranche_index": 0
+                    "current_tranche_index": 0,
+                    "prompt": {
+                        "entry_path": prompt_entry_path,
+                        "expanded_sha256": "abc123",
+                        "included_files": []
+                    }
                 }
             }),
         };
@@ -17868,6 +18617,12 @@ allow_in_memory_writes = true
         assert_eq!(plan.tasks[1].command, "echo third");
         assert_eq!(plan.tranche_plan[1].tranche_group.as_deref(), Some("core"));
         assert_eq!(plan.current_tranche_index, Some(1));
+        assert_eq!(
+            plan.prompt_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.entry_path.as_str()),
+            Some(prompt_entry_path)
+        );
     }
 
     #[test]
@@ -18112,6 +18867,59 @@ allow_in_memory_writes = true
     }
 
     #[test]
+    fn auto_advance_blocks_gate_retry_tranche() {
+        use yarli_core::entities::continuation::{
+            ContinuationPayload, ContinuationQualityGate, RunSummary, TrancheKind, TrancheSpec,
+        };
+
+        let payload = ContinuationPayload {
+            run_id: Uuid::new_v4(),
+            objective: "x".into(),
+            exit_state: RunState::RunFailed,
+            exit_reason: Some(yarli_core::domain::ExitReason::BlockedGateFailure),
+            cancellation_source: None,
+            cancellation_provenance: None,
+            completed_at: Utc::now(),
+            tasks: Vec::new(),
+            summary: RunSummary {
+                total: 2,
+                completed: 2,
+                failed: 0,
+                cancelled: 0,
+                pending: 0,
+            },
+            next_tranche: Some(TrancheSpec {
+                suggested_objective: "Re-verify after gate failure".into(),
+                kind: TrancheKind::GateRetry,
+                retry_task_keys: vec!["build".into(), "test".into()],
+                unfinished_task_keys: Vec::new(),
+                planned_task_keys: Vec::new(),
+                planned_tranche_key: None,
+                cursor: None,
+                config_snapshot: serde_json::json!({}),
+            }),
+            quality_gate: Some(ContinuationQualityGate {
+                allow_auto_advance: true,
+                reason: "improving".into(),
+                trend: Some(DeteriorationTrend::Improving),
+                score: Some(5.0),
+            }),
+        };
+
+        // GateRetry is not PlannedNext, so auto-advance should be blocked
+        let (allow, reason) = should_auto_advance_planned_tranche(
+            &payload,
+            AutoAdvanceConfig {
+                policy: AutoAdvancePolicy::ImprovingOnly,
+                max_tranches: 0,
+            },
+            0,
+        );
+        assert!(!allow);
+        assert!(reason.contains("retry/unfinished, not planned-next"));
+    }
+
+    #[test]
     fn verification_only_dispatch_detects_single_verification_tranche() {
         let plan = vec![PlannedTranche {
             key: "verification".to_string(),
@@ -18139,6 +18947,103 @@ allow_in_memory_writes = true
             },
         ];
         assert!(!is_verification_only_dispatch(&plan));
+    }
+
+    #[test]
+    fn validate_tranche_keys_rejects_uuid() {
+        let tranches = vec![PlannedTranche {
+            key: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            objective: "test".to_string(),
+            task_keys: vec!["task-001".to_string()],
+            tranche_group: None,
+        }];
+        let err = validate_tranche_keys(&tranches).unwrap_err();
+        assert!(
+            format!("{err}").contains("stale UUID"),
+            "expected UUID rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_tranche_keys_rejects_run_prefix() {
+        let tranches = vec![PlannedTranche {
+            key: "run-abc-123".to_string(),
+            objective: "test".to_string(),
+            task_keys: vec!["task-001".to_string()],
+            tranche_group: None,
+        }];
+        let err = validate_tranche_keys(&tranches).unwrap_err();
+        assert!(
+            format!("{err}").contains("reserved prefix"),
+            "expected prefix rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_tranche_keys_rejects_app_prefix() {
+        let tranches = vec![PlannedTranche {
+            key: "app-main-deploy".to_string(),
+            objective: "test".to_string(),
+            task_keys: vec!["task-001".to_string()],
+            tranche_group: None,
+        }];
+        assert!(validate_tranche_keys(&tranches).is_err());
+    }
+
+    #[test]
+    fn validate_tranche_keys_rejects_target_prefix() {
+        let tranches = vec![PlannedTranche {
+            key: "Target-production".to_string(),
+            objective: "test".to_string(),
+            task_keys: vec!["task-001".to_string()],
+            tranche_group: None,
+        }];
+        assert!(validate_tranche_keys(&tranches).is_err());
+    }
+
+    #[test]
+    fn validate_tranche_keys_rejects_empty() {
+        let tranches = vec![PlannedTranche {
+            key: "  ".to_string(),
+            objective: "test".to_string(),
+            task_keys: vec!["task-001".to_string()],
+            tranche_group: None,
+        }];
+        assert!(validate_tranche_keys(&tranches).is_err());
+    }
+
+    #[test]
+    fn validate_tranche_keys_allows_valid_keys() {
+        let tranches = vec![
+            PlannedTranche {
+                key: "build-and-test".to_string(),
+                objective: "build".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            },
+            PlannedTranche {
+                key: "verification".to_string(),
+                objective: "verify".to_string(),
+                task_keys: vec!["verify-001".to_string()],
+                tranche_group: None,
+            },
+            PlannedTranche {
+                key: "I9".to_string(),
+                objective: "implement I9".to_string(),
+                task_keys: vec!["tranche-001".to_string()],
+                tranche_group: None,
+            },
+        ];
+        assert!(validate_tranche_keys(&tranches).is_ok());
+    }
+
+    #[test]
+    fn looks_like_uuid_detects_valid_uuids() {
+        assert!(looks_like_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(looks_like_uuid("ABCDEF00-1234-5678-9ABC-DEF012345678"));
+        assert!(!looks_like_uuid("not-a-uuid"));
+        assert!(!looks_like_uuid("build-and-test"));
+        assert!(!looks_like_uuid("550e8400e29b41d4a716446655440000")); // no dashes
     }
 
     #[test]
@@ -18211,6 +19116,76 @@ allow_in_memory_writes = true
         assert!(!entries[0].is_complete);
         assert_eq!(entries[1].key, "I8B");
         assert!(entries[1].is_complete);
+    }
+
+    #[test]
+    fn discover_plan_dispatch_entries_parses_tp_keys_under_next_work_tranches() {
+        let plan = r#"
+## Next Work Tranches
+1. TP-05 `Config loader`: incomplete.
+2. TP-06 `Validation pass`: incomplete.
+3. TP-07 `Finalize schema`: complete.
+"#;
+        let entries = discover_plan_dispatch_entries(plan);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].key, "TP-05");
+        assert!(!entries[0].is_complete);
+        assert_eq!(entries[1].key, "TP-06");
+        assert!(!entries[1].is_complete);
+        assert_eq!(entries[2].key, "TP-07");
+        assert!(entries[2].is_complete);
+    }
+
+    #[test]
+    fn discover_plan_dispatch_entries_recognizes_next_priority_actions_header() {
+        let plan = r#"
+### Next Priority Actions
+1. TP-01 `Bootstrap runner`: incomplete.
+2. TP-02 `Wire events`: incomplete.
+"#;
+        let entries = discover_plan_dispatch_entries(plan);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "TP-01");
+        assert!(!entries[0].is_complete);
+        assert_eq!(entries[1].key, "TP-02");
+        assert!(!entries[1].is_complete);
+    }
+
+    #[test]
+    fn discover_plan_dispatch_entries_mixed_complete_and_pending() {
+        let plan = r#"
+## Next Work Tranches
+1. TP-10 `Done task`: complete.
+2. TP-11 `Open task`: incomplete.
+3. TP-12 `Blocked task`: blocked.
+"#;
+        let entries = discover_plan_dispatch_entries(plan);
+        assert_eq!(entries.len(), 3);
+        let open: Vec<_> = entries.iter().filter(|e| !e.is_complete).collect();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].key, "TP-11");
+        assert_eq!(open[1].key, "TP-12");
+    }
+
+    #[test]
+    fn discover_plan_dispatch_entries_i_prefix_backward_compat() {
+        let plan = r#"
+## Next Work Tranches
+1. I5 `Legacy format`: incomplete.
+2. I6 `Also legacy`: complete.
+"#;
+        let entries = discover_plan_dispatch_entries(plan);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "I5");
+        assert!(!entries[0].is_complete);
+        assert_eq!(entries[1].key, "I6");
+        assert!(entries[1].is_complete);
+    }
+
+    #[test]
+    fn parse_plan_tranche_header_line_rejects_uuid_keys() {
+        let line = "1. 550e8400-e29b-41d4-a716-446655440000 `Some task`: incomplete.";
+        assert!(parse_plan_tranche_header_line(line).is_none());
     }
 
     #[test]
@@ -18351,5 +19326,356 @@ mode = "implement"
         .unwrap();
 
         enforce_plan_guard_post_run(&loaded, &context).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured tranches file tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tranches_file_toml_roundtrip() {
+        let tf = TranchesFile {
+            version: 1,
+            tranches: vec![
+                TrancheDefinition {
+                    key: "TP-05".to_string(),
+                    summary: "Config loader".to_string(),
+                    status: TrancheStatus::Incomplete,
+                    group: Some("runtime".to_string()),
+                    allowed_paths: vec!["src/main.rs".to_string(), "docs/".to_string()],
+                },
+                TrancheDefinition {
+                    key: "TP-06".to_string(),
+                    summary: "Validation pass".to_string(),
+                    status: TrancheStatus::Complete,
+                    group: None,
+                    allowed_paths: vec![],
+                },
+                TrancheDefinition {
+                    key: "TP-07".to_string(),
+                    summary: "Blocked work".to_string(),
+                    status: TrancheStatus::Blocked,
+                    group: None,
+                    allowed_paths: vec![],
+                },
+            ],
+        };
+
+        let serialized = toml::to_string_pretty(&tf).unwrap();
+        let deserialized: TranchesFile = toml::from_str(&serialized).unwrap();
+        assert_eq!(tf, deserialized);
+    }
+
+    #[test]
+    fn tranches_file_to_entries_conversion() {
+        let tf = TranchesFile {
+            version: 1,
+            tranches: vec![
+                TrancheDefinition {
+                    key: "TP-05".to_string(),
+                    summary: "Config loader".to_string(),
+                    status: TrancheStatus::Incomplete,
+                    group: Some("runtime".to_string()),
+                    allowed_paths: vec!["src/".to_string()],
+                },
+                TrancheDefinition {
+                    key: "TP-06".to_string(),
+                    summary: "Validation pass".to_string(),
+                    status: TrancheStatus::Complete,
+                    group: None,
+                    allowed_paths: vec![],
+                },
+                TrancheDefinition {
+                    key: "TP-07".to_string(),
+                    summary: "Blocked item".to_string(),
+                    status: TrancheStatus::Blocked,
+                    group: Some("infra".to_string()),
+                    allowed_paths: vec![],
+                },
+            ],
+        };
+
+        let entries = tf.to_entries();
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].key, "TP-05");
+        assert!(!entries[0].is_complete);
+        assert_eq!(entries[0].tranche_group, Some("runtime".to_string()));
+        assert_eq!(entries[0].allowed_paths, vec!["src/".to_string()]);
+
+        assert_eq!(entries[1].key, "TP-06");
+        assert!(entries[1].is_complete);
+        assert_eq!(entries[1].tranche_group, None);
+
+        // Blocked maps to is_complete = false
+        assert_eq!(entries[2].key, "TP-07");
+        assert!(!entries[2].is_complete);
+        assert_eq!(entries[2].tranche_group, Some("infra".to_string()));
+    }
+
+    #[test]
+    fn validate_tranche_definition_rejects_uuid() {
+        let def = TrancheDefinition {
+            key: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            summary: "Some task".to_string(),
+            status: TrancheStatus::Incomplete,
+            group: None,
+            allowed_paths: vec![],
+        };
+        let err = validate_tranche_definition(&def).unwrap_err();
+        assert!(format!("{err}").contains("UUID"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_tranche_definition_rejects_reserved_prefix() {
+        for prefix in &["run-abc1", "app-test2", "target-foo3"] {
+            let def = TrancheDefinition {
+                key: prefix.to_string(),
+                summary: "Some task".to_string(),
+                status: TrancheStatus::Incomplete,
+                group: None,
+                allowed_paths: vec![],
+            };
+            let err = validate_tranche_definition(&def).unwrap_err();
+            assert!(
+                format!("{err}").contains("reserved prefix"),
+                "key={prefix}, error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_tranche_definition_rejects_alpha_only() {
+        let def = TrancheDefinition {
+            key: "configloader".to_string(),
+            summary: "No digits".to_string(),
+            status: TrancheStatus::Incomplete,
+            group: None,
+            allowed_paths: vec![],
+        };
+        let err = validate_tranche_definition(&def).unwrap_err();
+        assert!(
+            format!("{err}").contains("letters and digits"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_tranche_definition_accepts_valid_keys() {
+        for key in &["TP-05", "M3A", "CARD-001", "step2b"] {
+            let def = TrancheDefinition {
+                key: key.to_string(),
+                summary: "Valid tranche".to_string(),
+                status: TrancheStatus::Incomplete,
+                group: None,
+                allowed_paths: vec![],
+            };
+            assert!(
+                validate_tranche_definition(&def).is_ok(),
+                "key={key} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn build_plan_driven_prefers_structured_file() {
+        let temp = TempDir::new().unwrap();
+        let yarli_dir = temp.path().join(".yarli");
+        std::fs::create_dir_all(&yarli_dir).unwrap();
+
+        // Write a structured tranches file with one incomplete tranche
+        let tf = TranchesFile {
+            version: 1,
+            tranches: vec![TrancheDefinition {
+                key: "ST-01".to_string(),
+                summary: "Structured tranche".to_string(),
+                status: TrancheStatus::Incomplete,
+                group: None,
+                allowed_paths: vec![],
+            }],
+        };
+        let toml_content = toml::to_string_pretty(&tf).unwrap();
+        std::fs::write(yarli_dir.join("tranches.toml"), &toml_content).unwrap();
+
+        // Write an IMPLEMENTATION_PLAN.md with a DIFFERENT tranche key
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n- [ ] MD-99 Markdown-only tranche\n",
+        )
+        .unwrap();
+
+        // chdir into the temp directory so read_tranches_file() finds the file
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let result = read_tranches_file();
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        let tf_read = result.unwrap().expect("should find tranches file");
+        let entries: Vec<ImplementationPlanEntry> = tf_read
+            .to_entries()
+            .into_iter()
+            .filter(|e| !e.is_complete)
+            .collect();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "ST-01");
+        assert_eq!(entries[0].summary, "Structured tranche");
+    }
+
+    #[test]
+    fn structured_fallback_to_markdown() {
+        // When no tranches file exists, read_tranches_file returns None and
+        // discover_plan_dispatch_entries should still work.
+        let temp = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let result = read_tranches_file();
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        assert!(
+            result.unwrap().is_none(),
+            "should return None when file missing"
+        );
+
+        // Verify markdown parsing still works independently
+        let plan = "## Next Work Tranches\n1. FB-01 `Fallback tranche`: incomplete.\n";
+        let entries = discover_plan_dispatch_entries(plan);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "FB-01");
+        assert!(!entries[0].is_complete);
+    }
+
+    #[test]
+    fn auto_complete_structured_tranche_marks_matching_key_using_prompt_root() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. ST-01 `Structured`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "ST-01"
+summary = "Structured tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let decoy_cwd = TempDir::new().unwrap();
+        std::fs::create_dir_all(decoy_cwd.path().join(".yarli")).unwrap();
+        std::fs::write(
+            decoy_cwd.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "ST-01"
+summary = "Decoy tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let plan = RunPlan {
+            objective: "implement active plan [ST-01]".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: ".".to_string(),
+            timeout_secs: 1,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "ST-01".to_string(),
+                objective: "implement active plan [ST-01]".to_string(),
+                task_keys: vec!["tranche-001-ST-01".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(decoy_cwd.path()).unwrap();
+        let updated = maybe_mark_current_structured_tranche_complete(&plan).unwrap();
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(updated, "structured tranche should be marked complete");
+
+        let repo_tf = read_tranches_file_in(repo.path()).unwrap().unwrap();
+        assert_eq!(repo_tf.tranches.len(), 1);
+        assert_eq!(repo_tf.tranches[0].status, TrancheStatus::Complete);
+
+        let decoy_tf = read_tranches_file_in(decoy_cwd.path()).unwrap().unwrap();
+        assert_eq!(decoy_tf.tranches.len(), 1);
+        assert_eq!(decoy_tf.tranches[0].status, TrancheStatus::Incomplete);
+    }
+
+    #[test]
+    fn auto_complete_structured_tranche_skips_verification_tranche() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. ST-01 `Structured`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "ST-01"
+summary = "Structured tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let plan = RunPlan {
+            objective: "verification".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: ".".to_string(),
+            timeout_secs: 1,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "verification".to_string(),
+                objective: "verification".to_string(),
+                task_keys: vec!["verification-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let updated = maybe_mark_current_structured_tranche_complete(&plan).unwrap();
+        assert!(
+            !updated,
+            "verification tranche should not alter structured file"
+        );
+
+        let repo_tf = read_tranches_file_in(repo.path()).unwrap().unwrap();
+        assert_eq!(repo_tf.tranches.len(), 1);
+        assert_eq!(repo_tf.tranches[0].status, TrancheStatus::Incomplete);
     }
 }

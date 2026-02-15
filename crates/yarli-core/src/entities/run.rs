@@ -137,7 +137,9 @@ impl Run {
         match state {
             RunState::RunCompleted => ExitReason::CompletedAllGates,
             RunState::RunFailed => {
-                if reason.contains("policy") {
+                if reason.contains("gate") {
+                    ExitReason::BlockedGateFailure
+                } else if reason.contains("policy") {
                     ExitReason::FailedPolicyDenial
                 } else if reason.contains("timeout") || reason.contains("timed_out") {
                     ExitReason::TimedOut

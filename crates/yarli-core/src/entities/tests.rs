@@ -109,6 +109,22 @@ mod run_tests {
     }
 
     #[test]
+    fn run_failure_with_gate_reason() {
+        let mut run = Run::new("obj", SafeMode::Execute);
+        run.transition(RunState::RunActive, "starting", "system", None)
+            .unwrap();
+
+        run.transition(
+            RunState::RunFailed,
+            "2 gate(s) failed: evidence_present: missing; tests_passed: not run",
+            "scheduler",
+            None,
+        )
+        .unwrap();
+        assert_eq!(run.exit_reason, Some(ExitReason::BlockedGateFailure));
+    }
+
+    #[test]
     fn run_terminal_state_rejects_transition() {
         let mut run = Run::new("obj", SafeMode::Execute);
         run.transition(RunState::RunActive, "starting", "system", None)
