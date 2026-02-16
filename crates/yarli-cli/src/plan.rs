@@ -86,11 +86,12 @@ pub(crate) use crate::tranche::{
     cmd_plan_tranche_add, cmd_plan_tranche_complete, cmd_plan_tranche_list,
     cmd_plan_tranche_remove, cmd_plan_validate, discover_plan_dispatch_entries,
     enforce_plan_guard_post_run, maybe_mark_current_structured_tranche_complete,
-    plan_path_for_prompt_entry, plan_target_completion_state, read_tranches_file,
-    read_tranches_file_in, run_spec_plan_guard_preflight,
-    run_spec_plan_guard_preflight_with_override, target_matches_entry_key, tranches_file_path,
-    validate_tranche_definition, write_tranches_file, write_tranches_file_in, PlanGuardContext,
-    TRANCHES_FILE,
+    plan_path_for_prompt_entry, read_tranches_file_in, run_spec_plan_guard_preflight,
+    tranches_file_path,
+};
+#[cfg(test)]
+pub(crate) use crate::tranche::{
+    plan_target_completion_state, run_spec_plan_guard_preflight_with_override,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,15 +149,7 @@ impl TranchesFile {
 }
 
 pub(crate) use crate::workspace::{
-    apply_workspace_patch_to_source, copy_symlink_entry, copy_workspace_tree,
-    copy_workspace_tree_recursive, ensure_git_repository, ensure_git_success,
-    export_staged_workspace_patch, file_permissions_equivalent, is_parallel_merge_internal_path,
-    merge_parallel_workspace_results, metadata_if_exists, path_matches_excluded_dir_name,
-    path_within_any_root, persist_workspace_patch_for_recovery, prepare_parallel_workspace_layout,
-    remove_conflicting_new_files_for_patch, resolve_workspace_copy_exclusions, run_git_capture,
-    run_git_capture_with_input, scoped_workspace_changed_paths, stage_workspace_paths,
-    warn_on_new_file_content_divergence, workspace_candidate_paths, workspace_path_matches_source,
-    write_parallel_merge_recovery_note, ParallelWorkspaceLayout, ParallelWorkspaceMergeReport,
+    merge_parallel_workspace_results, prepare_parallel_workspace_layout,
 };
 
 pub(crate) fn resolve_run_plan(
@@ -2294,3 +2287,1093 @@ pub(crate) fn enforce_plan_guard_post_run(
     Ok(())
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::{build_run_config_snapshot, compute_quality_gate};
+    use crate::test_helpers::{write_test_config, write_test_config_at};
+    use chrono::Utc;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+    use yarli_cli::prompt;
+    use yarli_core::domain::{CommandClass, SafeMode};
+    use yarli_core::entities::run::Run;
+    use yarli_core::entities::task::Task;
+    use yarli_core::explain::{DeteriorationReport, DeteriorationTrend};
+    use yarli_core::fsm::run::RunState;
+    use yarli_core::fsm::task::TaskState;
+
+    #[test]
+    fn run_config_has_run_spec_data_detects_configured_sections() {
+        let loaded_empty = write_test_config(
+            r#"
+[run]
+continue_wait_timeout_seconds = 0
+"#,
+        );
+        assert!(!run_config_has_run_spec_data(&loaded_empty.config().run));
+
+        let loaded_objective = write_test_config(
+            r#"
+[run]
+objective = "verify config"
+"#,
+        );
+        assert!(run_config_has_run_spec_data(&loaded_objective.config().run));
+
+        let loaded_tasks = write_test_config(
+            r#"
+[[run.tasks]]
+key = "lint"
+cmd = "cargo clippy --workspace -- -D warnings"
+"#,
+        );
+        assert!(run_config_has_run_spec_data(&loaded_tasks.config().run));
+    }
+
+    #[test]
+    fn run_spec_from_run_config_maps_tasks_tranches_and_plan_guard() {
+        let loaded = write_test_config(
+            r#"
+[run]
+objective = "verify all"
+
+[[run.tasks]]
+key = "lint"
+cmd = "cargo clippy --workspace -- -D warnings"
+class = "cpu"
+
+[[run.tasks]]
+key = "test"
+cmd = "cargo test --workspace"
+
+[[run.tranches]]
+key = "verify"
+objective = "verification tranche"
+task_keys = ["lint", "test"]
+
+[run.plan_guard]
+target = "I8B"
+mode = "verify-only"
+"#,
+        );
+
+        let run_spec = run_spec_from_run_config(&loaded.config().run);
+        assert_eq!(run_spec.objective.as_deref(), Some("verify all"));
+        assert_eq!(run_spec.tasks.items.len(), 2);
+        assert_eq!(run_spec.tasks.items[0].key, "lint");
+        assert_eq!(run_spec.tasks.items[0].class.as_deref(), Some("cpu"));
+        assert_eq!(
+            run_spec
+                .tranches
+                .as_ref()
+                .map(|tranches| tranches.items.len()),
+            Some(1)
+        );
+        let guard = run_spec.plan_guard.as_ref().expect("plan guard expected");
+        assert_eq!(guard.target, "I8B");
+        assert_eq!(guard.mode, prompt::RunSpecPlanGuardMode::VerifyOnly);
+    }
+
+    #[test]
+    fn merge_run_specs_applies_prompt_overrides_on_top_of_config_defaults() {
+        let base = prompt::RunSpec {
+            version: 1,
+            objective: Some("config objective".to_string()),
+            tasks: prompt::RunSpecTasks {
+                items: vec![
+                    prompt::RunSpecTask {
+                        key: "lint".to_string(),
+                        cmd: "cargo clippy --workspace -- -D warnings".to_string(),
+                        class: Some("cpu".to_string()),
+                    },
+                    prompt::RunSpecTask {
+                        key: "test".to_string(),
+                        cmd: "cargo test --workspace".to_string(),
+                        class: Some("io".to_string()),
+                    },
+                ],
+            },
+            tranches: Some(prompt::RunSpecTranches {
+                items: vec![prompt::RunSpecTranche {
+                    key: "verify".to_string(),
+                    objective: Some("config tranche".to_string()),
+                    task_keys: vec!["lint".to_string(), "test".to_string()],
+                }],
+            }),
+            plan_guard: Some(prompt::RunSpecPlanGuard {
+                target: "I8A".to_string(),
+                mode: prompt::RunSpecPlanGuardMode::Implement,
+            }),
+        };
+        let prompt_override = prompt::RunSpec {
+            version: 1,
+            objective: Some("prompt objective".to_string()),
+            tasks: prompt::RunSpecTasks {
+                items: vec![
+                    prompt::RunSpecTask {
+                        key: "lint".to_string(),
+                        cmd: "cargo clippy --workspace --all-targets -- -D warnings".to_string(),
+                        class: Some("cpu".to_string()),
+                    },
+                    prompt::RunSpecTask {
+                        key: "docs".to_string(),
+                        cmd: "make docs-build".to_string(),
+                        class: Some("io".to_string()),
+                    },
+                ],
+            },
+            tranches: Some(prompt::RunSpecTranches {
+                items: vec![prompt::RunSpecTranche {
+                    key: "prompt-verify".to_string(),
+                    objective: Some("prompt tranche".to_string()),
+                    task_keys: vec!["lint".to_string(), "docs".to_string()],
+                }],
+            }),
+            plan_guard: Some(prompt::RunSpecPlanGuard {
+                target: "I8B".to_string(),
+                mode: prompt::RunSpecPlanGuardMode::VerifyOnly,
+            }),
+        };
+
+        let merged = merge_run_specs(&base, Some(&prompt_override));
+        assert_eq!(merged.objective.as_deref(), Some("prompt objective"));
+        assert_eq!(merged.tasks.items.len(), 3);
+        assert_eq!(merged.tasks.items[0].key, "lint");
+        assert!(merged.tasks.items[0]
+            .cmd
+            .contains("--all-targets -- -D warnings"));
+        assert_eq!(merged.tasks.items[1].key, "test");
+        assert_eq!(merged.tasks.items[2].key, "docs");
+        assert_eq!(
+            merged
+                .tranches
+                .as_ref()
+                .map(|tranches| tranches.items[0].key.as_str()),
+            Some("prompt-verify")
+        );
+        assert_eq!(
+            merged
+                .plan_guard
+                .as_ref()
+                .map(|guard| guard.target.as_str()),
+            Some("I8B")
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_uses_config_prompt_file_when_set() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(temp.path().join("prompts")).unwrap();
+        std::fs::write(temp.path().join("prompts/I8B.md"), "# prompt").unwrap();
+        let loaded = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[run]
+prompt_file = "prompts/I8B.md"
+"#,
+        );
+
+        let resolved = resolve_prompt_entry_path_with_cwd(&loaded, None, temp.path()).unwrap();
+        assert_eq!(resolved.source, PromptSource::Config);
+        assert_eq!(resolved.entry_path, temp.path().join("prompts/I8B.md"));
+    }
+
+    #[test]
+    fn resolve_prompt_cli_override_wins_over_config() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(temp.path().join("prompts")).unwrap();
+        std::fs::write(temp.path().join("prompts/I8B.md"), "# prompt").unwrap();
+        std::fs::write(temp.path().join("prompts/I8C.md"), "# prompt").unwrap();
+        let loaded = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[run]
+prompt_file = "prompts/I8B.md"
+"#,
+        );
+
+        let resolved = resolve_prompt_entry_path_with_cwd(
+            &loaded,
+            Some(Path::new("prompts/I8C.md")),
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(resolved.source, PromptSource::Cli);
+        assert_eq!(resolved.entry_path, temp.path().join("prompts/I8C.md"));
+    }
+
+    #[test]
+    fn resolve_prompt_defaults_to_prompt_md_lookup() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(temp.path().join("nested/work")).unwrap();
+        std::fs::write(temp.path().join("PROMPT.md"), "# prompt").unwrap();
+        let loaded = LoadedConfig::load(temp.path().join("yarli.toml")).unwrap();
+
+        let resolved =
+            resolve_prompt_entry_path_with_cwd(&loaded, None, &temp.path().join("nested/work"))
+                .unwrap();
+        assert_eq!(resolved.source, PromptSource::Default);
+        assert_eq!(resolved.entry_path, temp.path().join("PROMPT.md"));
+    }
+
+    #[test]
+    fn resolve_prompt_relative_paths_use_repo_root_before_config_dir() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(temp.path().join("prompts")).unwrap();
+        std::fs::create_dir_all(temp.path().join("config")).unwrap();
+        std::fs::write(temp.path().join("prompts/I8B.md"), "# prompt").unwrap();
+        let loaded = write_test_config_at(
+            &temp.path().join("config/yarli.toml"),
+            r#"
+[run]
+prompt_file = "prompts/I8B.md"
+"#,
+        );
+
+        let resolved =
+            resolve_prompt_entry_path_with_cwd(&loaded, None, &temp.path().join("config")).unwrap();
+        assert_eq!(resolved.source, PromptSource::Config);
+        assert_eq!(resolved.entry_path, temp.path().join("prompts/I8B.md"));
+    }
+
+    #[test]
+    fn resolve_prompt_relative_paths_fallback_to_config_dir_without_repo_root() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("config/prompts")).unwrap();
+        std::fs::write(temp.path().join("config/prompts/I8B.md"), "# prompt").unwrap();
+        let loaded = write_test_config_at(
+            &temp.path().join("config/yarli.toml"),
+            r#"
+[run]
+prompt_file = "prompts/I8B.md"
+"#,
+        );
+
+        let resolved =
+            resolve_prompt_entry_path_with_cwd(&loaded, None, &temp.path().join("somewhere"))
+                .unwrap();
+        assert_eq!(resolved.source, PromptSource::Config);
+        assert_eq!(
+            resolved.entry_path,
+            temp.path().join("config/prompts/I8B.md")
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_missing_configured_file_error_includes_resolved_path() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        let loaded = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[run]
+prompt_file = "prompts/missing.md"
+"#,
+        );
+
+        let err = resolve_prompt_entry_path_with_cwd(&loaded, None, temp.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&temp.path().join("prompts/missing.md").display().to_string()));
+        assert!(err.to_string().contains("run.prompt_file"));
+    }
+
+    #[test]
+    fn resolve_prompt_rejects_empty_config_prompt_file() {
+        let temp = TempDir::new().unwrap();
+        let loaded = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[run]
+prompt_file = "   "
+"#,
+        );
+
+        let err = resolve_prompt_entry_path_with_cwd(&loaded, None, temp.path()).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn run_config_snapshot_records_resolved_prompt_entry_path() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("prompts")).unwrap();
+        let prompt_path = temp.path().join("prompts/I8B.md");
+        std::fs::write(
+            &prompt_path,
+            r#"
+```yarli-run
+version = 1
+objective = "verify"
+[tasks]
+items = [{ key = "fmt", cmd = "cargo fmt --all -- --check" }]
+```
+"#,
+        )
+        .unwrap();
+
+        let loaded_prompt = prompt::load_prompt_and_run_spec(&prompt_path).unwrap();
+        let loaded_config = LoadedConfig::load(temp.path().join("yarli.toml")).unwrap();
+        let task_catalog = build_task_catalog_from_run_spec(&loaded_prompt.run_spec).unwrap();
+        let tranche_plan =
+            build_tranche_plan_from_run_spec(&loaded_prompt.run_spec, "verify").unwrap();
+        let first_tasks = tasks_for_tranche(&task_catalog, tranche_plan.first().unwrap()).unwrap();
+        let snapshot = build_run_config_snapshot(
+            &loaded_config,
+            ".",
+            300,
+            &first_tasks,
+            &task_catalog,
+            None,
+            Some(&loaded_prompt.snapshot),
+            Some(&loaded_prompt.run_spec),
+            &tranche_plan,
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot["runtime"]["prompt"]["entry_path"].as_str(),
+            Some(loaded_prompt.snapshot.entry_path.as_str())
+        );
+    }
+
+    #[test]
+    fn plan_driven_sequence_builds_open_tranches_plus_verification() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement active plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A first tranche\n- [ ] I8B second tranche\n- [x] I8C done\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
+                .unwrap();
+
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tranches.len(), 3);
+        assert_eq!(tranches[0].key, "I8A");
+        assert_eq!(tranches[1].key, "I8B");
+        assert_eq!(tranches[2].key, "verification");
+        assert!(tasks[0].command.contains("codex"));
+        assert!(tasks[0].command.contains("I8A"));
+        assert!(tasks[2].command.contains("verification"));
+    }
+
+    #[test]
+    fn plan_driven_sequence_uses_tranches_file_near_resolved_plan_not_cwd() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement active plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] MD-99 markdown tranche\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "ST-01"
+summary = "Structured tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let decoy_cwd = TempDir::new().unwrap();
+        std::fs::create_dir_all(decoy_cwd.path().join(".yarli")).unwrap();
+        std::fs::write(
+            decoy_cwd.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "WRONG-99"
+summary = "Decoy tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &repo.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&repo.path().join("PROMPT.md")).unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(decoy_cwd.path()).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
+                .unwrap();
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tranches.len(), 2);
+        assert_eq!(tranches[0].key, "ST-01");
+        assert_eq!(tranches[1].key, "verification");
+    }
+
+    #[test]
+    fn plan_driven_sequence_runs_verification_only_when_no_open_tranches() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement active plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [x] I8A first tranche\n- [x] I8B second tranche\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
+                .unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tranches.len(), 1);
+        assert_eq!(tranches[0].key, "verification");
+        assert!(tasks[0].command.contains("verification"));
+    }
+
+    #[test]
+    fn plain_prompt_sequence_dispatches_expanded_prompt_text() {
+        let temp = TempDir::new().unwrap();
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt = prompt::LoadedPrompt {
+            entry_path: temp.path().join("PROMPT.md"),
+            expanded_text: "# plain prompt\nImplement step 2.3.\n".to_string(),
+            snapshot: prompt::PromptSnapshot {
+                entry_path: temp.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            },
+            run_spec: prompt::RunSpec {
+                version: 1,
+                objective: None,
+                tasks: prompt::RunSpecTasks::default(),
+                tranches: None,
+                plan_guard: None,
+            },
+        };
+
+        let (tasks, tranches) =
+            build_plain_prompt_run_sequence(&loaded_config, &loaded_prompt, "yarli run").unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tranches.len(), 1);
+        assert_eq!(tranches[0].key, "prompt");
+        assert_eq!(tasks[0].task_key, "prompt-001");
+        assert!(tasks[0].command.contains("plain prompt"));
+        assert!(tasks[0].command.contains("Implement step 2.3."));
+    }
+
+    #[test]
+    fn plan_driven_sequence_ignores_stale_keys_in_non_header_evidence_lines() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement active plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            r#"
+## Next Work Tranches
+11. I9 `Runtime Contract`: complete. tranche_group=runtime-contract
+    Verification evidence:
+    1. Open-tranche dispatch evidence remains intact: `yarli run status 019c5308-e73b-7a23-8b7a-c4acc8b95e52` includes `I11` and `YARLI_DETERIORATION_REPORT_V1`.
+12. I10 `Follow-up`: complete. tranche_group=runtime-contract
+
+## Notes
+1. YARLI_DETERIORATION_REPORT_V1 incomplete in historical notes.
+"#,
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
+                .unwrap();
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tranches.len(), 1);
+        assert_eq!(tranches[0].key, "verification");
+        assert!(tasks[0].command.contains("verification"));
+    }
+
+    #[test]
+    fn plan_driven_sequence_groups_adjacent_entries_by_tranche_group_when_enabled() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement grouped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A first tranche_group=core\n- [ ] I8B second tranche_group=core\n- [ ] I8C third tranche_group=ui\n- [ ] I8D fourth\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enable_plan_tranche_grouping = true
+max_grouped_tasks_per_tranche = 0
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) = build_plan_driven_run_sequence(
+            &loaded_config,
+            &loaded_prompt,
+            "implement grouped plan",
+        )
+        .unwrap();
+
+        assert_eq!(tasks.len(), 5);
+        assert_eq!(tranches.len(), 4);
+        assert_eq!(tranches[0].key, "group-001-core");
+        assert_eq!(tranches[0].tranche_group.as_deref(), Some("core"));
+        assert_eq!(tranches[0].task_keys.len(), 2);
+        assert_eq!(tranches[1].key, "group-003-ui");
+        assert_eq!(tranches[1].tranche_group.as_deref(), Some("ui"));
+        assert_eq!(tranches[1].task_keys.len(), 1);
+        assert_eq!(tranches[2].key, "I8D");
+        assert_eq!(tranches[2].task_keys.len(), 1);
+        assert_eq!(tranches[3].key, "verification");
+        assert!(tasks[0].command.contains("Tranche group: core."));
+        assert!(tasks[2].command.contains("Tranche group: ui."));
+    }
+
+    #[test]
+    fn plan_driven_sequence_grouping_respects_max_grouped_tasks_per_tranche_cap() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement grouped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A first tranche_group=core\n- [ ] I8B second tranche_group=core\n- [ ] I8C third tranche_group=core\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enable_plan_tranche_grouping = true
+max_grouped_tasks_per_tranche = 2
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (_tasks, tranches) = build_plan_driven_run_sequence(
+            &loaded_config,
+            &loaded_prompt,
+            "implement grouped plan",
+        )
+        .unwrap();
+
+        assert_eq!(tranches.len(), 3);
+        assert_eq!(tranches[0].key, "group-001-core");
+        assert_eq!(tranches[0].task_keys.len(), 2);
+        assert_eq!(tranches[1].key, "group-003-core");
+        assert_eq!(tranches[1].task_keys.len(), 1);
+        assert_eq!(tranches[2].key, "verification");
+    }
+
+    #[test]
+    fn plan_driven_sequence_surfaces_allowed_paths_scope_when_enforced() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement scoped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A scoped tranche allowed_paths=src/main.rs,docs/CLI.md,../reject\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enforce_plan_tranche_allowed_paths = true
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement scoped plan")
+                .unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tranches.len(), 2);
+        assert_eq!(
+            tasks[0].allowed_paths,
+            vec!["src/main.rs".to_string(), "docs/CLI.md".to_string()]
+        );
+        assert!(tasks[0]
+            .command
+            .contains("Allowed file scope: src/main.rs, docs/CLI.md."));
+        assert!(tasks[0]
+            .command
+            .contains("Restrict edits to the allowed file scope above."));
+        assert!(!tasks[0].command.contains("../reject"));
+    }
+
+    #[test]
+    fn resolve_run_plan_rejects_cmd_and_pace() {
+        let loaded = write_test_config("");
+
+        let err = resolve_run_plan(
+            &loaded,
+            "obj".to_string(),
+            vec!["echo hi".to_string()],
+            Some("batch".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn resolve_run_plan_uses_named_pace_for_commands_and_overrides() {
+        let loaded = write_test_config(
+            r#"
+[execution]
+working_dir = "/default"
+command_timeout_seconds = 111
+
+[run]
+default_pace = "batch"
+
+[run.paces.batch]
+cmds = ["echo one", "echo two"]
+working_dir = "/pace"
+command_timeout_seconds = 222
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "obj".to_string(),
+            Vec::new(),
+            Some("batch".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].task_key, "task-1");
+        assert_eq!(plan.tasks[0].command, "echo one");
+        assert_eq!(plan.tasks[1].task_key, "task-2");
+        assert_eq!(plan.tasks[1].command, "echo two");
+        assert_eq!(plan.workdir, "/pace");
+        assert_eq!(plan.timeout_secs, 222);
+        assert_eq!(plan.pace.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn resolve_run_plan_start_without_cmd_uses_run_default_pace() {
+        let loaded = write_test_config(
+            r#"
+[run]
+default_pace = "batch"
+
+[run.paces.batch]
+cmds = ["echo ok"]
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "obj".to_string(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].command, "echo ok");
+        assert_eq!(plan.pace.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn resolve_run_plan_batch_defaults_to_batch_pace_name() {
+        let loaded = write_test_config(
+            r#"
+[run.paces.batch]
+cmds = ["echo ok"]
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "batch".to_string(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some("batch"),
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].command, "echo ok");
+        assert_eq!(plan.pace.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn resolve_run_plan_batch_falls_back_to_default_pace_when_batch_not_defined() {
+        let loaded = write_test_config(
+            r#"
+[run]
+default_pace = "ci"
+
+[run.paces.ci]
+cmds = ["echo ok"]
+"#,
+        );
+
+        let plan = resolve_run_plan(
+            &loaded,
+            "batch".to_string(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some("batch"),
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].command, "echo ok");
+        assert_eq!(plan.pace.as_deref(), Some("ci"));
+    }
+
+    #[test]
+    fn continuation_no_tranche_when_all_complete() {
+        use yarli_core::entities::continuation::ContinuationPayload;
+
+        let run = Run::new("all done", SafeMode::Execute);
+        let mut t1 = Task::new(
+            run.id,
+            "build",
+            "cargo build",
+            CommandClass::Io,
+            run.correlation_id,
+        );
+        t1.state = TaskState::TaskComplete;
+
+        let payload = ContinuationPayload::build(&run, &[&t1]);
+        assert!(payload.next_tranche.is_none());
+    }
+
+    #[test]
+    fn continuation_tranche_includes_failed_and_unfinished() {
+        use yarli_core::entities::continuation::ContinuationPayload;
+
+        let run = Run::new("mixed", SafeMode::Execute);
+        let mut t1 = Task::new(
+            run.id,
+            "lint",
+            "cargo clippy",
+            CommandClass::Io,
+            run.correlation_id,
+        );
+        t1.state = TaskState::TaskFailed;
+        let mut t2 = Task::new(
+            run.id,
+            "deploy",
+            "deploy.sh",
+            CommandClass::Io,
+            run.correlation_id,
+        );
+        t2.state = TaskState::TaskOpen;
+        let mut t3 = Task::new(
+            run.id,
+            "build",
+            "cargo build",
+            CommandClass::Io,
+            run.correlation_id,
+        );
+        t3.state = TaskState::TaskComplete;
+
+        let payload = ContinuationPayload::build(&run, &[&t1, &t2, &t3]);
+        let tranche = payload.next_tranche.as_ref().unwrap();
+        assert_eq!(tranche.retry_task_keys, vec!["lint"]);
+        assert_eq!(tranche.unfinished_task_keys, vec!["deploy"]);
+    }
+
+    #[test]
+    fn continuation_planned_next_resolves_command_from_task_catalog() {
+        use yarli_core::entities::continuation::{TrancheKind, TrancheSpec};
+
+        let loaded = write_test_config("");
+        let prompt_entry_path = "/tmp/project/PROMPT.md";
+        let tranche = TrancheSpec {
+            suggested_objective: "planned-next".into(),
+            kind: TrancheKind::PlannedNext,
+            retry_task_keys: vec![],
+            unfinished_task_keys: vec![],
+            planned_task_keys: vec!["two_task".into(), "three_task".into()],
+            planned_tranche_key: Some("two".into()),
+            cursor: Some(yarli_core::entities::continuation::TrancheCursor {
+                current_tranche_index: Some(0),
+                next_tranche_index: Some(1),
+            }),
+            config_snapshot: serde_json::json!({
+                "runtime": {
+                    "working_dir": ".",
+                    "timeout_secs": 300,
+                    "tasks": [
+                        {"task_key": "one_task", "command": "true", "command_class": "Io"}
+                    ],
+                    "task_catalog": [
+                        {"task_key": "one_task", "command": "true", "command_class": "Io"},
+                        {"task_key": "two_task", "command": "echo second", "command_class": "Io"},
+                        {"task_key": "three_task", "command": "echo third", "command_class": "Io"}
+                    ],
+                    "tranche_plan": [
+                        {"key": "one", "objective": "first", "task_keys": ["one_task"]},
+                        {"key": "two", "objective": "second", "task_keys": ["two_task", "three_task"], "tranche_group": "core"}
+                    ],
+                    "current_tranche_index": 0,
+                    "prompt": {
+                        "entry_path": prompt_entry_path,
+                        "expanded_sha256": "abc123",
+                        "included_files": []
+                    }
+                }
+            }),
+        };
+
+        let plan = build_plan_from_continuation_tranche(&tranche, &loaded).unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].task_key, "two_task");
+        assert_eq!(plan.tasks[0].command, "echo second");
+        assert_eq!(plan.tasks[1].task_key, "three_task");
+        assert_eq!(plan.tasks[1].command, "echo third");
+        assert_eq!(plan.tranche_plan[1].tranche_group.as_deref(), Some("core"));
+        assert_eq!(plan.current_tranche_index, Some(1));
+        assert_eq!(
+            plan.prompt_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.entry_path.as_str()),
+            Some(prompt_entry_path)
+        );
+    }
+
+    #[test]
+    fn compute_quality_gate_blocks_stable_when_policy_disabled() {
+        let report = DeteriorationReport {
+            score: 22.0,
+            window_size: 8,
+            factors: Vec::new(),
+            trend: DeteriorationTrend::Stable,
+        };
+
+        let gate = compute_quality_gate(Some(&report), AutoAdvancePolicy::ImprovingOnly);
+        assert!(!gate.allow_auto_advance);
+        assert_eq!(
+            gate.reason,
+            "deterioration trend stable (stagnation blocked)"
+        );
+    }
+
+    #[test]
+    fn compute_quality_gate_allows_stable_when_policy_enabled() {
+        let report = DeteriorationReport {
+            score: 22.0,
+            window_size: 8,
+            factors: Vec::new(),
+            trend: DeteriorationTrend::Stable,
+        };
+
+        let gate = compute_quality_gate(Some(&report), AutoAdvancePolicy::StableOk);
+        assert!(gate.allow_auto_advance);
+        assert_eq!(
+            gate.reason,
+            "deterioration trend stable (policy allows auto-advance)"
+        );
+    }
+
+    #[test]
+    fn auto_advance_requires_planned_next_and_allowed_quality_gate() {
+        use yarli_core::entities::continuation::{
+            ContinuationPayload, ContinuationQualityGate, RunSummary, TrancheKind, TrancheSpec,
+        };
+
+        let payload = ContinuationPayload {
+            run_id: Uuid::new_v4(),
+            objective: "x".into(),
+            exit_state: RunState::RunCompleted,
+            exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
+            completed_at: Utc::now(),
+            tasks: Vec::new(),
+            summary: RunSummary {
+                total: 1,
+                completed: 1,
+                failed: 0,
+                cancelled: 0,
+                pending: 0,
+            },
+            next_tranche: Some(TrancheSpec {
+                suggested_objective: "next".into(),
+                kind: TrancheKind::PlannedNext,
+                retry_task_keys: Vec::new(),
+                unfinished_task_keys: Vec::new(),
+                planned_task_keys: vec!["test".into()],
+                planned_tranche_key: Some("full".into()),
+                cursor: None,
+                config_snapshot: serde_json::json!({}),
+            }),
+            quality_gate: Some(ContinuationQualityGate {
+                allow_auto_advance: true,
+                reason: "improving".into(),
+                trend: Some(DeteriorationTrend::Improving),
+                score: Some(10.0),
+            }),
+        };
+
+        let (allow, _) = should_auto_advance_planned_tranche(
+            &payload,
+            config::AutoAdvanceConfig {
+                policy: AutoAdvancePolicy::ImprovingOnly,
+                max_tranches: 0,
+            },
+            0,
+        );
+        assert!(allow);
+    }
+}

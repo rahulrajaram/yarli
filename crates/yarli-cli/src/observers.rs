@@ -825,3 +825,155 @@ pub(crate) fn build_memory_observer(
         task_names,
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::{make_command_started, make_command_terminal, make_event};
+    use uuid::Uuid;
+    use yarli_core::domain::EntityType;
+    use yarli_core::explain::DeteriorationTrend;
+    use yarli_store::event_store::EventQuery;
+    use yarli_store::InMemoryEventStore;
+
+    #[test]
+    fn deterioration_scoring_distinguishes_stable_vs_deteriorating_trails() {
+        let corr = Uuid::now_v7();
+        let mut stable = DeteriorationObserverState::new(64);
+        let mut stable_events = Vec::new();
+        for _ in 0..8 {
+            let command_id = Uuid::now_v7();
+            stable_events.push(make_command_started(command_id, corr, "cargo test", "io"));
+            stable_events.push(make_command_terminal(
+                command_id,
+                corr,
+                "command.exited",
+                120,
+                Some(0),
+            ));
+        }
+        assert!(stable.ingest(&stable_events));
+        let stable_report = stable.report();
+        assert!(
+            stable_report.score < 25.0,
+            "stable score={}",
+            stable_report.score
+        );
+
+        let mut degrading = DeteriorationObserverState::new(64);
+        let mut baseline_events = Vec::new();
+        for _ in 0..6 {
+            let command_id = Uuid::now_v7();
+            baseline_events.push(make_command_started(command_id, corr, "cargo test", "io"));
+            baseline_events.push(make_command_terminal(
+                command_id,
+                corr,
+                "command.exited",
+                100,
+                Some(0),
+            ));
+        }
+        degrading.ingest(&baseline_events);
+        let baseline_report = degrading.report();
+
+        let mut degrade_events = Vec::new();
+        for i in 0..6 {
+            let command_id = Uuid::now_v7();
+            degrade_events.push(make_command_started(command_id, corr, "cargo test", "io"));
+            degrade_events.push(make_command_terminal(
+                command_id,
+                corr,
+                "command.exited",
+                400 + (i * 250),
+                Some(1),
+            ));
+            degrade_events.push(make_event(
+                EntityType::Task,
+                Uuid::now_v7().to_string(),
+                "task.retrying",
+                corr,
+                serde_json::json!({"attempt_no": 2}),
+            ));
+            degrade_events.push(make_event(
+                EntityType::Task,
+                Uuid::now_v7().to_string(),
+                "task.blocked",
+                corr,
+                serde_json::json!({"reason": "policy_denial"}),
+            ));
+            degrade_events.push(make_event(
+                EntityType::Task,
+                Uuid::now_v7().to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "reason": if i % 2 == 0 { "budget_exceeded" } else { "nonzero_exit" },
+                    "observed": 120.0 + (i as f64 * 10.0),
+                    "limit": 100.0,
+                }),
+            ));
+        }
+        assert!(degrading.ingest(&degrade_events));
+        let degrading_report = degrading.report();
+
+        assert!(degrading_report.score > baseline_report.score);
+        assert_eq!(degrading_report.trend, DeteriorationTrend::Deteriorating);
+    }
+
+    #[test]
+    fn deterioration_observer_emits_incremental_events() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        let command_id = Uuid::now_v7();
+
+        store
+            .append(make_command_started(command_id, corr, "cargo test", "io"))
+            .unwrap();
+        store
+            .append(make_command_terminal(
+                command_id,
+                corr,
+                "command.exited",
+                100,
+                Some(0),
+            ))
+            .unwrap();
+
+        let mut observer = DeteriorationObserver::new(run_id, corr, 32);
+        observer.observe_store(&store).unwrap();
+        observer.observe_store(&store).unwrap();
+
+        let observer_events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        assert_eq!(
+            observer_events
+                .iter()
+                .filter(|event| event.event_type == "run.observer.deterioration")
+                .count(),
+            1
+        );
+
+        store
+            .append(make_event(
+                EntityType::Task,
+                Uuid::now_v7().to_string(),
+                "task.retrying",
+                corr,
+                serde_json::json!({"attempt_no": 2}),
+            ))
+            .unwrap();
+        observer.observe_store(&store).unwrap();
+        let observer_events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        assert_eq!(
+            observer_events
+                .iter()
+                .filter(|event| event.event_type == "run.observer.deterioration")
+                .count(),
+            2
+        );
+    }
+}

@@ -204,7 +204,7 @@ fn load_expanded_prompt(entry_prompt_path: &Path) -> Result<(PathBuf, String, Pr
 }
 
 fn parse_run_spec_block(expanded: &str, require_block: bool) -> Result<Option<RunSpec>> {
-    let run_spec_blocks = extract_fenced_blocks(&expanded, "yarli-run");
+    let run_spec_blocks = extract_fenced_blocks(expanded, "yarli-run");
     if run_spec_blocks.is_empty() {
         if require_block {
             bail!("PROMPT.md must contain exactly one ```yarli-run fenced block (found 0)");

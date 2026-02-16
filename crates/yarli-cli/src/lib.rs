@@ -21,8 +21,6 @@ pub const YARLI_VERSION: &str = concat!(
 );
 pub const DEFAULT_CONTINUATION_FILE: &str = ".yarli/continuation.json";
 
-pub mod cli;
-pub mod config;
 pub mod dashboard;
 pub mod mode;
 pub mod prompt;

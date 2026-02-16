@@ -15,6 +15,7 @@ use crate::YARLI_VERSION;
 /// 1. `yarli run --prompt-file <path>`
 /// 2. `yarli.toml` `[run].prompt_file`
 /// 3. Legacy fallback lookup for `PROMPT.md`
+///
 /// Recommended durability: use Postgres (`core.backend = "postgres"`); in-memory mode blocks writes
 /// unless explicitly opted in via `core.allow_in_memory_writes = true`.
 ///

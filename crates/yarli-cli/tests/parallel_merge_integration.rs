@@ -24,7 +24,7 @@ fn parse_run_id(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         line.strip_prefix("Run ")
             .and_then(|rest| rest.split_whitespace().next())
-        .map(str::to_string)
+            .map(str::to_string)
     })
 }
 
@@ -42,7 +42,9 @@ fn run_output_path() -> std::path::PathBuf {
             if fallback.is_file() {
                 fallback
             } else {
-                panic!("CARGO_BIN_EXE_yarli is not set and target/debug/yarli fallback was not found");
+                panic!(
+                    "CARGO_BIN_EXE_yarli is not set and target/debug/yarli fallback was not found"
+                );
             }
         }
     }
@@ -108,8 +110,8 @@ worktree_root = "{}"
         "run {run_id} should complete in output, saw:\n{run_stdout}"
     );
 
-    let merged_alpha = std::fs::read_to_string(repo_dir.join("alpha.txt"))
-        .expect("read merged alpha.txt");
+    let merged_alpha =
+        std::fs::read_to_string(repo_dir.join("alpha.txt")).expect("read merged alpha.txt");
     assert_eq!(merged_alpha, "alpha merged\n");
 
     let artifact = repo_dir.join("tests/fixtures/rust-sample/target/.rustc_info.json");

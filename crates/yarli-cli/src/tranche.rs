@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use yarli_cli::prompt;
 
 use crate::plan::{
@@ -480,16 +480,16 @@ mod tests {
         plan::{
             discover_plan_dispatch_entries, is_verification_only_dispatch,
             plan_target_completion_state, run_spec_plan_guard_preflight_with_override,
-            should_auto_advance_planned_tranche, validate_tranche_keys,
+            should_auto_advance_planned_tranche, validate_tranche_keys, PlannedTranche,
         },
     };
     use chrono::Utc;
     use tempfile::TempDir;
     use uuid::Uuid;
-    use yarli_core::domain::DeteriorationTrend;
     use yarli_core::entities::continuation::{
         ContinuationPayload, ContinuationQualityGate, RunSummary, TrancheKind, TrancheSpec,
     };
+    use yarli_core::explain::DeteriorationTrend;
     use yarli_core::fsm::run::RunState;
 
     #[test]

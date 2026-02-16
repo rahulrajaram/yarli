@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
-use serde_json;
+
 use uuid::Uuid;
 
 use crate::persistence::query_events;
@@ -557,16 +557,16 @@ pub(crate) fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> 
         }
 
         // Extract last_error from failure events (preserve first occurrence).
-        if event.event_type == "task.failed" || event.event_type == "task.gate_failed" {
-            if entry.last_error.is_none() {
-                let error_msg = event
-                    .payload
-                    .get("detail")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| event.payload.get("reason").and_then(|v| v.as_str()));
-                if let Some(msg) = error_msg {
-                    entry.last_error = Some(msg.to_string());
-                }
+        if (event.event_type == "task.failed" || event.event_type == "task.gate_failed")
+            && entry.last_error.is_none()
+        {
+            let error_msg = event
+                .payload
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .or_else(|| event.payload.get("reason").and_then(|v| v.as_str()));
+            if let Some(msg) = error_msg {
+                entry.last_error = Some(msg.to_string());
             }
         }
 

@@ -1824,4 +1824,32 @@ mode = "stream"
             AutoAdvancePolicy::StableOk
         );
     }
+
+    #[test]
+    fn ensure_write_backend_guard_blocks_in_memory_writes_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("yarli.toml");
+        let loaded_config = LoadedConfig::load(config_path).unwrap();
+
+        let result = ensure_write_backend_guard(&loaded_config, "task unblock");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refuses in-memory write mode"));
+    }
+
+    #[test]
+    fn ensure_write_backend_guard_allows_explicit_ephemeral_override() {
+        let loaded_config = write_test_config(
+            r#"
+[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+"#,
+        );
+
+        let result = ensure_write_backend_guard(&loaded_config, "task unblock");
+        assert!(result.is_ok());
+    }
 }

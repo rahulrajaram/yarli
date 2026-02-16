@@ -30,6 +30,7 @@ struct RunSummary {
 ///
 /// Used when neither stream nor dashboard mode can initialize
 /// (no TTY, too small terminal, etc.).
+#[derive(Default)]
 pub struct HeadlessRenderer {
     summary: RunSummary,
     last_transient_status_emit_at: Option<DateTime<Utc>>,
@@ -37,10 +38,7 @@ pub struct HeadlessRenderer {
 
 impl HeadlessRenderer {
     pub fn new() -> Self {
-        Self {
-            summary: RunSummary::default(),
-            last_transient_status_emit_at: None,
-        }
+        Self::default()
     }
 
     /// Consume events from the channel until it closes, writing structured
@@ -249,12 +247,6 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
     use yarli_core::fsm::run::RunState;
-
-    fn make_renderer_and_channel() -> (HeadlessRenderer, mpsc::UnboundedSender<StreamEvent>) {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let renderer = HeadlessRenderer::new();
-        (renderer, tx)
-    }
 
     #[test]
     fn headless_counts_complete_tasks() {
