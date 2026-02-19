@@ -15,6 +15,6 @@ pub use memory::InMemoryTaskQueue;
 pub use postgres::PostgresTaskQueue;
 pub use queue::{ClaimRequest, ConcurrencyConfig, QueueEntry, QueueStats, QueueStatus, TaskQueue};
 pub use scheduler::{
-    ResourceBudgetConfig, Scheduler, SchedulerConfig, SchedulerError, TaskOutcome, TaskRegistry,
-    TickResult,
+    LiveOutputEvent, ResourceBudgetConfig, Scheduler, SchedulerConfig, SchedulerError, TaskOutcome,
+    TaskRegistry, TickResult,
 };

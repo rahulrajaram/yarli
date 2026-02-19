@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{self, Stdio};
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -17,12 +18,47 @@ use crate::plan::RunPlan;
 pub(crate) struct ParallelWorkspaceLayout {
     pub(crate) run_workspace_root: PathBuf,
     pub(crate) task_workspace_dirs: Vec<PathBuf>,
+    /// Source HEAD captured at workspace creation time. Used for merge
+    /// ancestry validation so we compare against a commit that is guaranteed
+    /// to exist in the copied workspace's object database.
+    pub(crate) source_head_at_creation: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParallelWorkspaceMergeReport {
     pub(crate) merged_task_keys: Vec<String>,
     pub(crate) skipped_task_keys: Vec<String>,
+    pub(crate) task_outcomes: Vec<ParallelTaskMergeOutcome>,
+    pub(crate) preserve_workspace_root: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParallelTaskMergeDisposition {
+    Merged,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParallelTaskSkipReason {
+    NoScopedPaths,
+    EmptyPatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ParallelTaskMergeOutcome {
+    pub(crate) task_key: String,
+    pub(crate) disposition: ParallelTaskMergeDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) skip_reason: Option<ParallelTaskSkipReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_head: Option<String>,
+    pub(crate) soft_reset_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) patch_path: Option<String>,
 }
 
 pub(crate) fn path_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
@@ -282,6 +318,13 @@ pub(crate) fn prepare_parallel_workspace_layout(
         resolve_workspace_copy_exclusions(&source_workdir, loaded_config);
     excluded_roots.append(&mut configured_excluded_roots);
 
+    // Capture source HEAD now so merge validation uses a commit the workspaces
+    // are guaranteed to have (the source may advance between now and merge time).
+    let source_head_at_creation = run_git_capture(&source_workdir, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
     let mut task_workspace_dirs = Vec::with_capacity(plan.tasks.len());
     for (index, task) in plan.tasks.iter().enumerate() {
         let slug = sanitize_task_key_component(&task.task_key);
@@ -303,6 +346,7 @@ pub(crate) fn prepare_parallel_workspace_layout(
     Ok(Some(ParallelWorkspaceLayout {
         run_workspace_root,
         task_workspace_dirs,
+        source_head_at_creation,
     }))
 }
 
@@ -462,6 +506,7 @@ pub(crate) fn apply_workspace_patch_to_source(
     source_workdir: &Path,
     task_key: &str,
     patch: &[u8],
+    merge_conflict_resolution: config::MergeConflictResolution,
 ) -> Result<()> {
     let backed_up_new_files = remove_conflicting_new_files_for_patch(source_workdir, patch)?;
 
@@ -493,7 +538,24 @@ pub(crate) fn apply_workspace_patch_to_source(
         return Ok(());
     }
 
-    // Not index-related — propagate the original --3way error.
+    // Not index-related — apply the merge conflict resolution strategy.
+    match merge_conflict_resolution {
+        config::MergeConflictResolution::Agent => {
+            // TODO: spawn an agent to resolve conflicts. For now, fall through to Fail.
+            warn!(task_key, "merge_conflict_resolution=agent is not yet implemented; falling back to fail");
+        }
+        config::MergeConflictResolution::Manual => {
+            bail!(
+                "merge conflict in task {task_key} (resolution=manual): workspace preserved for operator intervention.\n\
+                 Resolve conflicts manually, then re-run:\n\
+                   git -C \"{}\" status --short",
+                source_workdir.display()
+            );
+        }
+        config::MergeConflictResolution::Fail => {}
+    }
+
+    // Propagate the original --3way error.
     ensure_git_success(
         apply_output,
         source_workdir,
@@ -746,13 +808,25 @@ pub(crate) fn write_parallel_merge_recovery_note(
     workspace_dir: &Path,
     task_key: &str,
     patch_path: &Path,
+    original_workspace_head: Option<&str>,
 ) -> Result<PathBuf> {
     let note_path = run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+    let restore_guidance = if let Some(head) = original_workspace_head {
+        format!(
+            "\nOriginal workspace HEAD before merge normalization: {head}\n\
+To restore this workspace to its pre-merge-attempt commit:\n\
+   git -C \"{}\" reset --hard \"{}\"\n",
+            workspace_dir.display(),
+            head
+        )
+    } else {
+        String::new()
+    };
     let note = format!(
         "Parallel workspace merge failed for run {run_id} task {task_key}.\n\n\
 Source workspace: {}\n\
 Task workspace: {}\n\
-Patch artifact: {}\n\n\
+Patch artifact: {}\n{}\
 Operator recovery steps:\n\
 1. Inspect the repo and conflicted files:\n\
    git -C \"{}\" status --short\n\
@@ -765,6 +839,7 @@ Operator recovery steps:\n\
         source_workdir.display(),
         workspace_dir.display(),
         patch_path.display(),
+        restore_guidance,
         source_workdir.display(),
         source_workdir.display(),
         patch_path.display(),
@@ -780,13 +855,106 @@ Operator recovery steps:\n\
     Ok(note_path)
 }
 
+pub(crate) fn restore_workspace_head_after_failed_merge(
+    workspace_dir: &Path,
+    original_workspace_head: &str,
+) -> Result<()> {
+    let reset_args = ["reset", "--hard", original_workspace_head];
+    let reset_output = run_git_capture(workspace_dir, &reset_args)?;
+    ensure_git_success(
+        reset_output,
+        workspace_dir,
+        &reset_args,
+        "restore workspace HEAD after failed merge",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn write_parallel_merge_lineage_recovery_note(
+    run_id: Uuid,
+    source_workdir: &Path,
+    run_workspace_root: &Path,
+    workspace_dir: &Path,
+    task_key: &str,
+    source_head: &str,
+    workspace_head: &str,
+    reason: &str,
+) -> Result<PathBuf> {
+    let note_path = run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+    let note = format!(
+        "Parallel workspace merge blocked for run {run_id} task {task_key}.\n\n\
+Reason: {reason}\n\
+Source HEAD: {source_head}\n\
+Workspace HEAD: {workspace_head}\n\n\
+Source workspace: {}\n\
+Task workspace: {}\n\n\
+Operator recovery steps:\n\
+1. Inspect source merge state:\n\
+   git -C \"{}\" status --short\n\
+2. Inspect workspace commit lineage:\n\
+   git -C \"{}\" log --oneline --decorate --graph -n 20\n\
+3. Compare workspace changes relative to source HEAD:\n\
+   git -C \"{}\" diff --stat \"{}\"\n\
+4. Manually reconcile the workspace changes, then re-run yarli.\n",
+        source_workdir.display(),
+        workspace_dir.display(),
+        source_workdir.display(),
+        workspace_dir.display(),
+        workspace_dir.display(),
+        source_head
+    );
+    fs::write(&note_path, note).with_context(|| {
+        format!(
+            "failed to write merge recovery note {}",
+            note_path.display()
+        )
+    })?;
+    Ok(note_path)
+}
+
+#[cfg(test)]
 pub(crate) fn merge_parallel_workspace_results(
     source_workdir: &Path,
     run_id: Uuid,
     run_workspace_root: &Path,
     task_workspaces: &[(String, PathBuf)],
 ) -> Result<ParallelWorkspaceMergeReport> {
+    merge_parallel_workspace_results_with_resolution(
+        source_workdir,
+        run_id,
+        run_workspace_root,
+        task_workspaces,
+        config::MergeConflictResolution::Fail,
+        None,
+    )
+}
+
+pub(crate) fn merge_parallel_workspace_results_with_resolution(
+    source_workdir: &Path,
+    run_id: Uuid,
+    run_workspace_root: &Path,
+    task_workspaces: &[(String, PathBuf)],
+    merge_conflict_resolution: config::MergeConflictResolution,
+    source_head_at_creation: Option<&str>,
+) -> Result<ParallelWorkspaceMergeReport> {
     ensure_git_repository(source_workdir)?;
+
+    // Prefer the source HEAD captured at workspace creation time. If the source
+    // repo advanced since then (external commits, other processes), the current
+    // HEAD may not exist in the workspace's copied object database.
+    let source_head = if let Some(head) = source_head_at_creation {
+        head.to_string()
+    } else {
+        let source_head_args = ["rev-parse", "HEAD"];
+        let source_head_output = run_git_capture(source_workdir, &source_head_args)?;
+        let h = ensure_git_success(
+            source_head_output,
+            source_workdir,
+            &source_head_args,
+            "capture source HEAD for workspace merge",
+        )?;
+        h.trim().to_string()
+    };
 
     // Stash any pre-existing dirty state from prior runs so workspace patches
     // apply against the clean HEAD they were cloned from. Previous yarli versions
@@ -816,26 +984,232 @@ pub(crate) fn merge_parallel_workspace_results(
 
     let mut merged_task_keys = Vec::new();
     let mut skipped_task_keys = Vec::new();
+    let mut task_outcomes = Vec::new();
     for (task_index, (task_key, workspace_dir)) in task_workspaces.iter().enumerate() {
         ensure_git_repository(workspace_dir)?;
-        let scoped_paths = scoped_workspace_changed_paths(source_workdir, workspace_dir)?;
+        let mut original_workspace_head_for_restore: Option<String> = None;
+        let mut soft_reset_applied = false;
+        let ws_head_args = ["rev-parse", "HEAD"];
+        let ws_head_output = run_git_capture(workspace_dir, &ws_head_args)?;
+        let ws_head = ensure_git_success(
+            ws_head_output,
+            workspace_dir,
+            &ws_head_args,
+            "capture workspace HEAD for merge comparison",
+        )?;
+        let ws_head = ws_head.trim().to_string();
+        if ws_head != source_head {
+            let ancestry_args = [
+                "merge-base",
+                "--is-ancestor",
+                source_head.as_str(),
+                ws_head.as_str(),
+            ];
+            let ancestry_output = run_git_capture(workspace_dir, &ancestry_args)?;
+            if !ancestry_output.status.success() {
+                let ancestry_stderr = String::from_utf8_lossy(&ancestry_output.stderr);
+                if ancestry_output.status.code() == Some(1) {
+                    let reason = format!(
+                        "workspace {} HEAD ({}) is not a descendant of source HEAD ({})",
+                        workspace_dir.display(),
+                        &ws_head[..12.min(ws_head.len())],
+                        &source_head[..12.min(source_head.len())]
+                    );
+                    let note_path = write_parallel_merge_lineage_recovery_note(
+                        run_id,
+                        source_workdir,
+                        run_workspace_root,
+                        workspace_dir,
+                        task_key,
+                        &source_head,
+                        &ws_head,
+                        &reason,
+                    )
+                    .ok();
+                    let mut guidance = format!(
+                        "{reason}; cannot safely merge committed workspace changes\n\
+Operator recovery steps:\n\
+1. Inspect source merge state: git -C \"{}\" status --short\n\
+2. Inspect workspace lineage: git -C \"{}\" log --oneline --decorate --graph -n 20\n\
+3. Compare workspace changes: git -C \"{}\" diff --stat \"{}\"",
+                        source_workdir.display(),
+                        workspace_dir.display(),
+                        workspace_dir.display(),
+                        source_head
+                    );
+                    if let Some(path) = note_path {
+                        guidance.push_str(&format!("\nDetailed recovery note: {}", path.display()));
+                    }
+                    guidance.push_str(&format!(
+                        "\nWorkspace root preserved for inspection: {}",
+                        run_workspace_root.display()
+                    ));
+                    bail!("{guidance}");
+                }
+                let reason = format!(
+                    "workspace ancestry validation failed for {} (source {}, workspace {}): {}",
+                    workspace_dir.display(),
+                    &source_head[..12.min(source_head.len())],
+                    &ws_head[..12.min(ws_head.len())],
+                    ancestry_stderr.trim()
+                );
+                let note_path = write_parallel_merge_lineage_recovery_note(
+                    run_id,
+                    source_workdir,
+                    run_workspace_root,
+                    workspace_dir,
+                    task_key,
+                    &source_head,
+                    &ws_head,
+                    &reason,
+                )
+                .ok();
+                let mut guidance = format!(
+                    "{reason}\n\
+Operator recovery steps:\n\
+1. Inspect source merge state: git -C \"{}\" status --short\n\
+2. Inspect workspace lineage: git -C \"{}\" log --oneline --decorate --graph -n 20\n\
+3. Compare workspace changes: git -C \"{}\" diff --stat \"{}\"",
+                    source_workdir.display(),
+                    workspace_dir.display(),
+                    workspace_dir.display(),
+                    source_head
+                );
+                if let Some(path) = note_path {
+                    guidance.push_str(&format!("\nDetailed recovery note: {}", path.display()));
+                }
+                guidance.push_str(&format!(
+                    "\nWorkspace root preserved for inspection: {}",
+                    run_workspace_root.display()
+                ));
+                bail!("{guidance}");
+            }
+
+            info!(
+                "workspace {} HEAD ({}) advanced beyond source HEAD ({}); soft-resetting to surface committed changes",
+                workspace_dir.display(),
+                &ws_head[..12.min(ws_head.len())],
+                &source_head[..12.min(source_head.len())]
+            );
+            let reset_args = ["reset", "--soft", source_head.as_str()];
+            let reset_output = run_git_capture(workspace_dir, &reset_args)?;
+            ensure_git_success(
+                reset_output,
+                workspace_dir,
+                &reset_args,
+                "soft-reset workspace to source HEAD",
+            )?;
+            original_workspace_head_for_restore = Some(ws_head.clone());
+            soft_reset_applied = true;
+        }
+
+        let restore_workspace_head_on_error = |error_context: &str| -> Option<String> {
+            let Some(original_head) = original_workspace_head_for_restore.as_deref() else {
+                return None;
+            };
+            match restore_workspace_head_after_failed_merge(workspace_dir, original_head) {
+                Ok(()) => {
+                    info!(
+                        workspace = %workspace_dir.display(),
+                        original_head = %original_head,
+                        "{error_context}; restored workspace HEAD after merge failure"
+                    );
+                    Some(format!(
+                        "\nWorkspace restored to pre-merge HEAD: {original_head}"
+                    ))
+                }
+                Err(restore_err) => {
+                    warn!(
+                        error = %restore_err,
+                        workspace = %workspace_dir.display(),
+                        original_head = %original_head,
+                        "{error_context}; failed to restore workspace HEAD after merge failure"
+                    );
+                    Some(format!(
+                        "\nWARNING: failed to restore workspace to pre-merge HEAD {original_head}: {restore_err}"
+                    ))
+                }
+            }
+        };
+
+        let scoped_paths = match scoped_workspace_changed_paths(source_workdir, workspace_dir) {
+            Ok(paths) => paths,
+            Err(err) => {
+                let restore_note =
+                    restore_workspace_head_on_error("workspace scoped path computation failed")
+                        .unwrap_or_default();
+                return Err(err.context(format!(
+                    "parallel workspace merge failed while computing scoped paths for task {task_key}{restore_note}"
+                )));
+            }
+        };
         if scoped_paths.is_empty() {
             skipped_task_keys.push(task_key.clone());
+            task_outcomes.push(ParallelTaskMergeOutcome {
+                task_key: task_key.clone(),
+                disposition: ParallelTaskMergeDisposition::Skipped,
+                skip_reason: Some(ParallelTaskSkipReason::NoScopedPaths),
+                workspace_head: Some(ws_head.clone()),
+                source_head: Some(source_head.clone()),
+                soft_reset_applied,
+                patch_path: None,
+            });
             continue;
         }
 
-        stage_workspace_paths(workspace_dir, &scoped_paths)?;
-        let patch = export_staged_workspace_patch(workspace_dir)?;
+        if let Err(err) = stage_workspace_paths(workspace_dir, &scoped_paths) {
+            let restore_note =
+                restore_workspace_head_on_error("workspace staging failed").unwrap_or_default();
+            return Err(err.context(format!(
+                "parallel workspace merge failed while staging paths for task {task_key}{restore_note}"
+            )));
+        }
+        let patch = match export_staged_workspace_patch(workspace_dir) {
+            Ok(patch) => patch,
+            Err(err) => {
+                let restore_note = restore_workspace_head_on_error("workspace patch export failed")
+                    .unwrap_or_default();
+                return Err(err.context(format!(
+                    "parallel workspace merge failed while exporting patch for task {task_key}{restore_note}"
+                )));
+            }
+        };
         if patch.trim().is_empty() {
             skipped_task_keys.push(task_key.clone());
+            task_outcomes.push(ParallelTaskMergeOutcome {
+                task_key: task_key.clone(),
+                disposition: ParallelTaskMergeDisposition::Skipped,
+                skip_reason: Some(ParallelTaskSkipReason::EmptyPatch),
+                workspace_head: Some(ws_head.clone()),
+                source_head: Some(source_head.clone()),
+                soft_reset_applied,
+                patch_path: None,
+            });
             continue;
         }
 
-        let patch_path =
-            persist_workspace_patch_for_recovery(run_workspace_root, task_key, task_index, &patch)?;
+        let patch_path = match persist_workspace_patch_for_recovery(
+            run_workspace_root,
+            task_key,
+            task_index,
+            &patch,
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let restore_note = restore_workspace_head_on_error(
+                    "failed to persist workspace recovery patch artifact",
+                )
+                .unwrap_or_default();
+                return Err(err.context(format!(
+                    "parallel workspace merge failed while persisting patch artifact for task {task_key}{restore_note}"
+                )));
+            }
+        };
         if let Err(err) =
-            apply_workspace_patch_to_source(source_workdir, task_key, patch.as_bytes())
+            apply_workspace_patch_to_source(source_workdir, task_key, patch.as_bytes(), merge_conflict_resolution)
         {
+            let restore_note =
+                restore_workspace_head_on_error("workspace patch apply failed").unwrap_or_default();
             let note_path = write_parallel_merge_recovery_note(
                 run_id,
                 source_workdir,
@@ -843,6 +1217,7 @@ pub(crate) fn merge_parallel_workspace_results(
                 workspace_dir,
                 task_key,
                 &patch_path,
+                original_workspace_head_for_restore.as_deref(),
             )
             .ok();
             let mut guidance = format!(
@@ -860,6 +1235,7 @@ Operator recovery steps:\n\
             if let Some(path) = note_path {
                 guidance.push_str(&format!("\nDetailed recovery note: {}", path.display()));
             }
+            guidance.push_str(&restore_note);
             guidance.push_str(&format!(
                 "\nWorkspace root preserved for inspection: {}",
                 run_workspace_root.display()
@@ -867,6 +1243,15 @@ Operator recovery steps:\n\
             return Err(err.context(guidance));
         }
         merged_task_keys.push(task_key.clone());
+        task_outcomes.push(ParallelTaskMergeOutcome {
+            task_key: task_key.clone(),
+            disposition: ParallelTaskMergeDisposition::Merged,
+            skip_reason: None,
+            workspace_head: Some(ws_head.clone()),
+            source_head: Some(source_head.clone()),
+            soft_reset_applied,
+            patch_path: Some(patch_path.display().to_string()),
+        });
 
         // Commit the merged result so the next workspace starts with a clean
         // working tree + index. git apply --3way requires working tree == index,
@@ -939,8 +1324,10 @@ Operator recovery steps:\n\
     }
 
     Ok(ParallelWorkspaceMergeReport {
+        preserve_workspace_root: !skipped_task_keys.is_empty(),
         merged_task_keys,
         skipped_task_keys,
+        task_outcomes,
     })
 }
 
@@ -1302,6 +1689,249 @@ worktree_root = "{}"
     }
 
     #[test]
+    fn merge_parallel_workspace_results_detects_committed_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("file.txt"), "original\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace");
+        run_git_expect_ok(
+            temp_dir.path(),
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git_expect_ok(&workspace, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&workspace, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(workspace.join("file.txt"), "modified by worker\n").unwrap();
+        std::fs::write(workspace.join("new-file.txt"), "brand new file\n").unwrap();
+        run_git_expect_ok(&workspace, &["add", "."]);
+        run_git_expect_ok(&workspace, &["commit", "-m", "worker implementation"]);
+
+        let (_, status_out, _) = run_git(&workspace, &["status", "--porcelain"]);
+        assert!(
+            status_out.trim().is_empty(),
+            "workspace should be clean after commit"
+        );
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[("task-committed".to_string(), workspace.clone())],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged_task_keys, vec!["task-committed".to_string()]);
+        assert!(report.skipped_task_keys.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("file.txt")).unwrap(),
+            "modified by worker\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("new-file.txt")).unwrap(),
+            "brand new file\n"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_handles_mixed_committed_and_uncommitted() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("committed.txt"), "original\n").unwrap();
+        std::fs::write(source_repo.join("uncommitted.txt"), "original\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace");
+        run_git_expect_ok(
+            temp_dir.path(),
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git_expect_ok(&workspace, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&workspace, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(workspace.join("committed.txt"), "committed change\n").unwrap();
+        run_git_expect_ok(&workspace, &["add", "."]);
+        run_git_expect_ok(&workspace, &["commit", "-m", "worker commit"]);
+
+        std::fs::write(workspace.join("uncommitted.txt"), "uncommitted change\n").unwrap();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[("task-mixed".to_string(), workspace.clone())],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged_task_keys, vec!["task-mixed".to_string()]);
+        assert!(report.skipped_task_keys.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("committed.txt")).unwrap(),
+            "committed change\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("uncommitted.txt")).unwrap(),
+            "uncommitted change\n"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_multiple_commits_in_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("file.txt"), "base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace");
+        run_git_expect_ok(
+            temp_dir.path(),
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git_expect_ok(&workspace, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&workspace, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(workspace.join("file.txt"), "first edit\n").unwrap();
+        run_git_expect_ok(&workspace, &["add", "."]);
+        run_git_expect_ok(&workspace, &["commit", "-m", "first"]);
+
+        std::fs::write(workspace.join("file.txt"), "second edit\n").unwrap();
+        std::fs::write(workspace.join("extra.txt"), "extra file\n").unwrap();
+        run_git_expect_ok(&workspace, &["add", "."]);
+        run_git_expect_ok(&workspace, &["commit", "-m", "second"]);
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[("task-multi".to_string(), workspace.clone())],
+        )
+        .unwrap();
+
+        assert_eq!(report.merged_task_keys, vec!["task-multi".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("file.txt")).unwrap(),
+            "second edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("extra.txt")).unwrap(),
+            "extra file\n"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_rejects_non_descendant_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("file.txt"), "original\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace");
+        run_git_expect_ok(
+            temp_dir.path(),
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git_expect_ok(&workspace, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&workspace, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("file.txt"), "source advanced\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "source advance"]);
+        run_git_expect_ok(&workspace, &["fetch", "origin"]);
+
+        std::fs::write(workspace.join("file.txt"), "worker change\n").unwrap();
+        run_git_expect_ok(&workspace, &["add", "."]);
+        run_git_expect_ok(&workspace, &["commit", "-m", "worker commit"]);
+
+        let result = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[("task-diverged".to_string(), workspace.clone())],
+        );
+        assert!(
+            result.is_err(),
+            "expected error for non-descendant workspace"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not a descendant"),
+            "error should mention non-descendant ancestry: {err_msg}"
+        );
+        let note_path = run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+        assert!(
+            note_path.exists(),
+            "expected recovery note at {}",
+            note_path.display()
+        );
+        let note = std::fs::read_to_string(&note_path).unwrap();
+        assert!(
+            note.contains("Operator recovery steps"),
+            "expected operator guidance in recovery note: {note}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("file.txt")).unwrap(),
+            "source advanced\n"
+        );
+    }
+
+    #[test]
     fn merge_parallel_workspace_results_ignores_baseline_untracked_artifacts() {
         let temp_dir = TempDir::new().unwrap();
         let source_repo = temp_dir.path().join("source");
@@ -1622,6 +2252,64 @@ worktree_root = "{}"
     }
 
     #[test]
+    fn merge_parallel_workspace_results_applies_committed_permission_only_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        let script_path = source_repo.join("script.sh");
+        std::fs::write(&script_path, "#!/usr/bin/env bash\necho hi\n").unwrap();
+        let mut source_perms = std::fs::metadata(&script_path).unwrap().permissions();
+        source_perms.set_mode(0o644);
+        std::fs::set_permissions(&script_path, source_perms).unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace-one");
+        let source_repo_str = source_repo.to_str().unwrap();
+        let workspace_str = workspace.to_str().unwrap();
+        run_git_expect_ok(temp_dir.path(), &["clone", source_repo_str, workspace_str]);
+        run_git_expect_ok(&workspace, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&workspace, &["config", "user.name", "Yarli Test"]);
+
+        let workspace_script = workspace.join("script.sh");
+        let mut workspace_perms = std::fs::metadata(&workspace_script).unwrap().permissions();
+        workspace_perms.set_mode(0o755);
+        std::fs::set_permissions(&workspace_script, workspace_perms).unwrap();
+        run_git_expect_ok(&workspace, &["add", "script.sh"]);
+        run_git_expect_ok(&workspace, &["commit", "-m", "chmod +x script"]);
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[("task-mode-committed".to_string(), workspace.clone())],
+        )
+        .unwrap();
+        assert_eq!(
+            report.merged_task_keys,
+            vec!["task-mode-committed".to_string()]
+        );
+        assert!(report.skipped_task_keys.is_empty());
+
+        let source_mode = std::fs::metadata(script_path).unwrap().permissions().mode();
+        assert_ne!(
+            source_mode & 0o111,
+            0,
+            "expected committed executable bit to be merged"
+        );
+    }
+
+    #[test]
     fn merge_parallel_workspace_results_returns_error_on_conflicting_workspace_changes() {
         let temp_dir = TempDir::new().unwrap();
         let source_repo = temp_dir.path().join("source");
@@ -1691,6 +2379,95 @@ worktree_root = "{}"
         assert!(
             merged_contents.contains("workspace two change"),
             "expected second workspace change to remain visible: {merged_contents}"
+        );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_restores_workspace_head_after_failed_apply() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+        std::fs::write(source_repo.join("shared.txt"), "base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace_one = temp_dir.path().join("workspace-one");
+        let workspace_two = temp_dir.path().join("workspace-two");
+        let source_repo_str = source_repo.to_str().unwrap();
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_one.to_str().unwrap()],
+        );
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo_str, workspace_two.to_str().unwrap()],
+        );
+        run_git_expect_ok(&workspace_one, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&workspace_one, &["config", "user.name", "Yarli Test"]);
+        run_git_expect_ok(&workspace_two, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&workspace_two, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(workspace_one.join("shared.txt"), "workspace one change\n").unwrap();
+        run_git_expect_ok(&workspace_one, &["add", "shared.txt"]);
+        run_git_expect_ok(&workspace_one, &["commit", "-m", "workspace one commit"]);
+
+        std::fs::write(workspace_two.join("shared.txt"), "workspace two change\n").unwrap();
+        run_git_expect_ok(&workspace_two, &["add", "shared.txt"]);
+        run_git_expect_ok(&workspace_two, &["commit", "-m", "workspace two commit"]);
+
+        let (_ok, ws2_head_stdout, _stderr) = run_git(&workspace_two, &["rev-parse", "HEAD"]);
+        let ws2_head_before_merge = ws2_head_stdout.trim().to_string();
+
+        let run_id = Uuid::now_v7();
+        let err = merge_parallel_workspace_results(
+            &source_repo,
+            run_id,
+            &run_workspace_root,
+            &[
+                ("task-one".to_string(), workspace_one.clone()),
+                ("task-two".to_string(), workspace_two.clone()),
+            ],
+        )
+        .unwrap_err();
+        let err_text = err.to_string();
+        assert!(err_text.contains("task task-two"), "{err_text}");
+        assert!(
+            err_text.contains("Workspace restored to pre-merge HEAD"),
+            "{err_text}"
+        );
+
+        let (_ok, ws2_head_after_stdout, _stderr) = run_git(&workspace_two, &["rev-parse", "HEAD"]);
+        assert_eq!(ws2_head_after_stdout.trim(), ws2_head_before_merge);
+        let (_ok, ws2_status_stdout, _stderr) = run_git(&workspace_two, &["status", "--porcelain"]);
+        assert!(
+            ws2_status_stdout.trim().is_empty(),
+            "workspace should be clean after automatic head restore: {ws2_status_stdout:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_two.join("shared.txt")).unwrap(),
+            "workspace two change\n"
+        );
+
+        let note_path = run_workspace_root.join("PARALLEL_MERGE_RECOVERY.txt");
+        assert!(
+            note_path.exists(),
+            "expected recovery note at {}",
+            note_path.display()
+        );
+        let note = std::fs::read_to_string(&note_path).unwrap();
+        assert!(note.contains(&run_id.to_string()));
+        assert!(note.contains("Original workspace HEAD before merge normalization"));
+        assert!(note.contains(&ws2_head_before_merge));
+        assert!(
+            note.contains("reset --hard"),
+            "expected reset guidance in recovery note: {note}"
         );
     }
 

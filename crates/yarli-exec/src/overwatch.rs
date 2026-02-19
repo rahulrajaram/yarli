@@ -607,6 +607,7 @@ mod tests {
             idempotency_key: Some("ow:test".to_string()),
             timeout: None,
             env: vec![("A".to_string(), "B".to_string())],
+            live_output_tx: None,
         }
     }
 

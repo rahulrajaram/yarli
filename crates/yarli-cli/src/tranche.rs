@@ -1,6 +1,8 @@
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
+use std::process;
 
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info};
@@ -30,6 +32,117 @@ pub(crate) fn tranches_file_path(base_dir: &Path) -> PathBuf {
     base_dir.join(TRANCHES_FILE)
 }
 
+fn byte_offset_to_line_col(content: &str, byte_offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut column = 1usize;
+    let offset = byte_offset.min(content.len());
+    for ch in content[..offset].chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+fn format_tranches_toml_parse_error(content: &str, err: &toml::de::Error) -> String {
+    let mut detail = err.to_string();
+    if let Some(span) = err.span() {
+        let (line, column) = byte_offset_to_line_col(content, span.start);
+        detail.push_str(&format!(" (line {line}, column {column})"));
+    }
+    detail
+}
+
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    let pid = process::id();
+    let tmp_basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tranches.toml");
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 0..64u32 {
+        let tmp_path = parent.join(format!(".{tmp_basename}.tmp-{pid}-{attempt}"));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(content.as_bytes()) {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(err).with_context(|| {
+                        format!("failed to write temporary file {}", tmp_path.display())
+                    });
+                }
+                if let Err(err) = file.sync_all() {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(err).with_context(|| {
+                        format!("failed to sync temporary file {}", tmp_path.display())
+                    });
+                }
+                drop(file);
+                fs::rename(&tmp_path, path).with_context(|| {
+                    format!(
+                        "failed to atomically replace {} with {}",
+                        path.display(),
+                        tmp_path.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(err.into());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to create temporary file for {}", path.display())
+                });
+            }
+        }
+    }
+
+    let last_error = last_error.map(|err| format!(": {err}")).unwrap_or_default();
+    bail!(
+        "failed to create unique temporary file for {} after multiple attempts{}",
+        path.display(),
+        last_error
+    )
+}
+
+pub(crate) fn validate_structured_tranches_preflight_for_prompt(
+    entry_prompt_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let plan_path = match plan_path_for_prompt_entry(entry_prompt_path) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let tranches_base_dir = plan_path
+        .parent()
+        .context("plan file has no parent directory")?;
+    let tranches_path = tranches_file_path(tranches_base_dir);
+    if !tranches_path.exists() {
+        return Ok(None);
+    }
+
+    read_tranches_file_in(tranches_base_dir).map_err(|err| {
+        anyhow::anyhow!(
+            "structured tranches preflight failed for {}.\n\
+Run aborted to avoid continuation/plan state drift.\n\
+Fix the file syntax and rerun (for example: edit the file, then run `yarli plan validate`).\n\
+Parse details:\n{err:#}",
+            tranches_path.display()
+        )
+    })?;
+    Ok(Some(tranches_path))
+}
+
 pub(crate) fn read_tranches_file_in(base_dir: &Path) -> Result<Option<TranchesFile>> {
     let path = tranches_file_path(base_dir);
     if !path.exists() {
@@ -37,8 +150,10 @@ pub(crate) fn read_tranches_file_in(base_dir: &Path) -> Result<Option<TranchesFi
     }
     let content =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let tf: TranchesFile =
-        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+    let tf: TranchesFile = toml::from_str(&content).map_err(|err| {
+        let detail = format_tranches_toml_parse_error(&content, &err);
+        anyhow::anyhow!("failed to parse {}: {}", path.display(), detail)
+    })?;
     if tf.version != 1 {
         bail!(
             "{}: unsupported version {} (expected 1)",
@@ -61,7 +176,7 @@ pub(crate) fn write_tranches_file_in(base_dir: &Path, tf: &TranchesFile) -> Resu
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
     let content = toml::to_string_pretty(tf).context("failed to serialize tranches file")?;
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    atomic_write(&path, &content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -197,11 +312,42 @@ pub(crate) fn validate_tranche_definition(def: &TrancheDefinition) -> Result<()>
     if !token_has_alpha_and_digit(key) {
         bail!("tranche key '{}' must contain both letters and digits", key);
     }
-    if def.summary.trim().is_empty() {
+    let summary = def.summary.trim();
+    if summary.is_empty() {
         bail!("tranche summary must not be empty");
+    }
+    let word_count = summary.split_whitespace().count();
+    if word_count < 3 {
+        bail!(
+            "tranche summary '{}' is too vague ({} word(s)) — use format: Verb + outcome + scope",
+            summary,
+            word_count
+        );
+    }
+    let lower_summary = summary.to_ascii_lowercase();
+    for pattern in PLACEHOLDER_PHRASES {
+        if lower_summary.contains(pattern) {
+            bail!(
+                "tranche summary contains placeholder text '{}' — provide a specific work description",
+                pattern
+            );
+        }
     }
     Ok(())
 }
+
+/// Phrases that indicate a placeholder/vague tranche summary.
+const PLACEHOLDER_PHRASES: &[&str] = &[
+    "details pending",
+    "pending",
+    "placeholder",
+    "to be determined",
+    "tbd",
+    "todo",
+    "fix later",
+    "needs work",
+    "fill in",
+];
 
 // ---------------------------------------------------------------------------
 // `yarli plan` command handlers
@@ -212,6 +358,9 @@ pub(crate) fn cmd_plan_tranche_add(
     summary: &str,
     group: Option<&str>,
     allowed_paths: &[String],
+    verify: Option<&str>,
+    done_when: Option<&str>,
+    max_tokens: Option<u64>,
 ) -> Result<()> {
     let def = TrancheDefinition {
         key: key.to_string(),
@@ -219,6 +368,9 @@ pub(crate) fn cmd_plan_tranche_add(
         status: TrancheStatus::Incomplete,
         group: group.map(|g| g.to_string()),
         allowed_paths: allowed_paths.to_vec(),
+        verify: verify.map(|s| s.to_string()),
+        done_when: done_when.map(|s| s.to_string()),
+        max_tokens,
     };
     validate_tranche_definition(&def)?;
 
@@ -1106,6 +1258,9 @@ mode = "implement"
                     status: TrancheStatus::Incomplete,
                     group: Some("runtime".to_string()),
                     allowed_paths: vec!["src/main.rs".to_string(), "docs/".to_string()],
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
                 },
                 TrancheDefinition {
                     key: "TP-06".to_string(),
@@ -1113,6 +1268,9 @@ mode = "implement"
                     status: TrancheStatus::Complete,
                     group: None,
                     allowed_paths: vec![],
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
                 },
                 TrancheDefinition {
                     key: "TP-07".to_string(),
@@ -1120,6 +1278,9 @@ mode = "implement"
                     status: TrancheStatus::Blocked,
                     group: None,
                     allowed_paths: vec![],
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
                 },
             ],
         };
@@ -1140,6 +1301,9 @@ mode = "implement"
                     status: TrancheStatus::Incomplete,
                     group: Some("runtime".to_string()),
                     allowed_paths: vec!["src/".to_string()],
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
                 },
                 TrancheDefinition {
                     key: "TP-06".to_string(),
@@ -1147,6 +1311,9 @@ mode = "implement"
                     status: TrancheStatus::Complete,
                     group: None,
                     allowed_paths: vec![],
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
                 },
                 TrancheDefinition {
                     key: "TP-07".to_string(),
@@ -1154,6 +1321,9 @@ mode = "implement"
                     status: TrancheStatus::Blocked,
                     group: Some("infra".to_string()),
                     allowed_paths: vec![],
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
                 },
             ],
         };
@@ -1180,10 +1350,13 @@ mode = "implement"
     fn validate_tranche_definition_rejects_uuid() {
         let def = TrancheDefinition {
             key: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-            summary: "Some task".to_string(),
+            summary: "Implement query cache eviction".to_string(),
             status: TrancheStatus::Incomplete,
             group: None,
             allowed_paths: vec![],
+            verify: None,
+            done_when: None,
+            max_tokens: None,
         };
         let err = validate_tranche_definition(&def).unwrap_err();
         assert!(format!("{err}").contains("UUID"), "error: {err}");
@@ -1194,10 +1367,13 @@ mode = "implement"
         for prefix in &["run-abc1", "app-test2", "target-foo3"] {
             let def = TrancheDefinition {
                 key: prefix.to_string(),
-                summary: "Some task".to_string(),
+                summary: "Implement query cache eviction".to_string(),
                 status: TrancheStatus::Incomplete,
                 group: None,
                 allowed_paths: vec![],
+                verify: None,
+                done_when: None,
+                max_tokens: None,
             };
             let err = validate_tranche_definition(&def).unwrap_err();
             assert!(
@@ -1211,10 +1387,13 @@ mode = "implement"
     fn validate_tranche_definition_rejects_alpha_only() {
         let def = TrancheDefinition {
             key: "configloader".to_string(),
-            summary: "No digits".to_string(),
+            summary: "Reject invalid digit-only keys".to_string(),
             status: TrancheStatus::Incomplete,
             group: None,
             allowed_paths: vec![],
+            verify: None,
+            done_when: None,
+            max_tokens: None,
         };
         let err = validate_tranche_definition(&def).unwrap_err();
         assert!(
@@ -1228,14 +1407,107 @@ mode = "implement"
         for key in &["TP-05", "M3A", "CARD-001", "step2b"] {
             let def = TrancheDefinition {
                 key: key.to_string(),
-                summary: "Valid tranche".to_string(),
+                summary: "Valid tranche definition here".to_string(),
                 status: TrancheStatus::Incomplete,
                 group: None,
                 allowed_paths: vec![],
+                verify: None,
+                done_when: None,
+                max_tokens: None,
             };
             assert!(
                 validate_tranche_definition(&def).is_ok(),
                 "key={key} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_tranche_definition_rejects_empty_summary() {
+        let def = TrancheDefinition {
+            key: "TP-01".to_string(),
+            summary: "".to_string(),
+            status: TrancheStatus::Incomplete,
+            group: None,
+            allowed_paths: vec![],
+            verify: None,
+            done_when: None,
+            max_tokens: None,
+        };
+        let err = validate_tranche_definition(&def).unwrap_err();
+        assert!(
+            format!("{err}").contains("must not be empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_tranche_definition_rejects_short_summary() {
+        for summary in &["Fix", "Do thing"] {
+            let def = TrancheDefinition {
+                key: "TP-01".to_string(),
+                summary: summary.to_string(),
+                status: TrancheStatus::Incomplete,
+                group: None,
+                allowed_paths: vec![],
+                verify: None,
+                done_when: None,
+                max_tokens: None,
+            };
+            let err = validate_tranche_definition(&def).unwrap_err();
+            assert!(
+                format!("{err}").contains("too vague"),
+                "summary='{summary}', error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_tranche_definition_rejects_placeholder_phrases() {
+        for phrase in &[
+            "Implement feature details pending",
+            "TBD work on module",
+            "Todo implement the cache",
+            "Fix later the parser bug",
+        ] {
+            let def = TrancheDefinition {
+                key: "TP-01".to_string(),
+                summary: phrase.to_string(),
+                status: TrancheStatus::Incomplete,
+                group: None,
+                allowed_paths: vec![],
+                verify: None,
+                done_when: None,
+                max_tokens: None,
+            };
+            let err = validate_tranche_definition(&def).unwrap_err();
+            assert!(
+                format!("{err}").contains("placeholder text"),
+                "summary='{phrase}', error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_tranche_definition_accepts_good_summaries() {
+        for summary in &[
+            "Implement query cache eviction in src/query/cache.rs",
+            "Add retry logic for transient failures",
+            "Wire OpenTelemetry spans into scheduler",
+        ] {
+            let def = TrancheDefinition {
+                key: "TP-01".to_string(),
+                summary: summary.to_string(),
+                status: TrancheStatus::Incomplete,
+                group: None,
+                allowed_paths: vec![],
+                verify: None,
+                done_when: None,
+                max_tokens: None,
+            };
+            assert!(
+                validate_tranche_definition(&def).is_ok(),
+                "summary='{summary}' should be valid"
             );
         }
     }
@@ -1255,6 +1527,9 @@ mode = "implement"
                 status: TrancheStatus::Incomplete,
                 group: None,
                 allowed_paths: vec![],
+                verify: None,
+                done_when: None,
+                max_tokens: None,
             }],
         };
         let toml_content = toml::to_string_pretty(&tf).unwrap();
@@ -1308,6 +1583,73 @@ mode = "implement"
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "FB-01");
         assert!(!entries[0].is_complete);
+    }
+
+    #[test]
+    fn validate_structured_tranches_preflight_reports_parse_details() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. ST-01 `Structured`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+[[tranches]]
+key = "ST-01"
+summary = "Structured tranche"
+status = incomplete
+"#,
+        )
+        .unwrap();
+
+        let err = validate_structured_tranches_preflight_for_prompt(&repo.path().join("PROMPT.md"))
+            .unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("structured tranches preflight failed"),
+            "expected preflight context, got: {err_text}"
+        );
+        assert!(
+            err_text.contains("line"),
+            "expected parse position details, got: {err_text}"
+        );
+    }
+
+    #[test]
+    fn write_tranches_file_in_round_trips_without_parse_failures() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+
+        for idx in 0..64 {
+            let tf = TranchesFile {
+                version: 1,
+                tranches: vec![TrancheDefinition {
+                    key: format!("ST-{idx:02}"),
+                    summary: format!("Structured tranche {idx}"),
+                    status: if idx % 2 == 0 {
+                        TrancheStatus::Incomplete
+                    } else {
+                        TrancheStatus::Complete
+                    },
+                    group: Some("core".to_string()),
+                    allowed_paths: vec!["src/lib.rs".to_string()],
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
+                }],
+            };
+            write_tranches_file_in(repo.path(), &tf).unwrap();
+            let parsed = read_tranches_file_in(repo.path())
+                .unwrap()
+                .expect("tranches file should exist");
+            assert_eq!(parsed.version, 1);
+            assert_eq!(parsed.tranches.len(), 1);
+        }
     }
 
     #[test]

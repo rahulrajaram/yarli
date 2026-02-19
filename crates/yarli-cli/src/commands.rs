@@ -4,11 +4,16 @@ use yarli_exec::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
     OverwatchRunnerConfig,
 };
+use yarli_queue::scheduler::LiveOutputEvent;
 
 use super::*;
 use crate::events::*;
 use crate::persistence::RUN_CONTINUATION_EVENT_TYPE;
 use crate::render::*;
+use crate::workspace::{
+    merge_parallel_workspace_results_with_resolution, prepare_parallel_workspace_layout,
+    ParallelWorkspaceMergeReport,
+};
 
 #[derive(Clone)]
 enum SelectedCommandRunner {
@@ -223,6 +228,20 @@ pub(crate) async fn cmd_run_default(
         run_spec: run_spec.clone(),
     };
     let plan_guard_context = run_spec_plan_guard_preflight(&loaded)?;
+    if let Some(validated_tranches_path) =
+        validate_structured_tranches_preflight_for_prompt(&loaded.entry_path)?
+    {
+        info!(
+            tranches_file = %validated_tranches_path.display(),
+            "validated structured tranches file preflight"
+        );
+    }
+
+    // Preflight: verify the CLI backend is functional before dispatching real work.
+    let cli_invocation = config::resolve_cli_invocation_config(loaded_config)?;
+    config::preflight_cli_backend(&cli_invocation)
+        .context("CLI backend preflight check failed — fix the [cli] section in yarli.toml before running")?;
+    info!("CLI backend preflight passed");
 
     let objective = run_spec
         .objective
@@ -630,7 +649,7 @@ where
 
     // Drive scheduler loop, emitting events to renderer channel.
     let continuation_payload = drive_scheduler(
-        &scheduler,
+        &mut scheduler,
         &store,
         shutdown.clone(),
         cancel,
@@ -657,6 +676,7 @@ where
         .context("renderer error")?;
 
     let mut parallel_merge_error: Option<anyhow::Error> = None;
+    let mut parallel_merge_report: Option<ParallelWorkspaceMergeReport> = None;
     if continuation_payload.exit_state == RunState::RunCompleted {
         if let Some(layout) = parallel_workspace_layout.as_ref() {
             let source_workdir =
@@ -673,18 +693,30 @@ where
                 .zip(layout.task_workspace_dirs.iter())
                 .map(|(task, workspace_dir)| (task.task_key.clone(), workspace_dir.clone()))
                 .collect::<Vec<_>>();
-            match merge_parallel_workspace_results(
+            match merge_parallel_workspace_results_with_resolution(
                 &source_workdir,
                 run_id,
                 &layout.run_workspace_root,
                 &task_workspaces,
+                loaded_config.config().run.merge_conflict_resolution,
+                layout.source_head_at_creation.as_deref(),
             ) {
                 Ok(report) => {
                     let merged_count = report.merged_task_keys.len();
                     let skipped_count = report.skipped_task_keys.len();
+                    let preserved_workspace_root = report.preserve_workspace_root;
                     println!(
                         "Parallel workspace merge: merged {merged_count} task workspace(s), skipped {skipped_count} with no changes."
                     );
+                    if preserved_workspace_root {
+                        println!(
+                            "Parallel workspace merge retained task workspaces for operator review: {}",
+                            layout.run_workspace_root.display()
+                        );
+                    }
+                    let merged_task_keys = report.merged_task_keys.clone();
+                    let skipped_task_keys = report.skipped_task_keys.clone();
+                    let task_outcomes = report.task_outcomes.clone();
                     if let Err(err) = store.append(Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: chrono::Utc::now(),
@@ -692,8 +724,11 @@ where
                         entity_id: run_id.to_string(),
                         event_type: "run.parallel_merge_succeeded".to_string(),
                         payload: serde_json::json!({
-                            "merged_task_keys": report.merged_task_keys,
-                            "skipped_task_keys": report.skipped_task_keys,
+                            "merged_task_keys": merged_task_keys,
+                            "skipped_task_keys": skipped_task_keys,
+                            "task_outcomes": task_outcomes,
+                            "preserve_workspace_root": preserved_workspace_root,
+                            "preserved_workspace_root": preserved_workspace_root.then(|| layout.run_workspace_root.display().to_string()),
                             "source_workdir": source_workdir.display().to_string(),
                             "workspace_root": layout.run_workspace_root.display().to_string(),
                         }),
@@ -704,6 +739,7 @@ where
                     }) {
                         warn!(error = %err, "failed to persist parallel merge success event");
                     }
+                    parallel_merge_report = Some(report);
                 }
                 Err(err) => {
                     if let Err(append_err) = store.append(Event {
@@ -734,7 +770,16 @@ where
 
     if let Some(layout) = parallel_workspace_layout.as_ref() {
         if parallel_merge_error.is_none() {
-            if let Err(err) = fs::remove_dir_all(&layout.run_workspace_root) {
+            let preserve_workspace_root = parallel_merge_report
+                .as_ref()
+                .map(|report| report.preserve_workspace_root)
+                .unwrap_or(false);
+            if preserve_workspace_root {
+                warn!(
+                    workspace_root = %layout.run_workspace_root.display(),
+                    "preserving parallel run workspace root after skipped task workspace merge for inspection"
+                );
+            } else if let Err(err) = fs::remove_dir_all(&layout.run_workspace_root) {
                 warn!(
                     error = %err,
                     workspace_root = %layout.run_workspace_root.display(),
@@ -787,6 +832,7 @@ where
             warn!(
                 run_id = %run_id,
                 error = %err,
+                error_chain = %format!("{err:#}"),
                 "failed to auto-complete structured tranche status"
             );
         }
@@ -1437,7 +1483,7 @@ pub(crate) fn with_cancellation_diagnostics(
 /// Drive the scheduler, emitting StreamEvents to the renderer channel.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_scheduler<Q, S, R>(
-    scheduler: &Scheduler<Q, S, R>,
+    scheduler: &mut Scheduler<Q, S, R>,
     store: &Arc<S>,
     shutdown: ShutdownController,
     cancel: CancellationToken,
@@ -1485,6 +1531,32 @@ where
         warn!(error = %e, "failed to clean up stale queue entries");
     }
 
+    // Set up live output streaming: chunks flow from runner → scheduler → renderer
+    // in real time, bypassing the event store batch path.
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<LiveOutputEvent>();
+    scheduler.set_live_output(live_tx);
+    let live_streaming_active = true;
+
+    // Spawn an independent task that forwards live chunks to StreamEvents.
+    // This runs concurrently with the select! loop so output arrives even while
+    // tick_with_cancel blocks on a long-running command.
+    let stream_tx_live = tx.clone();
+    let task_names_vec: Vec<(Uuid, String)> = task_names.to_vec();
+    tokio::spawn(async move {
+        while let Some(event) = live_rx.recv().await {
+            let name = task_names_vec
+                .iter()
+                .find(|(tid, _)| *tid == event.task_id)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| event.task_id.to_string());
+            let _ = stream_tx_live.send(StreamEvent::CommandOutput {
+                task_id: event.task_id,
+                task_name: name,
+                line: event.chunk.data,
+            });
+        }
+    });
+
     let mut zero_progress_ticks: u64 = 0;
     let mut paused = false;
 
@@ -1523,7 +1595,7 @@ where
                 )
                 .await?;
                 let _new_events =
-                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
                 deterioration_observer.observe_store(store.as_ref())?;
                 if let Some(observer) = memory_observer.as_mut() {
                     match tokio::time::timeout(
@@ -1556,6 +1628,7 @@ where
                 let _ = tx.send(StreamEvent::RunExited {
                     payload: payload.clone(),
                 });
+                scheduler.clear_live_output();
                 drop(tx);
                 return Ok(payload);
             }
@@ -1643,7 +1716,7 @@ where
 
                 // Emit events using incremental cursor reads.
                 let _new_events =
-                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
                 let control_signal = _new_events
                     .iter()
                     .filter_map(|event| operator_control_signal_from_event(event, run_id))
@@ -1702,7 +1775,7 @@ where
                         )
                         .await?;
                         let cancel_events =
-                            emit_new_stream_events(store, &tx, task_names, &mut stream_cursor)?;
+                            emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
                         deterioration_observer.observe_store(store.as_ref())?;
                         if let Some(observer) = memory_observer.as_mut() {
                             match tokio::time::timeout(
@@ -1737,6 +1810,7 @@ where
                         let _ = tx.send(StreamEvent::RunExited {
                             payload: payload.clone(),
                         });
+                        scheduler.clear_live_output();
                         drop(tx);
                         return Ok(payload);
                     }
@@ -1747,34 +1821,42 @@ where
                 let _ = tx.send(StreamEvent::Tick);
 
                 // Check if the run is terminal.
-                let reg = scheduler.registry().read().await;
-                if let Some(run) = reg.get_run(&run_id) {
-                    if run.state.is_terminal() {
-                        info!(state = ?run.state, ticks = tick_count, "run reached terminal state");
-
-                        // Build and emit continuation payload before closing channel.
-                        let tasks: Vec<&yarli_core::entities::Task> = run
-                            .task_ids
-                            .iter()
-                            .filter_map(|tid| reg.get_task(tid))
-                            .collect();
-                        let payload = build_continuation_payload(
-                            run,
-                            &tasks,
-                            deterioration_observer.latest_report(),
-                            auto_advance_policy,
-                        );
-                        let _ = tx.send(StreamEvent::RunExited {
-                            payload: payload.clone(),
-                        });
-
-                        drop(tx);
-                        return Ok(payload);
+                let terminal_payload = {
+                    let reg = scheduler.registry().read().await;
+                    if let Some(run) = reg.get_run(&run_id) {
+                        if run.state.is_terminal() {
+                            info!(state = ?run.state, ticks = tick_count, "run reached terminal state");
+                            let tasks: Vec<&yarli_core::entities::Task> = run
+                                .task_ids
+                                .iter()
+                                .filter_map(|tid| reg.get_task(tid))
+                                .collect();
+                            Some(build_continuation_payload(
+                                run,
+                                &tasks,
+                                deterioration_observer.latest_report(),
+                                auto_advance_policy,
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
+                }; // reg dropped here
+
+                if let Some(payload) = terminal_payload {
+                    let _ = tx.send(StreamEvent::RunExited {
+                        payload: payload.clone(),
+                    });
+                    scheduler.clear_live_output();
+                    drop(tx);
+                    return Ok(payload);
                 }
 
                 // Safety: bail after 10000 ticks (~16 min at 100ms) to prevent infinite loops.
                 if tick_count > 10_000 {
+                    scheduler.clear_live_output();
                     drop(tx);
                     bail!("scheduler exceeded max ticks (10000)");
                 }
@@ -1788,6 +1870,7 @@ pub(crate) fn emit_new_stream_events<S: EventStore>(
     tx: &mpsc::UnboundedSender<StreamEvent>,
     task_names: &[(Uuid, String)],
     cursor: &mut IncrementalEventCursor,
+    suppress_command_output: bool,
 ) -> Result<Vec<Event>> {
     let new_events = cursor.read_new_events(store.as_ref())?;
 
@@ -1804,7 +1887,7 @@ pub(crate) fn emit_new_stream_events<S: EventStore>(
                 worker_id: worker_id.to_string(),
             });
         }
-        if let Some(se) = event_to_stream_event(event, task_names) {
+        if let Some(se) = event_to_stream_event(event, task_names, suppress_command_output) {
             let _ = tx.send(se);
         }
     }
@@ -5904,7 +5987,7 @@ mod tests {
 
     #[tokio::test]
     async fn drive_scheduler_captures_sigterm_cancellation_source() {
-        let (scheduler, store, run_id, correlation_id, task_names) =
+        let (mut scheduler, store, run_id, correlation_id, task_names) =
             setup_drive_scheduler_fixture("sleep 60").await;
         let shutdown = ShutdownController::new();
         let cancel = shutdown.token();
@@ -5919,7 +6002,7 @@ mod tests {
         let payload = tokio::time::timeout(
             Duration::from_secs(5),
             drive_scheduler(
-                &scheduler,
+                &mut scheduler,
                 &store,
                 shutdown,
                 cancel,
@@ -5977,7 +6060,7 @@ mod tests {
         let store = Arc::new(InMemoryEventStore::new());
         let queue = Arc::new(InMemoryTaskQueue::new());
         let runner = Arc::new(LocalCommandRunner::new());
-        let scheduler = Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
+        let mut scheduler = Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
         let run = Run::new(
             "drive operator cancel",
             yarli_core::domain::SafeMode::Execute,
@@ -6035,7 +6118,7 @@ mod tests {
         let payload = tokio::time::timeout(
             Duration::from_secs(8),
             drive_scheduler(
-                &scheduler,
+                &mut scheduler,
                 &store,
                 shutdown,
                 cancel,
@@ -6090,7 +6173,7 @@ mod tests {
 
     #[tokio::test]
     async fn drive_scheduler_captures_sw4rm_preemption_cancellation_source() {
-        let (scheduler, store, run_id, correlation_id, task_names) =
+        let (mut scheduler, store, run_id, correlation_id, task_names) =
             setup_drive_scheduler_fixture("sleep 60").await;
         let shutdown = ShutdownController::new();
         let cancel = shutdown.token();
@@ -6105,7 +6188,7 @@ mod tests {
         let payload = tokio::time::timeout(
             Duration::from_secs(5),
             drive_scheduler(
-                &scheduler,
+                &mut scheduler,
                 &store,
                 shutdown,
                 cancel,

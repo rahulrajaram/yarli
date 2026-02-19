@@ -221,6 +221,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         let result = journal.execute(req, cancel).await.unwrap();
@@ -257,6 +258,7 @@ mod tests {
             idempotency_key: None,
             timeout: Some(Duration::from_millis(100)),
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -291,6 +293,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -319,6 +322,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -347,6 +351,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -375,6 +380,7 @@ mod tests {
             idempotency_key: Some("my-key".to_string()),
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -406,6 +412,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         let result = journal.execute(req, cancel).await.unwrap();
@@ -434,6 +441,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -462,6 +470,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -487,6 +496,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -522,6 +532,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -551,6 +562,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -578,6 +590,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         let result = journal.execute(req, cancel).await;
@@ -602,6 +615,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         };
 
         journal.execute(req, cancel).await.unwrap();

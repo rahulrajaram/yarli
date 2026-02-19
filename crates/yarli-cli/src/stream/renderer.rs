@@ -532,7 +532,12 @@ impl StreamRenderer {
                 if let Some(ref output) = task.last_output_line {
                     let max_len = area.width.saturating_sub(40) as usize;
                     let truncated = if output.len() > max_len {
-                        &output[..max_len]
+                        // Walk back to the nearest char boundary at or before max_len.
+                        let mut end = max_len;
+                        while end > 0 && !output.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        &output[..end]
                     } else {
                         output.as_str()
                     };

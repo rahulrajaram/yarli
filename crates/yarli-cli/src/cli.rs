@@ -112,6 +112,7 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.enable_plan_tranche_grouping (default: false; group adjacent plan entries by shared tranche_group metadata)
 - run.max_grouped_tasks_per_tranche (default: 0; 0 = unlimited tasks per grouped tranche)
 - run.enforce_plan_tranche_allowed_paths (default: false; surface `allowed_paths=` plan metadata as scope constraints)
+- run.merge_conflict_resolution (default: "fail"; values: fail|agent|manual)
 - run.tasks (optional; array-of-table `[[run.tasks]]` entries with key/cmd/class)
 - run.tranches (optional; array-of-table `[[run.tranches]]` entries with key/objective/task_keys)
 - run.plan_guard.target (optional; when set, enforces plan target contract)
@@ -292,6 +293,8 @@ enable_plan_tranche_grouping = false
 max_grouped_tasks_per_tranche = 0
 # Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
 enforce_plan_tranche_allowed_paths = false
+# Merge conflict resolution strategy: fail | agent | manual
+# merge_conflict_resolution = "fail"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"
@@ -316,14 +319,16 @@ enforce_plan_tranche_allowed_paths = false
 # default_pace = "batch"
 
 [budgets]
+# Token guardrails (enabled by default to prevent runaway cost).
+max_task_total_tokens = 25000
+max_run_total_tokens = 250000
+
 # Optional hard limits. Leave commented/unset for no limit.
 # max_task_rss_bytes = 1073741824
 # max_task_cpu_user_ticks = 100000
 # max_task_cpu_system_ticks = 100000
 # max_task_io_read_bytes = 1073741824
 # max_task_io_write_bytes = 1073741824
-# max_task_total_tokens = 25000
-# max_run_total_tokens = 250000
 # max_run_peak_rss_bytes = 2147483648
 # max_run_cpu_user_ticks = 500000
 # max_run_cpu_system_ticks = 500000
@@ -411,7 +416,7 @@ parallel = true
 backend = "claude"
 prompt_mode = "arg"
 command = "claude"
-args = ["-p", "--model", "sonnet-4.5"]
+args = ["-p", "--dangerously-skip-permissions", "--model", "sonnet-4.5"]
 # env_unset = ["CLAUDECODE"]
 
 [event_loop]
@@ -880,6 +885,15 @@ pub(crate) enum TrancheAction {
         /// Optional comma-separated allowed paths for scope enforcement.
         #[arg(short, long, value_delimiter = ',')]
         allowed_paths: Vec<String>,
+        /// Verification command to run after completion (e.g. "cargo test --offline query_cache").
+        #[arg(short, long)]
+        verify: Option<String>,
+        /// Done-criteria describing what constitutes completion.
+        #[arg(short, long)]
+        done_when: Option<String>,
+        /// Per-tranche token budget override.
+        #[arg(short, long)]
+        max_tokens: Option<u64>,
     },
     #[command(about = "Mark a tranche as complete")]
     Complete {

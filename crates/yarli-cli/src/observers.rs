@@ -377,7 +377,11 @@ fn truncate_for_snippet(content: &str) -> String {
     if trimmed.len() <= MAX {
         return trimmed.to_string();
     }
-    format!("{}...", &trimmed[..MAX])
+    let mut end = MAX;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &trimmed[..end])
 }
 
 fn truncate_for_memory(content: &str) -> String {
@@ -386,7 +390,11 @@ fn truncate_for_memory(content: &str) -> String {
     if trimmed.len() <= MAX {
         return trimmed.to_string();
     }
-    format!("{}...", &trimmed[..MAX])
+    let mut end = MAX;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &trimmed[..end])
 }
 
 pub(crate) const OBSERVER_EVENT_BATCH_LIMIT: usize = 256;

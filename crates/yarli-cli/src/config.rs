@@ -449,6 +449,54 @@ pub(crate) fn build_cli_command(invocation: &CliInvocationConfig, prompt_text: &
     }
 }
 
+const PREFLIGHT_MARKER: &str = "YARLI_PREFLIGHT_OK";
+
+/// Exercise the configured CLI backend with a trivial prompt to verify it works
+/// before dispatching real tasks. Catches missing binaries, bad flags, permission
+/// failures, and auth issues early.
+pub(crate) fn preflight_cli_backend(invocation: &CliInvocationConfig) -> Result<()> {
+    let preflight_prompt = format!("Respond with exactly: {PREFLIGHT_MARKER}");
+    let cmd = build_cli_command(invocation, &preflight_prompt);
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!("CLI backend preflight failed to execute: {cmd}")
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        bail!(
+            "CLI backend preflight failed (exit {exit_code}).\n\
+             Command: {cmd}\n\
+             Stderr: {stderr}\n\
+             Fix: verify that the [cli] command and args in yarli.toml are correct and the binary is installed."
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains(PREFLIGHT_MARKER) {
+        bail!(
+            "CLI backend preflight succeeded (exit 0) but output did not contain expected marker.\n\
+             Command: {cmd}\n\
+             Expected marker: {PREFLIGHT_MARKER}\n\
+             Stdout (first 500 chars): {}\n\
+             Fix: the CLI backend may be permission-blocked or misconfigured.",
+            &stdout[..stdout.len().min(500)]
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
     File,
@@ -950,6 +998,13 @@ pub struct RunConfig {
     /// Defaults to false; recursive runs require explicit per-invocation opt-in.
     #[serde(default)]
     pub allow_recursive_run: bool,
+    /// Strategy for handling merge conflicts during parallel workspace patch application.
+    ///
+    /// `fail` (default): hard-fail on merge conflicts.
+    /// `agent`: spawn an agent to attempt automated resolution (stub — falls back to fail).
+    /// `manual`: preserve conflicted workspaces and emit operator instructions.
+    #[serde(default)]
+    pub merge_conflict_resolution: MergeConflictResolution,
     /// Optional project-level task catalog for run-spec execution.
     ///
     /// Serialized as `[[run.tasks]]`.
@@ -984,6 +1039,18 @@ impl RunConfig {
             AutoAdvancePolicy::ImprovingOnly
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeConflictResolution {
+    /// Hard-fail on merge conflicts (current default behavior).
+    #[default]
+    Fail,
+    /// Spawn an agent to attempt automated conflict resolution.
+    Agent,
+    /// Preserve conflicted workspaces and emit operator instructions.
+    Manual,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1338,6 +1405,7 @@ mod tests {
             "run.enable_plan_tranche_grouping",
             "run.max_grouped_tasks_per_tranche",
             "run.enforce_plan_tranche_allowed_paths",
+            "run.merge_conflict_resolution",
             "run.tasks",
             "run.tranches",
             "run.plan_guard.target",
@@ -1851,5 +1919,111 @@ allow_in_memory_writes = true
 
         let result = ensure_write_backend_guard(&loaded_config, "task unblock");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn preflight_cli_backend_succeeds_with_echo_command() {
+        let invocation = CliInvocationConfig {
+            command: "echo".to_string(),
+            args: vec![],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        // echo will output the prompt text which includes YARLI_PREFLIGHT_OK
+        preflight_cli_backend(&invocation).unwrap();
+    }
+
+    #[test]
+    fn preflight_cli_backend_fails_on_missing_binary() {
+        let invocation = CliInvocationConfig {
+            command: "yarli-nonexistent-binary-12345".to_string(),
+            args: vec![],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        let err = preflight_cli_backend(&invocation).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("preflight failed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_cli_backend_fails_on_bad_exit_code() {
+        let invocation = CliInvocationConfig {
+            command: "false".to_string(),
+            args: vec![],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        let err = preflight_cli_backend(&invocation).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("preflight failed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_cli_backend_fails_when_marker_missing() {
+        // `true` exits 0 but produces no output
+        let invocation = CliInvocationConfig {
+            command: "true".to_string(),
+            args: vec![],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        let err = preflight_cli_backend(&invocation).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not contain expected marker"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_conflict_resolution_config_parses_all_variants() {
+        let loaded = write_test_config(
+            r#"
+[run]
+merge_conflict_resolution = "fail"
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.merge_conflict_resolution,
+            MergeConflictResolution::Fail
+        );
+
+        let loaded = write_test_config(
+            r#"
+[run]
+merge_conflict_resolution = "agent"
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.merge_conflict_resolution,
+            MergeConflictResolution::Agent
+        );
+
+        let loaded = write_test_config(
+            r#"
+[run]
+merge_conflict_resolution = "manual"
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.merge_conflict_resolution,
+            MergeConflictResolution::Manual
+        );
+    }
+
+    #[test]
+    fn merge_conflict_resolution_defaults_to_fail() {
+        let loaded = write_test_config("[run]\n");
+        assert_eq!(
+            loaded.config().run.merge_conflict_resolution,
+            MergeConflictResolution::Fail
+        );
     }
 }

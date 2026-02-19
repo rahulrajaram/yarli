@@ -87,7 +87,7 @@ pub(crate) use crate::tranche::{
     cmd_plan_tranche_remove, cmd_plan_validate, discover_plan_dispatch_entries,
     enforce_plan_guard_post_run, maybe_mark_current_structured_tranche_complete,
     plan_path_for_prompt_entry, read_tranches_file_in, run_spec_plan_guard_preflight,
-    tranches_file_path,
+    tranches_file_path, validate_structured_tranches_preflight_for_prompt,
 };
 #[cfg(test)]
 pub(crate) use crate::tranche::{
@@ -124,6 +124,15 @@ pub(crate) struct TrancheDefinition {
     pub(crate) group: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) allowed_paths: Vec<String>,
+    /// Verification command to run after completion (e.g. `cargo test --offline query_cache`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verify: Option<String>,
+    /// Human-readable done-criteria describing what constitutes completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) done_when: Option<String>,
+    /// Per-tranche token budget override (takes precedence over global `max_task_total_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,10 +156,6 @@ impl TranchesFile {
             .collect()
     }
 }
-
-pub(crate) use crate::workspace::{
-    merge_parallel_workspace_results, prepare_parallel_workspace_layout,
-};
 
 pub(crate) fn resolve_run_plan(
     loaded_config: &LoadedConfig,
@@ -436,15 +441,10 @@ pub(crate) fn build_plan_driven_run_sequence(
                 .collect()
         }
         Err(e) => {
-            warn!(
-                error = %e,
-                tranches_file = %tranches_file_path(tranches_base_dir).display(),
-                "malformed tranches file, falling back to markdown parsing"
-            );
-            discover_plan_dispatch_entries(&plan_text)
-                .into_iter()
-                .filter(|e| !e.is_complete)
-                .collect()
+            return Err(e.context(format!(
+                "malformed structured tranches file {}; refusing markdown fallback to avoid state drift",
+                tranches_file_path(tranches_base_dir).display()
+            )));
         }
     };
 
@@ -1971,38 +1971,8 @@ pub(crate) fn validate_tranche_definition(def: &TrancheDefinition) -> Result<()>
 }
 
 // ---------------------------------------------------------------------------
-// `yarli plan` command handlers
+// `yarli plan` command handlers  (delegated to crate::tranche)
 // ---------------------------------------------------------------------------
-
-pub(crate) fn cmd_plan_tranche_add(
-    key: &str,
-    summary: &str,
-    group: Option<&str>,
-    allowed_paths: &[String],
-) -> Result<()> {
-    let def = TrancheDefinition {
-        key: key.to_string(),
-        summary: summary.to_string(),
-        status: TrancheStatus::Incomplete,
-        group: group.map(|g| g.to_string()),
-        allowed_paths: allowed_paths.to_vec(),
-    };
-    validate_tranche_definition(&def)?;
-
-    let mut tf = read_tranches_file()?.unwrap_or(TranchesFile {
-        version: 1,
-        tranches: Vec::new(),
-    });
-
-    if tf.tranches.iter().any(|t| t.key == key) {
-        bail!("tranche with key '{}' already exists", key);
-    }
-
-    tf.tranches.push(def);
-    write_tranches_file(&tf)?;
-    println!("Added tranche '{key}'");
-    Ok(())
-}
 
 pub(crate) fn cmd_plan_tranche_complete(key: &str) -> Result<()> {
     let mut tf = read_tranches_file()?
@@ -2757,6 +2727,63 @@ prompt_mode = "arg"
         assert_eq!(tranches.len(), 2);
         assert_eq!(tranches[0].key, "ST-01");
         assert_eq!(tranches[1].key, "verification");
+    }
+
+    #[test]
+    fn plan_driven_sequence_errors_on_malformed_structured_tranches_file() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement active plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] MD-99 markdown tranche\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "ST-01"
+summary = "Structured tranche"
+status = incomplete
+"#,
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &repo.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&repo.path().join("PROMPT.md")).unwrap();
+        let err =
+            build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
+                .unwrap_err();
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("malformed structured tranches file"),
+            "expected malformed tranches context, got: {err_text}"
+        );
+        assert!(
+            err_text.contains("refusing markdown fallback"),
+            "expected explicit fail-closed fallback refusal, got: {err_text}"
+        );
     }
 
     #[test]

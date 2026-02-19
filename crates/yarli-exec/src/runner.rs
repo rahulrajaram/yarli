@@ -50,6 +50,8 @@ pub struct CommandRequest {
     pub timeout: Option<Duration>,
     /// Environment variables to set (in addition to inherited env).
     pub env: Vec<(String, String)>,
+    /// Optional channel for live output streaming. Each chunk is sent as it arrives.
+    pub live_output_tx: Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
 }
 
 /// Result of a completed command execution.
@@ -116,6 +118,7 @@ impl CommandRunner for LocalCommandRunner {
         cancel: CancellationToken,
     ) -> Result<CommandResult, ExecError> {
         let timeout = request.timeout.or(self.default_timeout);
+        let live_tx = request.live_output_tx;
 
         // Create entity in CmdQueued state.
         let mut execution = CommandExecution::new(
@@ -221,16 +224,16 @@ impl CommandRunner for LocalCommandRunner {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
                     kill_child(&mut child).await;
                     // Drain remaining output.
-                    drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks).await;
+                    drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
                 _ = tokio::time::sleep(dur) => {
                     warn!(cmd_id = %cmd_id, timeout = ?dur, "command timed out");
                     kill_child(&mut child).await;
-                    drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks).await;
+                    drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Timeout(dur))
                 }
-                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks) => {
+                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx) => {
                     result
                 }
             }
@@ -240,14 +243,16 @@ impl CommandRunner for LocalCommandRunner {
                 _ = cancel.cancelled() => {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
                     kill_child(&mut child).await;
-                    drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks).await;
+                    drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
-                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks) => {
+                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx) => {
                     result
                 }
             }
         };
+        // Drop the live sender to signal streaming is done for this command.
+        drop(live_tx);
 
         let resource_usage = if let Some((stop_tx, monitor_handle)) = monitor {
             let _ = stop_tx.send(());
@@ -493,6 +498,7 @@ async fn collect_and_wait(
     cmd_id: Uuid,
     seq: &mut u64,
     chunks: &mut Vec<StreamChunk>,
+    live_tx: &Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
 ) -> Result<i32, ExecError> {
     // Read output lines until the channel closes (readers done).
     // Meanwhile the child is running.
@@ -503,13 +509,17 @@ async fn collect_and_wait(
                 match line {
                     Some((stream, data)) => {
                         *seq += 1;
-                        chunks.push(StreamChunk {
+                        let chunk = StreamChunk {
                             command_id: cmd_id,
                             sequence: *seq,
                             stream,
                             data,
                             captured_at: Utc::now(),
-                        });
+                        };
+                        if let Some(tx) = live_tx {
+                            let _ = tx.send(chunk.clone());
+                        }
+                        chunks.push(chunk);
                     }
                     None => break, // channel closed, readers done
                 }
@@ -528,18 +538,23 @@ async fn drain_channel(
     cmd_id: Uuid,
     seq: &mut u64,
     chunks: &mut Vec<StreamChunk>,
+    live_tx: &Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
 ) {
     // Close the channel and drain remaining messages.
     rx.close();
     while let Some((stream, data)) = rx.recv().await {
         *seq += 1;
-        chunks.push(StreamChunk {
+        let chunk = StreamChunk {
             command_id: cmd_id,
             sequence: *seq,
             stream,
             data,
             captured_at: Utc::now(),
-        });
+        };
+        if let Some(tx) = live_tx {
+            let _ = tx.send(chunk.clone());
+        }
+        chunks.push(chunk);
     }
 }
 
@@ -565,6 +580,7 @@ mod tests {
             idempotency_key: None,
             timeout: None,
             env: vec![],
+            live_output_tx: None,
         }
     }
 
@@ -820,5 +836,31 @@ mod tests {
             || usage.io_read_bytes.is_some()
             || usage.io_write_bytes.is_some();
         assert!(has_signal, "expected at least one resource usage metric");
+    }
+
+    #[tokio::test]
+    async fn test_live_output_tx_receives_chunks_as_they_arrive() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let (live_tx, mut live_rx) =
+            tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
+        let mut req = make_request("printf 'line1\nline2\nline3\n'");
+        req.live_output_tx = Some(live_tx);
+
+        let result = runner.run(req, cancel).await.unwrap();
+        assert_eq!(result.execution.state, CommandState::CmdExited);
+        assert_eq!(result.chunks.len(), 3);
+
+        // All chunks should also have been sent through the live channel.
+        let mut live_chunks = Vec::new();
+        while let Ok(chunk) = live_rx.try_recv() {
+            live_chunks.push(chunk);
+        }
+        assert_eq!(live_chunks.len(), 3);
+        assert_eq!(live_chunks[0].data, "line1");
+        assert_eq!(live_chunks[1].data, "line2");
+        assert_eq!(live_chunks[2].data, "line3");
+        // Sequences must match.
+        assert_eq!(live_chunks[0].sequence, result.chunks[0].sequence);
     }
 }

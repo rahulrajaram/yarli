@@ -751,7 +751,11 @@ pub(crate) fn render_run_list(store: &dyn EventStore) -> Result<String> {
             .unwrap_or_else(|| compact_run_id(run_id_str));
         let obj = objective.as_deref().unwrap_or("-");
         let obj_display = if obj.len() > 28 {
-            format!("{}…", &obj[..27])
+            let mut end = 27;
+            while end > 0 && !obj.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &obj[..end])
         } else {
             obj.to_string()
         };
@@ -1199,7 +1203,7 @@ mod tests {
             }),
         );
 
-        let mapped = event_to_stream_event(&event, &[]).expect("progress event should map");
+        let mapped = event_to_stream_event(&event, &[], false).expect("progress event should map");
         match mapped {
             StreamEvent::TransientStatus { message, .. } => {
                 assert_eq!(message, "heartbeat pending=1 leased=0");
@@ -1232,7 +1236,7 @@ mod tests {
             idempotency_key: Some(format!("{task_id}:cmd:1:output")),
         };
 
-        let mapped = event_to_stream_event(&event, &[(task_id, "tranche-001-i5".to_string())])
+        let mapped = event_to_stream_event(&event, &[(task_id, "tranche-001-i5".to_string())], false)
             .expect("command output should map");
         match mapped {
             StreamEvent::CommandOutput {
@@ -1270,7 +1274,7 @@ mod tests {
         };
 
         assert!(
-            event_to_stream_event(&event, &[]).is_none(),
+            event_to_stream_event(&event, &[], false).is_none(),
             "empty command output should not emit stream event"
         );
     }

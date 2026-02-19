@@ -26,6 +26,7 @@ use yarli_core::explain::GateType;
 use yarli_core::fsm::command::CommandState;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
+use yarli_core::entities::command_execution::StreamChunk;
 use yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError};
 use yarli_gates::{all_passed, collect_failures, evaluate_all, GateContext};
 use yarli_observability::{AuditEntry, AuditSink};
@@ -34,6 +35,13 @@ use yarli_store::EventStore;
 
 use crate::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry};
 use crate::TaskQueue;
+
+/// A live output chunk from a running command, for real-time streaming.
+#[derive(Debug, Clone)]
+pub struct LiveOutputEvent {
+    pub task_id: TaskId,
+    pub chunk: StreamChunk,
+}
 
 /// Scheduler configuration.
 #[derive(Debug, Clone)]
@@ -330,6 +338,8 @@ pub struct Scheduler<Q: TaskQueue, S: EventStore, R: CommandRunner> {
     policy_engine: Arc<Mutex<PolicyEngine>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     config: SchedulerConfig,
+    /// Optional sender for live command output streaming.
+    live_output_tx: Option<tokio::sync::mpsc::UnboundedSender<LiveOutputEvent>>,
 }
 
 impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
@@ -343,6 +353,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             config,
+            live_output_tx: None,
         }
     }
 
@@ -363,6 +374,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             config,
+            live_output_tx: None,
         }
     }
 
@@ -376,6 +388,16 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.audit_sink = Some(sink);
         self
+    }
+
+    /// Set the live output channel for real-time command output streaming.
+    pub fn set_live_output(&mut self, tx: tokio::sync::mpsc::UnboundedSender<LiveOutputEvent>) {
+        self.live_output_tx = Some(tx);
+    }
+
+    /// Drop the live output sender so any forwarding tasks can shut down.
+    pub fn clear_live_output(&mut self) {
+        self.live_output_tx = None;
     }
 
     /// Get a reference to the registry for inspection.
@@ -805,6 +827,19 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             })?;
         };
 
+        // Create per-task live output forwarding channel if live streaming is enabled.
+        let live_output_tx = self.live_output_tx.as_ref().map(|scheduler_tx| {
+            let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
+            let scheduler_tx = scheduler_tx.clone();
+            let tid = task_id;
+            tokio::spawn(async move {
+                while let Some(chunk) = task_rx.recv().await {
+                    let _ = scheduler_tx.send(LiveOutputEvent { task_id: tid, chunk });
+                }
+            });
+            task_tx
+        });
+
         let request = CommandRequest {
             task_id,
             run_id: entry.run_id,
@@ -815,6 +850,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             idempotency_key: Some(format!("{task_id}:cmd:{attempt_no}")),
             timeout: self.config.command_timeout,
             env: vec![],
+            live_output_tx,
         };
 
         // Execute via journal

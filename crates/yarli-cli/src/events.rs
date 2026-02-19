@@ -53,9 +53,13 @@ pub(crate) fn stream_task_catalog_entries(event: &Event) -> Vec<(Uuid, String)> 
 }
 
 /// Convert a domain Event to a StreamEvent for the renderer.
+///
+/// When `suppress_command_output` is true, `command.output` events are skipped
+/// because those chunks were already forwarded via the live streaming channel.
 pub(crate) fn event_to_stream_event(
     event: &Event,
     task_names: &[(Uuid, String)],
+    suppress_command_output: bool,
 ) -> Option<StreamEvent> {
     let task_name = |entity_id: &str| -> String {
         if let Ok(id) = entity_id.parse::<Uuid>() {
@@ -145,6 +149,9 @@ pub(crate) fn event_to_stream_event(
             Some(StreamEvent::TransientStatus { message: summary })
         }
         "command.output" => {
+            if suppress_command_output {
+                return None;
+            }
             let line = extract_command_output_line(&event.payload);
             if line.trim().is_empty() {
                 return None;
