@@ -74,6 +74,7 @@ mod tests {
 
         let req = ImplementationRequest {
             objective: "test".to_string(),
+            completed_tranche_work: vec![],
             scope: vec![],
             failures: vec![],
             iteration: 1,
@@ -95,6 +96,7 @@ mod tests {
         let mock = MockRouterSender::new();
         let req = ImplementationRequest {
             objective: "test".to_string(),
+            completed_tranche_work: vec![],
             scope: vec![],
             failures: vec![],
             iteration: 1,

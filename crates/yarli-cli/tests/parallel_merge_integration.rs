@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn run_git(cwd: &Path, args: &[&str]) -> Output {
@@ -68,6 +69,40 @@ fn list_run_workspace_roots(worktree_root: &Path) -> Vec<std::path::PathBuf> {
     }
     roots.sort();
     roots
+}
+
+fn read_continuation_payload(repo_dir: &Path) -> Value {
+    let continuation_path = repo_dir.join(".yarli").join("continuation.json");
+    let contents = std::fs::read_to_string(&continuation_path)
+        .unwrap_or_else(|err| panic!("failed to read continuation payload at {}: {err}", continuation_path.display()));
+    serde_json::from_str(&contents)
+        .unwrap_or_else(|err| panic!("failed to parse continuation payload JSON: {err}\n{contents}"))
+}
+
+fn assert_output_state_matches_continuation(run_output: &str, continuation: &Value) {
+    let Some(exit_state) = continuation.get("exit_state").and_then(Value::as_str) else {
+        return;
+    };
+    let state_matches = match exit_state {
+        "RunOpen" => run_output.contains("RunOpen") || run_output.contains("RUN_OPEN"),
+        "RunActive" => run_output.contains("RunActive") || run_output.contains("RUN_ACTIVE"),
+        "RunCompleted" => {
+            run_output.contains("RunCompleted") || run_output.contains("RUN_COMPLETED")
+        }
+        "RunFailed" => run_output.contains("RunFailed") || run_output.contains("RUN_FAILED"),
+        "RunCancelled" => {
+            run_output.contains("RunCancelled") || run_output.contains("RUN_CANCELLED")
+        }
+        "RunBlocked" => run_output.contains("RunBlocked") || run_output.contains("RUN_BLOCKED"),
+        "RunVerifying" => {
+            run_output.contains("RunVerifying") || run_output.contains("RUN_VERIFYING")
+        }
+        _ => true,
+    };
+    assert!(
+        state_matches,
+        "expected run output to reflect continuation exit_state={exit_state}\n{run_output}"
+    );
 }
 
 #[test]
@@ -420,6 +455,13 @@ worktree_root = "{}"
         String::from_utf8_lossy(&run_output.stderr),
     );
 
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        !run_stdout.contains("RunCompleted") && !run_stdout.contains("State: RunCompleted"),
+        "conflict run should not report RunCompleted before merge-finalization\nstdout:\n{}",
+        run_stdout
+    );
+
     let run_roots = list_run_workspace_roots(&worktree_root);
     assert_eq!(
         run_roots.len(),
@@ -474,6 +516,231 @@ worktree_root = "{}"
         source_shared.contains("<<<<<<<"),
         "expected conflict markers in source file after failed merge: {source_shared}"
     );
+
+    let continuation = read_continuation_payload(&repo_dir);
+    assert_eq!(
+        continuation
+            .get("exit_state")
+            .and_then(Value::as_str),
+        Some("RunFailed"),
+        "expected continuation exit_state to be RunFailed after merge conflict"
+    );
+    assert_eq!(
+        continuation
+            .get("exit_reason")
+            .and_then(Value::as_str),
+        Some("merge_conflict"),
+        "expected continuation exit_reason to be merge_conflict after merge conflict escalation"
+    );
+    assert_output_state_matches_continuation(&run_stdout, &continuation);
+}
+
+#[test]
+fn run_start_parallel_merge_auto_repair_resolves_overlap_and_completes() {
+    let temp_dir = TempDir::new().expect("create temp workspace");
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+    let worktree_root = repo_dir.join(".yarl/workspaces");
+    std::fs::create_dir_all(&worktree_root).expect("create worktree root dir");
+
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["checkout", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
+    run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
+    std::fs::write(repo_dir.join("shared.txt"), "base\n").expect("write shared baseline");
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "initial"]);
+
+    let config = format!(
+        r#"[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+
+[features]
+parallel = true
+
+[run]
+merge_conflict_resolution = "auto-repair"
+
+[execution]
+working_dir = "."
+worktree_root = "{}"
+"#,
+        worktree_root.display()
+    );
+    std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
+
+    let binary = run_output_path();
+    let task_one = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task one\\n' > shared.txt && git add shared.txt && git commit -m 'task one commit'";
+    let task_two = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task two\\n' > shared.txt && git add shared.txt && git commit -m 'task two commit'";
+    let run_output = Command::new(&binary)
+        .current_dir(&repo_dir)
+        .args([
+            "run",
+            "start",
+            "parallel merge auto-repair success regression",
+            "--stream",
+            "--cmd",
+            task_one,
+            "--cmd",
+            task_two,
+        ])
+        .output()
+        .expect("run start command invocation failed");
+
+    assert!(
+        run_output.status.success(),
+        "run should succeed after auto-repair resolves overlap\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr),
+    );
+
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    let run_id = parse_run_id(&run_stdout).expect("failed to parse run id from command output");
+    assert!(
+        run_stdout.contains("RunCompleted") || run_stdout.contains("RUN_COMPLETED"),
+        "auto-repair run should complete in output, saw:\n{run_stdout}"
+    );
+
+    let run_roots = list_run_workspace_roots(&worktree_root);
+    assert_eq!(
+        run_roots.len(),
+        0,
+        "workspace root should be cleaned after successful auto-repair"
+    );
+
+    let continuation = read_continuation_payload(&repo_dir);
+    assert_eq!(
+        continuation
+            .get("exit_state")
+            .and_then(Value::as_str),
+        Some("RunCompleted"),
+        "expected continuation exit_state to be RunCompleted after repaired merge conflict run"
+    );
+    assert!(
+        continuation.get("exit_reason").is_none()
+            || continuation.get("exit_reason") == Some(&Value::Null),
+        "auto-repair success should not carry an exit reason"
+    );
+    assert_output_state_matches_continuation(&run_stdout, &continuation);
+
+    let merged_shared =
+        std::fs::read_to_string(repo_dir.join("shared.txt")).expect("read merged shared.txt");
+    assert_eq!(merged_shared, "task two\n");
+    assert!(
+        !merged_shared.contains("<<<<<<<"),
+        "expected auto-repaired merge result to contain no conflict markers: {merged_shared}"
+    );
+}
+
+#[test]
+fn run_start_parallel_merge_auto_repair_fails_and_preserves_conflict_state() {
+    let temp_dir = TempDir::new().expect("create temp workspace");
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+    let worktree_root = repo_dir.join(".yarl/workspaces");
+    std::fs::create_dir_all(&worktree_root).expect("create worktree root dir");
+
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["checkout", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
+    run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
+    std::fs::write(repo_dir.join("shared.txt"), "base\n").expect("write shared baseline");
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "initial"]);
+
+    let config = format!(
+        r#"[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+
+[features]
+parallel = true
+
+[run]
+merge_conflict_resolution = "auto-repair"
+
+[execution]
+working_dir = "."
+worktree_root = "{}"
+"#,
+        worktree_root.display()
+    );
+    std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
+
+    let binary = run_output_path();
+    let task_one = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task one\\n' > shared.txt && git add shared.txt && git commit -m 'task one commit'";
+    let task_two = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && git rm -f shared.txt && git commit -m 'task two delete'";
+    let run_output = Command::new(&binary)
+        .current_dir(&repo_dir)
+        .args([
+            "run",
+            "start",
+            "parallel merge auto-repair failure regression",
+            "--stream",
+            "--cmd",
+            task_one,
+            "--cmd",
+            task_two,
+        ])
+        .output()
+        .expect("run start command invocation failed");
+
+    assert!(
+        !run_output.status.success(),
+        "run should fail when auto-repair cannot apply overlapping delete conflict\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr),
+    );
+
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        !run_stdout.contains("RunCompleted") && !run_stdout.contains("RUN_COMPLETED"),
+        "auto-repair failure run should not report RunCompleted\nstdout:\n{run_stdout}"
+    );
+    assert!(
+        run_stdout.contains("RunFailed") || run_stdout.contains("RUN_FAILED"),
+        "auto-repair failure run should report RunFailed\nstdout:\n{run_stdout}"
+    );
+
+    let run_roots = list_run_workspace_roots(&worktree_root);
+    assert_eq!(
+        run_roots.len(),
+        1,
+        "expected failed run workspace root to be preserved"
+    );
+    let run_root = &run_roots[0];
+    assert!(
+        run_root.join("001-task-1").exists(),
+        "task-1 workspace should be preserved"
+    );
+    assert!(
+        run_root.join("002-task-2").exists(),
+        "task-2 workspace should be preserved"
+    );
+    let recovery_note = run_root.join("PARALLEL_MERGE_RECOVERY.txt");
+    assert!(
+        recovery_note.exists(),
+        "expected recovery note at {}",
+        recovery_note.display()
+    );
+
+    let continuation = read_continuation_payload(&repo_dir);
+    assert_eq!(
+        continuation
+            .get("exit_state")
+            .and_then(Value::as_str),
+        Some("RunFailed"),
+        "expected continuation exit_state to be RunFailed after auto-repair merge conflict failure"
+    );
+    assert_eq!(
+        continuation
+            .get("exit_reason")
+            .and_then(Value::as_str),
+        Some("merge_conflict"),
+        "expected continuation exit_reason to be merge_conflict after auto-repair failure"
+    );
+    assert_output_state_matches_continuation(&run_stdout, &continuation);
 }
 
 #[test]

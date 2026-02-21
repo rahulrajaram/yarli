@@ -92,8 +92,21 @@ impl<R: RouterSender + 'static> YarliAgent<R> {
             })
             .unwrap_or_default();
 
+        let completed_tranche_work = cmd
+            .input
+            .as_ref()
+            .and_then(|v| v.get("completed_tranche_work"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         let params = ObjectiveParams {
             scope,
+            completed_tranche_work,
             repo_context: None,
         };
 

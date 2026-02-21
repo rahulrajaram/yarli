@@ -639,7 +639,8 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
     use yarli_core::entities::continuation::{
-        ContinuationPayload, ContinuationQualityGate, RunSummary, TrancheKind, TrancheSpec,
+        ContinuationPayload, ContinuationQualityGate, RunSummary, TaskHealthAction, TrancheKind,
+        TrancheSpec,
     };
     use yarli_core::explain::DeteriorationTrend;
     use yarli_core::fsm::run::RunState;
@@ -671,12 +672,14 @@ mod tests {
                 planned_tranche_key: Some("full".into()),
                 cursor: None,
                 config_snapshot: serde_json::json!({}),
+                interventions: Vec::new(),
             }),
             quality_gate: Some(ContinuationQualityGate {
                 allow_auto_advance: false,
                 reason: "stable".into(),
                 trend: Some(DeteriorationTrend::Stable),
                 score: Some(30.0),
+                task_health_action: TaskHealthAction::Continue,
             }),
         };
         let (allow, reason) = should_auto_advance_planned_tranche(
@@ -684,6 +687,7 @@ mod tests {
             config::AutoAdvanceConfig {
                 policy: crate::config::AutoAdvancePolicy::ImprovingOnly,
                 max_tranches: 0,
+                task_health: crate::config::RunTaskHealthConfig::default(),
             },
             0,
         );
@@ -718,12 +722,14 @@ mod tests {
                 planned_tranche_key: Some("full".into()),
                 cursor: None,
                 config_snapshot: serde_json::json!({}),
+                interventions: Vec::new(),
             }),
             quality_gate: Some(ContinuationQualityGate {
                 allow_auto_advance: false,
                 reason: "stable".into(),
                 trend: Some(DeteriorationTrend::Stable),
                 score: Some(30.0),
+                task_health_action: TaskHealthAction::Continue,
             }),
         };
         let (allow, reason) = should_auto_advance_planned_tranche(
@@ -731,6 +737,7 @@ mod tests {
             config::AutoAdvanceConfig {
                 policy: crate::config::AutoAdvancePolicy::Always,
                 max_tranches: 0,
+                task_health: crate::config::RunTaskHealthConfig::default(),
             },
             0,
         );
@@ -765,12 +772,14 @@ mod tests {
                 planned_tranche_key: Some("full".into()),
                 cursor: None,
                 config_snapshot: serde_json::json!({}),
+                interventions: Vec::new(),
             }),
             quality_gate: Some(ContinuationQualityGate {
                 allow_auto_advance: true,
                 reason: "improving".into(),
                 trend: Some(DeteriorationTrend::Improving),
                 score: Some(5.0),
+                task_health_action: TaskHealthAction::Continue,
             }),
         };
 
@@ -779,6 +788,7 @@ mod tests {
             config::AutoAdvanceConfig {
                 policy: crate::config::AutoAdvancePolicy::ImprovingOnly,
                 max_tranches: 2,
+                task_health: crate::config::RunTaskHealthConfig::default(),
             },
             2,
         );
@@ -813,12 +823,14 @@ mod tests {
                 planned_tranche_key: None,
                 cursor: None,
                 config_snapshot: serde_json::json!({}),
+                interventions: Vec::new(),
             }),
             quality_gate: Some(ContinuationQualityGate {
                 allow_auto_advance: true,
                 reason: "improving".into(),
                 trend: Some(DeteriorationTrend::Improving),
                 score: Some(5.0),
+                task_health_action: TaskHealthAction::Continue,
             }),
         };
 
@@ -827,6 +839,7 @@ mod tests {
             config::AutoAdvanceConfig {
                 policy: crate::config::AutoAdvancePolicy::ImprovingOnly,
                 max_tranches: 0,
+                task_health: crate::config::RunTaskHealthConfig::default(),
             },
             0,
         );
@@ -1543,11 +1556,11 @@ mode = "implement"
         .unwrap();
 
         // chdir into the temp directory so read_tranches_file() finds the file
-        let original_dir = std::env::current_dir().unwrap();
+        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         std::env::set_current_dir(temp.path()).unwrap();
 
         let result = read_tranches_file();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let _ = std::env::set_current_dir(&original_dir);
 
         let tf_read = result.unwrap().expect("should find tranches file");
         let entries: Vec<ImplementationPlanEntry> = tf_read
@@ -1566,11 +1579,11 @@ mode = "implement"
         // When no tranches file exists, read_tranches_file() returns None and
         // discover_plan_dispatch_entries should still work independently.
         let temp = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
+        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         std::env::set_current_dir(temp.path()).unwrap();
 
         let result = read_tranches_file();
-        std::env::set_current_dir(&original_dir).unwrap();
+        let _ = std::env::set_current_dir(&original_dir);
 
         assert!(
             result.unwrap().is_none(),
@@ -1712,10 +1725,12 @@ status = "incomplete"
             current_tranche_index: Some(0),
         };
 
-        let original_dir = std::env::current_dir().unwrap();
+        // Use a stable path for restore — current_dir() may be invalidated by
+        // concurrent tests that drop TempDirs, so fall back to a known-stable path.
+        let restore_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         std::env::set_current_dir(decoy_cwd.path()).unwrap();
         let updated = maybe_mark_current_structured_tranche_complete(&plan).unwrap();
-        std::env::set_current_dir(original_dir).unwrap();
+        let _ = std::env::set_current_dir(&restore_dir);
 
         assert!(updated, "structured tranche should be marked complete");
 

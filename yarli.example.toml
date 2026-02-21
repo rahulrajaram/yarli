@@ -67,6 +67,15 @@ continue_wait_timeout_seconds = 0
 allow_stable_auto_advance = false
 # improving-only | stable-ok | always
 auto_advance_policy = "stable-ok"
+# Optional task-health actions by trend (checkpoint-now|force-pivot|stop-and-summarize|continue)
+# improve/stable/deteriorating actions.
+[run.task_health]
+improving = "continue"
+stable = "continue"
+deteriorating = "continue"
+# Soft cap ratio of [budgets].max_run_total_tokens that triggers checkpoint-now.
+# Set to 0 to disable.
+soft_token_cap_ratio = 0.9
 # 0 = unlimited auto-advance tranches in one invocation.
 max_auto_advance_tranches = 0
 # Group adjacent open plan entries with matching `tranche_group=<name>` metadata.
@@ -75,6 +84,8 @@ enable_plan_tranche_grouping = false
 max_grouped_tasks_per_tranche = 0
 # Surface `allowed_paths=...` plan metadata as explicit per-tranche scope constraints.
 enforce_plan_tranche_allowed_paths = false
+# Merge strategy for parallel workspace patch conflicts: fail | manual | auto-repair
+# merge_conflict_resolution = "fail"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"

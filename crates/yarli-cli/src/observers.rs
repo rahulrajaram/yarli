@@ -1,9 +1,14 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde_json::Value;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use uuid::Uuid;
 
 use yarli_core::domain::Event;
@@ -399,6 +404,10 @@ fn truncate_for_memory(content: &str) -> String {
 
 pub(crate) const OBSERVER_EVENT_BATCH_LIMIT: usize = 256;
 pub(crate) const OBSERVER_WINDOW_SIZE: usize = 64;
+pub(crate) const OBSERVER_FAILURE_RING_SIZE: usize = 32;
+const OBSERVER_TREND_CYCLE_MAX_PATTERN: usize = 8;
+const OBSERVER_FAILURE_REPEAT_THRESHOLD: usize = 3;
+const OBSERVER_FAILURE_ALT_REPEAT_THRESHOLD: usize = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeteriorationObserver {
@@ -407,6 +416,278 @@ pub(crate) struct DeteriorationObserver {
     cursor: IncrementalEventCursor,
     state: DeteriorationObserverState,
     latest_report: Option<DeteriorationReport>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactTailCursor {
+    byte_offset: u64,
+}
+
+impl ArtifactTailCursor {
+    fn new() -> Self {
+        Self { byte_offset: 0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ToolOutcomeObservation {
+    tool: String,
+    status: String,
+    outcome: serde_json::Value,
+    detail: Option<String>,
+    score: Option<f64>,
+    metric: Option<String>,
+}
+
+impl ToolOutcomeObservation {
+    fn as_payload(
+        &self,
+        task_id: Uuid,
+        task_key: &str,
+        run_id: Uuid,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "task_id": task_id,
+            "task_key": task_key,
+            "run_id": run_id,
+            "tool": self.tool,
+            "status": self.status,
+            "outcome": self.outcome,
+            "detail": self.detail,
+            "score": self.score,
+            "metric": self.metric,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TaskHealthArtifactObserver {
+    run_id: Uuid,
+    correlation_id: Uuid,
+    task_keys: BTreeMap<Uuid, String>,
+    tail: HashMap<Uuid, ArtifactTailCursor>,
+}
+
+impl TaskHealthArtifactObserver {
+    pub(crate) fn new(run_id: Uuid, correlation_id: Uuid, task_names: &[(Uuid, String)]) -> Self {
+        Self {
+            run_id,
+            correlation_id,
+            task_keys: task_names.iter().cloned().collect(),
+            tail: task_names
+                .iter()
+                .map(|(task_id, _)| (*task_id, ArtifactTailCursor::new()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn observe_store(&mut self, store: &dyn EventStore) -> usize {
+        let mut emitted = 0usize;
+
+        let tasks: Vec<(Uuid, String)> = self
+            .task_keys
+            .iter()
+            .map(|(task_id, task_key)| (*task_id, task_key.clone()))
+            .collect();
+
+        for (task_id, task_key) in tasks {
+            let path = task_output_artifact_path(task_id);
+            let Some(events) = self.read_new_tool_outcomes(task_id, &path) else {
+                continue;
+            };
+
+            for (outcome, command_event_id, captured_at) in events {
+                emitted += 1;
+                let payload = outcome.as_payload(task_id, &task_key, self.run_id);
+                let status_event = Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: captured_at,
+                    entity_type: yarli_core::domain::EntityType::Run,
+                    entity_id: self.run_id.to_string(),
+                    event_type: "run.observer.task_health".to_string(),
+                    payload,
+                    correlation_id: self.correlation_id,
+                    causation_id: command_event_id,
+                    actor: "observer.task_health".to_string(),
+                    idempotency_key: None,
+                };
+                if let Err(err) = append_event(store, status_event) {
+                    warn!(error = %err, task_id = %task_id, "failed to append tool outcome observation event");
+                    continue;
+                }
+            }
+        }
+
+        emitted
+    }
+
+    fn read_new_tool_outcomes(
+        &mut self,
+        task_id: Uuid,
+        path: &PathBuf,
+    ) -> Option<Vec<(ToolOutcomeObservation, Option<Uuid>, chrono::DateTime<chrono::Utc>)>> {
+        let cursor = self.tail.get(&task_id).cloned()?;
+        let mut file = OpenOptions::new().read(true).open(path).ok()?;
+
+        if let Err(err) = file.seek(SeekFrom::Start(cursor.byte_offset)) {
+            warn!(error = %err, task_id = %task_id, "failed to seek backend artifact" );
+            return None;
+        }
+
+        let mut data = String::new();
+        let bytes_read = match file.read_to_string(&mut data) {
+            Ok(0) => return Some(Vec::new()),
+            Ok(bytes_read) => bytes_read,
+            Err(err) => {
+                warn!(error = %err, task_id = %task_id, "failed to read backend artifact");
+                return None;
+            }
+        };
+
+        let cursor = self
+            .tail
+            .get_mut(&task_id)
+            .expect("cursor must exist for observed task");
+        cursor.byte_offset = cursor.byte_offset.saturating_add(bytes_read as u64);
+
+        let mut observations = Vec::new();
+
+        for raw_line in data.lines() {
+            let Some(value) = serde_json::from_str::<serde_json::Value>(raw_line).ok() else {
+                continue;
+            };
+
+            let command_event_id = value
+                .get("command_id")
+                .and_then(|value| value.as_str())
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let captured_at = value
+                .get("captured_at")
+                .and_then(|value| value.as_str())
+                .and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(value)
+                        .ok()
+                        .map(|parsed| parsed.with_timezone(&chrono::Utc))
+                })
+                .unwrap_or_else(Utc::now);
+
+            if value
+                .get("artifact_type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| value == "command_output")
+            {
+                continue;
+            }
+
+            for parsed in expand_tool_outcome_payload_candidates(&value) {
+                if let Some(observation) = parse_tool_health_observation(&parsed) {
+                    observations.push((observation, command_event_id, captured_at));
+                    break;
+                }
+            }
+        }
+
+        Some(observations)
+    }
+}
+
+fn task_output_artifact_path(task_id: Uuid) -> PathBuf {
+    PathBuf::from(".yarl/runs").join(format!("{task_id}.jsonl"))
+}
+
+fn expand_tool_outcome_payload_candidates(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut candidates = Vec::new();
+
+    if let Some(data) = value.get("data").and_then(|value| value.as_str()) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+            candidates.push(parsed);
+        }
+    }
+    if let Some(inner) = value
+        .get("data")
+        .filter(|value| Value::is_object(value))
+    {
+        candidates.push(inner.to_owned());
+    }
+
+    candidates.push(value.clone());
+    candidates
+}
+
+fn parse_tool_health_observation(value: &serde_json::Value) -> Option<ToolOutcomeObservation> {
+    let event_type = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .map(|raw| raw.to_lowercase());
+    let event_type = event_type.as_deref();
+
+    let is_health_event = matches!(
+        event_type,
+        Some("task_health")
+            | Some("task-health")
+            | Some("tool_health")
+            | Some("tool-health")
+            | Some("tool_outcome")
+            | Some("tool-outcome")
+    );
+
+    let Some(tool) = value
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .or_else(|| value.get("name").and_then(|value| value.as_str()))
+        .or_else(|| value.get("source").and_then(|value| value.as_str()))
+        .map(ToString::to_string)
+    else {
+        return None;
+    };
+
+    let status = value
+        .get("status")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            value
+                .get("outcome")
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| value.get("result").and_then(|value| value.as_str()))
+        .unwrap_or("unknown");
+
+    let outcome = if let Some(outcome) = value.get("outcome") {
+        outcome.to_owned()
+    } else {
+        value.clone()
+    };
+
+    if !(is_health_event || value.get("status").is_some() || value.get("outcome").is_some()) {
+        return None;
+    }
+
+    let score = outcome
+        .get("score")
+        .and_then(|value| value.as_f64())
+        .or_else(|| value.get("score").and_then(|value| value.as_f64()));
+
+    let metric = outcome
+        .get("metric")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| value.get("metric").and_then(|value| value.as_str()).map(ToString::to_string));
+
+    let detail = outcome
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| value.get("message").and_then(|value| value.as_str()).map(ToString::to_string));
+
+    Some(ToolOutcomeObservation {
+        tool,
+        status: status.to_owned(),
+        outcome,
+        score,
+        metric,
+        detail,
+    })
 }
 
 impl DeteriorationObserver {
@@ -436,6 +717,52 @@ impl DeteriorationObserver {
 
         let report = self.state.report();
         self.latest_report = Some(report.clone());
+        for signal in self.state.take_deterioration_detected() {
+            append_event(
+                store,
+                Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: Utc::now(),
+                    entity_type: yarli_core::domain::EntityType::Run,
+                    entity_id: self.run_id.to_string(),
+                    event_type: "run.observer.deterioration_detected".to_string(),
+                    payload: signal.to_payload(&report),
+                    correlation_id: self.correlation_id,
+                    causation_id: events.last().map(|event| event.event_id),
+                    actor: "observer.deterioration".to_string(),
+                    idempotency_key: None,
+                },
+            )?;
+        }
+        if let Some(cycle) = self.state.take_cycle_event() {
+            append_event(
+                store,
+                Event {
+                    event_id: Uuid::now_v7(),
+                    occurred_at: Utc::now(),
+                    entity_type: yarli_core::domain::EntityType::Run,
+                    entity_id: self.run_id.to_string(),
+                    event_type: "run.observer.deterioration_cycle".to_string(),
+                    payload: serde_json::json!({
+                        "pattern": cycle
+                            .pattern
+                            .iter()
+                            .map(deterioration_trend_name)
+                            .collect::<Vec<_>>(),
+                        "pattern_length": cycle.pattern.len(),
+                        "repeat_count": cycle.repeat_count,
+                        "score": report.score,
+                        "window_size": report.window_size,
+                        "trend": deterioration_trend_name(&report.trend),
+                    }),
+                    correlation_id: self.correlation_id,
+                    causation_id: events.last().map(|event| event.event_id),
+                    actor: "observer.deterioration".to_string(),
+                    idempotency_key: None,
+                },
+            )?;
+        }
+
         append_event(
             store,
             Event {
@@ -463,6 +790,10 @@ impl DeteriorationObserver {
     pub(crate) fn latest_report(&self) -> Option<&DeteriorationReport> {
         self.latest_report.as_ref()
     }
+
+    pub(crate) fn has_deterioration_cycle(&self) -> bool {
+        self.state.has_deterioration_cycle()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -489,8 +820,16 @@ enum ObserverSignal {
 pub(crate) struct DeteriorationObserverState {
     window_size: usize,
     signals: VecDeque<ObserverSignal>,
+    failure_signatures: VecDeque<String>,
+    failure_signature_last_repeat_key: Option<String>,
+    failure_signature_last_alt_key: Option<String>,
     pending_commands: HashMap<String, String>,
     previous_score: Option<f64>,
+    trend_history: VecDeque<DeteriorationTrend>,
+    last_cycle_signature: Option<String>,
+    has_cycle_detected: bool,
+    latest_cycle: Option<DeteriorationCycle>,
+    latest_deterioration_detected: Vec<DeteriorationDetectedSignatureSignal>,
 }
 
 impl DeteriorationObserverState {
@@ -498,9 +837,21 @@ impl DeteriorationObserverState {
         Self {
             window_size,
             signals: VecDeque::new(),
+            failure_signatures: VecDeque::new(),
+            failure_signature_last_repeat_key: None,
+            failure_signature_last_alt_key: None,
             pending_commands: HashMap::new(),
             previous_score: None,
+            trend_history: VecDeque::new(),
+            last_cycle_signature: None,
+            has_cycle_detected: false,
+            latest_cycle: None,
+            latest_deterioration_detected: Vec::new(),
         }
+    }
+
+    pub(crate) fn has_deterioration_cycle(&self) -> bool {
+        self.has_cycle_detected
     }
 
     pub(crate) fn ingest(&mut self, events: &[Event]) -> bool {
@@ -551,15 +902,11 @@ impl DeteriorationObserverState {
                     changed = true;
                 }
                 "task.failed" => {
-                    let bucket = event
-                        .payload
-                        .get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let bucket = normalize_error_signature(event);
                     self.push_signal(ObserverSignal::Failure {
-                        reason_bucket: bucket,
+                        reason_bucket: bucket.clone(),
                     });
+                    self.push_failure_signature(bucket);
                     changed = true;
 
                     if let (Some(observed), Some(limit)) = (
@@ -572,6 +919,18 @@ impl DeteriorationObserverState {
                         }
                     }
                 }
+                "run.observer.task_health" => {
+                    if !is_backend_task_health_failure(event) {
+                        continue;
+                    }
+
+                    let bucket = normalize_error_signature(event);
+                    self.push_signal(ObserverSignal::Failure {
+                        reason_bucket: bucket.clone(),
+                    });
+                    self.push_failure_signature(bucket);
+                    changed = true;
+                }
                 _ => {}
             }
         }
@@ -583,6 +942,13 @@ impl DeteriorationObserverState {
         self.signals.push_back(signal);
         while self.signals.len() > self.window_size {
             self.signals.pop_front();
+        }
+    }
+
+    fn push_failure_signature(&mut self, signature: String) {
+        self.failure_signatures.push_back(signature);
+        while self.failure_signatures.len() > OBSERVER_FAILURE_RING_SIZE {
+            self.failure_signatures.pop_front();
         }
     }
 
@@ -637,6 +1003,9 @@ impl DeteriorationObserverState {
             Some(_) => DeteriorationTrend::Stable,
             None => DeteriorationTrend::Stable,
         };
+        self.push_trend(trend);
+        self.latest_deterioration_detected = self.detect_deterioration_signals();
+        self.latest_cycle = self.detect_cycle_event();
         self.previous_score = Some(score);
 
         DeteriorationReport {
@@ -701,15 +1070,9 @@ impl DeteriorationObserverState {
 
     fn failure_drift_score(&self) -> f64 {
         let failures: Vec<&str> = self
-            .signals
+            .failure_signatures
             .iter()
-            .filter_map(|signal| {
-                if let ObserverSignal::Failure { reason_bucket } = signal {
-                    Some(reason_bucket.as_str())
-                } else {
-                    None
-                }
-            })
+            .map(String::as_str)
             .collect();
         if failures.len() < 2 {
             return 0.0;
@@ -768,6 +1131,416 @@ impl DeteriorationObserverState {
         let second_avg = headrooms[split..].iter().sum::<f64>() / (headrooms.len() - split) as f64;
         (first_avg - second_avg).clamp(0.0, 1.0)
     }
+
+    fn push_trend(&mut self, trend: DeteriorationTrend) {
+        self.trend_history.push_back(trend);
+        while self.trend_history.len() > self.window_size {
+            self.trend_history.pop_front();
+        }
+    }
+
+    fn detect_cycle_event(&mut self) -> Option<DeteriorationCycle> {
+        let Some(cycle) = detect_deterioration_cycle(&self.trend_history) else {
+            self.last_cycle_signature = None;
+            return None;
+        };
+
+        let signature = deterioration_cycle_signature(&cycle.pattern, cycle.repeat_count);
+        if self.last_cycle_signature.as_deref() == Some(&signature) {
+            return None;
+        }
+
+        self.has_cycle_detected = true;
+        self.last_cycle_signature = Some(signature);
+        Some(cycle)
+    }
+
+    fn take_cycle_event(&mut self) -> Option<DeteriorationCycle> {
+        self.latest_cycle.take()
+    }
+
+    fn detect_deterioration_signals(&mut self) -> Vec<DeteriorationDetectedSignatureSignal> {
+        let mut signals = Vec::new();
+        if let Some(repeat) = self.detect_repeated_failure_signature() {
+            signals.push(repeat);
+        }
+        if let Some(cycle) = self.detect_alternating_failure_cycle() {
+            signals.push(cycle);
+        }
+        signals
+    }
+
+    fn take_deterioration_detected(&mut self) -> Vec<DeteriorationDetectedSignatureSignal> {
+        std::mem::take(&mut self.latest_deterioration_detected)
+    }
+
+    fn detect_repeated_failure_signature(&mut self) -> Option<DeteriorationDetectedSignatureSignal> {
+        let Some(signature) = self.failure_signatures.back() else {
+            return None;
+        };
+        let mut repeat_count = 0usize;
+        for known in self.failure_signatures.iter().rev() {
+            if known == signature {
+                repeat_count += 1;
+                continue;
+            }
+            break;
+        }
+
+        if repeat_count < OBSERVER_FAILURE_REPEAT_THRESHOLD {
+            self.failure_signature_last_repeat_key = None;
+            return None;
+        }
+
+        let key = format!("repeat:{signature}:{repeat_count}");
+        if self.failure_signature_last_repeat_key.as_deref() == Some(&key) {
+            return None;
+        }
+        self.failure_signature_last_repeat_key = Some(key);
+
+        Some(DeteriorationDetectedSignatureSignal {
+            kind: DeteriorationDetectedSignatureKind::RepeatedSignature,
+            signatures: vec![signature.clone()],
+            repeat_count,
+        })
+    }
+
+    fn detect_alternating_failure_cycle(&mut self) -> Option<DeteriorationDetectedSignatureSignal> {
+        let Some(cycle) = detect_signature_cycle(&self.failure_signatures) else {
+            self.failure_signature_last_alt_key = None;
+            return None;
+        };
+
+        let key = failure_cycle_signature(&cycle.pattern, cycle.repeat_count);
+        if self.failure_signature_last_alt_key.as_deref() == Some(&key) {
+            return None;
+        }
+        self.failure_signature_last_alt_key = Some(key);
+
+        Some(DeteriorationDetectedSignatureSignal {
+            kind: DeteriorationDetectedSignatureKind::AlternatingSignatureCycle,
+            signatures: cycle.pattern,
+            repeat_count: cycle.repeat_count,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DeteriorationCycle {
+    pattern: Vec<DeteriorationTrend>,
+    repeat_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DeteriorationDetectedSignatureSignal {
+    kind: DeteriorationDetectedSignatureKind,
+    signatures: Vec<String>,
+    repeat_count: usize,
+}
+
+impl DeteriorationDetectedSignatureSignal {
+    fn to_payload(&self, report: &DeteriorationReport) -> serde_json::Value {
+        match self.kind {
+            DeteriorationDetectedSignatureKind::RepeatedSignature => serde_json::json!({
+                "signal": "backend_failure_repeated_signature",
+                "signature_count": self.repeat_count,
+                "signatures": self.signatures,
+                "score": report.score,
+                "window_size": report.window_size,
+                "trend": deterioration_trend_name(&report.trend),
+            }),
+            DeteriorationDetectedSignatureKind::AlternatingSignatureCycle => serde_json::json!({
+                "signal": "backend_failure_alternating_cycle",
+                "signature_count": self.signatures.len() * self.repeat_count,
+                "repeat_count": self.repeat_count,
+                "signatures": self.signatures,
+                "score": report.score,
+                "window_size": report.window_size,
+                "trend": deterioration_trend_name(&report.trend),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DeteriorationDetectedSignatureKind {
+    RepeatedSignature,
+    AlternatingSignatureCycle,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FailureSignatureCycle {
+    pattern: Vec<String>,
+    repeat_count: usize,
+}
+
+fn detect_deterioration_cycle(
+    trend_history: &VecDeque<DeteriorationTrend>,
+) -> Option<DeteriorationCycle> {
+    if trend_history.len() < 4 {
+        return None;
+    }
+
+    let values: Vec<_> = trend_history.iter().copied().collect();
+    let trend_count = values.len();
+    let max_pattern_length = (trend_count / 2).min(OBSERVER_TREND_CYCLE_MAX_PATTERN);
+
+    for pattern_len in 2..=max_pattern_length {
+        let candidate = &values[(trend_count - pattern_len)..trend_count];
+        if all_same_trend(candidate) {
+            continue;
+        }
+
+        let mut repeats = 1;
+        let mut start = trend_count - pattern_len;
+        while start >= pattern_len {
+            let previous_start = start - pattern_len;
+            if values[previous_start..start] != *candidate {
+                break;
+            }
+            repeats += 1;
+            start = previous_start;
+            if start == 0 {
+                break;
+            }
+        }
+
+        if repeats >= 2 {
+            return Some(DeteriorationCycle {
+                pattern: candidate.to_vec(),
+                repeat_count: repeats,
+            });
+        }
+    }
+
+    None
+}
+
+fn deterioration_cycle_signature(pattern: &[DeteriorationTrend], repeat_count: usize) -> String {
+    let joined = pattern
+        .iter()
+        .map(deterioration_trend_name)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{repeat_count}:{joined}")
+}
+
+fn detect_signature_cycle(
+    failure_signatures: &VecDeque<String>,
+) -> Option<FailureSignatureCycle> {
+    if failure_signatures.len() < 4 {
+        return None;
+    }
+
+    if failure_signatures
+        .iter()
+        .skip(failure_signatures.len().saturating_sub(2))
+        .any(|signature| signature.is_empty())
+    {
+        return None;
+    }
+
+    let last_two_start = failure_signatures.len().saturating_sub(2);
+    let pattern = vec![
+        failure_signatures.get(last_two_start)?.to_owned(),
+        failure_signatures.get(last_two_start.saturating_add(1))?.to_owned(),
+    ];
+
+    if pattern[0] == pattern[1] {
+        return None;
+    }
+
+    let mut repeat_count = 1usize;
+    let mut idx = last_two_start;
+    while idx >= 2 {
+        let previous = [
+            failure_signatures.get(idx.saturating_sub(2))?,
+            failure_signatures.get(idx.saturating_sub(1))?,
+        ];
+
+        if previous != [&pattern[0], &pattern[1]] {
+            break;
+        }
+        repeat_count += 1;
+        if idx == 2 {
+            break;
+        }
+        idx -= 2;
+    }
+
+    if repeat_count >= OBSERVER_FAILURE_ALT_REPEAT_THRESHOLD {
+        return Some(FailureSignatureCycle {
+            pattern,
+            repeat_count,
+        });
+    }
+
+    None
+}
+
+fn failure_cycle_signature(pattern: &[String], repeat_count: usize) -> String {
+    let joined = pattern.join("|");
+    format!("{repeat_count}:{joined}")
+}
+
+fn all_same_trend(trends: &[DeteriorationTrend]) -> bool {
+    let mut iter = trends.iter();
+    let Some(first) = iter.next() else {
+        return true;
+    };
+
+    iter.all(|trend| trend == first)
+}
+
+const fn deterioration_trend_name(trend: &DeteriorationTrend) -> &'static str {
+    match trend {
+        DeteriorationTrend::Improving => "improving",
+        DeteriorationTrend::Stable => "stable",
+        DeteriorationTrend::Deteriorating => "deteriorating",
+    }
+}
+
+pub(crate) fn normalize_error_signature(event: &Event) -> String {
+    if event.event_type == "run.observer.task_health" {
+        return normalize_task_health_error_signature(event);
+    }
+
+    let reason = event
+        .payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let detail = event
+        .payload
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let scope = event
+        .payload
+        .get("scope")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let metric = event
+        .payload
+        .get("metric")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(reason) = reason {
+        let normalized = reason.to_ascii_lowercase();
+        match normalized.as_str() {
+            "nonzero_exit" | "timeout" | "killed" | "exec_error" => {
+                return normalized.to_string();
+            }
+            "budget_exceeded" => {
+                if let (Some(scope), Some(metric)) = (scope, metric) {
+                    return format!("budget_exceeded:{scope}:{metric}");
+                }
+                return "budget_exceeded".to_string();
+            }
+            _ => {
+                if let Some(bucket) = normalized.split(':').next() {
+                    return bucket.to_string();
+                }
+            }
+        }
+    }
+
+    if let Some(detail) = detail {
+        let detail = detail.to_ascii_lowercase();
+        if detail.contains("command exited with code") || detail.contains("exit code") {
+            return "nonzero_exit".to_string();
+        }
+        if detail.contains("command timed out") || detail.contains("timed out") {
+            return "timeout".to_string();
+        }
+        if detail.contains("execution error") {
+            return "exec_error".to_string();
+        }
+        if detail.contains("killed") {
+            return "killed".to_string();
+        }
+    }
+
+    "unknown".to_string()
+}
+
+fn normalize_task_health_error_signature(event: &Event) -> String {
+    let status = event
+        .payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = if status == "failed" || status == "error" {
+        "fail"
+    } else {
+        status.as_str()
+    };
+
+    let tool = event
+        .payload
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let metric = event
+        .payload
+        .get("metric")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("signal");
+
+    let detail = event
+        .payload
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            event
+                .payload
+                .get("outcome")
+                .and_then(|outcome| outcome.get("detail"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+
+    if let Some(detail) = detail {
+        let normalized = detail.to_ascii_lowercase();
+        if normalized.contains("timed out") || normalized.contains("timeout") {
+            return format!("{status}:{tool}:{metric}:timeout");
+        }
+        if normalized.contains("exit code") || normalized.contains("exited with code") || normalized.contains("nonzero") {
+            return format!("{status}:{tool}:{metric}:nonzero_exit");
+        }
+        if normalized.contains("execution error") || normalized.contains("permission") {
+            return format!("{status}:{tool}:{metric}:exec_error");
+        }
+    }
+
+    format!("{status}:{tool}:{metric}")
+}
+
+fn is_backend_task_health_failure(event: &Event) -> bool {
+    if event.event_type != "run.observer.task_health" {
+        return false;
+    }
+    let status = event
+        .payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(status.as_str(), "fail" | "failed" | "error")
 }
 
 pub(crate) fn build_memory_observer(
@@ -834,10 +1607,25 @@ pub(crate) fn build_memory_observer(
     )))
 }
 
+pub(crate) fn build_task_health_observer(
+    run_id: Uuid,
+    correlation_id: Uuid,
+    task_names: &[(Uuid, String)],
+) -> Option<TaskHealthArtifactObserver> {
+    (!task_names.is_empty()).then_some(TaskHealthArtifactObserver::new(
+        run_id,
+        correlation_id,
+        task_names,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_helpers::{make_command_started, make_command_terminal, make_event};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::Write;
+    use std::path::PathBuf;
     use uuid::Uuid;
     use yarli_core::domain::EntityType;
     use yarli_core::explain::DeteriorationTrend;
@@ -983,5 +1771,392 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn parse_tool_health_observation_reads_nested_tool_payload() {
+        let direct = serde_json::json!({
+            "tool": "runner",
+            "status": "pass",
+            "outcome": {
+                "score": 0.77,
+                "detail": "nested parsed from data payload",
+            },
+        });
+        let candidates = expand_tool_outcome_payload_candidates(&serde_json::json!({
+            "data": direct.to_string(),
+            "seq": 1,
+            "stream": "stdout",
+        }));
+        let observation = candidates
+            .into_iter()
+            .find_map(|candidate| parse_tool_health_observation(&candidate))
+            .expect("tool outcome should parse");
+
+        assert_eq!(observation.tool, "runner");
+        assert_eq!(observation.status, "pass");
+        assert_eq!(observation.score, Some(0.77));
+        assert_eq!(observation.detail.as_deref(), Some("nested parsed from data payload"));
+    }
+
+    #[test]
+    fn normalize_error_signature_handles_backend_task_health() {
+        let corr = Uuid::now_v7();
+        let task_id = Uuid::new_v4();
+
+        let fail_signature = normalize_error_signature(&make_event(
+            EntityType::Run,
+            task_id.to_string(),
+            "run.observer.task_health",
+            corr,
+            serde_json::json!({
+                "tool": "lint",
+                "status": "failed",
+                "metric": "quality",
+                "detail": "command exited with code 127",
+            }),
+        ));
+        assert_eq!(fail_signature, "fail:lint:quality:nonzero_exit");
+
+        let timeout_signature = normalize_error_signature(&make_event(
+            EntityType::Run,
+            task_id.to_string(),
+            "run.observer.task_health",
+            corr,
+            serde_json::json!({
+                "tool": "test",
+                "status": "error",
+                "metric": "coverage",
+                "detail": "timed out waiting for response",
+            }),
+        ));
+        assert_eq!(timeout_signature, "fail:test:coverage:timeout");
+    }
+
+    #[test]
+    fn deterioration_detected_for_repeated_backend_failure_signatures() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        for _ in 0..3 {
+            store
+                .append(make_event(
+                    EntityType::Run,
+                    run_id.to_string(),
+                    "run.observer.task_health",
+                    corr,
+                    serde_json::json!({
+                        "tool": "lint",
+                        "status": "fail",
+                        "metric": "quality",
+                        "detail": "command exited with code 2",
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let mut observer = DeteriorationObserver::new(run_id, corr, 64);
+        observer.observe_store(&store).unwrap();
+
+        let events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        let detected = events
+            .iter()
+            .filter(|event| event.event_type == "run.observer.deterioration_detected")
+            .collect::<Vec<_>>();
+
+        assert_eq!(detected.len(), 1);
+        let payload = &detected[0].payload;
+        assert_eq!(
+            payload.get("signal").and_then(Value::as_str),
+            Some("backend_failure_repeated_signature")
+        );
+        assert_eq!(payload.get("signature_count").and_then(Value::as_u64), Some(3));
+        assert_eq!(
+            payload
+                .get("signatures")
+                .and_then(Value::as_array)
+                .and_then(|values| values.get(0))
+                .and_then(Value::as_str),
+            Some("fail:lint:quality:nonzero_exit")
+        );
+    }
+
+    #[test]
+    fn deterioration_detected_for_alternating_backend_failure_signatures() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        for i in 0..4 {
+            let (tool, detail) = if i % 2 == 0 {
+                ("lint", "command exited with code 2")
+            } else {
+                ("test", "timed out waiting for resource")
+            };
+            store
+                .append(make_event(
+                    EntityType::Run,
+                    run_id.to_string(),
+                    "run.observer.task_health",
+                    corr,
+                    serde_json::json!({
+                        "tool": tool,
+                        "status": "fail",
+                        "metric": "quality",
+                        "detail": detail,
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let mut observer = DeteriorationObserver::new(run_id, corr, 64);
+        observer.observe_store(&store).unwrap();
+
+        let events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        let detected = events
+            .iter()
+            .filter(|event| event.event_type == "run.observer.deterioration_detected")
+            .collect::<Vec<_>>();
+
+        assert_eq!(detected.len(), 1);
+        let payload = &detected[0].payload;
+        assert_eq!(
+            payload.get("signal").and_then(Value::as_str),
+            Some("backend_failure_alternating_cycle")
+        );
+        assert_eq!(payload.get("repeat_count").and_then(Value::as_u64), Some(2));
+        let signatures = payload
+            .get("signatures")
+            .and_then(Value::as_array)
+            .expect("alternating signatures emitted")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            signatures,
+            vec![
+                "fail:lint:quality:nonzero_exit",
+                "fail:test:quality:timeout"
+            ]
+        );
+        assert_eq!(payload.get("signature_count").and_then(Value::as_u64), Some(4));
+    }
+
+    #[test]
+    fn task_health_observer_reads_task_output_artifact_incrementally() {
+        let run_id = Uuid::now_v7();
+        let correlation_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let task_names = vec![(task_id, "task-1".to_string())];
+        let artifact_path = PathBuf::from(".yarl/runs").join(format!("{task_id}.jsonl"));
+        let _ = fs::remove_file(&artifact_path);
+        fs::create_dir_all(".yarl/runs").unwrap();
+
+        let first_command_id = Uuid::now_v7();
+        let second_command_id = Uuid::now_v7();
+        {
+            let mut artifact = File::create(&artifact_path).unwrap();
+            writeln!(
+                &mut artifact,
+                "{}",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "artifact_type": "command_output",
+                })
+            )
+            .unwrap();
+            let first_payload = serde_json::json!({
+                "tool": "lint",
+                "status": "pass",
+                "score": 0.99,
+                "metric": "quality",
+                "detail": "first check",
+            });
+            writeln!(
+                &mut artifact,
+                "{}",
+                serde_json::json!({
+                    "command_id": first_command_id,
+                    "seq": 1,
+                    "stream": "stdout",
+                    "data": first_payload.to_string(),
+                    "captured_at": "2026-02-22T10:00:00Z",
+                })
+            )
+            .unwrap();
+        }
+
+        let store = InMemoryEventStore::new();
+        let mut observer = TaskHealthArtifactObserver::new(run_id, correlation_id, &task_names);
+        let emitted = observer.observe_store(&store);
+        assert_eq!(emitted, 1);
+
+        let events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload.get("tool").and_then(|v| v.as_str()), Some("lint"));
+        assert_eq!(events[0].payload.get("status").and_then(|v| v.as_str()), Some("pass"));
+        assert_eq!(
+            events[0].causation_id,
+            Some(first_command_id),
+            "first line causation id is preserved"
+        );
+        assert_eq!(events[0].payload.get("metric").and_then(|value| value.as_str()), Some("quality"));
+
+        let second_payload = serde_json::json!({
+            "tool": "lint",
+            "status": "fail",
+            "score": 0.33,
+            "metric": "quality",
+            "detail": "second check",
+        });
+        {
+            let mut artifact = OpenOptions::new()
+                .append(true)
+                .open(&artifact_path)
+                .unwrap();
+            writeln!(
+                &mut artifact,
+                "{}",
+                serde_json::json!({
+                    "command_id": second_command_id,
+                    "seq": 2,
+                    "stream": "stdout",
+                    "data": second_payload.to_string(),
+                    "captured_at": "2026-02-22T10:00:01Z",
+                })
+            )
+            .unwrap();
+        }
+
+        let emitted = observer.observe_store(&store);
+        assert_eq!(emitted, 1);
+        let events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[1].payload.get("status").and_then(|v| v.as_str()),
+            Some("fail")
+        );
+        assert_eq!(
+            events[1].causation_id,
+            Some(second_command_id),
+            "append line causation id is preserved"
+        );
+
+        let _ = fs::remove_file(&artifact_path);
+    }
+
+    #[test]
+    fn detect_deterioration_cycle_reports_patterns() {
+        let mut history = VecDeque::new();
+        history.push_back(DeteriorationTrend::Stable);
+        history.push_back(DeteriorationTrend::Deteriorating);
+        history.push_back(DeteriorationTrend::Stable);
+        history.push_back(DeteriorationTrend::Deteriorating);
+
+        let cycle = detect_deterioration_cycle(&history).expect("cycle expected");
+        assert_eq!(cycle.repeat_count, 2);
+        assert_eq!(
+            cycle.pattern,
+            vec![DeteriorationTrend::Stable, DeteriorationTrend::Deteriorating]
+        );
+    }
+
+    #[test]
+    fn stable_trend_does_not_trigger_cycle() {
+        let mut history = VecDeque::new();
+        history.push_back(DeteriorationTrend::Stable);
+        history.push_back(DeteriorationTrend::Stable);
+        history.push_back(DeteriorationTrend::Stable);
+        history.push_back(DeteriorationTrend::Stable);
+
+        assert!(detect_deterioration_cycle(&history).is_none());
+    }
+
+    #[test]
+    fn normalize_error_signature_handles_noisy_failure_details() {
+        let corr = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+
+        let nonzero_exit = normalize_error_signature(&make_event(
+            EntityType::Task,
+            task_id.to_string(),
+            "task.failed",
+            corr,
+            serde_json::json!({
+                "reason": "nonzero_exit",
+                "detail": "command exited with code 1",
+            }),
+        ));
+        assert_eq!(nonzero_exit, "nonzero_exit");
+
+        let nonzero_exit_variant = normalize_error_signature(&make_event(
+            EntityType::Task,
+            task_id.to_string(),
+            "task.failed",
+            corr,
+            serde_json::json!({
+                "reason": "nonzero_exit",
+                "detail": "command exited with code 127",
+            }),
+        ));
+        assert_eq!(nonzero_exit_variant, "nonzero_exit");
+
+        let exec_error = normalize_error_signature(&make_event(
+            EntityType::Task,
+            task_id.to_string(),
+            "task.failed",
+            corr,
+            serde_json::json!({
+                "reason": "exec_error",
+                "detail": "execution error: permission denied",
+            }),
+        ));
+        assert_eq!(exec_error, "exec_error");
+
+        let budget_exceeded = normalize_error_signature(&make_event(
+            EntityType::Task,
+            task_id.to_string(),
+            "task.failed",
+            corr,
+            serde_json::json!({
+                "reason": "budget_exceeded",
+                "scope": "task",
+                "metric": "total_tokens",
+            }),
+        ));
+        assert_eq!(budget_exceeded, "budget_exceeded:task:total_tokens");
+    }
+
+    #[test]
+    fn failure_signature_ring_is_bounded() {
+        let mut state = DeteriorationObserverState::new(16);
+        let corr = Uuid::now_v7();
+
+        for i in 0..(OBSERVER_FAILURE_RING_SIZE + 6) {
+            let event = make_event(
+                EntityType::Task,
+                Uuid::new_v4().to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "reason": "nonzero_exit",
+                    "detail": format!("command exited with code {i}"),
+                }),
+            );
+            let changed = state.ingest(std::slice::from_ref(&event));
+            assert!(changed);
+        }
+
+        assert_eq!(state.failure_signatures.len(), OBSERVER_FAILURE_RING_SIZE);
     }
 }

@@ -108,11 +108,16 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.continue_wait_timeout_seconds (default: 0; seconds to wait for continuation availability before failing)
 - run.allow_stable_auto_advance (legacy compatibility toggle; prefer run.auto_advance_policy)
 - run.auto_advance_policy (default: stable-ok; values: improving-only|stable-ok|always)
+- run.task_health (config block: improving/stable/deteriorating actions)
+- run.task_health.improving (default: "continue"; values: continue|checkpoint-now|force-pivot|stop-and-summarize)
+- run.task_health.stable (default: "continue"; values: continue|checkpoint-now|force-pivot|stop-and-summarize)
+- run.task_health.deteriorating (default: "continue"; values: continue|checkpoint-now|force-pivot|stop-and-summarize)
+- run.soft_token_cap_ratio (default: 0.9; when set, checkpoints when total tokens reach this fraction of max_run_total_tokens)
 - run.max_auto_advance_tranches (default: 0; 0 = unlimited auto-advance per invocation)
 - run.enable_plan_tranche_grouping (default: false; group adjacent plan entries by shared tranche_group metadata)
 - run.max_grouped_tasks_per_tranche (default: 0; 0 = unlimited tasks per grouped tranche)
 - run.enforce_plan_tranche_allowed_paths (default: false; surface `allowed_paths=` plan metadata as scope constraints)
-- run.merge_conflict_resolution (default: "fail"; values: fail|agent|manual)
+- run.merge_conflict_resolution (default: "fail"; values: fail|manual|auto-repair)
 - run.tasks (optional; array-of-table `[[run.tasks]]` entries with key/cmd/class)
 - run.tranches (optional; array-of-table `[[run.tranches]]` entries with key/objective/task_keys)
 - run.plan_guard.target (optional; when set, enforces plan target contract)
@@ -285,6 +290,19 @@ continue_wait_timeout_seconds = 0
 allow_stable_auto_advance = false
 # Preferred auto-advance policy: improving-only | stable-ok | always
 auto_advance_policy = "stable-ok"
+# Optional task-health actions by deterioration trend:
+# - continue: proceed with continuation + planned auto-advance evaluation
+# - checkpoint-now: stop planned auto-advance and checkpoint the current context
+# - force-pivot: force the next action to switch task focus (requires operator follow-up)
+# - stop-and-summarize: stop auto-advance and summarize state for manual review
+[run.task_health]
+improving = "continue"
+stable = "continue"
+deteriorating = "continue"
+# Optional soft-token checkpoint trigger ratio for run-level token hard caps.
+# - default: 0.9
+# - 0 disables the soft cap.
+soft_token_cap_ratio = 0.9
 # Maximum planned-tranche auto-advances per invocation (0 = unlimited).
 max_auto_advance_tranches = 0
 # Group adjacent open plan entries with matching `tranche_group=<name>` metadata.
@@ -293,7 +311,7 @@ enable_plan_tranche_grouping = false
 max_grouped_tasks_per_tranche = 0
 # Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
 enforce_plan_tranche_allowed_paths = false
-# Merge conflict resolution strategy: fail | agent | manual
+# Merge conflict resolution strategy: fail | manual | auto-repair
 # merge_conflict_resolution = "fail"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]

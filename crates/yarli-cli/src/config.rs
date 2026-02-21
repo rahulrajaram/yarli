@@ -7,7 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::Deserializer, Deserialize, Serialize};
+use yarli_core::entities::continuation::TaskHealthAction;
 use yarli_core::domain::SafeMode;
 use yarli_observability::JsonlAuditSink;
 use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, TaskQueue};
@@ -142,6 +143,7 @@ pub(crate) struct CliInvocationConfig {
 pub(crate) struct AutoAdvanceConfig {
     pub(crate) policy: AutoAdvancePolicy,
     pub(crate) max_tranches: u32,
+    pub(crate) task_health: RunTaskHealthConfig,
 }
 
 impl AutoAdvanceConfig {
@@ -149,6 +151,7 @@ impl AutoAdvanceConfig {
         Self {
             policy: loaded_config.config().run.effective_auto_advance_policy(),
             max_tranches: loaded_config.config().run.max_auto_advance_tranches,
+            task_health: loaded_config.config().run.task_health,
         }
     }
 
@@ -590,7 +593,7 @@ pub enum BackendSelection {
     Postgres { database_url: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct YarliConfig {
     #[serde(default)]
     pub core: CoreConfig,
@@ -896,6 +899,10 @@ fn default_tick_interval_ms() -> u64 {
     100
 }
 
+fn default_soft_token_cap_ratio() -> f64 {
+    0.9
+}
+
 fn default_worktree_exclude_paths() -> Vec<String> {
     vec![
         ".yarl/workspaces".to_string(),
@@ -946,7 +953,7 @@ fn default_overwatch_service_url() -> String {
     "http://127.0.0.1:8089".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunConfig {
     /// Optional prompt file for `yarli run` default execution.
     ///
@@ -966,6 +973,16 @@ pub struct RunConfig {
     /// Legacy compatibility toggle; prefer `auto_advance_policy`.
     #[serde(default)]
     pub allow_stable_auto_advance: bool,
+    /// Configure task-health actions per deterioration trend.
+    ///
+    /// Defaults keep behavior unchanged (`continue` for all trends).
+    #[serde(default)]
+    pub task_health: RunTaskHealthConfig,
+    /// Fractional hard-token cap threshold for the soft checkpoint trigger.
+    ///
+    /// Value is in `[0.0, 1.0]`. Set to `0.0` to disable.
+    #[serde(default = "default_soft_token_cap_ratio")]
+    pub soft_token_cap_ratio: f64,
     /// Auto-advance policy for planned tranches.
     ///
     /// `stable-ok` (default): stable and improving trends advance.
@@ -1001,9 +1018,9 @@ pub struct RunConfig {
     /// Strategy for handling merge conflicts during parallel workspace patch application.
     ///
     /// `fail` (default): hard-fail on merge conflicts.
-    /// `agent`: spawn an agent to attempt automated resolution (stub — falls back to fail).
+    /// `auto-repair`: attempt a deterministic automated repair before failing.
     /// `manual`: preserve conflicted workspaces and emit operator instructions.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_merge_conflict_resolution")]
     pub merge_conflict_resolution: MergeConflictResolution,
     /// Optional project-level task catalog for run-spec execution.
     ///
@@ -1028,6 +1045,26 @@ pub struct RunConfig {
     pub paces: std::collections::BTreeMap<String, RunPaceConfig>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunTaskHealthConfig {
+    #[serde(default)]
+    pub improving: TaskHealthAction,
+    #[serde(default)]
+    pub stable: TaskHealthAction,
+    #[serde(default)]
+    pub deteriorating: TaskHealthAction,
+}
+
+impl Default for RunTaskHealthConfig {
+    fn default() -> Self {
+        Self {
+            improving: TaskHealthAction::Continue,
+            stable: TaskHealthAction::Continue,
+            deteriorating: TaskHealthAction::Continue,
+        }
+    }
+}
+
 impl RunConfig {
     pub fn effective_auto_advance_policy(&self) -> AutoAdvancePolicy {
         if self.auto_advance_policy != AutoAdvancePolicy::ImprovingOnly {
@@ -1041,16 +1078,58 @@ impl RunConfig {
     }
 }
 
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            prompt_file: None,
+            objective: None,
+            continue_wait_timeout_seconds: 0,
+            allow_stable_auto_advance: false,
+            task_health: RunTaskHealthConfig::default(),
+            soft_token_cap_ratio: default_soft_token_cap_ratio(),
+            auto_advance_policy: AutoAdvancePolicy::StableOk,
+            max_auto_advance_tranches: 0,
+            enable_plan_tranche_grouping: false,
+            max_grouped_tasks_per_tranche: 0,
+            enforce_plan_tranche_allowed_paths: false,
+            allow_recursive_run: false,
+            merge_conflict_resolution: MergeConflictResolution::Fail,
+            tasks: Vec::new(),
+            tranches: Vec::new(),
+            plan_guard: None,
+            default_pace: None,
+            paces: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum MergeConflictResolution {
     /// Hard-fail on merge conflicts (current default behavior).
     #[default]
     Fail,
-    /// Spawn an agent to attempt automated conflict resolution.
-    Agent,
+    /// Attempt an automatic repair pass before failing.
+    AutoRepair,
     /// Preserve conflicted workspaces and emit operator instructions.
     Manual,
+}
+
+fn deserialize_merge_conflict_resolution<'de, D>(
+    deserializer: D,
+) -> Result<MergeConflictResolution, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    match raw.as_str() {
+        "fail" => Ok(MergeConflictResolution::Fail),
+        "auto-repair" => Ok(MergeConflictResolution::AutoRepair),
+        "manual" => Ok(MergeConflictResolution::Manual),
+        _ => Err(serde::de::Error::custom(format!(
+            "invalid [run].merge_conflict_resolution = {raw:?}; expected one of: \"fail\", \"manual\", \"auto-repair\""
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1401,6 +1480,11 @@ mod tests {
             "run.continue_wait_timeout_seconds",
             "run.allow_stable_auto_advance",
             "run.auto_advance_policy",
+            "run.task_health",
+            "run.task_health.improving",
+            "run.task_health.stable",
+            "run.task_health.deteriorating",
+            "run.soft_token_cap_ratio",
             "run.max_auto_advance_tranches",
             "run.enable_plan_tranche_grouping",
             "run.max_grouped_tasks_per_tranche",
@@ -1571,6 +1655,8 @@ env_unset = ["BAD-NAME"]
         assert_eq!(loaded.config().run.objective, None);
         assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 0);
         assert!(!loaded.config().run.allow_stable_auto_advance);
+        assert_eq!(loaded.config().run.soft_token_cap_ratio, 0.9);
+        assert_eq!(loaded.config().run.task_health, RunTaskHealthConfig::default());
         assert_eq!(
             loaded.config().run.auto_advance_policy,
             AutoAdvancePolicy::StableOk
@@ -1639,11 +1725,17 @@ objective = "ship it"
 continue_wait_timeout_seconds = 7
 allow_stable_auto_advance = true
 auto_advance_policy = "always"
+soft_token_cap_ratio = 0.9
 max_auto_advance_tranches = 0
 enable_plan_tranche_grouping = true
 max_grouped_tasks_per_tranche = 3
 enforce_plan_tranche_allowed_paths = true
 default_pace = "batch"
+
+[run.task_health]
+improving = "continue"
+stable = "checkpoint-now"
+deteriorating = "stop-and-summarize"
 [[run.tasks]]
 key = "lint"
 cmd = "cargo clippy --workspace -- -D warnings"
@@ -1751,6 +1843,15 @@ mode = "stream"
         assert_eq!(loaded.config().run.objective.as_deref(), Some("ship it"));
         assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 7);
         assert!(loaded.config().run.allow_stable_auto_advance);
+        assert_eq!(
+            loaded.config().run.task_health,
+            RunTaskHealthConfig {
+                improving: TaskHealthAction::Continue,
+                stable: TaskHealthAction::CheckpointNow,
+                deteriorating: TaskHealthAction::StopAndSummarize,
+            }
+        );
+        assert_eq!(loaded.config().run.soft_token_cap_ratio, 0.9);
         assert_eq!(
             loaded.config().run.auto_advance_policy,
             AutoAdvancePolicy::Always
@@ -1998,12 +2099,12 @@ merge_conflict_resolution = "fail"
         let loaded = write_test_config(
             r#"
 [run]
-merge_conflict_resolution = "agent"
+merge_conflict_resolution = "auto-repair"
 "#,
         );
         assert_eq!(
             loaded.config().run.merge_conflict_resolution,
-            MergeConflictResolution::Agent
+            MergeConflictResolution::AutoRepair
         );
 
         let loaded = write_test_config(
@@ -2016,6 +2117,37 @@ merge_conflict_resolution = "manual"
             loaded.config().run.merge_conflict_resolution,
             MergeConflictResolution::Manual
         );
+    }
+
+    #[test]
+    fn merge_conflict_resolution_rejects_unknown_values_with_clear_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        std::fs::write(
+            &path,
+            r#"
+[run]
+merge_conflict_resolution = "agentic"
+"#,
+        )
+        .unwrap();
+
+        let err = LoadedConfig::load(&path).unwrap_err();
+        let msg = err.to_string();
+        let root_msg = err.root_cause().to_string();
+        assert!(
+            msg.contains("failed to parse config file"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            root_msg.contains("invalid [run].merge_conflict_resolution"),
+            "unexpected root error: {root_msg}"
+        );
+        assert!(
+            root_msg.contains("expected one of: \"fail\", \"manual\", \"auto-repair\""),
+            "unexpected root error: {root_msg}"
+        );
+        assert!(root_msg.contains("agentic"));
     }
 
     #[test]

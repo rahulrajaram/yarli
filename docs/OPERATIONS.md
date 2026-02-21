@@ -224,6 +224,81 @@ Operator surfaces:
 - `yarli run explain-exit <run-id>` includes a sequence deterioration section.
 - `yarli-api` (if you run it) exposes the latest report as an optional `deterioration` field on `GET /v1/runs/<run-id>/status`.
 
+## Runtime Guard Telemetry and Operator Playbook
+
+Runtime guards now combine hard guardrails and quality gating:
+
+- Budget guardrails from `[budgets]` stop execution on token/usage overages.
+- Task-health and soft-token-cap guardrails produce continuation guidance (`checkpoint-now`, `force-pivot`, or `stop-and-summarize`) on completion.
+- Guard telemetry is observability-first and does not itself gate active scheduler semantics.
+
+Telemetry to monitor:
+
+- `run.observer.deterioration` and `run.observer.deterioration_cycle`
+  - Detect recurring instability patterns before automatic continuation paths drift too far.
+- `run.observer.progress`
+  - Confirms progress visibility for long-running tasks and supports hang triage.
+- `task.failed` with `reason = "budget_exceeded"`
+  - Includes observed/limit metrics, command usage, token usage, and aggregate run usage snapshots.
+- `run.continuation` (`quality_gate` payload)
+  - Captures `task_health_action`, `reason`, and optional `trend` for operator follow-up.
+
+Operator playbook:
+
+- Budget breach (`budget_exceeded`) response:
+  1. Pause if active: `yarli run pause <run-id>`
+  2. Inspect: `yarli run status <run-id>`, `yarli run explain-exit <run-id>`, `yarli task explain <task-id>`
+  3. Decide: lower scope, raise limits, or cancel and rerun (`yarli run cancel <run-id>`)
+- Deterioration-cycle response:
+  1. Inspect current state with `yarli run status <run-id>` and `yarli run explain-exit <run-id>`
+  2. If guidance is `force-pivot` or `stop-and-summarize`, pause/stop before continuing
+  3. Re-run with narrower scope, then continue via `yarli run continue` after intent is updated
+- Soft-cap continuation guidance (`checkpoint-now`):
+  1. Treat as a review checkpoint and avoid blind continuation
+  2. Evaluate remaining objective and current usage headroom
+  3. If safe, continue; otherwise cancel and restart with adjusted `[run]` strategy
+
+## Merge Conflict Policy and Incident Response
+
+- `run.parallel_merge_failed` is emitted for unresolved or unrecoverable conflicts during parallel workspace merge finalization.
+- `run.parallel_merge_succeeded` confirms successful parallel merge finalization.
+- Merge telemetry events are also emitted as part of merge apply tracking:
+  - `merge.apply.started`
+  - `merge.apply.conflict`
+  - `merge.apply.finalized`
+  - `merge.repair.succeeded`
+  - `merge.repair.failed`
+
+Merge policy modes (`[run].merge_conflict_resolution`) are:
+
+- `fail` (default): stop on conflict, preserve workspace for operator review.
+- `manual`: preserve workspace and emit explicit recovery instructions for manual intervention.
+- `auto-repair`: attempt deterministic patch-side repair before falling back to manual recovery.
+
+Incident response workflow:
+
+- Pull latest failure context:
+  1. `yarli run status <run-id>`
+  2. `yarli run explain-exit <run-id>`
+  3. `yarli audit tail` or your standard event consumer for merge telemetry and task-level context.
+- Open `PARALLEL_MERGE_RECOVERY.txt` in the preserved workspace root reported by `run.parallel_merge_failed`.
+- Run recovery commands from the note in order (status, patch diff stats, manual `git apply` retry).
+- Resolve conflicts and re-run with your normal operator decision path:
+  - `yarli run continue` when continuation is available, or
+  - rerun the target tranche after scope and policy review.
+- If recovery requires policy change, update `run.merge_conflict_resolution` (`fail`, `manual`, or `auto-repair`) and resume according to post-incident policy.
+
+Evidence capture for incident records should include:
+
+- `run.parallel_merge_failed` payload (including `task_key`, `patch_path`, `workspace_path`, `conflicted_files`, `repo_status`, `recovery_hints`)
+- associated `merge.apply.*` and `merge.repair.*` telemetry events
+- `PARALLEL_MERGE_RECOVERY.txt` and operator remediation steps.
+
+Policy defaults:
+
+- Keep guard-related telemetry in evidence (`evidence/<loop-id>/`) to preserve trend history.
+- Avoid runtime-guard bypass shortcuts; use continuation/replan actions and explicit operator commands.
+
 ## Reproducing Budget Stress Checks Locally
 
 Run these commands to verify budget governance under parallel workload:

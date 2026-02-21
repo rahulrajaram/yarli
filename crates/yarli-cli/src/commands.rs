@@ -10,10 +10,80 @@ use super::*;
 use crate::events::*;
 use crate::persistence::RUN_CONTINUATION_EVENT_TYPE;
 use crate::render::*;
-use crate::workspace::{
-    merge_parallel_workspace_results_with_resolution, prepare_parallel_workspace_layout,
-    ParallelWorkspaceMergeReport,
+use yarli_core::entities::continuation::{
+    ContinuationIntervention, ContinuationInterventionKind, TaskHealthAction,
 };
+use yarli_core::domain::ExitReason;
+use crate::workspace::{
+    merge_parallel_workspace_results_with_resolution_with_events, prepare_parallel_workspace_layout,
+    MergeApplyTelemetryEvent, ParallelWorkspaceMergeApplyError,
+    ParallelWorkspaceMergeFailureKind, ParallelWorkspaceMergeReport,
+};
+
+fn collect_telemetry_string_values(
+    metadata: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let Some(values) = metadata.and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    for value in values {
+        if let Some(text) = value.as_str() {
+            output.push(text.to_string());
+        }
+    }
+    output.sort_unstable();
+    output.dedup();
+    output
+}
+
+fn merge_apply_conflict_metadata(
+    telemetry: &[MergeApplyTelemetryEvent],
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+) {
+    telemetry
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "merge.apply.conflict")
+        .map_or_else(
+            || (None, None, None, Vec::new(), Vec::new(), None),
+            |event| {
+                let task_key = event
+                    .metadata
+                    .get("task_key")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                let patch_path = event
+                    .metadata
+                    .get("patch_path")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                let workspace_path = event
+                    .metadata
+                    .get("workspace_path")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                let conflicted_files = collect_telemetry_string_values(
+                    event.metadata.get("conflicted_files"),
+                );
+                let recovery_hints = collect_telemetry_string_values(
+                    event.metadata.get("recovery_hints"),
+                );
+                let repo_status = event
+                    .metadata
+                    .get("repo_status")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                (task_key, patch_path, workspace_path, conflicted_files, recovery_hints, repo_status)
+            },
+        )
+}
 
 #[derive(Clone)]
 enum SelectedCommandRunner {
@@ -50,6 +120,25 @@ pub(crate) fn resolve_render_mode(
         }
     };
     mode::select_render_mode(term_info, force_stream, force_tui).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn sw4rm_verification_runner(loaded_config: &LoadedConfig) -> Result<SelectedCommandRunner> {
+    match loaded_config.config().execution.runner {
+        ExecutionRunner::Native => Ok(SelectedCommandRunner::Native(LocalCommandRunner::new())),
+        ExecutionRunner::Overwatch => {
+            let overwatch = &loaded_config.config().execution.overwatch;
+            let runner = OverwatchCommandRunner::new(OverwatchRunnerConfig {
+                service_url: overwatch.service_url.clone(),
+                profile: overwatch.profile.clone().filter(|value| !value.trim().is_empty()),
+                soft_timeout_seconds: overwatch.soft_timeout_seconds,
+                silent_timeout_seconds: overwatch.silent_timeout_seconds,
+                max_log_bytes: overwatch.max_log_bytes,
+                ..OverwatchRunnerConfig::default()
+            })
+            .context("failed to initialize sw4rm verification runner")?;
+            Ok(SelectedCommandRunner::Overwatch(runner))
+        }
+    }
 }
 
 async fn load_continuation_payload_for_continue(
@@ -648,17 +737,22 @@ where
     });
 
     // Drive scheduler loop, emitting events to renderer channel.
-    let continuation_payload = drive_scheduler(
+    let scheduler_tx = tx.clone();
+    let mut continuation_payload = drive_scheduler(
         &mut scheduler,
         &store,
         shutdown.clone(),
         cancel,
-        tx,
+        scheduler_tx,
         run_id,
         correlation_id,
         &task_names,
         loaded_config.config().run.effective_auto_advance_policy(),
+        loaded_config.config().run.task_health,
+        loaded_config.config().budgets.max_run_total_tokens,
+        loaded_config.config().run.soft_token_cap_ratio,
         loaded_config.config().ui.cancellation_diagnostics,
+        observers::build_task_health_observer(run_id, correlation_id, &task_names),
         observers::build_memory_observer(
             loaded_config,
             run_id,
@@ -669,13 +763,8 @@ where
     )
     .await?;
 
-    // Wait for renderer to finish.
-    renderer_handle
-        .await
-        .context("renderer task panicked")?
-        .context("renderer error")?;
-
     let mut parallel_merge_error: Option<anyhow::Error> = None;
+    let mut parallel_merge_error_reason: Option<ParallelWorkspaceMergeFailureKind> = None;
     let mut parallel_merge_report: Option<ParallelWorkspaceMergeReport> = None;
     if continuation_payload.exit_state == RunState::RunCompleted {
         if let Some(layout) = parallel_workspace_layout.as_ref() {
@@ -687,19 +776,21 @@ where
                     source_workdir.display()
                 )
             })?;
+            let mut merge_apply_telemetry = Vec::new();
             let task_workspaces = plan
                 .tasks
                 .iter()
                 .zip(layout.task_workspace_dirs.iter())
                 .map(|(task, workspace_dir)| (task.task_key.clone(), workspace_dir.clone()))
                 .collect::<Vec<_>>();
-            match merge_parallel_workspace_results_with_resolution(
+            match merge_parallel_workspace_results_with_resolution_with_events(
                 &source_workdir,
                 run_id,
                 &layout.run_workspace_root,
                 &task_workspaces,
                 loaded_config.config().run.merge_conflict_resolution,
                 layout.source_head_at_creation.as_deref(),
+                &mut merge_apply_telemetry,
             ) {
                 Ok(report) => {
                     let merged_count = report.merged_task_keys.len();
@@ -739,9 +830,34 @@ where
                     }) {
                         warn!(error = %err, "failed to persist parallel merge success event");
                     }
+                    if let Err(err) = append_merge_apply_telemetry_events(
+                        store.as_ref(),
+                        run_id,
+                        correlation_id,
+                        &merge_apply_telemetry,
+                        None,
+                        scheduler.audit_sink().as_deref(),
+                    ) {
+                        warn!(error = %err, "failed to append merge apply telemetry events");
+                    }
                     parallel_merge_report = Some(report);
                 }
                 Err(err) => {
+                    let merge_failure_kind = err
+                        .root_cause()
+                        .downcast_ref::<ParallelWorkspaceMergeApplyError>()
+                        .map_or(
+                            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                            |merge_error| merge_error.kind,
+                        );
+                    let (
+                        conflict_task_key,
+                        conflict_patch_path,
+                        conflict_workspace_path,
+                        conflict_files,
+                        recovery_hints,
+                        conflict_repo_status,
+                    ) = merge_apply_conflict_metadata(&merge_apply_telemetry);
                     if let Err(append_err) = store.append(Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: chrono::Utc::now(),
@@ -752,6 +868,12 @@ where
                             "reason": err.to_string(),
                             "source_workdir": source_workdir.display().to_string(),
                             "workspace_root": layout.run_workspace_root.display().to_string(),
+                            "task_key": conflict_task_key,
+                            "patch_path": conflict_patch_path,
+                            "workspace_path": conflict_workspace_path,
+                            "repo_status": conflict_repo_status,
+                            "conflicted_files": conflict_files,
+                            "recovery_hints": recovery_hints,
                         }),
                         correlation_id,
                         causation_id: None,
@@ -760,9 +882,20 @@ where
                     }) {
                         warn!(error = %append_err, "failed to persist parallel merge failure event");
                     }
+                    if let Err(err) = append_merge_apply_telemetry_events(
+                        store.as_ref(),
+                        run_id,
+                        correlation_id,
+                        &merge_apply_telemetry,
+                        None,
+                        scheduler.audit_sink().as_deref(),
+                    ) {
+                        warn!(error = %err, "failed to append merge apply telemetry events");
+                    }
                     parallel_merge_error = Some(
                         err.context(format!("parallel workspace merge failed for run {run_id}")),
                     );
+                    parallel_merge_error_reason = Some(merge_failure_kind);
                 }
             }
         }
@@ -770,11 +903,51 @@ where
 
     if let Some(layout) = parallel_workspace_layout.as_ref() {
         if parallel_merge_error.is_none() {
-            let preserve_workspace_root = parallel_merge_report
+            let preserve_due_to_skipped_merge = parallel_merge_report
                 .as_ref()
                 .map(|report| report.preserve_workspace_root)
                 .unwrap_or(false);
-            if preserve_workspace_root {
+            let preserve_due_to_non_completed_run =
+                continuation_payload.exit_state != RunState::RunCompleted;
+            if preserve_due_to_non_completed_run {
+                warn!(
+                    workspace_root = %layout.run_workspace_root.display(),
+                    exit_state = ?continuation_payload.exit_state,
+                    "preserving parallel run workspace root because run did not complete"
+                );
+                println!(
+                    "Parallel workspace root preserved for recovery: {}",
+                    layout.run_workspace_root.display()
+                );
+                let mut failed_task_workspaces = continuation_payload
+                    .tasks
+                    .iter()
+                    .filter_map(|task| {
+                        if task.state == TaskState::TaskComplete {
+                            return None;
+                        }
+                        task_workspace_by_id
+                            .get(&task.task_id)
+                            .map(|workspace| (task.task_key.as_str(), task.state, workspace.as_str()))
+                    })
+                    .map(|(task_key, state, workspace)| {
+                        (
+                            task_key.to_owned(),
+                            format!("{state:?}"),
+                            workspace.to_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                failed_task_workspaces.sort_by(|a, b| a.0.cmp(&b.0));
+                if failed_task_workspaces.is_empty() {
+                    println!("Failed/unfinished task workspaces were not tracked for this run.");
+                } else {
+                    println!("Failed/unfinished task workspace paths:");
+                    for (task_key, state, workspace) in failed_task_workspaces {
+                        println!("  {} [{}] -> {}", task_key, state, workspace);
+                    }
+                }
+            } else if preserve_due_to_skipped_merge {
                 warn!(
                     workspace_root = %layout.run_workspace_root.display(),
                     "preserving parallel run workspace root after skipped task workspace merge for inspection"
@@ -791,6 +964,24 @@ where
                 workspace_root = %layout.run_workspace_root.display(),
                 "preserving parallel run workspace root after merge failure for inspection"
             );
+        }
+    }
+
+    if let Some(err) = parallel_merge_error.as_ref() {
+        warn!(run_id = %run_id, error = %err, "parallel workspace merge finalization failed");
+        if continuation_payload.exit_state == RunState::RunCompleted {
+            continuation_payload.exit_state = RunState::RunFailed;
+            continuation_payload.exit_reason = Some(match parallel_merge_error_reason {
+                Some(ParallelWorkspaceMergeFailureKind::MergeConflict) => {
+                    ExitReason::MergeConflict
+                }
+                _ => ExitReason::FailedRuntimeError,
+            });
+            continuation_payload.next_tranche = None;
+            eprintln!(
+                "Run {run_id} completed core tasks, but parallel merge did not finalize;"
+            );
+            eprintln!("Continuation state set to RunFailed to block auto-completion.");
         }
     }
 
@@ -823,10 +1014,6 @@ where
         }
     }
 
-    if let Some(err) = parallel_merge_error {
-        return Err(err);
-    }
-
     if continuation_payload.exit_state == RunState::RunCompleted {
         if let Err(err) = maybe_mark_current_structured_tranche_complete(&plan) {
             warn!(
@@ -849,6 +1036,18 @@ where
             RunTokenTotals::default()
         }
     };
+
+    let _ = tx.send(StreamEvent::RunExited {
+        payload: continuation_payload.clone(),
+    });
+
+    // Wait for renderer to finish.
+    renderer_handle
+        .await
+        .context("renderer task panicked")?
+        .context("renderer error")?;
+
+    drop(tx);
 
     Ok(RunExecutionOutcome {
         run_id,
@@ -954,11 +1153,12 @@ pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
     // The agent will boot and register but LLM dispatch will not function.
     eprintln!("WARNING: using mock router sender — real sw4rm transport not yet implemented");
     let router = std::sync::Arc::new(yarli_sw4rm::mock::MockRouterSender::new());
+    let command_runner = sw4rm_verification_runner(loaded_config)?;
     let orchestrator = std::sync::Arc::new(OrchestratorLoop::new(
         router,
         sw4rm_config.clone(),
         verification,
-    ));
+    ).with_verification_runner(command_runner));
 
     // Build sw4rm AgentConfig
     let agent_config = sw4rm_sdk::AgentConfig::new(
@@ -1138,6 +1338,7 @@ pub(crate) fn exit_reason_db(reason: yarli_core::domain::ExitReason) -> &'static
         yarli_core::domain::ExitReason::BlockedGateFailure => "blocked_gate_failure",
         yarli_core::domain::ExitReason::FailedPolicyDenial => "failed_policy_denial",
         yarli_core::domain::ExitReason::FailedRuntimeError => "failed_runtime_error",
+        yarli_core::domain::ExitReason::MergeConflict => "merge_conflict",
         yarli_core::domain::ExitReason::CancelledByOperator => "cancelled_by_operator",
         yarli_core::domain::ExitReason::TimedOut => "timed_out",
         yarli_core::domain::ExitReason::StalledNoProgress => "stalled_no_progress",
@@ -1298,58 +1499,95 @@ pub(crate) fn build_run_config_snapshot(
 pub(crate) fn compute_quality_gate(
     report: Option<&DeteriorationReport>,
     auto_advance_policy: AutoAdvancePolicy,
+    task_health: config::RunTaskHealthConfig,
+    run_total_tokens: u64,
+    max_run_total_tokens: Option<u64>,
+    soft_token_cap_ratio: f64,
 ) -> yarli_core::entities::continuation::ContinuationQualityGate {
-    match report {
-        Some(report) => {
-            let (allow_auto_advance, reason) = match report.trend {
-                DeteriorationTrend::Improving => {
-                    (true, "deterioration trend improving".to_string())
-                }
-                DeteriorationTrend::Stable => {
-                    if matches!(
-                        auto_advance_policy,
-                        AutoAdvancePolicy::StableOk | AutoAdvancePolicy::Always
-                    ) {
-                        (
-                            true,
-                            "deterioration trend stable (policy allows auto-advance)".to_string(),
-                        )
-                    } else {
-                        (
-                            false,
-                            "deterioration trend stable (stagnation blocked)".to_string(),
-                        )
-                    }
-                }
-                DeteriorationTrend::Deteriorating => {
-                    if auto_advance_policy == AutoAdvancePolicy::Always {
-                        (
-                            true,
-                            "deterioration trend deteriorating (always policy overrides gate)"
-                                .to_string(),
-                        )
-                    } else {
-                        (false, "deterioration trend deteriorating".to_string())
-                    }
-                }
-            };
-            yarli_core::entities::continuation::ContinuationQualityGate {
-                allow_auto_advance,
-                reason,
-                trend: Some(report.trend),
-                score: Some(report.score),
-            }
+    let soft_cap_triggered = match max_run_total_tokens {
+        Some(max_tokens) if max_tokens > 0 => {
+            soft_token_cap_ratio.is_finite()
+                && soft_token_cap_ratio > 0.0
+                && (run_total_tokens as f64) >= (max_tokens as f64 * soft_token_cap_ratio)
         }
-        None => yarli_core::entities::continuation::ContinuationQualityGate {
-            allow_auto_advance: auto_advance_policy == AutoAdvancePolicy::Always,
-            reason: if auto_advance_policy == AutoAdvancePolicy::Always {
+        _ => false,
+    };
+
+    let mut task_health_action = match report {
+        Some(report) => match report.trend {
+            DeteriorationTrend::Improving => task_health.improving,
+            DeteriorationTrend::Stable => task_health.stable,
+            DeteriorationTrend::Deteriorating => task_health.deteriorating,
+        },
+        None => task_health.improving,
+    };
+    if soft_cap_triggered {
+        task_health_action = TaskHealthAction::CheckpointNow;
+    }
+
+    let allow_auto_advance = if soft_cap_triggered {
+        false
+    } else if auto_advance_policy == AutoAdvancePolicy::Always {
+        true
+    } else {
+        match (report, task_health_action) {
+            (Some(report), TaskHealthAction::Continue) => match report.trend {
+                DeteriorationTrend::Improving => true,
+                DeteriorationTrend::Stable => auto_advance_policy == AutoAdvancePolicy::StableOk,
+                DeteriorationTrend::Deteriorating => false,
+            },
+            (None, TaskHealthAction::Continue) => false,
+            _ => false,
+        }
+    };
+
+    let reason = match (report, task_health_action) {
+        (_, TaskHealthAction::CheckpointNow) if soft_cap_triggered => {
+            format!(
+                "soft token cap reached at {} / {} ({}% hard cap)",
+                run_total_tokens,
+                max_run_total_tokens.unwrap_or(0),
+                (soft_token_cap_ratio * 100.0).round()
+            )
+        }
+        (Some(report), TaskHealthAction::Continue) => match report.trend {
+            DeteriorationTrend::Improving => {
+                "deterioration trend improving".to_string()
+            }
+            DeteriorationTrend::Stable if auto_advance_policy == AutoAdvancePolicy::StableOk => {
+                "deterioration trend stable (policy allows auto-advance)".to_string()
+            }
+            DeteriorationTrend::Stable => {
+                "deterioration trend stable (stagnation blocked)".to_string()
+            }
+            DeteriorationTrend::Deteriorating if auto_advance_policy == AutoAdvancePolicy::Always => {
+                "deterioration trend deteriorating (always policy overrides gate)".to_string()
+            }
+            DeteriorationTrend::Deteriorating => {
+                "deterioration trend deteriorating".to_string()
+            }
+        },
+        (Some(_), _) => "deterioration trend blocked by task-health action".to_string(),
+        (None, TaskHealthAction::Continue) => {
+            if auto_advance_policy == AutoAdvancePolicy::Always {
                 "no deterioration signal emitted (always policy overrides gate)".to_string()
             } else {
                 "no deterioration signal emitted".to_string()
-            },
-            trend: None,
-            score: None,
-        },
+            }
+        }
+        (None, _) => "no deterioration signal emitted".to_string(),
+    };
+
+    let (trend, score) = report
+        .map(|report| (Some(report.trend), Some(report.score)))
+        .unwrap_or_default();
+
+    yarli_core::entities::continuation::ContinuationQualityGate {
+        allow_auto_advance,
+        reason,
+        trend,
+        score,
+        task_health_action,
     }
 }
 
@@ -1382,9 +1620,56 @@ pub(crate) fn build_continuation_payload(
     tasks: &[&yarli_core::entities::Task],
     report: Option<&DeteriorationReport>,
     auto_advance_policy: AutoAdvancePolicy,
+    task_health: config::RunTaskHealthConfig,
+    run_total_tokens: u64,
+    max_run_total_tokens: Option<u64>,
+    soft_token_cap_ratio: f64,
+    deterioration_cycle_detected: bool,
 ) -> yarli_core::entities::ContinuationPayload {
     let mut payload = yarli_core::entities::ContinuationPayload::build(run, tasks);
-    payload.quality_gate = Some(compute_quality_gate(report, auto_advance_policy));
+    let mut quality_gate = compute_quality_gate(
+        report,
+        auto_advance_policy,
+        task_health,
+        run_total_tokens,
+        max_run_total_tokens,
+        soft_token_cap_ratio,
+    );
+    let had_strategy_pivot_checkpoint = tasks
+        .iter()
+        .any(|task| task.description.contains("Strategy-pivot checkpoint:"));
+    if quality_gate.task_health_action == TaskHealthAction::ForcePivot
+        && deterioration_cycle_detected
+        && had_strategy_pivot_checkpoint
+    {
+        quality_gate = yarli_core::entities::continuation::ContinuationQualityGate {
+            allow_auto_advance: false,
+            reason: "deterioration cycle persisted after strategy pivot; summarize and schedule follow-up tranche".to_string(),
+            trend: quality_gate.trend,
+            score: quality_gate.score,
+            task_health_action: TaskHealthAction::StopAndSummarize,
+        };
+    }
+    if quality_gate.task_health_action == TaskHealthAction::ForcePivot {
+        if let Some(next_tranche) = payload.next_tranche.as_mut() {
+            let already_recorded = next_tranche
+                .interventions
+                .iter()
+                .any(|intervention| {
+                    intervention.kind == ContinuationInterventionKind::StrategyPivotCheckpoint
+                });
+            if !already_recorded {
+                next_tranche.interventions.push(ContinuationIntervention {
+                    kind: ContinuationInterventionKind::StrategyPivotCheckpoint,
+                    reason: format!(
+                        "strategy-pivot checkpoint requested before continuing: {}",
+                        quality_gate.reason
+                    ),
+                });
+            }
+        }
+    }
+    payload.quality_gate = Some(quality_gate);
     payload
 }
 
@@ -1492,7 +1777,11 @@ pub(crate) async fn drive_scheduler<Q, S, R>(
     correlation_id: Uuid,
     task_names: &[(Uuid, String)],
     auto_advance_policy: AutoAdvancePolicy,
+    task_health: config::RunTaskHealthConfig,
+    max_run_total_tokens: Option<u64>,
+    soft_token_cap_ratio: f64,
     cancellation_diagnostics: bool,
+    mut task_health_observer: Option<observers::TaskHealthArtifactObserver>,
     mut memory_observer: Option<observers::MemoryObserver>,
 ) -> Result<yarli_core::entities::ContinuationPayload>
 where
@@ -1559,6 +1848,11 @@ where
 
     let mut zero_progress_ticks: u64 = 0;
     let mut paused = false;
+    let collect_run_total_tokens = || -> u64 {
+        collect_run_token_totals(store.as_ref(), correlation_id)
+            .map(|totals| totals.total_tokens)
+            .unwrap_or_default()
+    };
 
     loop {
         tokio::select! {
@@ -1596,6 +1890,9 @@ where
                 .await?;
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                if let Some(observer) = task_health_observer.as_mut() {
+                    observer.observe_store(store.as_ref());
+                }
                 deterioration_observer.observe_store(store.as_ref())?;
                 if let Some(observer) = memory_observer.as_mut() {
                     match tokio::time::timeout(
@@ -1618,16 +1915,19 @@ where
                         .iter()
                         .filter_map(|tid| reg.get_task(tid))
                         .collect();
+                    let run_total_tokens = collect_run_total_tokens();
                     build_continuation_payload(
                         run,
                         &tasks,
                         deterioration_observer.latest_report(),
                         auto_advance_policy,
+                        task_health,
+                        run_total_tokens,
+                        max_run_total_tokens,
+                        soft_token_cap_ratio,
+                        deterioration_observer.has_deterioration_cycle(),
                     )
                 };
-                let _ = tx.send(StreamEvent::RunExited {
-                    payload: payload.clone(),
-                });
                 scheduler.clear_live_output();
                 drop(tx);
                 return Ok(payload);
@@ -1721,6 +2021,9 @@ where
                     .iter()
                     .filter_map(|event| operator_control_signal_from_event(event, run_id))
                     .next_back();
+                if let Some(observer) = task_health_observer.as_mut() {
+                    observer.observe_store(store.as_ref());
+                }
                 deterioration_observer.observe_store(store.as_ref())?;
                 if let Some(observer) = memory_observer.as_mut() {
                     match tokio::time::timeout(
@@ -1776,6 +2079,9 @@ where
                         .await?;
                         let cancel_events =
                             emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                        if let Some(observer) = task_health_observer.as_mut() {
+                            observer.observe_store(store.as_ref());
+                        }
                         deterioration_observer.observe_store(store.as_ref())?;
                         if let Some(observer) = memory_observer.as_mut() {
                             match tokio::time::timeout(
@@ -1800,16 +2106,19 @@ where
                                 .iter()
                                 .filter_map(|tid| reg.get_task(tid))
                                 .collect();
+                            let run_total_tokens = collect_run_total_tokens();
                             build_continuation_payload(
                                 run,
                                 &tasks,
                                 deterioration_observer.latest_report(),
                                 auto_advance_policy,
+                                task_health,
+                                run_total_tokens,
+                                max_run_total_tokens,
+                                soft_token_cap_ratio,
+                                deterioration_observer.has_deterioration_cycle(),
                             )
                         };
-                        let _ = tx.send(StreamEvent::RunExited {
-                            payload: payload.clone(),
-                        });
                         scheduler.clear_live_output();
                         drop(tx);
                         return Ok(payload);
@@ -1831,11 +2140,17 @@ where
                                 .iter()
                                 .filter_map(|tid| reg.get_task(tid))
                                 .collect();
+                            let run_total_tokens = collect_run_total_tokens();
                             Some(build_continuation_payload(
                                 run,
                                 &tasks,
                                 deterioration_observer.latest_report(),
                                 auto_advance_policy,
+                                task_health,
+                                run_total_tokens,
+                                max_run_total_tokens,
+                                soft_token_cap_ratio,
+                                deterioration_observer.has_deterioration_cycle(),
                             ))
                         } else {
                             None
@@ -1846,9 +2161,6 @@ where
                 }; // reg dropped here
 
                 if let Some(payload) = terminal_payload {
-                    let _ = tx.send(StreamEvent::RunExited {
-                        payload: payload.clone(),
-                    });
                     scheduler.clear_live_output();
                     drop(tx);
                     return Ok(payload);
@@ -3006,6 +3318,22 @@ pub(crate) fn merge_operation_idempotency_key(
     format!("{merge_id}:{operation}:{event_type}")
 }
 
+pub(crate) fn merge_apply_idempotency_key(
+    run_id: Uuid,
+    event_type: &str,
+    task_key: Option<&str>,
+    task_index: Option<usize>,
+) -> String {
+    match (task_key, task_index) {
+        (Some(task_key), Some(task_index)) => {
+            format!("{run_id}:{event_type}:{task_index}:{task_key}")
+        }
+        (Some(task_key), None) => format!("{run_id}:{event_type}:{task_key}"),
+        (None, Some(task_index)) => format!("{run_id}:{event_type}:{task_index}"),
+        (None, None) => format!("{run_id}:{event_type}"),
+    }
+}
+
 pub(crate) fn persist_merge_policy_decision(
     store: &dyn EventStore,
     merge: &MergeProjection,
@@ -3148,6 +3476,85 @@ pub(crate) fn append_merge_execution_event(
             )),
         },
     )
+}
+
+pub(crate) fn append_merge_apply_event(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    event: &MergeApplyTelemetryEvent,
+    causation_id: Option<Uuid>,
+) -> Result<()> {
+    let mut payload = event.metadata.clone();
+    payload["run_id"] = serde_json::json!(run_id);
+    payload["event_type"] = serde_json::Value::String(event.event_type.clone());
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: event.event_type.clone(),
+            payload,
+            correlation_id,
+            causation_id,
+            actor: "cli".to_string(),
+            idempotency_key: Some(merge_apply_idempotency_key(
+                run_id,
+                &event.event_type,
+                event.task_key.as_deref(),
+                event.task_index,
+            )),
+        },
+    )
+}
+
+pub(crate) fn append_merge_apply_audit_event(
+    audit_sink: Option<&dyn AuditSink>,
+    event: &MergeApplyTelemetryEvent,
+    run_id: Uuid,
+) -> Result<()> {
+    if let Some(sink) = audit_sink {
+        sink.append(&AuditEntry::destructive_attempt(
+            "cli",
+            event.event_type.as_str(),
+            "merge apply telemetry",
+            Some(run_id),
+            None,
+            event.metadata.clone(),
+        ))
+        .map_err(|e| anyhow::anyhow!("failed to append merge telemetry audit entry: {e}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn append_merge_apply_telemetry_events(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    events: &[MergeApplyTelemetryEvent],
+    causation_id: Option<Uuid>,
+    audit_sink: Option<&dyn AuditSink>,
+) -> Result<()> {
+    for event in events {
+        if let Err(err) = append_merge_apply_event(store, run_id, correlation_id, event, causation_id) {
+            warn!(
+                run_id = %run_id,
+                event = %event.event_type,
+                "failed to append merge telemetry event: {err}"
+            );
+            continue;
+        }
+        if let Err(err) = append_merge_apply_audit_event(audit_sink, event, run_id) {
+            warn!(
+                run_id = %run_id,
+                event = %event.event_type,
+                "failed to append merge telemetry audit event: {err}"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn execute_merge_request(
@@ -4670,6 +5077,11 @@ pub(crate) fn cmd_audit_tail(file: &str, lines: usize, category: Option<&str>) -
         if let Some(ref task_id) = entry.task_id {
             println!("  task:   {task_id}");
         }
+        if !entry.details.is_null() && entry.details != serde_json::json!({}) {
+            let details = serde_json::to_string_pretty(&entry.details)
+                .unwrap_or_else(|_| entry.details.to_string());
+            println!("  details: {details}");
+        }
         println!();
     }
 
@@ -6011,7 +6423,11 @@ mod tests {
                 correlation_id,
                 &task_names,
                 AutoAdvancePolicy::StableOk,
+                config::RunTaskHealthConfig::default(),
+                None,
+                0.9,
                 false,
+                None,
                 None,
             ),
         )
@@ -6127,7 +6543,11 @@ mod tests {
                 correlation_id,
                 &task_names,
                 AutoAdvancePolicy::StableOk,
+                config::RunTaskHealthConfig::default(),
+                None,
+                0.9,
                 false,
+                None,
                 None,
             ),
         )
@@ -6197,7 +6617,11 @@ mod tests {
                 correlation_id,
                 &task_names,
                 AutoAdvancePolicy::StableOk,
+                config::RunTaskHealthConfig::default(),
+                None,
+                0.9,
                 false,
+                None,
                 None,
             ),
         )
@@ -6364,5 +6788,38 @@ mod tests {
 
         let stats = queue.stats();
         assert_eq!(stats.cancelled, 1);
+    }
+
+    #[test]
+    fn merge_apply_conflict_metadata_includes_workspace_path_and_repo_status() {
+        let telemetry = vec![MergeApplyTelemetryEvent {
+            event_type: "merge.apply.conflict".to_string(),
+            task_key: Some("task-2".to_string()),
+            task_index: Some(2),
+            metadata: serde_json::json!({
+                "task_key": "task-2",
+                "patch_path": "patches/task-2.patch",
+                "workspace_path": "/tmp/yarli/task-2",
+                "conflicted_files": ["shared.txt", "src/lib.rs"],
+                "recovery_hints": ["hint-a", "hint-b"],
+                "repo_status": "UU src/lib.rs\nUU shared.txt"
+            }),
+        }];
+
+        let (
+            task_key,
+            patch_path,
+            workspace_path,
+            conflicted_files,
+            recovery_hints,
+            repo_status,
+        ) = merge_apply_conflict_metadata(&telemetry);
+
+        assert_eq!(task_key.as_deref(), Some("task-2"));
+        assert_eq!(patch_path.as_deref(), Some("patches/task-2.patch"));
+        assert_eq!(workspace_path.as_deref(), Some("/tmp/yarli/task-2"));
+        assert_eq!(conflicted_files, vec!["shared.txt".to_string(), "src/lib.rs".to_string()]);
+        assert_eq!(recovery_hints, vec!["hint-a".to_string(), "hint-b".to_string()]);
+        assert_eq!(repo_status.as_deref(), Some("UU src/lib.rs\nUU shared.txt"));
     }
 }

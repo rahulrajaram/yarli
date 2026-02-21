@@ -254,6 +254,7 @@ mod tests {
                 planned_tranche_key: None,
                 cursor: None,
                 config_snapshot: serde_json::json!({"tasks": [{"task_key": "test", "command": "cargo test"}]}),
+                interventions: Vec::new(),
             }),
             quality_gate: None,
         };

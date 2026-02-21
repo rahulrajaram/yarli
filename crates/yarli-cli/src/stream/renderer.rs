@@ -17,6 +17,8 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use yarli_core::domain::CancellationProvenance;
 use yarli_core::domain::TaskId;
+use yarli_core::entities::continuation::TaskHealthAction;
+use yarli_core::explain::DeteriorationTrend;
 use yarli_core::fsm::task::TaskState;
 
 use super::events::{StreamEvent, TaskView};
@@ -477,8 +479,48 @@ impl StreamRenderer {
             })?;
         }
 
+        if let Some(quality_gate) = payload.quality_gate.as_ref() {
+            if matches!(quality_gate.task_health_action, TaskHealthAction::ForcePivot) {
+                if let Some(guidance) = Self::force_pivot_guidance(quality_gate.trend.as_ref()) {
+                    let guidance_line =
+                        Line::from(vec![Span::styled(guidance, Tier::Urgent.style())]);
+                    self.terminal.insert_before(1, |buf| {
+                        Paragraph::new(guidance_line).render(buf.area, buf);
+                    })?;
+                }
+            }
+            if matches!(quality_gate.task_health_action, TaskHealthAction::StopAndSummarize) {
+                let guidance = format!(
+                    "  Stop-and-summarize guidance: {}",
+                    quality_gate.reason
+                );
+                let guidance_line = Line::from(vec![Span::styled(guidance, Tier::Urgent.style())]);
+                self.terminal.insert_before(1, |buf| {
+                    Paragraph::new(guidance_line).render(buf.area, buf);
+                })?;
+            }
+            if matches!(quality_gate.task_health_action, TaskHealthAction::CheckpointNow) {
+                let guidance = format!("  Checkpoint-now guidance: {}", quality_gate.reason);
+                let guidance_line = Line::from(vec![Span::styled(guidance, Tier::Urgent.style())]);
+                self.terminal.insert_before(1, |buf| {
+                    Paragraph::new(guidance_line).render(buf.area, buf);
+                })?;
+            }
+        }
+
         Ok(())
     }
+
+fn force_pivot_guidance(trend: Option<&DeteriorationTrend>) -> Option<String> {
+    if matches!(trend, Some(DeteriorationTrend::Deteriorating)) {
+        Some(
+            "  Force-pivot guidance: sequence quality is deteriorating; narrow scope and shift task focus before continuing."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
 
     /// Redraw the inline viewport with current task status.
     fn draw_viewport(&mut self) -> io::Result<()> {

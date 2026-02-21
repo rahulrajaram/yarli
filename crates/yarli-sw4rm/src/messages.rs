@@ -20,6 +20,13 @@ pub struct ImplementationRequest {
     /// The high-level objective to accomplish.
     pub objective: String,
 
+    /// Completed tranche work to preserve between iterations while retrying.
+    ///
+    /// This lets the orchestrator carry forward work already completed in previous
+    /// attempts when running an auto-repair loop.
+    #[serde(default)]
+    pub completed_tranche_work: Vec<String>,
+
     /// Scope hint (e.g. file paths, module names) to focus the agent.
     #[serde(default)]
     pub scope: Vec<String>,
@@ -138,6 +145,7 @@ mod tests {
     fn implementation_request_round_trips() {
         let req = ImplementationRequest {
             objective: "Add error handling".to_string(),
+            completed_tranche_work: vec![],
             scope: vec!["src/lib.rs".to_string()],
             failures: vec![],
             iteration: 1,
@@ -147,6 +155,26 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ImplementationRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, parsed);
+    }
+
+    #[test]
+    fn request_includes_completed_tranche_work() {
+        let req = ImplementationRequest {
+            objective: "Add repair flow".to_string(),
+            completed_tranche_work: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+            scope: vec!["src/lib.rs".to_string()],
+            failures: vec![],
+            iteration: 2,
+            correlation_id: "corr-789".to_string(),
+            repo_context: None,
+        };
+
+        let json = serde_json::to_string_pretty(&req).unwrap();
+        assert!(json.contains("completed_tranche_work"));
+
+        let parsed: ImplementationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.completed_tranche_work.len(), 2);
+        assert_eq!(parsed.completed_tranche_work[0], "src/main.rs");
     }
 
     #[test]
@@ -180,6 +208,7 @@ mod tests {
     fn request_with_failures_serializes() {
         let req = ImplementationRequest {
             objective: "Fix tests".to_string(),
+            completed_tranche_work: vec![],
             scope: vec![],
             failures: vec![VerificationFailure {
                 task_key: "test".to_string(),

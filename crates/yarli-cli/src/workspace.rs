@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
@@ -30,6 +32,14 @@ pub(crate) struct ParallelWorkspaceMergeReport {
     pub(crate) skipped_task_keys: Vec<String>,
     pub(crate) task_outcomes: Vec<ParallelTaskMergeOutcome>,
     pub(crate) preserve_workspace_root: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MergeApplyTelemetryEvent {
+    pub(crate) event_type: String,
+    pub(crate) task_key: Option<String>,
+    pub(crate) task_index: Option<usize>,
+    pub(crate) metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -502,19 +512,260 @@ pub(crate) fn warn_on_new_file_content_divergence(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParallelWorkspaceMergeFailureKind {
+    MergeConflict,
+    RuntimeFailure,
+}
+
+#[derive(Debug)]
+pub(crate) struct ParallelWorkspaceMergeApplyError {
+    pub(crate) kind: ParallelWorkspaceMergeFailureKind,
+    pub(crate) message: String,
+    pub(crate) repair_attempted: bool,
+}
+
+impl ParallelWorkspaceMergeApplyError {
+    fn new(
+        kind: ParallelWorkspaceMergeFailureKind,
+        repair_attempted: bool,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            repair_attempted,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ParallelWorkspaceMergeApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl Error for ParallelWorkspaceMergeApplyError {}
+
+fn merge_conflict_from_stderr(stderr: &str) -> bool {
+    let text = stderr.to_lowercase();
+    text.contains("conflict")
+        || text.contains("patch failed")
+        || text.contains("does not apply")
+        || text.contains("did not apply")
+        || text.contains("apply with 3-way merge")
+        || text.contains("merge conflict")
+}
+
+fn classify_merge_apply_failure(stderr: &str) -> ParallelWorkspaceMergeFailureKind {
+    if merge_conflict_from_stderr(stderr) {
+        ParallelWorkspaceMergeFailureKind::MergeConflict
+    } else {
+        ParallelWorkspaceMergeFailureKind::RuntimeFailure
+    }
+}
+
+fn collect_conflicted_workspace_files(source_workdir: &Path) -> Vec<String> {
+    let mut conflicted = std::collections::HashSet::new();
+    let commands: &[&[&str]] = &[
+        &["diff", "--name-only", "--diff-filter=U"],
+        &["diff", "--cached", "--name-only", "--diff-filter=U"],
+    ];
+
+    for args in commands {
+        let output = match run_git_capture(source_workdir, args) {
+            Ok(output) => output,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    workspace = %source_workdir.display(),
+                    "failed to collect conflicted workspace files"
+                );
+                continue;
+            }
+        };
+        let stdout = match ensure_git_success(
+            output,
+            source_workdir,
+            args,
+            "collect conflicted workspace file list",
+        ) {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    workspace = %source_workdir.display(),
+                    "failed to collect conflicted workspace file list"
+                );
+                continue;
+            }
+        };
+        for line in stdout.lines() {
+            let path = line.trim();
+            if !path.is_empty() {
+                let _ = conflicted.insert(path.to_string());
+            }
+        }
+    }
+
+    let mut files = conflicted.into_iter().collect::<Vec<String>>();
+    files.sort_unstable();
+    files
+}
+
+fn collect_workspace_status_snapshot(source_workdir: &Path) -> String {
+    let status_args = ["status", "--short"];
+    match run_git_capture(source_workdir, &status_args) {
+        Ok(output) => match ensure_git_success(
+            output,
+            source_workdir,
+            &status_args,
+            "collect repository status for repair payload",
+        ) {
+            Ok(status) => {
+                let status = status.trim();
+                if status.is_empty() {
+                    "(clean)".to_string()
+                } else {
+                    status.to_string()
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    workspace = %source_workdir.display(),
+                    "failed to collect repository status for repair payload"
+                );
+                "(unavailable: status command failed)".to_string()
+            }
+        },
+        Err(error) => {
+            warn!(
+                error = %error,
+                workspace = %source_workdir.display(),
+                "failed to run status command for repair payload"
+            );
+            "(unavailable: status command failed)".to_string()
+        }
+    }
+}
+
+fn merge_conflict_recovery_hints(source_workdir: &Path, patch_path: &Path) -> Vec<String> {
+    vec![
+        format!(
+            "Inspect conflicted files: git -C \"{}\" diff --name-only --diff-filter=U",
+            source_workdir.display()
+        ),
+        format!(
+            "Review task patch: git -C \"{}\" apply --stat \"{}\"",
+            source_workdir.display(),
+            patch_path.display()
+        ),
+        format!(
+            "Retry patch manually: git -C \"{}\" apply --3way --whitespace=nowarn \"{}\"",
+            source_workdir.display(),
+            patch_path.display()
+        ),
+    ]
+}
+
+fn repair_with_workspace_versions(
+    source_workdir: &Path,
+    task_key: &str,
+) -> Result<(), ParallelWorkspaceMergeApplyError> {
+    let conflicted_files = collect_conflicted_workspace_files(source_workdir);
+    if conflicted_files.is_empty() {
+        return Err(ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!(
+                "parallel workspace merge auto-repair could not identify conflicted files for task {task_key}"
+            ),
+        ));
+    }
+
+    for path in &conflicted_files {
+        run_git_capture(source_workdir, &["checkout", "--theirs", "--", path]).map_err(|error| {
+            ParallelWorkspaceMergeApplyError::new(
+                ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                true,
+                format!(
+                    "parallel workspace merge auto-repair failed while resolving {path} for task {task_key}: {error}"
+                ),
+            )
+        })?;
+    }
+
+    let add_output = run_git_capture(source_workdir, &["add", "-A"])
+        .map_err(|error| ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!(
+                "parallel workspace merge auto-repair failed while staging resolved conflicts for task {task_key}: {error}"
+            ),
+        ))?;
+    ensure_git_success(
+        add_output,
+        source_workdir,
+        &["add", "-A"],
+        "parallel workspace merge auto-repair",
+    )
+    .map_err(|error| {
+        ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!("parallel workspace merge auto-repair failed for task {task_key}: {error}"),
+        )
+    })?;
+
+    let unresolved_conflicts = collect_conflicted_workspace_files(source_workdir);
+    if !unresolved_conflicts.is_empty() {
+        return Err(ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::MergeConflict,
+            true,
+            format!(
+                "parallel workspace merge auto-repair could not resolve all conflicts for task {task_key}: {}",
+                unresolved_conflicts.join(", ")
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn apply_workspace_patch_to_source(
     source_workdir: &Path,
     task_key: &str,
     patch: &[u8],
     merge_conflict_resolution: config::MergeConflictResolution,
-) -> Result<()> {
-    let backed_up_new_files = remove_conflicting_new_files_for_patch(source_workdir, patch)?;
+) -> Result<bool, ParallelWorkspaceMergeApplyError> {
+    let backed_up_new_files = remove_conflicting_new_files_for_patch(source_workdir, patch).map_err(
+        |error| {
+            ParallelWorkspaceMergeApplyError::new(
+                ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                false,
+                format!(
+                    "parallel workspace merge pre-processing failed for task {task_key}: {error}"
+                ),
+            )
+        },
+    )?;
 
     let apply_args = ["apply", "--3way", "--whitespace=nowarn", "-"];
-    let apply_output = run_git_capture_with_input(source_workdir, &apply_args, patch)?;
+    let apply_output = run_git_capture_with_input(source_workdir, &apply_args, patch).map_err(
+        |error| {
+            ParallelWorkspaceMergeApplyError::new(
+                ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                false,
+                format!(
+                    "parallel workspace merge command failed for task {task_key} with --3way: {error}"
+                ),
+            )
+        },
+    )?;
     if apply_output.status.success() {
         warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
-        return Ok(());
+        return Ok(false);
     }
 
     // --3way failed. Check if it's an index-related issue where plain apply might
@@ -524,46 +775,66 @@ pub(crate) fn apply_workspace_patch_to_source(
         || apply_stderr.contains("does not match index");
     if index_related {
         let direct_apply_args = ["apply", "--whitespace=nowarn", "-"];
-        let direct_apply_output =
-            run_git_capture_with_input(source_workdir, &direct_apply_args, patch)?;
-        ensure_git_success(
-            direct_apply_output,
-            source_workdir,
-            &direct_apply_args,
-            &format!(
-                "parallel workspace merge apply failed for task {task_key} after index-mismatch fallback"
+        let direct_apply_output = run_git_capture_with_input(source_workdir, &direct_apply_args, patch)
+            .map_err(|error| {
+                ParallelWorkspaceMergeApplyError::new(
+                    ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                    true,
+                    format!(
+                        "parallel workspace merge direct apply command failed for task {task_key} after index mismatch fallback: {error}"
+                    ),
+                )
+            })?;
+        if direct_apply_output.status.success() {
+            warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
+            return Ok(true);
+        }
+
+        let direct_stderr = String::from_utf8_lossy(&direct_apply_output.stderr);
+        return Err(ParallelWorkspaceMergeApplyError::new(
+            classify_merge_apply_failure(&direct_stderr),
+            true,
+            format!(
+                "parallel workspace merge direct apply failed for task {task_key} after index mismatch fallback: {}",
+                direct_stderr.trim()
             ),
-        )?;
-        warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
-        return Ok(());
+        ));
     }
 
     // Not index-related — apply the merge conflict resolution strategy.
     match merge_conflict_resolution {
-        config::MergeConflictResolution::Agent => {
-            // TODO: spawn an agent to resolve conflicts. For now, fall through to Fail.
-            warn!(task_key, "merge_conflict_resolution=agent is not yet implemented; falling back to fail");
+        config::MergeConflictResolution::AutoRepair => {
+            repair_with_workspace_versions(source_workdir, task_key)?;
+            warn!(
+                task_key,
+                "merge_conflict_resolution=auto-repair resolved workspace conflicts by preferring patch side"
+            );
+            warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
+            return Ok(true);
         }
         config::MergeConflictResolution::Manual => {
-            bail!(
-                "merge conflict in task {task_key} (resolution=manual): workspace preserved for operator intervention.\n\
-                 Resolve conflicts manually, then re-run:\n\
-                   git -C \"{}\" status --short",
-                source_workdir.display()
-            );
+            return Err(ParallelWorkspaceMergeApplyError::new(
+                ParallelWorkspaceMergeFailureKind::MergeConflict,
+                false,
+                format!(
+                    "merge conflict in task {task_key} (resolution=manual): workspace preserved for operator intervention.\n\
+                     Resolve conflicts manually, then re-run:\n\
+                       git -C \"{}\" status --short",
+                    source_workdir.display()
+                ),
+            ));
         }
         config::MergeConflictResolution::Fail => {}
     }
 
-    // Propagate the original --3way error.
-    ensure_git_success(
-        apply_output,
-        source_workdir,
-        &apply_args,
-        &format!("parallel workspace merge apply failed for task {task_key}"),
-    )?;
-    warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
-    Ok(())
+    Err(ParallelWorkspaceMergeApplyError::new(
+        classify_merge_apply_failure(&apply_stderr),
+        false,
+        format!(
+            "parallel workspace merge apply failed for task {task_key}: {}",
+            apply_stderr.trim()
+        ),
+    ))
 }
 
 pub(crate) fn is_parallel_merge_internal_path(relative: &Path) -> bool {
@@ -929,6 +1200,21 @@ pub(crate) fn merge_parallel_workspace_results(
     )
 }
 
+fn merge_apply_telemetry_event(
+    events: &mut Vec<MergeApplyTelemetryEvent>,
+    event_type: &str,
+    task_key: Option<&str>,
+    task_index: Option<usize>,
+    metadata: serde_json::Value,
+) {
+    events.push(MergeApplyTelemetryEvent {
+        event_type: event_type.to_string(),
+        task_key: task_key.map(ToString::to_string),
+        task_index,
+        metadata,
+    });
+}
+
 pub(crate) fn merge_parallel_workspace_results_with_resolution(
     source_workdir: &Path,
     run_id: Uuid,
@@ -936,6 +1222,28 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution(
     task_workspaces: &[(String, PathBuf)],
     merge_conflict_resolution: config::MergeConflictResolution,
     source_head_at_creation: Option<&str>,
+) -> Result<ParallelWorkspaceMergeReport> {
+    let mut apply_telemetry = Vec::new();
+    let report = merge_parallel_workspace_results_with_resolution_with_events(
+        source_workdir,
+        run_id,
+        run_workspace_root,
+        task_workspaces,
+        merge_conflict_resolution,
+        source_head_at_creation,
+        &mut apply_telemetry,
+    )?;
+    Ok(report)
+}
+
+pub(crate) fn merge_parallel_workspace_results_with_resolution_with_events(
+    source_workdir: &Path,
+    run_id: Uuid,
+    run_workspace_root: &Path,
+    task_workspaces: &[(String, PathBuf)],
+    merge_conflict_resolution: config::MergeConflictResolution,
+    source_head_at_creation: Option<&str>,
+    apply_telemetry: &mut Vec<MergeApplyTelemetryEvent>,
 ) -> Result<ParallelWorkspaceMergeReport> {
     ensure_git_repository(source_workdir)?;
 
@@ -955,6 +1263,22 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution(
         )?;
         h.trim().to_string()
     };
+
+    merge_apply_telemetry_event(
+        apply_telemetry,
+        "merge.apply.started",
+        None,
+        None,
+        serde_json::json!({
+            "run_id": run_id.to_string(),
+            "source_head": source_head,
+            "source_head_from_creation": source_head_at_creation.is_some(),
+            "source_workdir": source_workdir.display().to_string(),
+            "workspace_root": run_workspace_root.display().to_string(),
+            "task_count": task_workspaces.len(),
+            "merge_conflict_resolution": format!("{:?}", merge_conflict_resolution),
+        }),
+    );
 
     // Stash any pre-existing dirty state from prior runs so workspace patches
     // apply against the clean HEAD they were cloned from. Previous yarli versions
@@ -985,6 +1309,10 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution(
     let mut merged_task_keys = Vec::new();
     let mut skipped_task_keys = Vec::new();
     let mut task_outcomes = Vec::new();
+    let mut repair_started_count = 0usize;
+    let mut repair_succeeded_count = 0usize;
+    let mut repair_failed_count = 0usize;
+    let mut conflict_count = 0usize;
     for (task_index, (task_key, workspace_dir)) in task_workspaces.iter().enumerate() {
         ensure_git_repository(workspace_dir)?;
         let mut original_workspace_head_for_restore: Option<String> = None;
@@ -1205,42 +1533,135 @@ Operator recovery steps:\n\
                 )));
             }
         };
-        if let Err(err) =
-            apply_workspace_patch_to_source(source_workdir, task_key, patch.as_bytes(), merge_conflict_resolution)
-        {
-            let restore_note =
-                restore_workspace_head_on_error("workspace patch apply failed").unwrap_or_default();
-            let note_path = write_parallel_merge_recovery_note(
-                run_id,
-                source_workdir,
-                run_workspace_root,
-                workspace_dir,
-                task_key,
-                &patch_path,
-                original_workspace_head_for_restore.as_deref(),
-            )
-            .ok();
-            let mut guidance = format!(
-                "parallel workspace merge failed for run {run_id} task {task_key}\n\
+        match apply_workspace_patch_to_source(
+            source_workdir,
+            task_key,
+            patch.as_bytes(),
+            merge_conflict_resolution,
+        ) {
+            Ok(repaired) => {
+                if repaired {
+                    repair_succeeded_count += 1;
+                    merge_apply_telemetry_event(
+                        apply_telemetry,
+                        "merge.repair.succeeded",
+                        Some(task_key),
+                        Some(task_index),
+                        serde_json::json!({
+                            "run_id": run_id.to_string(),
+                            "task_index": task_index,
+                            "task_key": task_key,
+                            "patch_path": patch_path.display().to_string(),
+                            "source_head": source_head,
+                            "workspace_head": ws_head,
+                            "soft_reset_applied": soft_reset_applied,
+                        }),
+                    );
+                }
+            }
+            Err(err) => {
+                if err.repair_attempted {
+                    repair_started_count += 1;
+                    repair_failed_count += 1;
+                    merge_apply_telemetry_event(
+                        apply_telemetry,
+                        "merge.repair.failed",
+                        Some(task_key),
+                        Some(task_index),
+                        serde_json::json!({
+                            "run_id": run_id.to_string(),
+                            "task_index": task_index,
+                            "task_key": task_key,
+                            "patch_path": patch_path.display().to_string(),
+                            "source_head": source_head,
+                            "workspace_head": ws_head,
+                            "soft_reset_applied": soft_reset_applied,
+                            "reason": err.message,
+                        }),
+                    );
+                }
+                if err.kind == ParallelWorkspaceMergeFailureKind::MergeConflict {
+                    conflict_count += 1;
+                    let conflicted_files = collect_conflicted_workspace_files(source_workdir);
+                    let repo_status = collect_workspace_status_snapshot(source_workdir);
+                    let recovery_hints =
+                        merge_conflict_recovery_hints(source_workdir, &patch_path);
+                    merge_apply_telemetry_event(
+                        apply_telemetry,
+                        "merge.apply.conflict",
+                        Some(task_key),
+                        Some(task_index),
+                        serde_json::json!({
+                            "run_id": run_id.to_string(),
+                            "task_index": task_index,
+                            "task_key": task_key,
+                            "patch_path": patch_path.display().to_string(),
+                            "workspace_path": workspace_dir.display().to_string(),
+                            "source_head": source_head,
+                            "workspace_head": ws_head,
+                            "soft_reset_applied": soft_reset_applied,
+                            "reason": err.message,
+                            "conflicted_files": conflicted_files,
+                            "repo_status": repo_status,
+                            "recovery_hints": recovery_hints,
+                        }),
+                    );
+                }
+                let restore_note =
+                    restore_workspace_head_on_error("workspace patch apply failed").unwrap_or_default();
+                let note_path = write_parallel_merge_recovery_note(
+                    run_id,
+                    source_workdir,
+                    run_workspace_root,
+                    workspace_dir,
+                    task_key,
+                    &patch_path,
+                    original_workspace_head_for_restore.as_deref(),
+                )
+                .ok();
+                let mut guidance = format!(
+                    "parallel workspace merge failed for run {run_id} task {task_key}\n\
 Operator recovery steps:\n\
 1. Inspect merge state: git -C \"{}\" status --short\n\
 2. Review task patch: git -C \"{}\" apply --stat \"{}\"\n\
 3. Retry task patch: git -C \"{}\" apply --3way --whitespace=nowarn \"{}\"",
-                source_workdir.display(),
-                source_workdir.display(),
-                patch_path.display(),
-                source_workdir.display(),
-                patch_path.display()
-            );
-            if let Some(path) = note_path {
-                guidance.push_str(&format!("\nDetailed recovery note: {}", path.display()));
+                    source_workdir.display(),
+                    source_workdir.display(),
+                    patch_path.display(),
+                    source_workdir.display(),
+                    patch_path.display()
+                );
+                if let Some(path) = note_path {
+                    guidance.push_str(&format!("\nDetailed recovery note: {}", path.display()));
+                }
+                guidance.push_str(&restore_note);
+                guidance.push_str(&format!(
+                    "\nWorkspace root preserved for inspection: {}",
+                    run_workspace_root.display()
+                ));
+                merge_apply_telemetry_event(
+                    apply_telemetry,
+                    "merge.apply.finalized",
+                    Some(task_key),
+                    Some(task_index),
+                    serde_json::json!({
+                        "run_id": run_id.to_string(),
+                        "task_index": task_index,
+                        "task_key": task_key,
+                        "status": "failed",
+                        "merged_task_count": merged_task_keys.len(),
+                        "skipped_task_count": skipped_task_keys.len(),
+                        "conflict_task_count": conflict_count,
+                        "repair_started_count": repair_started_count,
+                        "repair_succeeded_count": repair_succeeded_count,
+                        "repair_failed_count": repair_failed_count,
+                        "reason": err.message,
+                    }),
+                );
+                return Err(err).context(format!(
+                    "parallel workspace merge apply failed for task {task_key}: {guidance}"
+                ));
             }
-            guidance.push_str(&restore_note);
-            guidance.push_str(&format!(
-                "\nWorkspace root preserved for inspection: {}",
-                run_workspace_root.display()
-            ));
-            return Err(err.context(guidance));
         }
         merged_task_keys.push(task_key.clone());
         task_outcomes.push(ParallelTaskMergeOutcome {
@@ -1265,6 +1686,26 @@ Operator recovery steps:\n\
             &["commit", "--no-verify", "--allow-empty", "-m", &commit_msg],
         );
     }
+
+    merge_apply_telemetry_event(
+        apply_telemetry,
+        "merge.apply.finalized",
+        None,
+        None,
+        serde_json::json!({
+            "run_id": run_id.to_string(),
+            "status": "succeeded",
+            "task_count": task_workspaces.len(),
+            "merged_task_count": merged_task_keys.len(),
+            "skipped_task_count": skipped_task_keys.len(),
+            "conflict_task_count": conflict_count,
+            "repair_started_count": repair_started_count,
+            "repair_succeeded_count": repair_succeeded_count,
+            "repair_failed_count": repair_failed_count,
+            "preserve_workspace_root": !skipped_task_keys.is_empty(),
+            "workspace_root": run_workspace_root.display().to_string(),
+        }),
+    );
 
     // Reapply stashed dirty state. If it conflicts with workspace changes,
     // resolve conflicting files in favor of the workspace (HEAD) while
@@ -2379,6 +2820,57 @@ worktree_root = "{}"
         assert!(
             merged_contents.contains("workspace two change"),
             "expected second workspace change to remain visible: {merged_contents}"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_to_source_auto_repair_prefers_workspace_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&source_repo).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("shared.txt"), "base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo.to_str().unwrap(), workspace.to_str().unwrap()],
+        );
+
+        std::fs::write(source_repo.join("shared.txt"), "source update\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "shared.txt"]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "source update"]);
+
+        std::fs::write(workspace.join("shared.txt"), "workspace update\n").unwrap();
+        let (ok, patch, stderr) = run_git(&workspace, &["diff"]);
+        assert!(ok, "failed to produce workspace patch: {stderr}");
+
+        let repaired = apply_workspace_patch_to_source(
+            &source_repo,
+            "task-auto-repair",
+            patch.as_bytes(),
+            config::MergeConflictResolution::AutoRepair,
+        )
+        .unwrap();
+        assert!(repaired);
+
+        let merged = std::fs::read_to_string(source_repo.join("shared.txt")).unwrap();
+        assert_eq!(merged, "workspace update\n");
+        let (_ok, status, _stderr) = run_git(&source_repo, &["status", "--porcelain"]);
+        assert!(
+            !status.contains("UU"),
+            "expected no unresolved conflict markers after auto-repair: {status}"
+        );
+        assert!(
+            !merged.contains("<<<<<<<"),
+            "expected resolved file content after auto-repair: {merged}"
         );
     }
 

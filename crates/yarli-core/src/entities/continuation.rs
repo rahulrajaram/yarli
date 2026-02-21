@@ -19,6 +19,7 @@ use crate::fsm::task::TaskState;
 pub struct ContinuationPayload {
     pub run_id: RunId,
     pub objective: String,
+    #[serde(with = "run_state_pascal_case")]
     pub exit_state: RunState,
     pub exit_reason: Option<ExitReason>,
     #[serde(default)]
@@ -31,6 +32,91 @@ pub struct ContinuationPayload {
     pub next_tranche: Option<TrancheSpec>,
     #[serde(default)]
     pub quality_gate: Option<ContinuationQualityGate>,
+}
+
+mod run_state_pascal_case {
+    use crate::fsm::run::RunState;
+    use serde::de::Error as DeError;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(state: &RunState, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match state {
+            RunState::RunOpen => "RunOpen",
+            RunState::RunActive => "RunActive",
+            RunState::RunVerifying => "RunVerifying",
+            RunState::RunBlocked => "RunBlocked",
+            RunState::RunFailed => "RunFailed",
+            RunState::RunCompleted => "RunCompleted",
+            RunState::RunCancelled => "RunCancelled",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<RunState, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "RunOpen" | "RUN_OPEN" => RunState::RunOpen,
+            "RunActive" | "RUN_ACTIVE" => RunState::RunActive,
+            "RunVerifying" | "RUN_VERIFYING" => RunState::RunVerifying,
+            "RunBlocked" | "RUN_BLOCKED" => RunState::RunBlocked,
+            "RunFailed" | "RUN_FAILED" => RunState::RunFailed,
+            "RunCompleted" | "RUN_COMPLETED" => RunState::RunCompleted,
+            "RunCancelled" | "RUN_CANCELLED" => RunState::RunCancelled,
+            other => {
+                return Err(D::Error::unknown_variant(
+                    other,
+                    &[
+                        "RunOpen",
+                        "RunActive",
+                        "RunVerifying",
+                        "RunBlocked",
+                        "RunFailed",
+                        "RunCompleted",
+                        "RunCancelled",
+                        "RUN_OPEN",
+                        "RUN_ACTIVE",
+                        "RUN_VERIFYING",
+                        "RUN_BLOCKED",
+                        "RUN_FAILED",
+                        "RUN_COMPLETED",
+                        "RUN_CANCELLED",
+                    ],
+                ))
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskHealthAction {
+    Continue,
+    CheckpointNow,
+    ForcePivot,
+    StopAndSummarize,
+}
+
+impl Default for TaskHealthAction {
+    fn default() -> Self {
+        Self::Continue
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContinuationInterventionKind {
+    StrategyPivotCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinuationIntervention {
+    pub kind: ContinuationInterventionKind,
+    pub reason: String,
 }
 
 /// Outcome record for a single task.
@@ -69,6 +155,8 @@ pub struct TrancheSpec {
     #[serde(default)]
     pub cursor: Option<TrancheCursor>,
     pub config_snapshot: serde_json::Value,
+    #[serde(default)]
+    pub interventions: Vec<ContinuationIntervention>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +187,8 @@ pub struct ContinuationQualityGate {
     pub reason: String,
     pub trend: Option<DeteriorationTrend>,
     pub score: Option<f64>,
+    #[serde(default)]
+    pub task_health_action: TaskHealthAction,
 }
 
 impl ContinuationPayload {
@@ -176,6 +266,7 @@ impl ContinuationPayload {
                     next_tranche_index: current_tranche_index,
                 }),
                 config_snapshot: run.config_snapshot.clone(),
+                interventions: Vec::new(),
             })
         } else if run.state == RunState::RunFailed
             && run.exit_reason == Some(crate::domain::ExitReason::BlockedGateFailure)
@@ -197,6 +288,7 @@ impl ContinuationPayload {
                     next_tranche_index: current_tranche_index,
                 }),
                 config_snapshot: run.config_snapshot.clone(),
+                interventions: Vec::new(),
             })
         } else if run.state == RunState::RunCompleted {
             planned_next_from_snapshot(&run.config_snapshot, current_tranche_index).map(|next| {
@@ -215,6 +307,7 @@ impl ContinuationPayload {
                         next_tranche_index: Some(next.next_index),
                     }),
                     config_snapshot: run.config_snapshot.clone(),
+                    interventions: Vec::new(),
                 }
             })
         } else {

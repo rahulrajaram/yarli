@@ -4,6 +4,10 @@
 //! transitions and output chunks as events (Invariant 4: every transition
 //! persisted before side effects continue).
 
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+use std::fs::OpenOptions;
+
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -11,6 +15,7 @@ use yarli_core::domain::{EntityType, Event};
 use yarli_core::entities::command_execution::{StreamChunk, StreamType};
 use yarli_observability::audit::{AuditEntry, AuditSink};
 use yarli_store::EventStore;
+use tracing::warn;
 
 use crate::error::ExecError;
 use crate::runner::{CommandRequest, CommandResult, CommandRunner};
@@ -79,6 +84,18 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
         self.store
             .append(started_event)
             .map_err(|e| ExecError::Journal(e.to_string()))?;
+
+        if let Err(err) = persist_task_output_artifact(
+            result.execution.run_id,
+            result.execution.task_id,
+            &result.chunks,
+        ) {
+            warn!(
+                task_id = %result.execution.task_id,
+                error = %err,
+                "failed to persist backend output artifact"
+            );
+        }
 
         // Persist output chunks (batched into a single event for efficiency).
         if !result.chunks.is_empty() {
@@ -188,8 +205,86 @@ fn serialize_chunks(chunks: &[StreamChunk]) -> serde_json::Value {
                     "data": c.data,
                 })
             })
-            .collect(),
+                .collect(),
     )
+}
+
+/// Persist raw command chunks to stable per-task JSONL artifacts under `.yarl/runs`.
+///
+/// Artifacts are stored at `.yarl/runs/{task_id}.jsonl` and include one JSON object
+/// per chunk for deterministic replay and offline analysis.
+fn persist_task_output_artifact(
+    run_id: Uuid,
+    task_id: Uuid,
+    chunks: &[StreamChunk],
+) -> Result<(), ExecError> {
+    let output_dir = PathBuf::from(".yarl/runs");
+    std::fs::create_dir_all(&output_dir).map_err(|err| {
+        ExecError::Journal(format!(
+            "failed to create output artifact directory {}: {err}",
+            output_dir.display()
+        ))
+    })?;
+
+    let artifact_path = output_dir.join(format!("{task_id}.jsonl"));
+
+    let mut file = BufWriter::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&artifact_path)
+            .map_err(|err| {
+                ExecError::Journal(format!(
+                    "failed to open output artifact {}: {err}",
+                    artifact_path.display()
+                ))
+            })?,
+    );
+
+    writeln!(
+        &mut file,
+        "{}",
+        serde_json::json!({
+            "run_id": run_id,
+            "task_id": task_id,
+            "artifact_type": "command_output",
+        })
+    )
+    .map_err(|err| {
+        ExecError::Journal(format!(
+            "failed to write artifact header {}: {err}",
+            artifact_path.display()
+        ))
+    })?;
+
+    for chunk in chunks {
+        let line = serde_json::json!({
+            "command_id": chunk.command_id,
+            "seq": chunk.sequence,
+            "stream": chunk.stream,
+            "data": chunk.data,
+            "captured_at": chunk.captured_at.to_rfc3339(),
+        });
+        let record = serde_json::to_string(&line).map_err(|err| {
+            ExecError::Journal(format!("failed to serialize output chunk for task {task_id}: {err}"))
+        })?;
+
+        writeln!(&mut file, "{record}").map_err(|err| {
+            ExecError::Journal(format!(
+                "failed to write output chunk to {}: {err}",
+                artifact_path.display()
+            ))
+        })?;
+    }
+
+    file.flush().map_err(|err| {
+        ExecError::Journal(format!(
+            "failed to flush output artifact {}: {err}",
+            artifact_path.display()
+        ))
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use yarli_core::domain::{EntityType, Event, PolicyDecision, PolicyOutcome, RunId, TaskId};
+use yarli_core::domain::{
+    EntityType, Event, ExitReason, PolicyDecision, PolicyOutcome, RunId, TaskId,
+};
 use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::{BlockerCode, Task};
@@ -31,6 +33,7 @@ use yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, E
 use yarli_gates::{all_passed, collect_failures, evaluate_all, GateContext};
 use yarli_observability::{AuditEntry, AuditSink};
 use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
+use yarli_store::event_store::EventQuery;
 use yarli_store::EventStore;
 
 use crate::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry};
@@ -325,6 +328,15 @@ impl Default for TaskRegistry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MergeFinalizationState {
+    Succeeded,
+    Failed {
+        reason: String,
+        is_conflict: bool,
+    },
+}
+
 /// The scheduler loop orchestrator.
 ///
 /// Ties together the TaskQueue, EventStore, and CommandRunner to drive
@@ -414,6 +426,56 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     pub async fn bind_task_working_dir(&self, task_id: TaskId, working_dir: impl Into<String>) {
         let mut dirs = self.task_working_dirs.write().await;
         dirs.insert(task_id, working_dir.into());
+    }
+
+    fn classify_merge_failure_reason(reason: &str, payload: &serde_json::Value) -> bool {
+        payload
+            .get("failure_kind")
+            .and_then(|kind| kind.as_str())
+            .is_some_and(|kind| matches!(kind, "merge_conflict" | "MergeConflict" | "MERGE_CONFLICT"))
+            || reason.to_lowercase().contains("merge conflict")
+    }
+
+    fn query_merge_finalization_state(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<MergeFinalizationState>, SchedulerError> {
+        let run_id = run_id.to_string();
+        let events = self
+            .store
+            .query(&EventQuery {
+                entity_type: Some(EntityType::Run),
+                entity_id: Some(run_id),
+                ..Default::default()
+            })?;
+
+        let mut merge_finalization_state = None;
+        for event in events {
+            match event.event_type.as_str() {
+                "run.parallel_merge_succeeded" => {
+                    merge_finalization_state = Some(MergeFinalizationState::Succeeded);
+                }
+                "run.parallel_merge_failed" => {
+                    let reason = event
+                        .payload
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("parallel merge failed")
+                        .to_string();
+                    let is_conflict = Self::classify_merge_failure_reason(
+                        &reason,
+                        &event.payload,
+                    );
+                    merge_finalization_state = Some(MergeFinalizationState::Failed {
+                        reason,
+                        is_conflict,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(merge_finalization_state)
     }
 
     /// Register a new run and its tasks with the scheduler.
@@ -1670,6 +1732,58 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             }
 
             if all_complete {
+                let merge_finalization = self.query_merge_finalization_state(run_id)?;
+
+                if let Some(MergeFinalizationState::Failed {
+                    reason,
+                    is_conflict,
+                }) = merge_finalization
+                {
+                    let merge_reason = format!("parallel merge failed: {reason}");
+                    run.exit_reason = Some(if is_conflict {
+                        ExitReason::MergeConflict
+                    } else {
+                        ExitReason::FailedRuntimeError
+                    });
+
+                    if run.state == RunState::RunActive || run.state == RunState::RunVerifying {
+                        let correlation_id = run.correlation_id;
+                        let transition = run.transition(
+                            RunState::RunFailed,
+                            merge_reason,
+                            &self.config.worker_id,
+                            None,
+                        )?;
+
+                        self.store.append(Event {
+                            event_id: transition.event_id,
+                            occurred_at: transition.occurred_at,
+                            entity_type: EntityType::Run,
+                            entity_id: run_id.to_string(),
+                            event_type: "run.failed".to_string(),
+                            payload: serde_json::json!({
+                                "from": transition.from_state,
+                                "to": transition.to_state,
+                                "reason": "parallel_merge_failed",
+                                "detail": transition.reason,
+                                "exit_reason": run.exit_reason.map(|r| r.to_string()),
+                                "merge_conflict": is_conflict,
+                            }),
+                            correlation_id,
+                            causation_id: None,
+                            actor: self.config.worker_id.clone(),
+                            idempotency_key: Some(format!("{run_id}:failed")),
+                        })?;
+
+                        warn!(
+                            run_id = %run_id,
+                            merge_conflict = %is_conflict,
+                            "run failed due to parallel merge failure"
+                        );
+                        continue;
+                    }
+                }
+
                 if run.state == RunState::RunActive {
                     let correlation_id = run.correlation_id;
                     let transition = run.transition(
@@ -2359,6 +2473,112 @@ mod tests {
         let reg = sched.registry().read().await;
         let run = reg.get_run(&run_id).unwrap();
         assert_eq!(run.state, RunState::RunFailed);
+    }
+
+    #[tokio::test]
+    async fn test_run_fails_on_parallel_merge_conflict() {
+        let (sched, store) = test_scheduler();
+        let run = make_run("parallel merge conflict");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+
+        let task = make_task(run_id, "echo", "echo done", corr_id);
+        let task_id = task.id;
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        {
+            let mut reg = sched.registry().write().await;
+            let task = reg
+                .get_task_mut(&task_id)
+                .expect("task should be present");
+            task.state = TaskState::TaskComplete;
+        }
+
+        store
+            .append(Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: chrono::Utc::now(),
+                entity_type: EntityType::Run,
+                entity_id: run_id.to_string(),
+                event_type: "run.parallel_merge_failed".to_string(),
+                payload: serde_json::json!({
+                    "reason": "parallel merge failed: merge conflict in task 1 while applying patch"
+                }),
+                correlation_id: corr_id,
+                causation_id: None,
+                actor: "cli".to_string(),
+                idempotency_key: Some(format!("{run_id}:parallel_merge_failed")),
+            })
+            .unwrap();
+
+        let _ = sched.evaluate_runs().await.unwrap();
+
+        let reg = sched.registry().read().await;
+        let run = reg.get_run(&run_id).unwrap();
+        assert_eq!(run.state, RunState::RunFailed);
+        assert_eq!(run.exit_reason, Some(ExitReason::MergeConflict));
+        assert!(
+            store
+                .all()
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "run.failed"),
+            "expected run.failed transition after merge conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_completes_with_parallel_merge_success_signal() {
+        let (sched, store) = test_scheduler();
+        let run = make_run("parallel merge success");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+
+        let task = make_task(run_id, "echo", "echo done", corr_id);
+        let task_id = task.id;
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        {
+            let mut reg = sched.registry().write().await;
+            let task = reg
+                .get_task_mut(&task_id)
+                .expect("task should be present");
+            task.state = TaskState::TaskComplete;
+        }
+
+        store
+            .append(Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: chrono::Utc::now(),
+                entity_type: EntityType::Run,
+                entity_id: run_id.to_string(),
+                event_type: "run.parallel_merge_succeeded".to_string(),
+                payload: serde_json::json!({
+                    "merged_task_keys": ["echo"],
+                }),
+                correlation_id: corr_id,
+                causation_id: None,
+                actor: "cli".to_string(),
+                idempotency_key: Some(format!("{run_id}:parallel_merge_succeeded")),
+            })
+            .unwrap();
+
+        let runs_completed = sched.evaluate_runs().await.unwrap();
+
+        let reg = sched.registry().read().await;
+        let run = reg.get_run(&run_id).unwrap();
+        assert_eq!(run.state, RunState::RunCompleted);
+        assert_eq!(runs_completed, 1);
+        assert!(
+            store
+                .all()
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "run.completed"),
+            "expected run.completed transition after merge success"
+        );
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use yarli_exec::{CommandRunner, LocalCommandRunner};
 use yarli_core::domain::{CommandClass, SafeMode};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::{BlockerCode, Task};
@@ -106,26 +107,54 @@ pub struct VerificationCommand {
 pub struct ObjectiveParams {
     /// Scope hint (e.g. file paths, module names) to focus the agent.
     pub scope: Vec<String>,
+    /// Work already completed before this orchestrator run starts.
+    pub completed_tranche_work: Vec<String>,
     /// Repository context (branch, commit, working dir).
     pub repo_context: Option<RepoContext>,
 }
 
 /// The orchestrator loop: dispatch to LLM → verify → iterate.
-pub struct OrchestratorLoop<R: RouterSender> {
+pub struct OrchestratorLoop<R: RouterSender, V: CommandRunner = LocalCommandRunner> {
     router: Arc<R>,
     config: Sw4rmConfig,
     verification: VerificationSpec,
+    verification_runner: Arc<V>,
 }
 
-impl<R: RouterSender> OrchestratorLoop<R> {
+impl<R: RouterSender> OrchestratorLoop<R, LocalCommandRunner> {
     pub fn new(router: Arc<R>, config: Sw4rmConfig, verification: VerificationSpec) -> Self {
         Self {
             router,
             config,
             verification,
+            verification_runner: Arc::new(LocalCommandRunner::new()),
         }
     }
+}
 
+impl<R, V> OrchestratorLoop<R, V>
+where
+    R: RouterSender,
+    V: CommandRunner + Clone,
+{
+    pub fn with_verification_runner<Runner>(self, command_runner: Runner) -> OrchestratorLoop<R, Runner>
+    where
+        Runner: CommandRunner,
+    {
+        OrchestratorLoop {
+            router: self.router,
+            config: self.config,
+            verification: self.verification,
+            verification_runner: Arc::new(command_runner),
+        }
+    }
+}
+
+impl<R, V> OrchestratorLoop<R, V>
+where
+    R: RouterSender,
+    V: CommandRunner + Clone,
+{
     /// Run the full orchestration loop for an objective.
     pub async fn run_objective(
         &self,
@@ -134,7 +163,8 @@ impl<R: RouterSender> OrchestratorLoop<R> {
         cancel: CancellationToken,
         params: &ObjectiveParams,
     ) -> Result<OrchestratorResult, OrchestratorError> {
-        let mut all_files_modified = Vec::new();
+        let mut all_files_modified = params.completed_tranche_work.clone();
+        let mut completed_tranche_work = params.completed_tranche_work.clone();
         let mut failures: Vec<VerificationFailure> = Vec::new();
         let mut final_summary = String::new();
         let timeout = Duration::from_secs(self.config.llm_response_timeout_secs);
@@ -148,6 +178,7 @@ impl<R: RouterSender> OrchestratorLoop<R> {
 
             let request = ImplementationRequest {
                 objective: objective.to_string(),
+                completed_tranche_work: completed_tranche_work.clone(),
                 scope: params.scope.clone(),
                 failures: failures.clone(),
                 iteration,
@@ -171,6 +202,7 @@ impl<R: RouterSender> OrchestratorLoop<R> {
             for f in &response.files_modified {
                 if !all_files_modified.contains(f) {
                     all_files_modified.push(f.clone());
+                    completed_tranche_work.push(f.clone());
                 }
             }
             final_summary = response.summary.clone();
@@ -180,7 +212,9 @@ impl<R: RouterSender> OrchestratorLoop<R> {
             }
 
             // Run verification
-            failures = self.run_verification(&cancel).await?;
+            failures = self
+                .run_verification(&cancel, &response.additional_verification)
+                .await?;
 
             if failures.is_empty() {
                 info!(iteration, "verification passed — objective complete");
@@ -213,10 +247,12 @@ impl<R: RouterSender> OrchestratorLoop<R> {
     async fn run_verification(
         &self,
         cancel: &CancellationToken,
+        additional_verification: &[String],
     ) -> Result<Vec<VerificationFailure>, OrchestratorError> {
         let store = Arc::new(yarli_store::InMemoryEventStore::new());
         let queue = Arc::new(InMemoryTaskQueue::new());
-        let runner = Arc::new(yarli_exec::LocalCommandRunner::new());
+        let runner = self.verification_runner.clone();
+        let verification_commands = self.compose_verification_commands(additional_verification);
 
         let mut sched_config = SchedulerConfig::default();
         sched_config.working_dir = self.verification.working_dir.clone();
@@ -249,7 +285,7 @@ impl<R: RouterSender> OrchestratorLoop<R> {
         .map_err(|e| OrchestratorError::Scheduler(e.to_string()))?;
 
         let mut task_info = Vec::new();
-        for cmd in &self.verification.commands {
+        for cmd in &verification_commands {
             let task = Task::new(run_id, &cmd.task_key, &cmd.command, cmd.class, corr_id);
             let task_id = task.id;
             task_info.push((task_id, cmd.task_key.clone(), cmd.command.clone()));
@@ -334,6 +370,29 @@ impl<R: RouterSender> OrchestratorLoop<R> {
 
         Ok(failures)
     }
+
+    fn compose_verification_commands(&self, additional_verification: &[String]) -> Vec<VerificationCommand> {
+        let mut commands = self.verification.commands.clone();
+
+        let mut repair_commands = additional_verification
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                let command = command.trim();
+                if command.is_empty() {
+                    return None;
+                }
+                Some(VerificationCommand {
+                    task_key: format!("repair-{index}"),
+                    command: command.to_string(),
+                    class: CommandClass::Io,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        commands.append(&mut repair_commands);
+        commands
+    }
 }
 
 /// Fix #7: Classify a failed task using its structured `BlockerCode` instead of
@@ -392,6 +451,75 @@ mod tests {
 
     fn default_params() -> ObjectiveParams {
         ObjectiveParams::default()
+    }
+
+    #[tokio::test]
+    async fn completed_tranche_work_is_preserved_between_requests() {
+        let mock = Arc::new(MockRouterSender::new());
+        mock.enqueue_response(ImplementationResponse {
+            complete: true,
+            files_modified: vec!["b.rs".to_string()],
+            summary: "repair-aware".to_string(),
+            additional_verification: vec![],
+        });
+
+        let params = ObjectiveParams {
+            scope: vec!["src/lib.rs".to_string()],
+            completed_tranche_work: vec!["a.rs".to_string(), "b.rs".to_string()],
+            repo_context: None,
+        };
+
+        let orch = OrchestratorLoop::new(mock.clone(), test_config(), test_verification());
+        let result = orch
+            .run_objective("preserve", "corr-preserve", CancellationToken::new(), &params)
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.files_modified, vec!["a.rs".to_string(), "b.rs".to_string()]);
+
+        let reqs = mock.requests().await;
+        assert_eq!(reqs[0].completed_tranche_work, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn auto_repair_includes_repair_commands_in_verification_task_list() {
+        let mock = Arc::new(MockRouterSender::new());
+        mock.enqueue_response(ImplementationResponse {
+            complete: false,
+            files_modified: vec![],
+            summary: "repair requested".to_string(),
+            additional_verification: vec!["false".to_string()],
+        });
+
+        let verification = VerificationSpec {
+            commands: vec![VerificationCommand {
+                task_key: "build".to_string(),
+                command: "echo ok".to_string(),
+                class: CommandClass::Io,
+            }],
+            working_dir: "/tmp".to_string(),
+            task_gates: Some(vec![]),
+            run_gates: Some(vec![]),
+        };
+
+        let orch = OrchestratorLoop::new(
+            mock.clone(),
+            Sw4rmConfig {
+                max_fix_iterations: 1,
+                ..Sw4rmConfig::default()
+            },
+            verification,
+        );
+        let result = orch
+            .run_objective("repair", "corr-repair", CancellationToken::new(), &ObjectiveParams::default())
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.iterations_used, 1);
+        assert_eq!(result.remaining_failures.len(), 1);
+        assert_eq!(result.remaining_failures[0].task_key, "repair-0");
     }
 
     #[tokio::test]
@@ -611,6 +739,7 @@ mod tests {
 
         let params = ObjectiveParams {
             scope: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+            completed_tranche_work: vec![],
             repo_context: Some(RepoContext {
                 branch: Some("feature/foo".to_string()),
                 commit: Some("abc123".to_string()),

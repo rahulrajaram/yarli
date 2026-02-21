@@ -18,6 +18,7 @@ use crate::config::{
 
 use yarli_cli::mode::RenderMode;
 use yarli_cli::{self, prompt};
+use yarli_core::entities::continuation::ContinuationInterventionKind;
 use yarli_core::domain::CommandClass;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
@@ -101,6 +102,9 @@ pub(crate) struct ImplementationPlanEntry {
     pub(crate) is_complete: bool,
     pub(crate) tranche_group: Option<String>,
     pub(crate) allowed_paths: Vec<String>,
+    pub(crate) verify: Option<String>,
+    pub(crate) done_when: Option<String>,
+    pub(crate) max_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +156,9 @@ impl TranchesFile {
                 is_complete: def.status == TrancheStatus::Complete,
                 tranche_group: def.group.clone(),
                 allowed_paths: def.allowed_paths.clone(),
+                verify: def.verify.clone(),
+                done_when: def.done_when.clone(),
+                max_tokens: def.max_tokens,
             })
             .collect()
     }
@@ -324,13 +331,62 @@ pub(crate) fn build_tranche_task_prompt(
     } else {
         String::new()
     };
-    let allowed_paths_instruction = if enforce_allowed_paths && !tranche.allowed_paths.is_empty() {
-        "5. Restrict edits to the allowed file scope above.\n6. Keep output concise and concrete."
+    let mut instruction_lines = vec![
+        "1. Read PROMPT and plan context from the workspace paths above.".to_string(),
+        "2. Implement only the target tranche if it is still incomplete.".to_string(),
+        "3. Update IMPLEMENTATION_PLAN.md and evidence in-repo.".to_string(),
+        "4. Run the tranche's required verification commands before finishing.".to_string(),
+    ];
+    let mut instruction_counter = 5;
+    if let Some(done_when) = tranche.done_when.as_ref().filter(|s| !s.trim().is_empty()) {
+        instruction_lines.push(format!(
+            "{instruction_counter}. Completion criteria: {done_when}.",
+            instruction_counter = instruction_counter
+        ));
+        instruction_counter += 1;
+    }
+    if let Some(verify) = tranche.verify.as_ref().filter(|s| !s.trim().is_empty()) {
+        instruction_lines.push(format!(
+            "{instruction_counter}. Verification hook: run `{verify}` and report pass/fail clearly.",
+            instruction_counter = instruction_counter
+        ));
+        instruction_counter += 1;
+    }
+    if let Some(max_tokens) = tranche.max_tokens {
+        instruction_lines.push(format!(
+            "{instruction_counter}. Per-tranche token budget override: max_tokens={max_tokens}.",
+            instruction_counter = instruction_counter
+        ));
+        instruction_counter += 1;
+    }
+
+    if enforce_allowed_paths && !tranche.allowed_paths.is_empty() {
+        instruction_lines.push(format!(
+            "{instruction_counter}. Restrict edits to the allowed file scope above."
+        ));
+        instruction_counter += 1;
+    }
+    instruction_lines.push(format!("{instruction_counter}. Keep output concise and concrete."));
+    let instructions = instruction_lines.join("\n");
+
+    let mut contract_lines = Vec::new();
+    if let Some(done_when) = tranche.done_when.as_ref().filter(|s| !s.trim().is_empty()) {
+        contract_lines.push(format!("Done criteria: {done_when}."));
+    }
+    if let Some(verify) = tranche.verify.as_ref().filter(|s| !s.trim().is_empty()) {
+        contract_lines.push(format!("Verification command: `{verify}`."));
+    }
+    if let Some(max_tokens) = tranche.max_tokens {
+        contract_lines.push(format!("Per-tranche max_tokens: {max_tokens}."));
+    }
+    let contract = if contract_lines.is_empty() {
+        String::new()
     } else {
-        "5. Keep output concise and concrete."
+        format!("Contract:\n- {}\n", contract_lines.join("\n- "))
     };
+
     format!(
-        "YARLI tranche task {}/{}.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nTarget tranche: {}.\nTarget summary: {}\n{}{}Mode: implementation.\n\nInstructions:\n1. Read PROMPT and plan context from the workspace paths above.\n2. Implement only the target tranche if it is still incomplete.\n3. Update IMPLEMENTATION_PLAN.md and evidence in-repo.\n4. Run the tranche's required verification commands before finishing.\n{}",
+        "YARLI tranche task {}/{}.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nTarget tranche: {}.\nTarget summary: {}\n{}{}{}Mode: implementation.\n\nInstructions:\n{}",
         index + 1,
         total,
         objective,
@@ -340,7 +396,8 @@ pub(crate) fn build_tranche_task_prompt(
         tranche.summary,
         tranche_group_line,
         allowed_paths_line,
-        allowed_paths_instruction
+        contract,
+        instructions
     )
 }
 
@@ -1255,7 +1312,7 @@ pub(crate) fn build_plan_from_continuation_tranche(
         .map(|task| (task.task_key.as_str(), task))
         .collect();
 
-    let tasks: Vec<PlannedTask> = task_keys
+    let mut tasks: Vec<PlannedTask> = task_keys
         .into_iter()
         .map(|key| {
             if let Some(task) = catalog_by_key.get(key.as_str()) {
@@ -1272,6 +1329,11 @@ pub(crate) fn build_plan_from_continuation_tranche(
             }
         })
         .collect();
+    if tranche_has_strategy_pivot_checkpoint_intervention(tranche) {
+        for task in &mut tasks {
+            task.command = append_strategy_pivot_checkpoint_to_command(&task.command);
+        }
+    }
 
     let current_tranche_index = tranche
         .cursor
@@ -1321,6 +1383,29 @@ pub(crate) fn build_plan_from_continuation_tranche(
         },
         current_tranche_index,
     })
+}
+
+const STRATEGY_PIVOT_CHECKPOINT_INSTRUCTION: &str = "Strategy-pivot checkpoint:\n\
+The run quality is deteriorating, so re-check strategy and scope before continuing.\n\
+- Identify stale assumptions.\n- Narrow scope.\n- Introduce a deliberate reset point in the next step.";
+
+fn tranche_has_strategy_pivot_checkpoint_intervention(
+    tranche: &yarli_core::entities::continuation::TrancheSpec,
+) -> bool {
+    tranche
+        .interventions
+        .iter()
+        .any(|intervention| intervention.kind == ContinuationInterventionKind::StrategyPivotCheckpoint)
+}
+
+fn append_strategy_pivot_checkpoint_to_command(command: &str) -> String {
+    if command.contains("Strategy-pivot checkpoint:") {
+        command.to_string()
+    } else {
+        format!(
+            "{command}\n\n{STRATEGY_PIVOT_CHECKPOINT_INSTRUCTION}"
+        )
+    }
 }
 
 pub(crate) fn should_auto_advance_planned_tranche(
@@ -1720,6 +1805,9 @@ pub(crate) fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntr
             is_complete,
             tranche_group: parse_plan_tranche_group(entry),
             allowed_paths: parse_plan_allowed_paths(entry),
+            verify: None,
+            done_when: None,
+            max_tokens: None,
         });
     }
 
@@ -1746,6 +1834,9 @@ pub(crate) fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntr
         is_complete,
         tranche_group: parse_plan_tranche_group(candidate),
         allowed_paths: parse_plan_allowed_paths(candidate),
+        verify: None,
+        done_when: None,
+        max_tokens: None,
     })
 }
 
@@ -1835,6 +1926,9 @@ pub(crate) fn parse_plan_tranche_header_line(line: &str) -> Option<Implementatio
         is_complete,
         tranche_group: parse_plan_tranche_group(candidate),
         allowed_paths: parse_plan_allowed_paths(candidate),
+        verify: None,
+        done_when: None,
+        max_tokens: None,
     })
 }
 
@@ -2261,7 +2355,8 @@ pub(crate) fn enforce_plan_guard_post_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{build_run_config_snapshot, compute_quality_gate};
+    use crate::commands::{build_continuation_payload, build_run_config_snapshot, compute_quality_gate};
+    use crate::config::RunTaskHealthConfig;
     use crate::test_helpers::{write_test_config, write_test_config_at};
     use chrono::Utc;
     use tempfile::TempDir;
@@ -2270,6 +2365,7 @@ mod tests {
     use yarli_core::domain::{CommandClass, SafeMode};
     use yarli_core::entities::run::Run;
     use yarli_core::entities::task::Task;
+    use yarli_core::entities::continuation::TaskHealthAction;
     use yarli_core::explain::{DeteriorationReport, DeteriorationTrend};
     use yarli_core::fsm::run::RunState;
     use yarli_core::fsm::task::TaskState;
@@ -2716,12 +2812,12 @@ prompt_mode = "arg"
         let loaded_prompt =
             prompt::load_prompt_and_run_spec(&repo.path().join("PROMPT.md")).unwrap();
 
-        let original_dir = std::env::current_dir().unwrap();
+        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         std::env::set_current_dir(decoy_cwd.path()).unwrap();
         let (tasks, tranches) =
             build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
                 .unwrap();
-        std::env::set_current_dir(original_dir).unwrap();
+        let _ = std::env::set_current_dir(&original_dir);
 
         assert_eq!(tasks.len(), 2);
         assert_eq!(tranches.len(), 2);
@@ -3073,6 +3169,88 @@ enforce_plan_tranche_allowed_paths = true
     }
 
     #[test]
+    fn plan_driven_tranche_prompt_includes_contract_fields() {
+        let temp = TempDir::new().unwrap();
+        let loaded_prompt = prompt::LoadedPrompt {
+            entry_path: temp.path().join("PROMPT.md"),
+            expanded_text: "".to_string(),
+            snapshot: prompt::PromptSnapshot {
+                entry_path: temp.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "snapshot-hash".to_string(),
+                included_files: Vec::new(),
+            },
+            run_spec: prompt::RunSpec {
+                version: 1,
+                objective: Some("Implement contract contract".to_string()),
+                tasks: prompt::RunSpecTasks::default(),
+                tranches: None,
+                plan_guard: None,
+            },
+        };
+        let tranche = ImplementationPlanEntry {
+            key: "R9-06".to_string(),
+            summary: "Implement checkpoint contract metadata in prompts".to_string(),
+            is_complete: false,
+            tranche_group: Some("runtime-contract".to_string()),
+            allowed_paths: vec!["crates/yarli-cli/src".to_string()],
+            verify: Some("cargo test --workspace".to_string()),
+            done_when:
+                Some("All tranche contract checks in this file are represented in generated prompt output".to_string()),
+            max_tokens: Some(42_000),
+        };
+
+        let prompt = build_tranche_task_prompt(
+            &loaded_prompt,
+            temp.path().join("IMPLEMENTATION_PLAN.md").as_path(),
+            "implement current tranche",
+            &tranche,
+            0,
+            1,
+            true,
+        );
+
+        assert!(prompt.contains("Tranche group: runtime-contract."));
+        assert!(prompt.contains("Allowed file scope: crates/yarli-cli/src."));
+        assert!(prompt.contains("Restrict edits to the allowed file scope above."));
+        assert!(prompt.contains("Contract:"));
+        assert!(prompt.contains("Done criteria: All tranche contract checks in this file are represented in generated prompt output."));
+        assert!(prompt.contains("Verification command: `cargo test --workspace`."));
+        assert!(prompt.contains("Per-tranche max_tokens: 42000."));
+        assert!(prompt.contains("Mode: implementation."));
+    }
+
+    #[test]
+    fn tranches_file_to_entries_preserves_contract_fields() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "R9-06"
+summary = "Implement checkpoint prompt contract"
+status = "incomplete"
+verify = "cargo test --workspace"
+done_when = "All tests pass"
+max_tokens = 21000
+"#,
+        )
+        .unwrap();
+
+        let file = read_tranches_file_in(repo.path()).unwrap().unwrap();
+        let entries = file.to_entries();
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.key, "R9-06");
+        assert_eq!(entry.verify.as_deref(), Some("cargo test --workspace"));
+        assert_eq!(entry.done_when.as_deref(), Some("All tests pass"));
+        assert_eq!(entry.max_tokens, Some(21000));
+    }
+
+    #[test]
     fn resolve_run_plan_rejects_cmd_and_pace() {
         let loaded = write_test_config("");
 
@@ -3262,7 +3440,9 @@ cmds = ["echo ok"]
 
     #[test]
     fn continuation_planned_next_resolves_command_from_task_catalog() {
-        use yarli_core::entities::continuation::{TrancheKind, TrancheSpec};
+        use yarli_core::entities::continuation::{
+            TrancheKind, TrancheSpec,
+        };
 
         let loaded = write_test_config("");
         let prompt_entry_path = "/tmp/project/PROMPT.md";
@@ -3301,6 +3481,7 @@ cmds = ["echo ok"]
                     }
                 }
             }),
+            interventions: Vec::new(),
         };
 
         let plan = build_plan_from_continuation_tranche(&tranche, &loaded).unwrap();
@@ -3320,6 +3501,49 @@ cmds = ["echo ok"]
     }
 
     #[test]
+    fn continuation_planned_next_appends_strategy_pivot_checkpoint_prompt() {
+        use yarli_core::entities::continuation::{
+            ContinuationIntervention, ContinuationInterventionKind, TrancheKind, TrancheSpec,
+        };
+
+        let loaded = write_test_config("");
+        let tranche = TrancheSpec {
+            suggested_objective: "planned-next".into(),
+            kind: TrancheKind::PlannedNext,
+            retry_task_keys: vec![],
+            unfinished_task_keys: vec![],
+            planned_task_keys: vec!["one_task".into()],
+            planned_tranche_key: Some("one".into()),
+            cursor: Some(yarli_core::entities::continuation::TrancheCursor {
+                current_tranche_index: Some(0),
+                next_tranche_index: Some(0),
+            }),
+            config_snapshot: serde_json::json!({
+                "runtime": {
+                    "working_dir": ".",
+                    "timeout_secs": 300,
+                    "tasks": [
+                        {"task_key": "one_task", "command": "echo first", "command_class": "Io"}
+                    ],
+                    "task_catalog": [
+                        {"task_key": "one_task", "command": "echo first", "command_class": "Io"}
+                    ]
+                }
+            }),
+            interventions: vec![ContinuationIntervention {
+                kind: ContinuationInterventionKind::StrategyPivotCheckpoint,
+                reason: "deterioration forced pivot".into(),
+            }],
+        };
+
+        let plan = build_plan_from_continuation_tranche(&tranche, &loaded).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert!(plan.tasks[0]
+            .command
+            .contains("Strategy-pivot checkpoint:"));
+    }
+
+    #[test]
     fn compute_quality_gate_blocks_stable_when_policy_disabled() {
         let report = DeteriorationReport {
             score: 22.0,
@@ -3328,7 +3552,14 @@ cmds = ["echo ok"]
             trend: DeteriorationTrend::Stable,
         };
 
-        let gate = compute_quality_gate(Some(&report), AutoAdvancePolicy::ImprovingOnly);
+        let gate = compute_quality_gate(
+            Some(&report),
+            AutoAdvancePolicy::ImprovingOnly,
+            crate::config::RunTaskHealthConfig::default(),
+            0,
+            None,
+            0.9,
+        );
         assert!(!gate.allow_auto_advance);
         assert_eq!(
             gate.reason,
@@ -3345,11 +3576,203 @@ cmds = ["echo ok"]
             trend: DeteriorationTrend::Stable,
         };
 
-        let gate = compute_quality_gate(Some(&report), AutoAdvancePolicy::StableOk);
+        let gate = compute_quality_gate(
+            Some(&report),
+            AutoAdvancePolicy::StableOk,
+            crate::config::RunTaskHealthConfig::default(),
+            0,
+            None,
+            0.9,
+        );
         assert!(gate.allow_auto_advance);
         assert_eq!(
             gate.reason,
             "deterioration trend stable (policy allows auto-advance)"
+        );
+    }
+
+    #[test]
+    fn compute_quality_gate_soft_token_cap_forces_checkpoint() {
+        let gate = compute_quality_gate(
+            None,
+            AutoAdvancePolicy::Always,
+            crate::config::RunTaskHealthConfig::default(),
+            900,
+            Some(1_000),
+            0.9,
+        );
+        assert_eq!(gate.task_health_action, TaskHealthAction::CheckpointNow);
+        assert!(!gate.allow_auto_advance);
+        assert_eq!(
+            gate.reason,
+            "soft token cap reached at 900 / 1000 (90% hard cap)"
+        );
+    }
+
+    #[test]
+    fn compute_quality_gate_soft_token_cap_can_be_disabled() {
+        let gate = compute_quality_gate(
+            None,
+            AutoAdvancePolicy::Always,
+            crate::config::RunTaskHealthConfig::default(),
+            900,
+            Some(1_000),
+            0.0,
+        );
+        assert_eq!(gate.task_health_action, TaskHealthAction::Continue);
+        assert!(gate.allow_auto_advance);
+    }
+
+    #[test]
+    fn compute_quality_gate_soft_token_cap_overrides_deterioration_report() {
+        let report = DeteriorationReport {
+            score: 72.5,
+            window_size: 12,
+            factors: Vec::new(),
+            trend: DeteriorationTrend::Deteriorating,
+        };
+
+        let mut task_health = crate::config::RunTaskHealthConfig::default();
+        task_health.deteriorating = TaskHealthAction::ForcePivot;
+
+        let gate = compute_quality_gate(
+            Some(&report),
+            AutoAdvancePolicy::Always,
+            task_health,
+            950,
+            Some(1000),
+            0.9,
+        );
+        assert_eq!(gate.task_health_action, TaskHealthAction::CheckpointNow);
+        assert!(!gate.allow_auto_advance);
+        assert_eq!(
+            gate.reason,
+            "soft token cap reached at 950 / 1000 (90% hard cap)"
+        );
+        assert_eq!(gate.trend, Some(DeteriorationTrend::Deteriorating));
+        assert_eq!(gate.score, Some(72.5));
+    }
+
+    #[test]
+    fn compute_quality_gate_soft_token_cap_overrides_stable_report_blocking_policy() {
+        let report = DeteriorationReport {
+            score: 61.0,
+            window_size: 10,
+            factors: Vec::new(),
+            trend: DeteriorationTrend::Stable,
+        };
+
+        let gate = compute_quality_gate(
+            Some(&report),
+            AutoAdvancePolicy::ImprovingOnly,
+            crate::config::RunTaskHealthConfig::default(),
+            900,
+            Some(1000),
+            0.9,
+        );
+        assert_eq!(gate.task_health_action, TaskHealthAction::CheckpointNow);
+        assert!(!gate.allow_auto_advance);
+        assert_eq!(
+            gate.reason,
+            "soft token cap reached at 900 / 1000 (90% hard cap)"
+        );
+    }
+
+    #[test]
+    fn build_continuation_payload_force_pivot_appends_checkpoint_intervention() {
+        let mut task_health = RunTaskHealthConfig::default();
+        task_health.deteriorating = TaskHealthAction::ForcePivot;
+
+        let run = Run::new("checkpoint test", SafeMode::Execute);
+        let mut task = Task::new(
+            run.id,
+            "task-1",
+            "do check",
+            CommandClass::Io,
+            run.correlation_id,
+        );
+        task.state = TaskState::TaskFailed;
+        let tasks = vec![&task];
+
+        let report = DeteriorationReport {
+            score: 82.0,
+            window_size: 12,
+            factors: Vec::new(),
+            trend: DeteriorationTrend::Deteriorating,
+        };
+
+        let payload = build_continuation_payload(
+            &run,
+            &tasks,
+            Some(&report),
+            AutoAdvancePolicy::ImprovingOnly,
+            task_health,
+            0,
+            None,
+            0.9,
+            false,
+        );
+        let quality_gate = payload.quality_gate.expect("quality gate exists");
+        assert_eq!(quality_gate.task_health_action, TaskHealthAction::ForcePivot);
+        let interventions = payload
+            .next_tranche
+            .as_ref()
+            .expect("retry tranche")
+            .interventions
+            .len();
+        assert_eq!(interventions, 1);
+    }
+
+    #[test]
+    fn build_continuation_payload_after_previous_pivot_cycles_stops_and_summarizes() {
+        let mut task_health = RunTaskHealthConfig::default();
+        task_health.deteriorating = TaskHealthAction::ForcePivot;
+
+        let run = Run::new("checkpoint test follow-up", SafeMode::Execute);
+        let mut task = Task::new(
+            run.id,
+            "task-1",
+            "do check\n\nStrategy-pivot checkpoint:\nkeep going",
+            CommandClass::Io,
+            run.correlation_id,
+        );
+        task.state = TaskState::TaskFailed;
+        let tasks = vec![&task];
+
+        let report = DeteriorationReport {
+            score: 90.0,
+            window_size: 12,
+            factors: Vec::new(),
+            trend: DeteriorationTrend::Deteriorating,
+        };
+
+        let payload = build_continuation_payload(
+            &run,
+            &tasks,
+            Some(&report),
+            AutoAdvancePolicy::ImprovingOnly,
+            task_health,
+            0,
+            None,
+            0.9,
+            true,
+        );
+        let quality_gate = payload.quality_gate.expect("quality gate exists");
+        assert_eq!(
+            quality_gate.task_health_action,
+            TaskHealthAction::StopAndSummarize
+        );
+        let interventions = payload
+            .next_tranche
+            .as_ref()
+            .expect("retry tranche")
+            .interventions
+            .len();
+        assert_eq!(interventions, 0);
+        assert!(
+            quality_gate
+                .reason
+                .contains("deterioration cycle persisted after strategy pivot")
         );
     }
 
@@ -3384,12 +3807,14 @@ cmds = ["echo ok"]
                 planned_tranche_key: Some("full".into()),
                 cursor: None,
                 config_snapshot: serde_json::json!({}),
+                interventions: Vec::new(),
             }),
             quality_gate: Some(ContinuationQualityGate {
                 allow_auto_advance: true,
                 reason: "improving".into(),
                 trend: Some(DeteriorationTrend::Improving),
                 score: Some(10.0),
+                task_health_action: yarli_core::entities::continuation::TaskHealthAction::Continue,
             }),
         };
 
@@ -3398,6 +3823,7 @@ cmds = ["echo ok"]
             config::AutoAdvanceConfig {
                 policy: AutoAdvancePolicy::ImprovingOnly,
                 max_tranches: 0,
+                task_health: crate::config::RunTaskHealthConfig::default(),
             },
             0,
         );

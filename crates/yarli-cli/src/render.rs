@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -16,6 +19,13 @@ use crate::commands::format_cancel_provenance_summary;
 use crate::events::task_id_from_command_event;
 use crate::persistence::query_events;
 use crate::projection::*;
+
+fn write_blocker_lines(out: &mut String, blocker: &str) -> Result<(), std::fmt::Error> {
+    for line in blocker.lines() {
+        writeln!(&mut *out, "  {line}")?;
+    }
+    Ok(())
+}
 
 pub(crate) fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
     let run = match load_run_projection(store, run_id)? {
@@ -96,6 +106,14 @@ pub(crate) fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<
                 "  factor {} impact={:.2} ({})",
                 factor.name, factor.impact, factor.detail
             )?;
+        }
+    }
+
+    if !run.merge_finalization_blockers.is_empty() {
+        writeln!(&mut out)?;
+        writeln!(&mut out, "Merge-finalization blockers:")?;
+        for blocker in &run.merge_finalization_blockers {
+            write_blocker_lines(&mut out, blocker)?;
         }
     }
 
@@ -302,6 +320,9 @@ pub(crate) fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result
     }
     writeln!(&mut out, "Blocking tasks: {}", explain.blocking_tasks.len())?;
     writeln!(&mut out, "Failed gates: {}", explain.failed_gates.len())?;
+    if !run.merge_finalization_blockers.is_empty() {
+        writeln!(&mut out, "Merge-finalization blockers: {}", run.merge_finalization_blockers.len())?;
+    }
 
     if !explain.blocking_tasks.is_empty() {
         writeln!(&mut out)?;
@@ -312,6 +333,14 @@ pub(crate) fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result
                 "  {} ({:?}) - {}",
                 blocker.task_name, blocker.state, blocker.reason
             )?;
+        }
+    }
+
+    if !run.merge_finalization_blockers.is_empty() {
+        writeln!(&mut out)?;
+        writeln!(&mut out, "Merge-finalization blockers:")?;
+        for blocker in &run.merge_finalization_blockers {
+            write_blocker_lines(&mut out, blocker)?;
         }
     }
 
@@ -821,6 +850,17 @@ pub(crate) fn unique_run_id_prefixes(
 }
 
 pub(crate) fn render_task_output(store: &dyn EventStore, task_id: Uuid) -> Result<String> {
+    if let Some(artifact_lines) = read_task_output_artifact(task_id)? {
+        if !artifact_lines.is_empty() {
+            let mut out = String::new();
+            for line in &artifact_lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+            return Ok(out);
+        }
+    }
+
     let command_events = query_events(store, &EventQuery::by_entity_type(EntityType::Command))?;
 
     let mut output_lines: Vec<(Uuid, String)> = Vec::new();
@@ -859,6 +899,41 @@ pub(crate) fn render_task_output(store: &dyn EventStore, task_id: Uuid) -> Resul
     Ok(out)
 }
 
+fn task_output_artifact_path(task_id: Uuid) -> PathBuf {
+    PathBuf::from(".yarl/runs").join(format!("{task_id}.jsonl"))
+}
+
+fn read_task_output_artifact(task_id: Uuid) -> Result<Option<Vec<String>>> {
+    let path = task_output_artifact_path(task_id);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to read command output artifact {}: {err}",
+                path.display()
+            ));
+        }
+    };
+
+    let mut lines = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(data) = payload.get("data").and_then(serde_json::Value::as_str) {
+                if !data.trim().is_empty() {
+                    lines.push(data.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(Some(lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +941,8 @@ mod tests {
     use crate::events::*;
     use crate::test_helpers::make_event;
     use chrono::Utc;
+    use std::fs::{self, File};
+    use std::io::Write;
     use std::path::Path;
     use std::process::Command;
     use tokio::sync::mpsc;
@@ -1277,6 +1354,36 @@ mod tests {
             event_to_stream_event(&event, &[], false).is_none(),
             "empty command output should not emit stream event"
         );
+    }
+
+    #[test]
+    fn render_task_output_uses_task_artifact_when_available() {
+        let store = InMemoryEventStore::new();
+        let task_id = Uuid::now_v7();
+
+        // Use a dedicated tempdir as cwd to isolate from concurrent tests.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact_dir = tmp.path().join(".yarl/runs");
+        let artifact_path = artifact_dir.join(format!("{task_id}.jsonl"));
+
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let mut artifact = File::create(&artifact_path).unwrap();
+        writeln!(
+            &mut artifact,
+            "{{\"artifact_type\":\"command_output\",\"run_id\":\"{}\",\"task_id\":\"{}\"}}",
+            task_id,
+            task_id
+        )
+        .unwrap();
+        writeln!(&mut artifact, "{{\"command_id\":\"{}\",\"seq\":1,\"stream\":\"stdout\",\"data\":\"from artifact\"}}", task_id).unwrap();
+        drop(artifact);
+
+        let restore_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let output = render_task_output(&store, task_id).unwrap();
+        let _ = std::env::set_current_dir(&restore_dir);
+
+        assert!(output.contains("from artifact"));
     }
 
     #[test]
@@ -2059,6 +2166,65 @@ mod tests {
     }
 
     #[test]
+    fn run_status_surfaces_merge_finalization_blockers() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.parallel_merge_failed",
+                corr,
+                serde_json::json!({
+                    "reason": "parallel merge did not finalize due to conflict markers",
+                    "workspace_root": "/tmp/yarli-runs/demo",
+                    "task_key": "task-alpha",
+                    "patch_path": "/tmp/yarli-runs/demo/patches/task-alpha.patch",
+                    "conflicted_files": ["src/lib.rs", "src/main.rs"],
+                    "recovery_hints": [
+                        "Inspect conflicted files: git -C \"/tmp/yarli-runs/demo\" diff --name-only --diff-filter=U",
+                        "Review task patch: git -C \"/tmp/yarli-runs/demo\" apply --stat \"/tmp/yarli-runs/demo/patches/task-alpha.patch\"",
+                        "Retry patch manually: git -C \"/tmp/yarli-runs/demo\" apply --3way --whitespace=nowarn \"/tmp/yarli-runs/demo/patches/task-alpha.patch\""
+                    ],
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(
+            output.contains("Merge-finalization blockers:"),
+            "run status must show merge finalization blocker header: {output}"
+        );
+        assert!(
+            output.contains("parallel merge did not finalize due to conflict markers"),
+            "run status must include blocker detail: {output}"
+        );
+        assert!(output.contains("/tmp/yarli-runs/demo"), "run status must include blocker workspace path");
+        assert!(output.contains("task_key=task-alpha"), "run status must include task key");
+        assert!(output.contains("conflicted files:"), "run status must include conflicted files block");
+        assert!(output.contains("  - src/lib.rs"), "run status must list conflicted file");
+        assert!(
+            output.contains("recovery_hints:"),
+            "run status must include recovery hints block"
+        );
+        assert!(
+            output.contains("Retry patch manually: git -C \"/tmp/yarli-runs/demo\" apply --3way --whitespace=nowarn"),
+            "run status must include recovery hint"
+        );
+    }
+
+    #[test]
     fn task_explain_displays_last_error() {
         let store = InMemoryEventStore::new();
         let task_id = Uuid::now_v7();
@@ -2122,6 +2288,64 @@ mod tests {
         assert!(
             output.contains("last_error: command exited with code 42"),
             "run status must show last_error: {output}"
+        );
+    }
+
+    #[test]
+    fn render_run_explain_surfaces_merge_finalization_blockers() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.parallel_merge_failed",
+                corr,
+                serde_json::json!({
+                    "reason": "parallel merge did not finalize due to conflict markers",
+                    "workspace_root": "/tmp/yarli-runs/demo",
+                    "task_key": "task-alpha",
+                    "patch_path": "/tmp/yarli-runs/demo/patches/task-alpha.patch",
+                    "conflicted_files": ["src/lib.rs", "src/main.rs"],
+                    "recovery_hints": [
+                        "Inspect conflicted files: git -C \"/tmp/yarli-runs/demo\" diff --name-only --diff-filter=U",
+                        "Review task patch: git -C \"/tmp/yarli-runs/demo\" apply --stat \"/tmp/yarli-runs/demo/patches/task-alpha.patch\"",
+                        "Retry patch manually: git -C \"/tmp/yarli-runs/demo\" apply --3way --whitespace=nowarn \"/tmp/yarli-runs/demo/patches/task-alpha.patch\""
+                    ],
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_explain(&store, run_id).unwrap();
+        assert!(
+            output.contains("Merge-finalization blockers: 1"),
+            "run explain must show blocker count: {output}"
+        );
+        assert!(
+            output.contains("parallel merge did not finalize due to conflict markers"),
+            "run explain must include blocker detail: {output}"
+        );
+        assert!(output.contains("/tmp/yarli-runs/demo"), "run explain must include blocker workspace path");
+        assert!(output.contains("task_key=task-alpha"), "run explain must include task key");
+        assert!(
+            output.contains("conflicted files:"),
+            "run explain must include conflicted files block"
+        );
+        assert!(output.contains("  - src/main.rs"), "run explain must list conflicted file");
+        assert!(
+            output.contains("recovery_hints:"),
+            "run explain must include recovery hints block"
         );
     }
 

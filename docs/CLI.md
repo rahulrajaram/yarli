@@ -19,7 +19,13 @@ This is the exhaustive, command-by-command usage guide for `yarli`.
 - It uses prompt context/objective plus `yarli.toml` runtime config for execution behavior.
 - Default execution discovers incomplete tranches in `IMPLEMENTATION_PLAN.md`, dispatches each tranche as a task, then appends a verification task.
 - Optional grouped dispatch is enabled with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.
-- Optional tranche file-scope policy metadata is `allowed_paths=...` on plan lines; enable explicit scope instructions with `[run].enforce_plan_tranche_allowed_paths = true`.
+- Optional tranche metadata is supported on `IMPLEMENTATION_PLAN.md`:
+  - `tranche_group=<name>`
+  - `allowed_paths=...` (enable strict instructions with `[run].enforce_plan_tranche_allowed_paths = true`)
+  - `verify="cmd"` (post-tranche verification command hint)
+  - `done_when="criteria"` (explicit completion contract)
+  - `max_tokens=N` (per-tranche token-budget hint)
+- Structured-tranche metadata is included in generated tranche prompts.
 - If no run-spec configuration exists and no incomplete tranches are found, it dispatches the full prompt text as one task.
 
 Minimum `PROMPT.md` structure:
@@ -209,9 +215,22 @@ Purpose:
 - Configure workspace copy exclusions with `[execution].worktree_exclude_paths` (for example: `["target", "node_modules", ".venv", "venv", "__pycache__"]`).
 - On `RunCompleted`, YARLI scopes each task merge to paths that actually differ from the source workspace, then applies a patch with `git apply --3way`.
 - If any workspace merge conflicts, YARLI records `run.parallel_merge_failed`, returns a non-zero exit, preserves the run workspace root, and writes `PARALLEL_MERGE_RECOVERY.txt` with deterministic recovery commands.
+- Merge conflict resolution mode is controlled by `[run].merge_conflict_resolution`:
+  - `fail` (default): hard-fail unresolved merge conflicts.
+  - `manual`: preserve conflicted workspace state and require operator intervention.
+  - `auto-repair`: attempt deterministic conflict repair in the patch workspace before failing.
 - Auto-advance policy is configured with:
   - `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"` (default: `stable-ok`)
   - `[run] max_auto_advance_tranches = <N>` (`0` = unlimited)
+- `run.task_health` can block or redirect planned continuation by trend:
+  - `[run.task_health]`
+  - `[run.task_health.improving]`
+  - `[run.task_health.stable]`
+  - `[run.task_health.deteriorating]`
+  - valid values: `continue | checkpoint-now | force-pivot | stop-and-summarize`
+  - default is `continue` for all trends.
+- `run.soft_token_cap_ratio` triggers checkpoint-now when total run token usage reaches
+  `ratio * [budgets].max_run_total_tokens` (default: `0.9`; set to `0.0` to disable).
 - Grouped tranche dispatch is configured with:
   - `[run] enable_plan_tranche_grouping = true|false`
   - `[run] max_grouped_tasks_per_tranche = <N>` (`0` = unlimited)
@@ -229,6 +248,9 @@ Purpose:
   - `yarli run cancel [<run-id>|--all-active]`
 - Long-running execution emits heartbeat progress events (`run.observer.progress`) so stream output does not go silent for minutes.
 - `run.allow_stable_auto_advance` remains as a legacy compatibility toggle.
+- `run.task_health.<trend>` defaults to `continue`; set `deteriorating = "stop-and-summarize"` to force human review.
+- When `force-pivot` is triggered, continuation exit output now includes forced-pivot guidance if trend data is available (for example during deterioration), so operators know to narrow scope before continuing.
+- When `checkpoint-now` is triggered from task-health policy or soft token-cap rules, continuation output now includes checkpoint guidance and the quality-gate reason.
 - If continuation is not yet published when `yarli run continue` is invoked, configure wait behavior with:
   - `[run] continue_wait_timeout_seconds = <seconds>` (default `0` = fail fast).
 - If `[run.plan_guard]` (or prompt override plan guard) is set in the effective run spec, `yarli run` performs a preflight plan/prompt consistency check against `IMPLEMENTATION_PLAN.md` before dispatching tasks.
@@ -277,6 +299,51 @@ Notes:
 - Provenance inspection durability depends on backend:
   - `core.backend = "postgres"` persists provenance across process restarts.
   - `core.backend = "in-memory"` is ephemeral; `run status` / `run explain-exit` only reflect currently running process state unless `.yarli/continuation.json` is still present.
+
+### Runtime Guard Playbook (`yarli run`)
+
+Use these commands when guard-related telemetry indicates a stop or pivot condition:
+
+- `yarli run status <run-id>`: inspect latest budget and deterioration signals.
+- `yarli run explain-exit <run-id>`: inspect guard breach reason(s) and trend summary.
+- `yarli task explain <task-id>`: inspect specific task-level `budget_exceeded`, usage, and failure provenance.
+- `yarli run pause|resume|cancel <run-id>`: hold or stop a guarded run while you adjust scope.
+- `yarli run continue`: continue from persisted continuation payload only after guard intent has been reviewed.
+
+### Merge Conflict Policy and Recovery Playbook (`yarli run`)
+
+Use this flow when merge failure telemetry is visible in output or when `run.status` / `run.explain-exit` show unresolved merge state.
+
+1. Inspect the terminal event and status surface:
+   - `yarli run status <run-id>`
+   - `yarli run explain-exit <run-id>`
+   - `yarli audit tail` and filter for:
+     - `run.parallel_merge_failed`
+     - `merge.apply.started`
+     - `merge.apply.conflict`
+     - `merge.apply.finalized`
+     - `merge.repair.succeeded`
+     - `merge.repair.failed`
+
+2. Open the preserved recovery artifact at the workspace root printed by status output:
+   - `PARALLEL_MERGE_RECOVERY.txt` in `run.parallel_merge_failed.workspace_root`.
+
+3. Follow the printed recovery steps in order:
+   - inspect conflicted files from repository `status`
+   - review the generated patch
+   - retry apply manually using `git apply`
+   - resolve remaining markers and continue your normal run flow
+
+4. Pick an operator action based on policy:
+   - `fail`: manually resolve and rerun the tranche.
+   - `manual`: keep human intervention required and rerun after cleanup.
+   - `auto-repair`: let the automated resolver run; unresolved paths still require manual cleanup and rerun.
+
+5. Continue the run only after remediation:
+   - `yarli run continue` when continuation is available, or
+   - rerun the target run/tranche after verification scope adjustment.
+
+For recurring incidents, keep the `run.parallel_merge_failed` record (payload includes `task_key`, `patch_path`, `workspace_path`, `conflicted_files`, `repo_status`, and `recovery_hints`) as incident evidence.
 
 Legacy prompt-run-spec tranche example (`PROMPT.md` `yarli-run` block):
 

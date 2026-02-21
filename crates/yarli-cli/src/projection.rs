@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
+use serde_json::Value;
 
 use uuid::Uuid;
 
@@ -63,6 +64,7 @@ pub(crate) struct RunProjection {
     pub(crate) objective: Option<String>,
     pub(crate) tasks: Vec<TaskProjection>,
     pub(crate) failed_gates: Vec<(GateType, String)>,
+    pub(crate) merge_finalization_blockers: Vec<String>,
     pub(crate) deterioration: Option<DeteriorationReport>,
     pub(crate) memory_hints: Option<MemoryHintsReport>,
     pub(crate) tranche_plan: Vec<PlannedTranche>,
@@ -151,16 +153,17 @@ pub(crate) fn collect_run_token_totals(
 }
 
 pub(crate) fn run_state_from_event(event: &Event) -> Option<RunState> {
-    event
-        .payload
-        .get("to")
-        .and_then(|v| v.as_str())
-        .and_then(crate::parse_run_state)
+        event
+            .payload
+            .get("to")
+            .and_then(|v| v.as_str())
+            .and_then(crate::parse_run_state)
         .or(match event.event_type.as_str() {
             "run.activated" => Some(RunState::RunActive),
             "run.blocked" => Some(RunState::RunBlocked),
             "run.verifying" => Some(RunState::RunVerifying),
             "run.completed" => Some(RunState::RunCompleted),
+            "run.parallel_merge_failed" => Some(RunState::RunFailed),
             "run.failed" | "run.gate_failed" => Some(RunState::RunFailed),
             "run.cancelled" => Some(RunState::RunCancelled),
             _ => None,
@@ -191,6 +194,19 @@ pub(crate) fn event_reason(event: &Event) -> Option<String> {
         .get("reason")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn event_string_list(payload: Option<&Value>, key: &str) -> Vec<String> {
+    let Some(values) = payload.and_then(|value| value.get(key)).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut entries = values
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries.dedup();
+    entries
 }
 
 pub(crate) fn parse_cancellation_source(raw: &str) -> Option<CancellationSource> {
@@ -626,6 +642,7 @@ pub(crate) fn load_run_projection(
     let mut updated_at = run_events[0].occurred_at;
     let mut last_event_type = run_events[0].event_type.clone();
     let mut failed_gates = Vec::new();
+    let mut merge_finalization_blockers = Vec::new();
     let mut deterioration = None;
     let mut memory_hints = None;
     let mut tranche_plan = Vec::new();
@@ -671,6 +688,62 @@ pub(crate) fn load_run_projection(
             "run.activated" | "run.verifying" | "run.completed" | "run.cancelled"
         ) {
             failed_gates.clear();
+        } else if event.event_type == "run.parallel_merge_failed" {
+            let reason = event
+                .payload
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("parallel merge finalization failed");
+            let mut detail_lines = vec![reason.to_string()];
+            if let Some(workspace_root) = event
+                .payload
+                .get("workspace_root")
+                .and_then(|value| value.as_str())
+            {
+                detail_lines.push(format!("workspace_root={workspace_root}"));
+            }
+            if let Some(source_workdir) = event
+                .payload
+                .get("source_workdir")
+                .and_then(|value| value.as_str())
+            {
+                detail_lines.push(format!("source_workdir={source_workdir}"));
+            }
+            if let Some(task_key) = event.payload.get("task_key").and_then(|value| value.as_str()) {
+                detail_lines.push(format!("task_key={task_key}"));
+            }
+            if let Some(patch_path) = event.payload.get("patch_path").and_then(|value| value.as_str()) {
+                detail_lines.push(format!("patch_path={patch_path}"));
+            }
+            if let Some(workspace_path) = event.payload.get("workspace_path").and_then(|value| value.as_str()) {
+                detail_lines.push(format!("workspace_path={workspace_path}"));
+            }
+            if let Some(repo_status) = event.payload.get("repo_status").and_then(|value| value.as_str()) {
+                detail_lines.push("repo_status:".to_string());
+                for line in repo_status.lines() {
+                    detail_lines.push(format!("- {line}"));
+                }
+            }
+            let conflicted_files = event_string_list(Some(&event.payload), "conflicted_files");
+            if !conflicted_files.is_empty() {
+                detail_lines.push("conflicted files:".to_string());
+                for file in conflicted_files {
+                    detail_lines.push(format!("- {file}"));
+                }
+            }
+            let recovery_hints = event_string_list(Some(&event.payload), "recovery_hints");
+            if !recovery_hints.is_empty() {
+                detail_lines.push("recovery_hints:".to_string());
+                for hint in recovery_hints {
+                    detail_lines.push(format!("- {hint}"));
+                }
+            }
+            let message = detail_lines.join("\n");
+            if !merge_finalization_blockers.contains(&message) {
+                merge_finalization_blockers.push(message);
+            }
+        } else if event.event_type == "run.parallel_merge_succeeded" {
+            merge_finalization_blockers.clear();
         }
 
         if let Some(report) = deterioration_from_event(event) {
@@ -733,6 +806,7 @@ pub(crate) fn load_run_projection(
         objective,
         tasks,
         failed_gates,
+        merge_finalization_blockers,
         deterioration,
         memory_hints,
         tranche_plan,

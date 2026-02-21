@@ -12,6 +12,8 @@ use tracing::{debug, info, warn};
 
 use super::events::StreamEvent;
 use yarli_core::domain::CancellationProvenance;
+use yarli_core::entities::continuation::TaskHealthAction;
+use yarli_core::explain::DeteriorationTrend;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 
@@ -172,6 +174,27 @@ impl HeadlessRenderer {
                         format_cancel_provenance_summary(payload.cancellation_provenance.as_ref());
                     let _ = writeln!(io::stderr(), "  Cancel provenance: {summary}");
                 }
+
+                if let Some(quality_gate) = payload.quality_gate.as_ref() {
+                    if matches!(quality_gate.task_health_action, TaskHealthAction::ForcePivot) {
+                        if let Some(guidance) =
+                            force_pivot_guidance(quality_gate.trend.as_ref())
+                        {
+                            let _ = writeln!(io::stderr(), "{guidance}");
+                        }
+                    }
+                    if matches!(quality_gate.task_health_action, TaskHealthAction::StopAndSummarize) {
+                        let guidance =
+                            format!("  Stop-and-summarize guidance: {}", quality_gate.reason);
+                        let _ = writeln!(io::stderr(), "{guidance}");
+                    }
+                    if matches!(quality_gate.task_health_action, TaskHealthAction::CheckpointNow) {
+                        let guidance =
+                            format!("  Checkpoint-now guidance: {}", quality_gate.reason);
+                        let _ = writeln!(io::stderr(), "{guidance}");
+                    }
+                }
+
                 // Print machine-readable JSON to stdout (not stderr).
                 if let Ok(json) = serde_json::to_string(&payload) {
                     let _ = writeln!(io::stdout(), "{json}");
@@ -238,6 +261,17 @@ fn format_cancel_provenance_summary(provenance: Option<&CancellationProvenance>)
         .map(|stage| stage.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     format!("signal={signal} sender={sender} receiver={receiver} actor={actor} stage={stage}")
+}
+
+fn force_pivot_guidance(trend: Option<&DeteriorationTrend>) -> Option<String> {
+    if matches!(trend, Some(DeteriorationTrend::Deteriorating)) {
+        Some(
+            "  Force-pivot guidance: sequence quality is deteriorating; narrow scope and shift task focus before continuing."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +488,7 @@ mod tests {
                     planned_tranche_key: Some("t2".into()),
                     cursor: None,
                     config_snapshot: serde_json::json!({}),
+                    interventions: Vec::new(),
                 }),
                 quality_gate: None,
             },
