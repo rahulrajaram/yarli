@@ -1,5 +1,5 @@
-use std::env;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,15 +8,15 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgPool, Row};
 use sqlx::ConnectOptions;
+use sqlx::{PgPool, Row};
 use tempfile::TempDir;
-use uuid::Uuid;
-use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{sleep, Duration, Instant};
+use uuid::Uuid;
+use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
 
 const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
 const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";
@@ -27,9 +27,9 @@ const LOCAL_POSTGRES_BOOTSTRAP_HINT: &str =
 #[tokio::test]
 async fn merge_request_and_status_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "merge_request_and_status_roundtrip_against_postgres",
-    ) else {
+    let Some(admin_database_url) =
+        test_database_url_for_test("merge_request_and_status_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -87,9 +87,9 @@ async fn merge_request_and_status_roundtrip_against_postgres(
 #[tokio::test]
 async fn run_start_and_status_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "run_start_and_status_roundtrip_against_postgres",
-    ) else {
+    let Some(admin_database_url) =
+        test_database_url_for_test("run_start_and_status_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -140,10 +140,11 @@ async fn run_start_and_status_roundtrip_against_postgres() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-async fn run_projection_state_consistency_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "run_projection_state_consistency_roundtrip_against_postgres",
-    ) else {
+async fn run_projection_state_consistency_roundtrip_against_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) =
+        test_database_url_for_test("run_projection_state_consistency_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -178,7 +179,8 @@ async fn run_projection_state_consistency_roundtrip_against_postgres() -> Result
         String::from_utf8_lossy(&completed_output.stderr)
     );
     let completed_stdout = String::from_utf8(completed_output.stdout)?;
-    let completed_run_id = parse_run_id(&completed_stdout).ok_or("missing run id in completed run output")?;
+    let completed_run_id =
+        parse_run_id(&completed_stdout).ok_or("missing run id in completed run output")?;
 
     verify_projection_state_consistency(&pool, completed_run_id).await?;
 
@@ -201,8 +203,8 @@ async fn run_projection_state_consistency_roundtrip_against_postgres() -> Result
         );
     }
     let failed_stdout = String::from_utf8(failed_output.stdout)?;
-    let failed_run_id = parse_run_id(&failed_stdout)
-        .ok_or("missing run id in failed run output")?;
+    let failed_run_id =
+        parse_run_id(&failed_stdout).ok_or("missing run id in failed run output")?;
 
     verify_projection_state_consistency(&pool, failed_run_id).await?;
 
@@ -211,10 +213,11 @@ async fn run_projection_state_consistency_roundtrip_against_postgres() -> Result
 }
 
 #[tokio::test]
-async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "run_cancel_hardening_roundtrip_against_postgres",
-    ) else {
+async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(admin_database_url) =
+        test_database_url_for_test("run_cancel_hardening_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -246,7 +249,8 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
         String::from_utf8_lossy(&start_output.stderr)
     );
     let start_stdout = String::from_utf8(start_output.stdout)?;
-    let run_id = parse_run_id(&start_stdout).ok_or("missing run id in cancellation hardening output")?;
+    let run_id =
+        parse_run_id(&start_stdout).ok_or("missing run id in cancellation hardening output")?;
 
     wait_for_run_state_in(
         &pool,
@@ -332,9 +336,9 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
 #[tokio::test]
 async fn run_cancel_load_hardening_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "run_cancel_load_hardening_roundtrip_against_postgres",
-    ) else {
+    let Some(admin_database_url) =
+        test_database_url_for_test("run_cancel_load_hardening_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -345,7 +349,11 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
     write_test_config(temp_dir.path(), &database.database_url)?;
     let binary = yarli_binary_path()?;
 
-    let pool = connect_postgres(&database.database_url, "run_cancel_load_hardening_roundtrip").await?;
+    let pool = connect_postgres(
+        &database.database_url,
+        "run_cancel_load_hardening_roundtrip",
+    )
+    .await?;
 
     let start_output = Command::new(&binary)
         .current_dir(temp_dir.path())
@@ -374,7 +382,8 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
         String::from_utf8_lossy(&start_output.stderr)
     );
     let start_stdout = String::from_utf8(start_output.stdout)?;
-    let run_id = parse_run_id(&start_stdout).ok_or("missing run id in cancellation load hardening output")?;
+    let run_id = parse_run_id(&start_stdout)
+        .ok_or("missing run id in cancellation load hardening output")?;
 
     wait_for_run_state_in(
         &pool,
@@ -413,7 +422,10 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
     assert_eq!(exit_reason, Some("cancelled_by_operator".to_string()));
 
     let task_states_after = fetch_task_states(&pool, run_id).await?;
-    assert!(!task_states_after.is_empty(), "expected tasks for cancelled run");
+    assert!(
+        !task_states_after.is_empty(),
+        "expected tasks for cancelled run"
+    );
     assert!(
         task_states_after
             .iter()
@@ -454,10 +466,11 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
 }
 
 #[tokio::test]
-async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "run_timeout_hardening_roundtrip_against_postgres",
-    ) else {
+async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(admin_database_url) =
+        test_database_url_for_test("run_timeout_hardening_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -511,7 +524,8 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
     assert!(String::from_utf8(status_output.stdout)?.contains("State: RunFailed"));
 
     assert!(
-        count_events_by_entity_type_for_run(&pool, run_id, "command", "command.timed_out").await? >= 1,
+        count_events_by_entity_type_for_run(&pool, run_id, "command", "command.timed_out").await?
+            >= 1,
         "expected at least one command.timed_out event"
     );
     assert!(
@@ -540,9 +554,9 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
 #[tokio::test]
 async fn overwatch_runner_hardening_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "overwatch_runner_hardening_roundtrip_against_postgres",
-    ) else {
+    let Some(admin_database_url) =
+        test_database_url_for_test("overwatch_runner_hardening_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -555,7 +569,11 @@ async fn overwatch_runner_hardening_roundtrip_against_postgres(
     write_overwatch_test_config(temp_dir.path(), &database.database_url, &overwatch_url)?;
     let binary = yarli_binary_path()?;
 
-    let pool = connect_postgres(&database.database_url, "overwatch_runner_hardening_roundtrip").await?;
+    let pool = connect_postgres(
+        &database.database_url,
+        "overwatch_runner_hardening_roundtrip",
+    )
+    .await?;
 
     let run_output = Command::new(&binary)
         .current_dir(temp_dir.path())
@@ -609,8 +627,7 @@ async fn overwatch_runner_hardening_roundtrip_against_postgres(
         String::from_utf8_lossy(&status_output.stderr)
     );
     assert!(
-        String::from_utf8(status_output.stdout)?
-            .contains("State: RunCompleted"),
+        String::from_utf8(status_output.stdout)?.contains("State: RunCompleted"),
         "overwatch run should complete"
     );
     drop(state);
@@ -621,10 +638,11 @@ async fn overwatch_runner_hardening_roundtrip_against_postgres(
 }
 
 #[tokio::test]
-async fn overwatch_runner_failure_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(admin_database_url) = test_database_url_for_test(
-        "overwatch_runner_failure_roundtrip_against_postgres",
-    ) else {
+async fn overwatch_runner_failure_roundtrip_against_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) =
+        test_database_url_for_test("overwatch_runner_failure_roundtrip_against_postgres")
+    else {
         return Ok(());
     };
 
@@ -637,11 +655,8 @@ async fn overwatch_runner_failure_roundtrip_against_postgres() -> Result<(), Box
     write_overwatch_test_config(temp_dir.path(), &database.database_url, &overwatch_url)?;
     let binary = yarli_binary_path()?;
 
-    let pool = connect_postgres(
-        &database.database_url,
-        "overwatch_runner_failure_roundtrip",
-    )
-    .await?;
+    let pool =
+        connect_postgres(&database.database_url, "overwatch_runner_failure_roundtrip").await?;
 
     let run_output = Command::new(&binary)
         .current_dir(temp_dir.path())
@@ -662,7 +677,8 @@ async fn overwatch_runner_failure_roundtrip_against_postgres() -> Result<(), Box
         String::from_utf8_lossy(&run_output.stderr)
     );
     let run_stdout = String::from_utf8(run_output.stdout)?;
-    let run_id = parse_run_id(&run_stdout).ok_or("missing run id in overwatch failure hardening output")?;
+    let run_id =
+        parse_run_id(&run_stdout).ok_or("missing run id in overwatch failure hardening output")?;
 
     wait_for_run_state(&pool, run_id, "RUN_FAILED", Duration::from_secs(20)).await?;
 
@@ -711,8 +727,14 @@ async fn overwatch_runner_failure_roundtrip_against_postgres() -> Result<(), Box
 
     let state = mock_state.lock().await;
     assert!(state.run_requests >= 1, "expected at least one /run call");
-    assert!(state.status_requests >= 1, "expected status polling for failed run");
-    assert_eq!(state.cancel_requests, 0, "did not expect /cancel for failed run");
+    assert!(
+        state.status_requests >= 1,
+        "expected status polling for failed run"
+    );
+    assert_eq!(
+        state.cancel_requests, 0,
+        "did not expect /cancel for failed run"
+    );
 
     mock_task.abort();
     database.drop().await?;
@@ -773,7 +795,9 @@ async fn spawn_mock_overwatch_server(
 
             let handler_state = serve_state.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_overwatch_connection(stream, handler_state, terminal_state).await {
+                if let Err(err) =
+                    handle_overwatch_connection(stream, handler_state, terminal_state).await
+                {
                     eprintln!("mock overwatch server connection error: {err}");
                 }
             });
@@ -818,10 +842,7 @@ async fn handle_overwatch_connection(
     let headers_end = headers_end.ok_or_else(|| {
         "mock overwatch request did not include complete HTTP headers".to_string()
     })?;
-    let body = buffer
-        .get(headers_end + 4..)
-        .unwrap_or(&[])
-        .to_vec();
+    let body = buffer.get(headers_end + 4..).unwrap_or(&[]).to_vec();
 
     let header_text = String::from_utf8_lossy(&buffer[..headers_end]);
     let request_line = header_text.lines().next().unwrap_or("");
@@ -829,7 +850,7 @@ async fn handle_overwatch_connection(
     let method = request_parts.next().unwrap_or("").to_uppercase();
     let path = request_parts.next().unwrap_or("/").to_string();
 
-            match (method.as_str(), path.as_str()) {
+    match (method.as_str(), path.as_str()) {
         ("POST", "/run") => {
             let mut state_guard = state.lock().await;
             state_guard.run_requests = state_guard.run_requests.saturating_add(1);
@@ -840,7 +861,10 @@ async fn handle_overwatch_connection(
                 .and_then(|value| value.as_str())
                 .map(ToString::to_string)
                 .unwrap_or_else(|| Uuid::now_v7().to_string());
-            state_guard.status_calls_by_task.entry(task_id.clone()).or_insert(0);
+            state_guard
+                .status_calls_by_task
+                .entry(task_id.clone())
+                .or_insert(0);
             send_json_response(
                 &mut stream,
                 200,
@@ -998,8 +1022,7 @@ async fn wait_for_run_state_in(
         let state: Option<String> = sqlx::query_scalar("SELECT state FROM runs WHERE run_id = $1")
             .bind(run_id)
             .fetch_optional(pool)
-            .await?
-            .map(|value| value);
+            .await?;
 
         if let Some(state) = state {
             if expected_states.contains(&state.as_str()) {
@@ -1008,10 +1031,9 @@ async fn wait_for_run_state_in(
         }
 
         if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for run {run_id} state in {expected_states:?}"
-            )
-            .into());
+            return Err(
+                format!("timed out waiting for run {run_id} state in {expected_states:?}").into(),
+            );
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -1194,16 +1216,14 @@ async fn verify_projection_state_consistency(
     pool: &PgPool,
     run_id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let materialized_run_state: String = sqlx::query_scalar(
-        "SELECT state FROM runs WHERE run_id = $1",
-    )
-    .bind(run_id)
-    .fetch_one(pool)
-    .await?;
+    let materialized_run_state: String =
+        sqlx::query_scalar("SELECT state FROM runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await?;
     let projected_run_state = expected_run_state_from_events(pool, run_id).await?;
     assert_eq!(
-        materialized_run_state,
-        projected_run_state,
+        materialized_run_state, projected_run_state,
         "run state should match event projection for run {run_id}",
     );
 
@@ -1211,15 +1231,17 @@ async fn verify_projection_state_consistency(
         .bind(run_id)
         .fetch_all(pool)
         .await?;
-    assert!(!task_rows.is_empty(), "expected at least one task for run {run_id}");
+    assert!(
+        !task_rows.is_empty(),
+        "expected at least one task for run {run_id}"
+    );
 
     for row in task_rows {
         let task_id: Uuid = row.try_get("task_id")?;
         let materialized_task_state: String = row.try_get("state")?;
         let projected_task_state = expected_task_state_from_events(pool, task_id).await?;
         assert_eq!(
-            materialized_task_state,
-            projected_task_state,
+            materialized_task_state, projected_task_state,
             "task state should match event projection for task {task_id}",
         );
     }
@@ -1367,7 +1389,8 @@ struct TestDatabase {
 
 impl TestDatabase {
     async fn create(admin_database_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let admin_pool = connect_postgres(admin_database_url, "TestDatabase::create(admin)").await?;
+        let admin_pool =
+            connect_postgres(admin_database_url, "TestDatabase::create(admin)").await?;
 
         let database_name = format!("yarli_test_{}", Uuid::now_v7().simple());
         sqlx::query(&format!(r#"CREATE DATABASE "{database_name}""#))
@@ -1388,7 +1411,8 @@ impl TestDatabase {
     }
 
     async fn drop(self) -> Result<(), Box<dyn std::error::Error>> {
-        let admin_pool = connect_postgres(&self.admin_database_url, "TestDatabase::drop(admin)").await?;
+        let admin_pool =
+            connect_postgres(&self.admin_database_url, "TestDatabase::drop(admin)").await?;
 
         sqlx::query(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
@@ -1471,13 +1495,14 @@ async fn connect_postgres_with_timeout(
     let redacted_url = redact_database_url(database_url);
     eprintln!("[{context}] attempting Postgres connect to {redacted_url} with timeout {timeout:?}");
 
-    let connect = PgPoolOptions::new().max_connections(1).connect(database_url);
+    let connect = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url);
     match tokio::time::timeout(timeout, connect).await {
         Ok(Ok(pool)) => Ok(pool),
-        Ok(Err(err)) => Err(format!(
-            "[{context}] Postgres connect failed for {redacted_url}: {err}"
-        )
-        .into()),
+        Ok(Err(err)) => {
+            Err(format!("[{context}] Postgres connect failed for {redacted_url}: {err}").into())
+        }
         Err(err) => Err(format!(
             "[{context}] Postgres connect timed out after {timeout:?}: {redacted_url}: {err}"
         )

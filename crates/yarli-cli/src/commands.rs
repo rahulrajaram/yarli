@@ -4,28 +4,27 @@ use yarli_exec::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
     OverwatchRunnerConfig,
 };
+use yarli_observability::{AuditCategory, YarliMetrics};
 use yarli_queue::scheduler::LiveOutputEvent;
 use yarli_queue::{QueueEntry, QueueStatus};
-use yarli_observability::{AuditCategory, Registry, YarliMetrics};
 
 use super::*;
+use crate::cli::AuditOutputFormat;
 use crate::events::*;
 use crate::persistence::RUN_CONTINUATION_EVENT_TYPE;
 use crate::render::*;
+use crate::workspace::{
+    cleanup_parallel_workspace, merge_parallel_workspace_results_with_resolution_with_events,
+    merge_worktree_workspace_results, prepare_parallel_workspace_layout, MergeApplyTelemetryEvent,
+    MergeResolutionConfig, ParallelWorkspaceMergeApplyError, ParallelWorkspaceMergeFailureKind,
+    ParallelWorkspaceMergeReport, ParallelWorkspaceMode,
+};
+use yarli_core::domain::ExitReason;
 use yarli_core::entities::continuation::{
     ContinuationIntervention, ContinuationInterventionKind, TaskHealthAction,
 };
-use yarli_core::domain::ExitReason;
-use crate::cli::AuditOutputFormat;
-use crate::workspace::{
-    merge_parallel_workspace_results_with_resolution_with_events, prepare_parallel_workspace_layout,
-    MergeApplyTelemetryEvent, MergeResolutionConfig, ParallelWorkspaceMergeApplyError,
-    ParallelWorkspaceMergeFailureKind, ParallelWorkspaceMergeReport,
-};
 
-fn collect_telemetry_string_values(
-    metadata: Option<&serde_json::Value>,
-) -> Vec<String> {
+fn collect_telemetry_string_values(metadata: Option<&serde_json::Value>) -> Vec<String> {
     let Some(values) = metadata.and_then(|value| value.as_array()) else {
         return Vec::new();
     };
@@ -66,7 +65,9 @@ fn collect_run_resource_limits(
     let Some(snapshot) = latest_snapshot else {
         return Ok(budget);
     };
-    let budgets = snapshot.get("config").and_then(|value| value.get("budgets"));
+    let budgets = snapshot
+        .get("config")
+        .and_then(|value| value.get("budgets"));
     if budgets.is_none() {
         return Ok(budget);
     }
@@ -77,7 +78,9 @@ fn collect_run_resource_limits(
     budget.max_run_cpu_system_ticks = budgets
         .get("max_run_cpu_system_ticks")
         .and_then(serde_json::Value::as_u64);
-    budget.max_run_io_read_bytes = budgets.get("max_run_io_read_bytes").and_then(serde_json::Value::as_u64);
+    budget.max_run_io_read_bytes = budgets
+        .get("max_run_io_read_bytes")
+        .and_then(serde_json::Value::as_u64);
     budget.max_run_io_write_bytes = budgets
         .get("max_run_io_write_bytes")
         .and_then(serde_json::Value::as_u64);
@@ -210,7 +213,10 @@ fn render_queue_depth(entries: &[QueueEntry]) -> String {
 
 fn render_active_leases(entries: &[QueueEntry], now: chrono::DateTime<chrono::Utc>) -> String {
     let mut leases = Vec::new();
-    for entry in entries.iter().filter(|entry| entry.status == QueueStatus::Leased) {
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.status == QueueStatus::Leased)
+    {
         leases.push(entry);
     }
     leases.sort_by(|left, right| left.lease_expires_at.cmp(&right.lease_expires_at));
@@ -253,16 +259,17 @@ fn render_active_leases(entries: &[QueueEntry], now: chrono::DateTime<chrono::Ut
     output
 }
 
-fn render_resource_usage_summary(run_id: Uuid, totals: &RunResourceTotals, budgets: &RunResourceBudgetLimits) -> String {
+fn render_resource_usage_summary(
+    run_id: Uuid,
+    totals: &RunResourceTotals,
+    budgets: &RunResourceBudgetLimits,
+) -> String {
     let mut output = String::new();
     output.push_str(&format!("Run resource usage for {run_id}\n"));
     output.push_str("--------------------------\n");
     output.push_str(&format!(
         "CPU user:       {}\n",
-        format_budget_value(
-            totals.total_cpu_user_ticks,
-            budgets.max_run_cpu_user_ticks,
-        )
+        format_budget_value(totals.total_cpu_user_ticks, budgets.max_run_cpu_user_ticks,)
     ));
     output.push_str(&format!(
         "CPU system:     {}\n",
@@ -323,18 +330,23 @@ fn merge_apply_conflict_metadata(
                     .get("workspace_path")
                     .and_then(|value| value.as_str())
                     .map(ToString::to_string);
-                let conflicted_files = collect_telemetry_string_values(
-                    event.metadata.get("conflicted_files"),
-                );
-                let recovery_hints = collect_telemetry_string_values(
-                    event.metadata.get("recovery_hints"),
-                );
+                let conflicted_files =
+                    collect_telemetry_string_values(event.metadata.get("conflicted_files"));
+                let recovery_hints =
+                    collect_telemetry_string_values(event.metadata.get("recovery_hints"));
                 let repo_status = event
                     .metadata
                     .get("repo_status")
                     .and_then(|value| value.as_str())
                     .map(ToString::to_string);
-                (task_key, patch_path, workspace_path, conflicted_files, recovery_hints, repo_status)
+                (
+                    task_key,
+                    patch_path,
+                    workspace_path,
+                    conflicted_files,
+                    recovery_hints,
+                    repo_status,
+                )
             },
         )
 }
@@ -384,7 +396,10 @@ fn sw4rm_verification_runner(loaded_config: &LoadedConfig) -> Result<SelectedCom
             let overwatch = &loaded_config.config().execution.overwatch;
             let runner = OverwatchCommandRunner::new(OverwatchRunnerConfig {
                 service_url: overwatch.service_url.clone(),
-                profile: overwatch.profile.clone().filter(|value| !value.trim().is_empty()),
+                profile: overwatch
+                    .profile
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
                 soft_timeout_seconds: overwatch.soft_timeout_seconds,
                 silent_timeout_seconds: overwatch.silent_timeout_seconds,
                 max_log_bytes: overwatch.max_log_bytes,
@@ -583,8 +598,9 @@ pub(crate) async fn cmd_run_default(
 
     // Preflight: verify the CLI backend is functional before dispatching real work.
     let cli_invocation = config::resolve_cli_invocation_config(loaded_config)?;
-    config::preflight_cli_backend(&cli_invocation)
-        .context("CLI backend preflight check failed — fix the [cli] section in yarli.toml before running")?;
+    config::preflight_cli_backend(&cli_invocation).context(
+        "CLI backend preflight check failed — fix the [cli] section in yarli.toml before running",
+    )?;
     info!("CLI backend preflight passed");
 
     let objective = run_spec
@@ -752,8 +768,7 @@ pub(crate) async fn cmd_run_start_with_backend<Q, S>(
     queue: Arc<Q>,
     allow_recursive_run_override: bool,
     metrics: Arc<YarliMetrics>,
-    #[cfg(feature = "chaos")]
-    chaos: Option<Arc<yarli_chaos::ChaosController>>,
+    #[cfg(feature = "chaos")] chaos: Option<Arc<yarli_chaos::ChaosController>>,
 ) -> Result<RunExecutionOutcome>
 where
     Q: TaskQueue + 'static,
@@ -851,8 +866,7 @@ where
         max_run_io_write_bytes: loaded_config.config().budgets.max_run_io_write_bytes,
     };
 
-    let mut scheduler =
-        Scheduler::new(queue, store.clone(), runner, config).with_metrics(metrics);
+    let mut scheduler = Scheduler::new(queue, store.clone(), runner, config).with_metrics(metrics);
 
     #[cfg(feature = "chaos")]
     if let Some(c) = chaos {
@@ -1005,7 +1019,13 @@ where
         loaded_config.config().observability.audit_file.clone(),
     ));
     let renderer_handle = tokio::task::spawn_blocking(move || {
-        run_renderer(rx, render_mode, renderer_shutdown, verbose_output, audit_file)
+        run_renderer(
+            rx,
+            render_mode,
+            renderer_shutdown,
+            verbose_output,
+            audit_file,
+        )
     });
 
     // Drive scheduler loop, emitting events to renderer channel.
@@ -1058,15 +1078,27 @@ where
                 .zip(layout.task_workspace_dirs.iter())
                 .map(|(task, workspace_dir)| (task.task_key.clone(), workspace_dir.clone()))
                 .collect::<Vec<_>>();
-            match merge_parallel_workspace_results_with_resolution_with_events(
-                &source_workdir,
-                run_id,
-                &layout.run_workspace_root,
-                &task_workspaces,
-                &resolution_config,
-                layout.source_head_at_creation.as_deref(),
-                &mut merge_apply_telemetry,
-            ) {
+            let merge_result = if layout.mode == ParallelWorkspaceMode::GitWorktree {
+                merge_worktree_workspace_results(
+                    &source_workdir,
+                    run_id,
+                    &task_workspaces,
+                    &layout.worktree_branches,
+                    &resolution_config,
+                    &mut merge_apply_telemetry,
+                )
+            } else {
+                merge_parallel_workspace_results_with_resolution_with_events(
+                    &source_workdir,
+                    run_id,
+                    &layout.run_workspace_root,
+                    &task_workspaces,
+                    &resolution_config,
+                    layout.source_head_at_creation.as_deref(),
+                    &mut merge_apply_telemetry,
+                )
+            };
+            match merge_result {
                 Ok(report) => {
                     let merged_count = report.merged_task_keys.len();
                     let skipped_count = report.skipped_task_keys.len();
@@ -1116,6 +1148,28 @@ where
                         warn!(error = %err, "failed to append merge apply telemetry events");
                     }
                     parallel_merge_report = Some(report);
+
+                    // Auto-commit YARLI state files after successful merge.
+                    let auto_commit_interval = loaded_config.config().run.auto_commit_interval;
+                    if auto_commit_interval > 0 {
+                        let tranche_key = plan
+                            .tasks
+                            .first()
+                            .and_then(|t| t.tranche_key.as_deref())
+                            .unwrap_or("unknown");
+                        let auto_commit_message =
+                            loaded_config.config().run.auto_commit_message.as_deref();
+                        if let Err(err) = crate::workspace::auto_commit_state_files(
+                            &source_workdir,
+                            tranche_key,
+                            &run_id.to_string(),
+                            1,
+                            1,
+                            auto_commit_message,
+                        ) {
+                            warn!(error = %err, "auto-commit of state files failed");
+                        }
+                    }
                 }
                 Err(err) => {
                     let merge_failure_kind = err
@@ -1201,9 +1255,9 @@ where
                         if task.state == TaskState::TaskComplete {
                             return None;
                         }
-                        task_workspace_by_id
-                            .get(&task.task_id)
-                            .map(|workspace| (task.task_key.as_str(), task.state, workspace.as_str()))
+                        task_workspace_by_id.get(&task.task_id).map(|workspace| {
+                            (task.task_key.as_str(), task.state, workspace.as_str())
+                        })
                     })
                     .map(|(task_key, state, workspace)| {
                         (
@@ -1227,12 +1281,8 @@ where
                     workspace_root = %layout.run_workspace_root.display(),
                     "preserving parallel run workspace root after skipped task workspace merge for inspection"
                 );
-            } else if let Err(err) = fs::remove_dir_all(&layout.run_workspace_root) {
-                warn!(
-                    error = %err,
-                    workspace_root = %layout.run_workspace_root.display(),
-                    "failed to clean parallel run workspace root"
-                );
+            } else {
+                cleanup_parallel_workspace(layout);
             }
         } else {
             warn!(
@@ -1247,15 +1297,11 @@ where
         if continuation_payload.exit_state == RunState::RunCompleted {
             continuation_payload.exit_state = RunState::RunFailed;
             continuation_payload.exit_reason = Some(match parallel_merge_error_reason {
-                Some(ParallelWorkspaceMergeFailureKind::MergeConflict) => {
-                    ExitReason::MergeConflict
-                }
+                Some(ParallelWorkspaceMergeFailureKind::MergeConflict) => ExitReason::MergeConflict,
                 _ => ExitReason::FailedRuntimeError,
             });
             continuation_payload.next_tranche = None;
-            eprintln!(
-                "Run {run_id} completed core tasks, but parallel merge did not finalize;"
-            );
+            eprintln!("Run {run_id} completed core tasks, but parallel merge did not finalize;");
             eprintln!("Continuation state set to RunFailed to block auto-completion.");
         }
     }
@@ -1431,11 +1477,10 @@ pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
     eprintln!("WARNING: using mock router sender — real sw4rm transport not yet implemented");
     let router = std::sync::Arc::new(yarli_sw4rm::mock::MockRouterSender::new());
     let command_runner = sw4rm_verification_runner(loaded_config)?;
-    let orchestrator = std::sync::Arc::new(OrchestratorLoop::new(
-        router,
-        sw4rm_config.clone(),
-        verification,
-    ).with_verification_runner(command_runner));
+    let orchestrator = std::sync::Arc::new(
+        OrchestratorLoop::new(router, sw4rm_config.clone(), verification)
+            .with_verification_runner(command_runner),
+    );
 
     // Build sw4rm AgentConfig
     let agent_config = sw4rm_sdk::AgentConfig::new(
@@ -1828,21 +1873,19 @@ pub(crate) fn compute_quality_gate(
             )
         }
         (Some(report), TaskHealthAction::Continue) => match report.trend {
-            DeteriorationTrend::Improving => {
-                "deterioration trend improving".to_string()
-            }
+            DeteriorationTrend::Improving => "deterioration trend improving".to_string(),
             DeteriorationTrend::Stable if auto_advance_policy == AutoAdvancePolicy::StableOk => {
                 "deterioration trend stable (policy allows auto-advance)".to_string()
             }
             DeteriorationTrend::Stable => {
                 "deterioration trend stable (stagnation blocked)".to_string()
             }
-            DeteriorationTrend::Deteriorating if auto_advance_policy == AutoAdvancePolicy::Always => {
+            DeteriorationTrend::Deteriorating
+                if auto_advance_policy == AutoAdvancePolicy::Always =>
+            {
                 "deterioration trend deteriorating (always policy overrides gate)".to_string()
             }
-            DeteriorationTrend::Deteriorating => {
-                "deterioration trend deteriorating".to_string()
-            }
+            DeteriorationTrend::Deteriorating => "deterioration trend deteriorating".to_string(),
         },
         (Some(_), _) => "deterioration trend blocked by task-health action".to_string(),
         (None, TaskHealthAction::Continue) => {
@@ -1930,12 +1973,9 @@ pub(crate) fn build_continuation_payload(
     }
     if quality_gate.task_health_action == TaskHealthAction::ForcePivot {
         if let Some(next_tranche) = payload.next_tranche.as_mut() {
-            let already_recorded = next_tranche
-                .interventions
-                .iter()
-                .any(|intervention| {
-                    intervention.kind == ContinuationInterventionKind::StrategyPivotCheckpoint
-                });
+            let already_recorded = next_tranche.interventions.iter().any(|intervention| {
+                intervention.kind == ContinuationInterventionKind::StrategyPivotCheckpoint
+            });
             if !already_recorded {
                 next_tranche.interventions.push(ContinuationIntervention {
                     kind: ContinuationInterventionKind::StrategyPivotCheckpoint,
@@ -2109,20 +2149,21 @@ where
     // tick_with_cancel blocks on a long-running command.
     let stream_tx_live = tx.clone();
     let task_names_vec: Vec<(Uuid, String)> = task_names.to_vec();
-    let mut forwarder_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
-        while let Some(event) = live_rx.recv().await {
-            let name = task_names_vec
-                .iter()
-                .find(|(tid, _)| *tid == event.task_id)
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| event.task_id.to_string());
-            let _ = stream_tx_live.send(StreamEvent::CommandOutput {
-                task_id: event.task_id,
-                task_name: name,
-                line: event.chunk.data,
-            });
-        }
-    }));
+    let mut forwarder_handle: Option<tokio::task::JoinHandle<()>> =
+        Some(tokio::spawn(async move {
+            while let Some(event) = live_rx.recv().await {
+                let name = task_names_vec
+                    .iter()
+                    .find(|(tid, _)| *tid == event.task_id)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| event.task_id.to_string());
+                let _ = stream_tx_live.send(StreamEvent::CommandOutput {
+                    task_id: event.task_id,
+                    task_name: name,
+                    line: event.chunk.data,
+                });
+            }
+        }));
 
     let mut zero_progress_ticks: u64 = 0;
     let mut paused = false;
@@ -2831,6 +2872,10 @@ pub(crate) fn run_renderer(
                     .handle_event(event)
                     .context("renderer handle_event failed")?;
             }
+
+            renderer
+                .restore()
+                .context("failed to restore stream terminal")?;
         }
         RenderMode::Dashboard => {
             let config = DashboardConfig::default();
@@ -3829,7 +3874,9 @@ pub(crate) fn append_merge_apply_telemetry_events(
     audit_sink: Option<&dyn AuditSink>,
 ) -> Result<()> {
     for event in events {
-        if let Err(err) = append_merge_apply_event(store, run_id, correlation_id, event, causation_id) {
+        if let Err(err) =
+            append_merge_apply_event(store, run_id, correlation_id, event, causation_id)
+        {
             warn!(
                 run_id = %run_id,
                 event = %event.event_type,
@@ -5418,12 +5465,13 @@ fn parse_audit_time(value: &str, label: &str) -> Result<chrono::DateTime<chrono:
         let midnight = date
             .and_hms_opt(0, 0, 0)
             .ok_or_else(|| anyhow::anyhow!("{label}: invalid timestamp '{value}'"))?;
-        return Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(midnight, chrono::Utc));
+        return Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            midnight,
+            chrono::Utc,
+        ));
     }
 
-    bail!(
-        "{label} must be RFC3339 timestamp or YYYY-MM-DD date (got '{value}')"
-    )
+    bail!("{label} must be RFC3339 timestamp or YYYY-MM-DD date (got '{value}')")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5489,10 +5537,7 @@ fn parse_audit_filters(
     })
 }
 
-fn query_audit_entries(
-    path: &Path,
-    query: &ParsedAuditQuery,
-) -> Result<Vec<AuditEntry>> {
+fn query_audit_entries(path: &Path, query: &ParsedAuditQuery) -> Result<Vec<AuditEntry>> {
     let sink = JsonlAuditSink::new(path);
     let entries = match sink.read_all() {
         Ok(entries) => entries,
@@ -5619,13 +5664,7 @@ fn render_audit_table(entries: &[AuditEntry]) {
 
     println!(
         "{:<20} {:<20} {:<16} {:<24} {:<8} {:<36} {:<36} REASON",
-        "TIMESTAMP",
-        "CATEGORY",
-        "ACTOR",
-        "ACTION",
-        "OUTCOME",
-        "RUN ID",
-        "TASK ID",
+        "TIMESTAMP", "CATEGORY", "ACTOR", "ACTION", "OUTCOME", "RUN ID", "TASK ID",
     );
     for entry in entries {
         let outcome = entry.outcome.map(|o| format!("{o:?}")).unwrap_or_default();
@@ -5666,7 +5705,9 @@ pub(crate) fn cmd_audit_query(
     limit: usize,
     format: AuditOutputFormat,
 ) -> Result<()> {
-    let query = parse_audit_filters(run_id, task_id, category, actor, since, before, after, offset, limit, format)?;
+    let query = parse_audit_filters(
+        run_id, task_id, category, actor, since, before, after, offset, limit, format,
+    )?;
     let path = PathBuf::from(file);
     let entries = query_audit_entries(&path, &query)?;
 
@@ -7209,7 +7250,8 @@ mod tests {
         let store = Arc::new(InMemoryEventStore::new());
         let queue = Arc::new(InMemoryTaskQueue::new());
         let runner = Arc::new(LocalCommandRunner::new());
-        let mut scheduler = Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
+        let mut scheduler =
+            Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
         let run = Run::new(
             "drive operator cancel",
             yarli_core::domain::SafeMode::Execute,
@@ -7539,20 +7581,20 @@ mod tests {
             }),
         }];
 
-        let (
-            task_key,
-            patch_path,
-            workspace_path,
-            conflicted_files,
-            recovery_hints,
-            repo_status,
-        ) = merge_apply_conflict_metadata(&telemetry);
+        let (task_key, patch_path, workspace_path, conflicted_files, recovery_hints, repo_status) =
+            merge_apply_conflict_metadata(&telemetry);
 
         assert_eq!(task_key.as_deref(), Some("task-2"));
         assert_eq!(patch_path.as_deref(), Some("patches/task-2.patch"));
         assert_eq!(workspace_path.as_deref(), Some("/tmp/yarli/task-2"));
-        assert_eq!(conflicted_files, vec!["shared.txt".to_string(), "src/lib.rs".to_string()]);
-        assert_eq!(recovery_hints, vec!["hint-a".to_string(), "hint-b".to_string()]);
+        assert_eq!(
+            conflicted_files,
+            vec!["shared.txt".to_string(), "src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            recovery_hints,
+            vec!["hint-a".to_string(), "hint-b".to_string()]
+        );
         assert_eq!(repo_status.as_deref(), Some("UU src/lib.rs\nUU shared.txt"));
     }
 }

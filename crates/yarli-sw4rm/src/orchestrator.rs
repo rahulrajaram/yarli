@@ -13,13 +13,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use yarli_exec::{CommandRunner, LocalCommandRunner};
 use yarli_core::domain::{CommandClass, SafeMode};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::{BlockerCode, Task};
 use yarli_core::explain::GateType;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
+use yarli_exec::{CommandRunner, LocalCommandRunner};
 use yarli_queue::{InMemoryTaskQueue, Scheduler, SchedulerConfig};
 
 use crate::config::Sw4rmConfig;
@@ -137,7 +137,10 @@ where
     R: RouterSender,
     V: CommandRunner + Clone,
 {
-    pub fn with_verification_runner<Runner>(self, command_runner: Runner) -> OrchestratorLoop<R, Runner>
+    pub fn with_verification_runner<Runner>(
+        self,
+        command_runner: Runner,
+    ) -> OrchestratorLoop<R, Runner>
     where
         Runner: CommandRunner,
     {
@@ -372,7 +375,10 @@ where
         Ok(failures)
     }
 
-    fn compose_verification_commands(&self, additional_verification: &[String]) -> Vec<VerificationCommand> {
+    fn compose_verification_commands(
+        &self,
+        additional_verification: &[String],
+    ) -> Vec<VerificationCommand> {
         let mut commands = self.verification.commands.clone();
 
         let mut repair_commands = additional_verification
@@ -472,15 +478,26 @@ mod tests {
 
         let orch = OrchestratorLoop::new(mock.clone(), test_config(), test_verification());
         let result = orch
-            .run_objective("preserve", "corr-preserve", CancellationToken::new(), &params)
+            .run_objective(
+                "preserve",
+                "corr-preserve",
+                CancellationToken::new(),
+                &params,
+            )
             .await
             .unwrap();
 
         assert!(result.success);
-        assert_eq!(result.files_modified, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(
+            result.files_modified,
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
 
         let reqs = mock.requests().await;
-        assert_eq!(reqs[0].completed_tranche_work, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(
+            reqs[0].completed_tranche_work,
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -513,7 +530,12 @@ mod tests {
             verification,
         );
         let result = orch
-            .run_objective("repair", "corr-repair", CancellationToken::new(), &ObjectiveParams::default())
+            .run_objective(
+                "repair",
+                "corr-repair",
+                CancellationToken::new(),
+                &ObjectiveParams::default(),
+            )
             .await
             .unwrap();
 

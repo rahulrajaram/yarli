@@ -86,10 +86,10 @@ async fn concurrent_runs_respect_concurrency_caps() {
         let reg = sched.registry().read().await;
         let a_done = reg
             .get_run(&run_a_id)
-            .map_or(false, |r| r.state.is_terminal());
+            .is_some_and(|r| r.state.is_terminal());
         let b_done = reg
             .get_run(&run_b_id)
-            .map_or(false, |r| r.state.is_terminal());
+            .is_some_and(|r| r.state.is_terminal());
         drop(reg);
 
         if a_done && b_done {

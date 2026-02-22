@@ -50,7 +50,11 @@ fn run_yarli(binary: &Path, cwd: &Path, args: &[&str]) -> Output {
 
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
-    Output { status, stdout, stderr }
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Output {
@@ -122,10 +126,15 @@ fn list_run_workspace_roots(worktree_root: &Path) -> Vec<std::path::PathBuf> {
 
 fn read_continuation_payload(repo_dir: &Path) -> Value {
     let continuation_path = repo_dir.join(".yarli").join("continuation.json");
-    let contents = std::fs::read_to_string(&continuation_path)
-        .unwrap_or_else(|err| panic!("failed to read continuation payload at {}: {err}", continuation_path.display()));
-    serde_json::from_str(&contents)
-        .unwrap_or_else(|err| panic!("failed to parse continuation payload JSON: {err}\n{contents}"))
+    let contents = std::fs::read_to_string(&continuation_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read continuation payload at {}: {err}",
+            continuation_path.display()
+        )
+    });
+    serde_json::from_str(&contents).unwrap_or_else(|err| {
+        panic!("failed to parse continuation payload JSON: {err}\n{contents}")
+    })
 }
 
 fn assert_output_state_matches_continuation(run_output: &str, continuation: &Value) {
@@ -176,6 +185,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [execution]
 working_dir = "."
@@ -187,14 +197,18 @@ worktree_root = "{}"
 
     let binary = run_output_path();
     let task_cmd = "mkdir -p tests/fixtures/rust-sample/target && printf 'generated artifact\\n' > tests/fixtures/rust-sample/target/.rustc_info.json && printf 'alpha merged\\n' > alpha.txt";
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge artifact regression",
-        "--stream",
-        "--cmd",
-        task_cmd,
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge artifact regression",
+            "--stream",
+            "--cmd",
+            task_cmd,
+        ],
+    );
 
     assert!(
         run_output.status.success(),
@@ -244,6 +258,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [execution]
 working_dir = "."
@@ -255,14 +270,18 @@ worktree_root = "{}"
 
     let binary = run_output_path();
     let task_cmd = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'alpha committed\\n' > alpha.txt && printf 'new committed file\\n' > committed.txt && git add -A && git commit -m 'worker commit'";
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge committed workspace regression",
-        "--stream",
-        "--cmd",
-        task_cmd,
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge committed workspace regression",
+            "--stream",
+            "--cmd",
+            task_cmd,
+        ],
+    );
 
     assert!(
         run_output.status.success(),
@@ -309,6 +328,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [execution]
 working_dir = "."
@@ -319,16 +339,20 @@ worktree_root = "{}"
     std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
 
     let binary = run_output_path();
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge preserve skipped workspace regression",
-        "--stream",
-        "--cmd",
-        "git reset --hard HEAD >/dev/null && git clean -fdx >/dev/null",
-        "--cmd",
-        "printf 'beta merged\\n' > beta.txt",
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge preserve skipped workspace regression",
+            "--stream",
+            "--cmd",
+            "git reset --hard HEAD >/dev/null && git clean -fdx >/dev/null",
+            "--cmd",
+            "printf 'beta merged\\n' > beta.txt",
+        ],
+    );
 
     assert!(
         run_output.status.success(),
@@ -387,6 +411,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [execution]
 working_dir = "."
@@ -397,16 +422,20 @@ worktree_root = "{}"
     std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
 
     let binary = run_output_path();
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge cleanup on full merge regression",
-        "--stream",
-        "--cmd",
-        "printf 'one\\n' > task_one.txt",
-        "--cmd",
-        "printf 'two\\n' > task_two.txt",
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge cleanup on full merge regression",
+            "--stream",
+            "--cmd",
+            "printf 'one\\n' > task_one.txt",
+            "--cmd",
+            "printf 'two\\n' > task_two.txt",
+        ],
+    );
 
     assert!(
         run_output.status.success(),
@@ -454,6 +483,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [execution]
 working_dir = "."
@@ -466,16 +496,20 @@ worktree_root = "{}"
     let binary = run_output_path();
     let task_one = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task one\\n' > shared.txt && git add shared.txt && git commit -m 'task one commit'";
     let task_two = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task two\\n' > shared.txt && git add shared.txt && git commit -m 'task two commit'";
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge conflict retention regression",
-        "--stream",
-        "--cmd",
-        task_one,
-        "--cmd",
-        task_two,
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge conflict retention regression",
+            "--stream",
+            "--cmd",
+            task_one,
+            "--cmd",
+            task_two,
+        ],
+    );
 
     assert!(
         !run_output.status.success(),
@@ -550,16 +584,12 @@ worktree_root = "{}"
 
     let continuation = read_continuation_payload(&repo_dir);
     assert_eq!(
-        continuation
-            .get("exit_state")
-            .and_then(Value::as_str),
+        continuation.get("exit_state").and_then(Value::as_str),
         Some("RunFailed"),
         "expected continuation exit_state to be RunFailed after merge conflict"
     );
     assert_eq!(
-        continuation
-            .get("exit_reason")
-            .and_then(Value::as_str),
+        continuation.get("exit_reason").and_then(Value::as_str),
         Some("merge_conflict"),
         "expected continuation exit_reason to be merge_conflict after merge conflict escalation"
     );
@@ -589,6 +619,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [run]
 merge_conflict_resolution = "auto-repair"
@@ -604,16 +635,20 @@ worktree_root = "{}"
     let binary = run_output_path();
     let task_one = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task one\\n' > shared.txt && git add shared.txt && git commit -m 'task one commit'";
     let task_two = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task two\\n' > shared.txt && git add shared.txt && git commit -m 'task two commit'";
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge auto-repair success regression",
-        "--stream",
-        "--cmd",
-        task_one,
-        "--cmd",
-        task_two,
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge auto-repair success regression",
+            "--stream",
+            "--cmd",
+            task_one,
+            "--cmd",
+            task_two,
+        ],
+    );
 
     assert!(
         run_output.status.success(),
@@ -623,7 +658,7 @@ worktree_root = "{}"
     );
 
     let run_stdout = String::from_utf8_lossy(&run_output.stdout);
-    let run_id = parse_run_id(&run_stdout).expect("failed to parse run id from command output");
+    let _run_id = parse_run_id(&run_stdout).expect("failed to parse run id from command output");
     assert!(
         run_stdout.contains("RunCompleted") || run_stdout.contains("RUN_COMPLETED"),
         "auto-repair run should complete in output, saw:\n{run_stdout}"
@@ -638,9 +673,7 @@ worktree_root = "{}"
 
     let continuation = read_continuation_payload(&repo_dir);
     assert_eq!(
-        continuation
-            .get("exit_state")
-            .and_then(Value::as_str),
+        continuation.get("exit_state").and_then(Value::as_str),
         Some("RunCompleted"),
         "expected continuation exit_state to be RunCompleted after repaired merge conflict run"
     );
@@ -683,6 +716,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [run]
 merge_conflict_resolution = "auto-repair"
@@ -698,16 +732,20 @@ worktree_root = "{}"
     let binary = run_output_path();
     let task_one = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'task one\\n' > shared.txt && git add shared.txt && git commit -m 'task one commit'";
     let task_two = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && git rm -f shared.txt && git commit -m 'task two delete'";
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge auto-repair failure regression",
-        "--stream",
-        "--cmd",
-        task_one,
-        "--cmd",
-        task_two,
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge auto-repair failure regression",
+            "--stream",
+            "--cmd",
+            task_one,
+            "--cmd",
+            task_two,
+        ],
+    );
 
     assert!(
         !run_output.status.success(),
@@ -748,9 +786,7 @@ worktree_root = "{}"
 
     let continuation = read_continuation_payload(&repo_dir);
     assert_eq!(
-        continuation
-            .get("exit_state")
-            .and_then(Value::as_str),
+        continuation.get("exit_state").and_then(Value::as_str),
         Some("RunFailed"),
         "expected continuation exit_state to be RunFailed after auto-repair merge conflict failure"
     );
@@ -787,6 +823,7 @@ allow_in_memory_writes = true
 
 [features]
 parallel = true
+parallel_worktree = false
 
 [execution]
 working_dir = "."
@@ -798,14 +835,18 @@ worktree_root = "{}"
 
     let binary = run_output_path();
     let lineage_break_cmd = "git checkout --orphan rogue && git rm -rf . >/dev/null 2>&1 || true && git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'rogue\\n' > rogue.txt && git add -A && git commit -m 'rogue commit'";
-    let run_output = run_yarli(&binary, &repo_dir, &[
-        "run",
-        "start",
-        "parallel merge lineage safety regression",
-        "--stream",
-        "--cmd",
-        lineage_break_cmd,
-    ]);
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge lineage safety regression",
+            "--stream",
+            "--cmd",
+            lineage_break_cmd,
+        ],
+    );
 
     assert!(
         !run_output.status.success(),

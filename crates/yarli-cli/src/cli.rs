@@ -76,6 +76,7 @@ commands unless `core.allow_in_memory_writes = true`.
 
 [features]
 - features.parallel (default: true; requires execution.worktree_root and enables per-task workspace execution)
+- features.parallel_worktree (default: true; use git worktrees instead of directory copies for parallel workspaces)
 
 [queue]
 - queue.claim_batch_size (default: 4)
@@ -120,6 +121,8 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.merge_conflict_resolution (default: "fail"; values: fail|manual|auto-repair|llm-assisted)
 - run.merge_repair_command (optional; shell command for llm-assisted conflict repair)
 - run.merge_repair_timeout_seconds (default: 300; 0 = no timeout)
+- run.auto_commit_interval (default: 1; commit state files every N tranches; 0 disables)
+- run.auto_commit_message (optional; template with {tranche_key}/{run_id}/{tranches_completed}/{tranches_total})
 - run.tasks (optional; array-of-table `[[run.tasks]]` entries with key/cmd/class)
 - run.tranches (optional; array-of-table `[[run.tranches]]` entries with key/objective/task_keys)
 - run.plan_guard.target (optional; when set, enforces plan target contract)
@@ -237,6 +240,9 @@ checkpoint_interval = 5
 [features]
 # Parallel task execution (requires [execution].worktree_root for per-task workspaces).
 parallel = true
+# Use git worktrees instead of full directory copies for parallel workspaces.
+# Falls back to copy mode when git worktrees are unavailable.
+# parallel_worktree = true
 # --- CLI_BACKEND_END ---
 
 [queue]
@@ -319,6 +325,10 @@ enforce_plan_tranche_allowed_paths = false
 # merge_repair_command = "claude --print"
 # Timeout in seconds for the repair command (0 = no timeout).
 # merge_repair_timeout_seconds = 300
+# Auto-commit YARLI state files after every N tranches (0 = disabled).
+# auto_commit_interval = 1
+# Template for auto-commit messages (placeholders: {tranche_key}, {run_id}, {tranches_completed}, {tranches_total}).
+# auto_commit_message = "yarli: checkpoint after {tranche_key} ({tranches_completed}/{tranches_total})"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"

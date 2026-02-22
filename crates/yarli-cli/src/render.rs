@@ -321,7 +321,11 @@ pub(crate) fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result
     writeln!(&mut out, "Blocking tasks: {}", explain.blocking_tasks.len())?;
     writeln!(&mut out, "Failed gates: {}", explain.failed_gates.len())?;
     if !run.merge_finalization_blockers.is_empty() {
-        writeln!(&mut out, "Merge-finalization blockers: {}", run.merge_finalization_blockers.len())?;
+        writeln!(
+            &mut out,
+            "Merge-finalization blockers: {}",
+            run.merge_finalization_blockers.len()
+        )?;
     }
 
     if !explain.blocking_tasks.is_empty() {
@@ -1313,8 +1317,9 @@ mod tests {
             idempotency_key: Some(format!("{task_id}:cmd:1:output")),
         };
 
-        let mapped = event_to_stream_event(&event, &[(task_id, "tranche-001-i5".to_string())], false)
-            .expect("command output should map");
+        let mapped =
+            event_to_stream_event(&event, &[(task_id, "tranche-001-i5".to_string())], false)
+                .expect("command output should map");
         match mapped {
             StreamEvent::CommandOutput {
                 task_id: mapped_task_id,
@@ -1371,11 +1376,15 @@ mod tests {
         writeln!(
             &mut artifact,
             "{{\"artifact_type\":\"command_output\",\"run_id\":\"{}\",\"task_id\":\"{}\"}}",
-            task_id,
+            task_id, task_id
+        )
+        .unwrap();
+        writeln!(
+            &mut artifact,
+            "{{\"command_id\":\"{}\",\"seq\":1,\"stream\":\"stdout\",\"data\":\"from artifact\"}}",
             task_id
         )
         .unwrap();
-        writeln!(&mut artifact, "{{\"command_id\":\"{}\",\"seq\":1,\"stream\":\"stdout\",\"data\":\"from artifact\"}}", task_id).unwrap();
         drop(artifact);
 
         let restore_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
@@ -2210,10 +2219,22 @@ mod tests {
             output.contains("parallel merge did not finalize due to conflict markers"),
             "run status must include blocker detail: {output}"
         );
-        assert!(output.contains("/tmp/yarli-runs/demo"), "run status must include blocker workspace path");
-        assert!(output.contains("task_key=task-alpha"), "run status must include task key");
-        assert!(output.contains("conflicted files:"), "run status must include conflicted files block");
-        assert!(output.contains("  - src/lib.rs"), "run status must list conflicted file");
+        assert!(
+            output.contains("/tmp/yarli-runs/demo"),
+            "run status must include blocker workspace path"
+        );
+        assert!(
+            output.contains("task_key=task-alpha"),
+            "run status must include task key"
+        );
+        assert!(
+            output.contains("conflicted files:"),
+            "run status must include conflicted files block"
+        );
+        assert!(
+            output.contains("  - src/lib.rs"),
+            "run status must list conflicted file"
+        );
         assert!(
             output.contains("recovery_hints:"),
             "run status must include recovery hints block"
@@ -2336,13 +2357,22 @@ mod tests {
             output.contains("parallel merge did not finalize due to conflict markers"),
             "run explain must include blocker detail: {output}"
         );
-        assert!(output.contains("/tmp/yarli-runs/demo"), "run explain must include blocker workspace path");
-        assert!(output.contains("task_key=task-alpha"), "run explain must include task key");
+        assert!(
+            output.contains("/tmp/yarli-runs/demo"),
+            "run explain must include blocker workspace path"
+        );
+        assert!(
+            output.contains("task_key=task-alpha"),
+            "run explain must include task key"
+        );
         assert!(
             output.contains("conflicted files:"),
             "run explain must include conflicted files block"
         );
-        assert!(output.contains("  - src/main.rs"), "run explain must list conflicted file");
+        assert!(
+            output.contains("  - src/main.rs"),
+            "run explain must list conflicted file"
+        );
         assert!(
             output.contains("recovery_hints:"),
             "run explain must include recovery hints block"

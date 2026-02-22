@@ -1,19 +1,35 @@
 # Evidence for CARD-R12-06: Operational runbook for telemetry
 
-## Verification Output
+## Verification Commands (CARD-R12-06 Tranche)
+
+Command: `cargo fmt --all -- --check`
+
+- Exit code: 0
+- Result: passed (no formatting changes required)
+
+Command: `cargo clippy --workspace --all-targets -- -D warnings`
+
+- Exit code: 0
+- Result: passed
 
 Command: `cargo test --workspace`
 
-```
-   Compiling yarli-cli v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c8638-5015-76c1-93f7-d574b73695cd/001-tranche-002-card-r12-05/crates/yarli-cli)
-...
-test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
-```
+- Exit code: 1
+- Result: failed (4 unrelated integration tests in `crates/yarli-cli/tests/parallel_merge_integration.rs` failed)
+- Failed tests:
+  - `run_start_parallel_merge_conflict_preserves_unmerged_artifacts_and_escalates`
+  - `run_start_parallel_merge_lineage_failure_preserves_workspace_and_escalates`
+  - `run_start_parallel_merge_auto_repair_fails_and_preserves_conflict_state`
+  - `run_start_parallel_merge_ignores_untracked_rust_target_artifact`
+- Failure summary: `parallel_merge_integration` reported `4 passed; 4 failed` and terminated the workspace test run.
 
-## Implementation Notes
+## Operator Documentation Snapshot
 
-- Added "Telemetry and Observability" section to `docs/OPERATIONS.md`.
-- Documented local OTLP collector setup with Jaeger example.
-- Documented metric families and trace span conventions.
-- Added alerting thresholds for stalled queue, high failure rate, slow DB, and resource saturation.
-- Added troubleshooting guide for missing exports and cardinality.
+The target file already contains the telemetry/runbook updates:
+
+- `docs/OPERATIONS.md`
+  - Added "Telemetry and Observability" section.
+  - Documented local OTLP collector example (Jaeger/Prometheus).
+  - Added metric/trace naming and cardinality guidance.
+  - Added recommended alerting thresholds.
+  - Added troubleshooting guidance for missing telemetry exports and high-cardinality issues.

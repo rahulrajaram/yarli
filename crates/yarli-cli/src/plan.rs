@@ -18,13 +18,13 @@ use crate::config::{
 
 use yarli_cli::mode::RenderMode;
 use yarli_cli::{self, prompt};
-use yarli_core::entities::continuation::ContinuationInterventionKind;
 use yarli_core::domain::CommandClass;
+use yarli_core::entities::continuation::ContinuationInterventionKind;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
+use yarli_observability::{Registry, YarliMetrics};
 use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue};
 use yarli_store::{InMemoryEventStore, PostgresEventStore};
-use yarli_observability::{Registry, YarliMetrics};
 
 /// `yarli run start` — create a run, submit tasks, drive scheduler with stream output.
 #[derive(Debug, Clone)]
@@ -367,7 +367,9 @@ pub(crate) fn build_tranche_task_prompt(
         ));
         instruction_counter += 1;
     }
-    instruction_lines.push(format!("{instruction_counter}. Keep output concise and concrete."));
+    instruction_lines.push(format!(
+        "{instruction_counter}. Keep output concise and concrete."
+    ));
     let instructions = instruction_lines.join("\n");
 
     let mut contract_lines = Vec::new();
@@ -1043,9 +1045,8 @@ pub(crate) async fn execute_run_plan(
         }
         BackendSelection::Postgres { database_url } => {
             println!("Using backend: postgres");
-            let store = PostgresEventStore::new(&database_url).map_err(|e| {
-                anyhow::anyhow!("failed to initialize postgres event store: {e}")
-            })?;
+            let store = PostgresEventStore::new(&database_url)
+                .map_err(|e| anyhow::anyhow!("failed to initialize postgres event store: {e}"))?;
             let store = Arc::new(store.with_metrics(metrics.clone()));
             let queue =
                 Arc::new(PostgresTaskQueue::new(&database_url).map_err(|e| {
@@ -1405,19 +1406,16 @@ The run quality is deteriorating, so re-check strategy and scope before continui
 fn tranche_has_strategy_pivot_checkpoint_intervention(
     tranche: &yarli_core::entities::continuation::TrancheSpec,
 ) -> bool {
-    tranche
-        .interventions
-        .iter()
-        .any(|intervention| intervention.kind == ContinuationInterventionKind::StrategyPivotCheckpoint)
+    tranche.interventions.iter().any(|intervention| {
+        intervention.kind == ContinuationInterventionKind::StrategyPivotCheckpoint
+    })
 }
 
 fn append_strategy_pivot_checkpoint_to_command(command: &str) -> String {
     if command.contains("Strategy-pivot checkpoint:") {
         command.to_string()
     } else {
-        format!(
-            "{command}\n\n{STRATEGY_PIVOT_CHECKPOINT_INSTRUCTION}"
-        )
+        format!("{command}\n\n{STRATEGY_PIVOT_CHECKPOINT_INSTRUCTION}")
     }
 }
 
@@ -2368,7 +2366,9 @@ pub(crate) fn enforce_plan_guard_post_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{build_continuation_payload, build_run_config_snapshot, compute_quality_gate};
+    use crate::commands::{
+        build_continuation_payload, build_run_config_snapshot, compute_quality_gate,
+    };
     use crate::config::RunTaskHealthConfig;
     use crate::test_helpers::{write_test_config, write_test_config_at};
     use chrono::Utc;
@@ -2376,9 +2376,9 @@ mod tests {
     use uuid::Uuid;
     use yarli_cli::prompt;
     use yarli_core::domain::{CommandClass, SafeMode};
+    use yarli_core::entities::continuation::TaskHealthAction;
     use yarli_core::entities::run::Run;
     use yarli_core::entities::task::Task;
-    use yarli_core::entities::continuation::TaskHealthAction;
     use yarli_core::explain::{DeteriorationReport, DeteriorationTrend};
     use yarli_core::fsm::run::RunState;
     use yarli_core::fsm::task::TaskState;
@@ -3453,9 +3453,7 @@ cmds = ["echo ok"]
 
     #[test]
     fn continuation_planned_next_resolves_command_from_task_catalog() {
-        use yarli_core::entities::continuation::{
-            TrancheKind, TrancheSpec,
-        };
+        use yarli_core::entities::continuation::{TrancheKind, TrancheSpec};
 
         let loaded = write_test_config("");
         let prompt_entry_path = "/tmp/project/PROMPT.md";
@@ -3551,9 +3549,7 @@ cmds = ["echo ok"]
 
         let plan = build_plan_from_continuation_tranche(&tranche, &loaded).unwrap();
         assert_eq!(plan.tasks.len(), 1);
-        assert!(plan.tasks[0]
-            .command
-            .contains("Strategy-pivot checkpoint:"));
+        assert!(plan.tasks[0].command.contains("Strategy-pivot checkpoint:"));
     }
 
     #[test]
@@ -3645,8 +3641,10 @@ cmds = ["echo ok"]
             trend: DeteriorationTrend::Deteriorating,
         };
 
-        let mut task_health = crate::config::RunTaskHealthConfig::default();
-        task_health.deteriorating = TaskHealthAction::ForcePivot;
+        let task_health = crate::config::RunTaskHealthConfig {
+            deteriorating: TaskHealthAction::ForcePivot,
+            ..Default::default()
+        };
 
         let gate = compute_quality_gate(
             Some(&report),
@@ -3693,8 +3691,10 @@ cmds = ["echo ok"]
 
     #[test]
     fn build_continuation_payload_force_pivot_appends_checkpoint_intervention() {
-        let mut task_health = RunTaskHealthConfig::default();
-        task_health.deteriorating = TaskHealthAction::ForcePivot;
+        let task_health = RunTaskHealthConfig {
+            deteriorating: TaskHealthAction::ForcePivot,
+            ..Default::default()
+        };
 
         let run = Run::new("checkpoint test", SafeMode::Execute);
         let mut task = Task::new(
@@ -3726,7 +3726,10 @@ cmds = ["echo ok"]
             false,
         );
         let quality_gate = payload.quality_gate.expect("quality gate exists");
-        assert_eq!(quality_gate.task_health_action, TaskHealthAction::ForcePivot);
+        assert_eq!(
+            quality_gate.task_health_action,
+            TaskHealthAction::ForcePivot
+        );
         let interventions = payload
             .next_tranche
             .as_ref()
@@ -3738,8 +3741,10 @@ cmds = ["echo ok"]
 
     #[test]
     fn build_continuation_payload_after_previous_pivot_cycles_stops_and_summarizes() {
-        let mut task_health = RunTaskHealthConfig::default();
-        task_health.deteriorating = TaskHealthAction::ForcePivot;
+        let task_health = RunTaskHealthConfig {
+            deteriorating: TaskHealthAction::ForcePivot,
+            ..Default::default()
+        };
 
         let run = Run::new("checkpoint test follow-up", SafeMode::Execute);
         let mut task = Task::new(
@@ -3782,11 +3787,9 @@ cmds = ["echo ok"]
             .interventions
             .len();
         assert_eq!(interventions, 0);
-        assert!(
-            quality_gate
-                .reason
-                .contains("deterioration cycle persisted after strategy pivot")
-        );
+        assert!(quality_gate
+            .reason
+            .contains("deterioration cycle persisted after strategy pivot"));
     }
 
     #[test]

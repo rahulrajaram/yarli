@@ -16,6 +16,12 @@ use crate::config::LoadedConfig;
 use crate::plan::sanitize_task_key_component;
 use crate::plan::RunPlan;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParallelWorkspaceMode {
+    FileCopy,
+    GitWorktree,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ParallelWorkspaceLayout {
     pub(crate) run_workspace_root: PathBuf,
@@ -24,6 +30,12 @@ pub(crate) struct ParallelWorkspaceLayout {
     /// ancestry validation so we compare against a commit that is guaranteed
     /// to exist in the copied workspace's object database.
     pub(crate) source_head_at_creation: Option<String>,
+    /// How the parallel workspaces were created.
+    pub(crate) mode: ParallelWorkspaceMode,
+    /// Branch names for each task workspace (only populated in GitWorktree mode).
+    pub(crate) worktree_branches: Vec<String>,
+    /// Source working directory (needed for worktree cleanup).
+    pub(crate) source_workdir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +300,23 @@ pub(crate) fn prepare_parallel_workspace_layout(
         return Ok(None);
     }
 
+    let use_worktrees = loaded_config.config().features.parallel_worktree;
+    if use_worktrees {
+        let source_workdir =
+            config::resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+        if source_workdir.is_dir() && git_worktree_available(&source_workdir) {
+            return prepare_parallel_workspace_layout_worktree(plan, loaded_config);
+        }
+        warn!("git worktrees unavailable; falling back to file-copy mode");
+    }
+
+    prepare_parallel_workspace_layout_copy(plan, loaded_config)
+}
+
+fn prepare_parallel_workspace_layout_copy(
+    plan: &RunPlan,
+    loaded_config: &LoadedConfig,
+) -> Result<Option<ParallelWorkspaceLayout>> {
     let configured_root =
         config::configured_parallel_worktree_root(loaded_config).ok_or_else(|| {
             anyhow::anyhow!(
@@ -375,7 +404,300 @@ pub(crate) fn prepare_parallel_workspace_layout(
         run_workspace_root,
         task_workspace_dirs,
         source_head_at_creation,
+        mode: ParallelWorkspaceMode::FileCopy,
+        worktree_branches: Vec::new(),
+        source_workdir: Some(source_workdir),
     }))
+}
+
+/// Maximum number of git worktrees allowed per project.
+const MAX_WORKTREES: usize = 10;
+
+/// Check if `git worktree` is available in the given directory.
+pub(crate) fn git_worktree_available(cwd: &Path) -> bool {
+    run_git_capture(cwd, &["worktree", "list"])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Count existing worktrees (excluding the main worktree).
+pub(crate) fn count_existing_worktrees(cwd: &Path) -> Result<usize> {
+    let output = run_git_capture(cwd, &["worktree", "list", "--porcelain"])?;
+    ensure_git_success(
+        output.clone(),
+        cwd,
+        &["worktree", "list", "--porcelain"],
+        "count existing worktrees",
+    )?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Each worktree block starts with "worktree <path>". The first is always main.
+    let count = text.lines().filter(|l| l.starts_with("worktree ")).count();
+    Ok(count.saturating_sub(1))
+}
+
+/// Prune stale worktree metadata.
+pub(crate) fn prune_stale_worktrees(cwd: &Path) -> Result<()> {
+    let output = run_git_capture(cwd, &["worktree", "prune"])?;
+    ensure_git_success(output, cwd, &["worktree", "prune"], "prune stale worktrees")?;
+    Ok(())
+}
+
+/// Create parallel workspaces using git worktrees.
+fn prepare_parallel_workspace_layout_worktree(
+    plan: &RunPlan,
+    loaded_config: &LoadedConfig,
+) -> Result<Option<ParallelWorkspaceLayout>> {
+    let configured_root =
+        config::configured_parallel_worktree_root(loaded_config).ok_or_else(|| {
+            anyhow::anyhow!(
+                "`yarli run` requires `[execution].worktree_root` when `[features].parallel = true`"
+            )
+        })?;
+    let source_workdir =
+        config::resolve_execution_path_from_cwd(&plan.workdir, "execution.working_dir")?;
+    if !source_workdir.is_dir() {
+        bail!(
+            "execution working_dir is not a directory: {}",
+            source_workdir.display()
+        );
+    }
+    let source_workdir = source_workdir.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize execution working_dir {}",
+            source_workdir.display()
+        )
+    })?;
+
+    let worktree_root =
+        config::resolve_execution_path_from_cwd(&configured_root, "execution.worktree_root")?;
+    fs::create_dir_all(&worktree_root).with_context(|| {
+        format!(
+            "failed to create execution.worktree_root {}",
+            worktree_root.display()
+        )
+    })?;
+    let worktree_root = worktree_root.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize execution.worktree_root {}",
+            worktree_root.display()
+        )
+    })?;
+    if worktree_root == source_workdir {
+        bail!(
+            "execution.worktree_root must not equal execution.working_dir ({}); choose a dedicated workspace root",
+            worktree_root.display()
+        );
+    }
+
+    prune_stale_worktrees(&source_workdir)?;
+
+    let existing = count_existing_worktrees(&source_workdir)?;
+    let needed = plan.tasks.len();
+    if existing + needed > MAX_WORKTREES {
+        bail!(
+            "creating {} worktrees would exceed the maximum of {} (currently {} active); \
+             clean up stale worktrees or reduce parallel task count",
+            needed,
+            MAX_WORKTREES,
+            existing
+        );
+    }
+
+    let source_head_at_creation = run_git_capture(&source_workdir, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    let run_id_short = &Uuid::now_v7().simple().to_string()[..12];
+    let run_workspace_root = worktree_root.join(format!("run-{run_id_short}"));
+    fs::create_dir_all(&run_workspace_root).with_context(|| {
+        format!(
+            "failed to create run workspace root {}",
+            run_workspace_root.display()
+        )
+    })?;
+
+    let mut task_workspace_dirs = Vec::with_capacity(needed);
+    let mut worktree_branches = Vec::with_capacity(needed);
+    let mut created_worktrees: Vec<(PathBuf, String)> = Vec::new();
+
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let slug = sanitize_task_key_component(&task.task_key);
+        let slug = if slug.is_empty() {
+            format!("task-{}", index + 1)
+        } else {
+            slug
+        };
+        let branch = format!("yarli/{run_id_short}/{:03}-{slug}", index + 1);
+        let workspace_dir = run_workspace_root.join(format!("{:03}-{slug}", index + 1));
+
+        let workspace_dir_str = workspace_dir.display().to_string();
+        let result = run_git_capture(
+            &source_workdir,
+            &["worktree", "add", "-b", &branch, &workspace_dir_str, "HEAD"],
+        );
+
+        match result {
+            Ok(output) if output.status.success() => {
+                created_worktrees.push((workspace_dir.clone(), branch.clone()));
+                task_workspace_dirs.push(workspace_dir);
+                worktree_branches.push(branch);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    branch = %branch,
+                    workspace = %workspace_dir.display(),
+                    "git worktree add failed: {stderr}; rolling back"
+                );
+                rollback_worktrees(&source_workdir, &created_worktrees);
+                let _ = fs::remove_dir_all(&run_workspace_root);
+                bail!("git worktree add failed for branch {branch}: {stderr}");
+            }
+            Err(err) => {
+                warn!(
+                    branch = %branch,
+                    workspace = %workspace_dir.display(),
+                    "git worktree add failed: {err}; rolling back"
+                );
+                rollback_worktrees(&source_workdir, &created_worktrees);
+                let _ = fs::remove_dir_all(&run_workspace_root);
+                return Err(err.context(format!("git worktree add failed for branch {branch}")));
+            }
+        }
+    }
+
+    Ok(Some(ParallelWorkspaceLayout {
+        run_workspace_root,
+        task_workspace_dirs,
+        source_head_at_creation,
+        mode: ParallelWorkspaceMode::GitWorktree,
+        worktree_branches,
+        source_workdir: Some(source_workdir),
+    }))
+}
+
+/// Remove worktrees and their branches on failure.
+fn rollback_worktrees(source_workdir: &Path, created: &[(PathBuf, String)]) {
+    for (path, branch) in created.iter().rev() {
+        let path_str = path.display().to_string();
+        let _ = run_git_capture(
+            source_workdir,
+            &["worktree", "remove", &path_str, "--force"],
+        );
+        let _ = run_git_capture(source_workdir, &["branch", "-D", branch]);
+    }
+    let _ = run_git_capture(source_workdir, &["worktree", "prune"]);
+}
+
+/// Clean up a parallel workspace layout.
+pub(crate) fn cleanup_parallel_workspace(layout: &ParallelWorkspaceLayout) {
+    match layout.mode {
+        ParallelWorkspaceMode::FileCopy => {
+            if let Err(err) = fs::remove_dir_all(&layout.run_workspace_root) {
+                warn!(
+                    error = %err,
+                    workspace_root = %layout.run_workspace_root.display(),
+                    "failed to clean parallel run workspace root"
+                );
+            }
+        }
+        ParallelWorkspaceMode::GitWorktree => {
+            let source_workdir = match layout.source_workdir.as_ref() {
+                Some(dir) => dir,
+                None => {
+                    warn!("no source_workdir in layout; falling back to dir removal");
+                    let _ = fs::remove_dir_all(&layout.run_workspace_root);
+                    return;
+                }
+            };
+            for (dir, branch) in layout
+                .task_workspace_dirs
+                .iter()
+                .zip(layout.worktree_branches.iter())
+            {
+                let dir_str = dir.display().to_string();
+                let _ =
+                    run_git_capture(source_workdir, &["worktree", "remove", &dir_str, "--force"]);
+                let _ = run_git_capture(source_workdir, &["branch", "-D", branch]);
+            }
+            let _ = run_git_capture(source_workdir, &["worktree", "prune"]);
+            // Remove run workspace root if empty or still has remnants.
+            let _ = fs::remove_dir_all(&layout.run_workspace_root);
+        }
+    }
+}
+
+/// Auto-commit YARLI state files after a tranche merge.
+///
+/// Stages only `.yarli/continuation.json` and `.yarli/tranches.toml`, then commits
+/// with a templated message. Returns `Ok(true)` if a commit was made.
+pub(crate) fn auto_commit_state_files(
+    source_workdir: &Path,
+    tranche_key: &str,
+    run_id: &str,
+    tranches_completed: u32,
+    tranches_total: u32,
+    message_template: Option<&str>,
+) -> Result<bool> {
+    let state_files = [".yarli/continuation.json", ".yarli/tranches.toml"];
+    let mut any_staged = false;
+    for file in &state_files {
+        let full = source_workdir.join(file);
+        if full.exists() {
+            let output = run_git_capture(source_workdir, &["add", "--", file])?;
+            if output.status.success() {
+                any_staged = true;
+            }
+        }
+    }
+
+    if !any_staged {
+        return Ok(false);
+    }
+
+    // Check if there are actually staged changes.
+    let diff_output = run_git_capture(source_workdir, &["diff", "--cached", "--quiet"])?;
+    if diff_output.status.success() {
+        // No staged changes.
+        return Ok(false);
+    }
+
+    let default_template =
+        "yarli: checkpoint after {tranche_key} ({tranches_completed}/{tranches_total})";
+    let template = message_template.unwrap_or(default_template);
+    let message = template
+        .replace("{tranche_key}", tranche_key)
+        .replace("{run_id}", run_id)
+        .replace("{tranches_completed}", &tranches_completed.to_string())
+        .replace("{tranches_total}", &tranches_total.to_string());
+
+    let commit_result = run_git_capture(source_workdir, &["commit", "--no-verify", "-m", &message]);
+    match commit_result {
+        Ok(output) if output.status.success() => {
+            info!(
+                tranche_key = %tranche_key,
+                "auto-committed state files: {message}"
+            );
+            Ok(true)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                tranche_key = %tranche_key,
+                "auto-commit of state files failed: {stderr}"
+            );
+            Ok(false)
+        }
+        Err(err) => {
+            warn!(
+                tranche_key = %tranche_key,
+                error = %err,
+                "auto-commit of state files failed"
+            );
+            Ok(false)
+        }
+    }
 }
 
 pub(crate) fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -927,7 +1249,9 @@ fn repair_with_llm_command(
             ParallelWorkspaceMergeApplyError::new(
                 ParallelWorkspaceMergeFailureKind::RuntimeFailure,
                 true,
-                format!("failed to wait for llm-assisted repair command for task {task_key}: {error}"),
+                format!(
+                    "failed to wait for llm-assisted repair command for task {task_key}: {error}"
+                ),
             )
         })?
     } else {
@@ -970,9 +1294,7 @@ fn repair_with_llm_command(
         return Err(ParallelWorkspaceMergeApplyError::new(
             ParallelWorkspaceMergeFailureKind::RuntimeFailure,
             true,
-            format!(
-                "llm-assisted repair command exited with {exit_code} for task {task_key}"
-            ),
+            format!("llm-assisted repair command exited with {exit_code} for task {task_key}"),
         ));
     }
 
@@ -1038,8 +1360,8 @@ pub(crate) fn apply_workspace_patch_to_source(
     patch: &[u8],
     resolution_config: &MergeResolutionConfig,
 ) -> Result<bool, ParallelWorkspaceMergeApplyError> {
-    let backed_up_new_files = remove_conflicting_new_files_for_patch(source_workdir, patch).map_err(
-        |error| {
+    let backed_up_new_files = remove_conflicting_new_files_for_patch(source_workdir, patch)
+        .map_err(|error| {
             ParallelWorkspaceMergeApplyError::new(
                 ParallelWorkspaceMergeFailureKind::RuntimeFailure,
                 false,
@@ -1047,8 +1369,7 @@ pub(crate) fn apply_workspace_patch_to_source(
                     "parallel workspace merge pre-processing failed for task {task_key}: {error}"
                 ),
             )
-        },
-    )?;
+        })?;
 
     let apply_args = ["apply", "--3way", "--whitespace=nowarn", "-"];
     let apply_output = run_git_capture_with_input(source_workdir, &apply_args, patch).map_err(
@@ -1516,6 +1837,328 @@ pub(crate) fn merge_parallel_workspace_results(
     )
 }
 
+/// Merge parallel workspace results using git branch merges (worktree mode).
+///
+/// For each task worktree: commit any changes, then merge the branch into the
+/// current branch in source_workdir.
+pub(crate) fn merge_worktree_workspace_results(
+    source_workdir: &Path,
+    run_id: Uuid,
+    task_workspaces: &[(String, PathBuf)],
+    worktree_branches: &[String],
+    resolution_config: &MergeResolutionConfig,
+    apply_telemetry: &mut Vec<MergeApplyTelemetryEvent>,
+) -> Result<ParallelWorkspaceMergeReport> {
+    ensure_git_repository(source_workdir)?;
+
+    merge_apply_telemetry_event(
+        apply_telemetry,
+        "merge.apply.started",
+        None,
+        None,
+        serde_json::json!({
+            "run_id": run_id.to_string(),
+            "mode": "git_worktree",
+            "source_workdir": source_workdir.display().to_string(),
+            "task_count": task_workspaces.len(),
+            "merge_conflict_resolution": format!("{:?}", resolution_config.strategy),
+        }),
+    );
+
+    // Stash any pre-existing dirty state so `git merge` doesn't refuse due to
+    // local modifications. This mirrors the stash/unstash flow in the copy-mode
+    // merge (merge_parallel_workspace_results_with_resolution_with_events).
+    let pre_status = run_git_capture(source_workdir, &["status", "--porcelain"])?;
+    let pre_status_text = String::from_utf8_lossy(&pre_status.stdout);
+    let has_stashed_dirty_state = if !pre_status_text.trim().is_empty() {
+        info!("stashing pre-existing dirty state before worktree merge");
+        let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let stash_result = run_git_capture(
+            source_workdir,
+            &[
+                "stash",
+                "push",
+                "-m",
+                "yarli: stash pre-existing workspace state before worktree merge",
+            ],
+        );
+        stash_result.map(|o| o.status.success()).unwrap_or(false)
+    } else {
+        false
+    };
+
+    // Run the merge loop in a closure so we can always pop the stash on exit,
+    // even if the merge loop errors out.
+    let merge_loop_result =
+        (|| -> Result<(Vec<String>, Vec<String>, Vec<ParallelTaskMergeOutcome>)> {
+            let mut merged_task_keys = Vec::new();
+            let mut skipped_task_keys = Vec::new();
+            let mut task_outcomes = Vec::new();
+
+            for (task_index, ((task_key, workspace_dir), branch)) in task_workspaces
+                .iter()
+                .zip(worktree_branches.iter())
+                .enumerate()
+            {
+                // Check if worktree has any changes.
+                let status_output = run_git_capture(workspace_dir, &["status", "--porcelain"])?;
+                let status_text = String::from_utf8_lossy(&status_output.stdout);
+                if status_text.trim().is_empty() {
+                    // No changes — check if there are committed changes beyond HEAD.
+                    let source_head_output =
+                        run_git_capture(source_workdir, &["rev-parse", "HEAD"])?;
+                    let source_head = String::from_utf8_lossy(&source_head_output.stdout)
+                        .trim()
+                        .to_string();
+                    let ws_head_output = run_git_capture(workspace_dir, &["rev-parse", "HEAD"])?;
+                    let ws_head = String::from_utf8_lossy(&ws_head_output.stdout)
+                        .trim()
+                        .to_string();
+
+                    if source_head == ws_head {
+                        skipped_task_keys.push(task_key.clone());
+                        task_outcomes.push(ParallelTaskMergeOutcome {
+                            task_key: task_key.clone(),
+                            disposition: ParallelTaskMergeDisposition::Skipped,
+                            skip_reason: Some(ParallelTaskSkipReason::NoScopedPaths),
+                            workspace_head: Some(ws_head),
+                            source_head: Some(source_head),
+                            soft_reset_applied: false,
+                            patch_path: None,
+                        });
+                        continue;
+                    }
+                }
+
+                // Stage and commit all changes in the worktree.
+                if !status_text.trim().is_empty() {
+                    let _ = run_git_capture(workspace_dir, &["add", "-A"]);
+                    let commit_msg = format!("yarli: task {task_key} work");
+                    let commit_result = run_git_capture(
+                        workspace_dir,
+                        &["commit", "--no-verify", "--allow-empty", "-m", &commit_msg],
+                    );
+                    if let Ok(output) = &commit_result {
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            warn!(
+                                task_key = %task_key,
+                                "git commit in worktree failed: {stderr}"
+                            );
+                        }
+                    }
+                }
+
+                // Merge the worktree branch into the main working directory.
+                let merge_msg = format!("yarli: merge {task_key}");
+                let merge_result = run_git_capture(
+                    source_workdir,
+                    &["merge", "--no-ff", branch, "-m", &merge_msg],
+                );
+
+                match merge_result {
+                    Ok(output) if output.status.success() => {
+                        merged_task_keys.push(task_key.clone());
+                        let ws_head_output =
+                            run_git_capture(workspace_dir, &["rev-parse", "HEAD"])?;
+                        let ws_head = String::from_utf8_lossy(&ws_head_output.stdout)
+                            .trim()
+                            .to_string();
+                        let source_head_output =
+                            run_git_capture(source_workdir, &["rev-parse", "HEAD"])?;
+                        let source_head = String::from_utf8_lossy(&source_head_output.stdout)
+                            .trim()
+                            .to_string();
+                        task_outcomes.push(ParallelTaskMergeOutcome {
+                            task_key: task_key.clone(),
+                            disposition: ParallelTaskMergeDisposition::Merged,
+                            skip_reason: None,
+                            workspace_head: Some(ws_head),
+                            source_head: Some(source_head),
+                            soft_reset_applied: false,
+                            patch_path: None,
+                        });
+                        merge_apply_telemetry_event(
+                            apply_telemetry,
+                            "merge.apply.task_merged",
+                            Some(task_key),
+                            Some(task_index),
+                            serde_json::json!({
+                                "run_id": run_id.to_string(),
+                                "task_key": task_key,
+                                "branch": branch,
+                                "mode": "git_worktree",
+                            }),
+                        );
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        // Merge conflict — attempt resolution based on strategy.
+                        match resolution_config.strategy {
+                            config::MergeConflictResolution::AutoRepair => {
+                                // Accept theirs (worktree version) for all conflicts.
+                                let status =
+                                    run_git_capture(source_workdir, &["status", "--porcelain"])?;
+                                let status_text = String::from_utf8_lossy(&status.stdout);
+                                for line in status_text.lines() {
+                                    if line.len() < 3 {
+                                        continue;
+                                    }
+                                    let prefix = &line[..2];
+                                    let path = line[3..].trim();
+                                    match prefix {
+                                        "UU" | "AA" => {
+                                            let _ = run_git_capture(
+                                                source_workdir,
+                                                &["checkout", "--theirs", "--", path],
+                                            );
+                                            let _ = run_git_capture(
+                                                source_workdir,
+                                                &["add", "--", path],
+                                            );
+                                        }
+                                        "DU" => {
+                                            let _ = run_git_capture(
+                                                source_workdir,
+                                                &["checkout", "--theirs", "--", path],
+                                            );
+                                            let _ = run_git_capture(
+                                                source_workdir,
+                                                &["add", "--", path],
+                                            );
+                                        }
+                                        "UD" => {
+                                            let _ = run_git_capture(
+                                                source_workdir,
+                                                &["rm", "--", path],
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                let repair_msg =
+                                    format!("yarli: auto-repair merge conflict for {task_key}");
+                                let _ = run_git_capture(
+                                    source_workdir,
+                                    &["commit", "--no-verify", "--allow-empty", "-m", &repair_msg],
+                                );
+                                merged_task_keys.push(task_key.clone());
+                                task_outcomes.push(ParallelTaskMergeOutcome {
+                                    task_key: task_key.clone(),
+                                    disposition: ParallelTaskMergeDisposition::Merged,
+                                    skip_reason: None,
+                                    workspace_head: None,
+                                    source_head: None,
+                                    soft_reset_applied: false,
+                                    patch_path: None,
+                                });
+                            }
+                            _ => {
+                                // Abort the merge and report failure.
+                                let _ = run_git_capture(source_workdir, &["merge", "--abort"]);
+                                merge_apply_telemetry_event(
+                                    apply_telemetry,
+                                    "merge.apply.conflict",
+                                    Some(task_key),
+                                    Some(task_index),
+                                    serde_json::json!({
+                                        "run_id": run_id.to_string(),
+                                        "task_key": task_key,
+                                        "branch": branch,
+                                        "mode": "git_worktree",
+                                        "stderr": stderr.to_string(),
+                                    }),
+                                );
+                                bail!("merge conflict for task {task_key} (branch {branch}): {stderr}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(err.context(format!(
+                            "git merge failed for task {task_key} branch {branch}"
+                        )));
+                    }
+                }
+            }
+
+            Ok((merged_task_keys, skipped_task_keys, task_outcomes))
+        })();
+
+    // Always reapply stashed dirty state, even if the merge loop failed.
+    // This prevents leaving the working tree in a stashed state.
+    if has_stashed_dirty_state {
+        let pop_result = run_git_capture(source_workdir, &["stash", "pop"]);
+        let pop_ok = pop_result
+            .as_ref()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !pop_ok {
+            warn!("pre-existing dirty state partially conflicted with worktree merge; resolving conflicts in favor of workspace");
+            if let Ok(status_output) = run_git_capture(source_workdir, &["status", "--porcelain"]) {
+                let status_text = String::from_utf8_lossy(&status_output.stdout);
+                for line in status_text.lines() {
+                    if line.len() < 3 {
+                        continue;
+                    }
+                    let prefix = &line[..2];
+                    let path = line[3..].trim();
+                    match prefix {
+                        "UU" | "AA" | "UD" => {
+                            let _ = run_git_capture(
+                                source_workdir,
+                                &["checkout", "--ours", "--", path],
+                            );
+                        }
+                        "DU" => {
+                            let _ = run_git_capture(source_workdir, &["rm", "-f", "--", path]);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let _ = run_git_capture(source_workdir, &["add", "-A"]);
+            let _ = run_git_capture(source_workdir, &["stash", "drop"]);
+        }
+        // Commit the reapplied dirty state (clean pop or resolved conflicts).
+        let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let _ = run_git_capture(
+            source_workdir,
+            &[
+                "commit",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "yarli: reapply pre-existing workspace state after worktree merge",
+            ],
+        );
+    }
+
+    // Propagate merge loop error after stash has been restored.
+    let (merged_task_keys, skipped_task_keys, task_outcomes) = merge_loop_result?;
+
+    merge_apply_telemetry_event(
+        apply_telemetry,
+        "merge.apply.finalized",
+        None,
+        None,
+        serde_json::json!({
+            "run_id": run_id.to_string(),
+            "status": "succeeded",
+            "mode": "git_worktree",
+            "task_count": task_workspaces.len(),
+            "merged_task_count": merged_task_keys.len(),
+            "skipped_task_count": skipped_task_keys.len(),
+        }),
+    );
+
+    Ok(ParallelWorkspaceMergeReport {
+        preserve_workspace_root: !skipped_task_keys.is_empty(),
+        merged_task_keys,
+        skipped_task_keys,
+        task_outcomes,
+    })
+}
+
 fn merge_apply_telemetry_event(
     events: &mut Vec<MergeApplyTelemetryEvent>,
     event_type: &str,
@@ -1901,8 +2544,7 @@ Operator recovery steps:\n\
                     conflict_count += 1;
                     let conflicted_files = collect_conflicted_workspace_files(source_workdir);
                     let repo_status = collect_workspace_status_snapshot(source_workdir);
-                    let recovery_hints =
-                        merge_conflict_recovery_hints(source_workdir, &patch_path);
+                    let recovery_hints = merge_conflict_recovery_hints(source_workdir, &patch_path);
                     merge_apply_telemetry_event(
                         apply_telemetry,
                         "merge.apply.conflict",
@@ -1924,8 +2566,8 @@ Operator recovery steps:\n\
                         }),
                     );
                 }
-                let restore_note =
-                    restore_workspace_head_on_error("workspace patch apply failed").unwrap_or_default();
+                let restore_note = restore_workspace_head_on_error("workspace patch apply failed")
+                    .unwrap_or_default();
                 let note_path = write_parallel_merge_recovery_note(
                     run_id,
                     source_workdir,
@@ -3158,7 +3800,11 @@ worktree_root = "{}"
 
         run_git_expect_ok(
             temp_dir.path(),
-            &["clone", source_repo.to_str().unwrap(), workspace.to_str().unwrap()],
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
         );
 
         std::fs::write(source_repo.join("shared.txt"), "source update\n").unwrap();
@@ -4323,7 +4969,11 @@ worktree_root = "{}"
 
         run_git_expect_ok(
             temp_dir.path(),
-            &["clone", source_repo.to_str().unwrap(), workspace.to_str().unwrap()],
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
         );
 
         // Diverge source (commit a different change)
@@ -4347,9 +4997,7 @@ worktree_root = "{}"
         // Repair command that simply writes resolved content
         let resolution_config = MergeResolutionConfig {
             strategy: config::MergeConflictResolution::LlmAssisted,
-            repair_command: Some(
-                "printf 'resolved content\\n' > shared.txt".to_string(),
-            ),
+            repair_command: Some("printf 'resolved content\\n' > shared.txt".to_string()),
             repair_timeout_seconds: 10,
         };
         let repaired = apply_workspace_patch_to_source(
@@ -4452,9 +5100,7 @@ worktree_root = "{}"
         // Command that resolves and lets us verify artifacts were written
         let resolution_config = MergeResolutionConfig {
             strategy: config::MergeConflictResolution::LlmAssisted,
-            repair_command: Some(
-                "printf 'resolved\\n' > shared.txt".to_string(),
-            ),
+            repair_command: Some("printf 'resolved\\n' > shared.txt".to_string()),
             repair_timeout_seconds: 10,
         };
         apply_workspace_patch_to_source(
@@ -4475,7 +5121,10 @@ worktree_root = "{}"
             serde_json::from_str(&std::fs::read_to_string(&context_path).unwrap()).unwrap();
         assert_eq!(context_json["task_key"], "task-ctx");
         assert!(
-            context_json["conflicted_files"].as_array().unwrap().len() > 0,
+            !context_json["conflicted_files"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
             "should have at least one conflicted file"
         );
         let first_file = &context_json["conflicted_files"][0];
@@ -4568,6 +5217,590 @@ worktree_root = "{}"
         assert!(
             env_dump.contains("YARLI_TASK_KEY=task-env"),
             "should set YARLI_TASK_KEY: {env_dump}"
+        );
+    }
+
+    // ── Worktree mode tests ──
+
+    fn init_git_repo(path: &Path) {
+        run_git_expect_ok(path, &["init"]);
+        run_git_expect_ok(path, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(path, &["config", "user.name", "Test"]);
+    }
+
+    #[test]
+    fn git_worktree_available_true_in_git_repo() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+        assert!(git_worktree_available(&repo));
+    }
+
+    #[test]
+    fn git_worktree_available_false_outside_repo() {
+        let temp = TempDir::new().unwrap();
+        assert!(!git_worktree_available(temp.path()));
+    }
+
+    #[test]
+    fn count_existing_worktrees_zero_for_fresh_repo() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_existing_worktrees_counts_added() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt1 = temp.path().join("wt1");
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "b1",
+                &wt1.display().to_string(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 1);
+
+        let wt2 = temp.path().join("wt2");
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "b2",
+                &wt2.display().to_string(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 2);
+    }
+
+    fn make_planned_task(key: &str) -> PlannedTask {
+        PlannedTask {
+            task_key: key.into(),
+            command: format!("echo {key}"),
+            command_class: CommandClass::Io,
+            tranche_key: None,
+            tranche_group: None,
+            allowed_paths: Vec::new(),
+        }
+    }
+
+    fn make_run_plan(workdir: &Path, tasks: Vec<PlannedTask>) -> RunPlan {
+        RunPlan {
+            objective: "test".to_string(),
+            tasks,
+            task_catalog: Vec::new(),
+            workdir: workdir.display().to_string(),
+            timeout_secs: 60,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: Vec::new(),
+            current_tranche_index: None,
+        }
+    }
+
+    #[test]
+    fn prepare_worktree_layout_creates_worktrees() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt_root = temp.path().join("workspaces");
+        let config_path = repo.join("yarli.toml");
+        let loaded = write_test_config_at(
+            &config_path,
+            &format!(
+                r#"
+[features]
+parallel = true
+parallel_worktree = true
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+                repo.display(),
+                wt_root.display()
+            ),
+        );
+
+        let plan = make_run_plan(
+            &repo,
+            vec![make_planned_task("alpha"), make_planned_task("beta")],
+        );
+
+        let layout = prepare_parallel_workspace_layout(&plan, &loaded)
+            .unwrap()
+            .expect("layout should be Some");
+
+        assert_eq!(layout.mode, ParallelWorkspaceMode::GitWorktree);
+        assert_eq!(layout.task_workspace_dirs.len(), 2);
+        assert_eq!(layout.worktree_branches.len(), 2);
+
+        for dir in &layout.task_workspace_dirs {
+            assert!(
+                dir.is_dir(),
+                "workspace dir should exist: {}",
+                dir.display()
+            );
+            // In a worktree, .git is a file (not a directory).
+            let git_file = dir.join(".git");
+            assert!(git_file.exists(), ".git should exist in worktree");
+            assert!(
+                git_file.is_file(),
+                ".git should be a file in worktree, not a dir"
+            );
+        }
+
+        for branch in &layout.worktree_branches {
+            assert!(
+                branch.starts_with("yarli/"),
+                "branch should start with yarli/: {branch}"
+            );
+        }
+
+        // Cleanup.
+        cleanup_parallel_workspace(&layout);
+        assert!(!layout.run_workspace_root.exists());
+    }
+
+    #[test]
+    fn prepare_worktree_layout_enforces_cap() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt_root = temp.path().join("workspaces");
+        let config_path = repo.join("yarli.toml");
+        let loaded = write_test_config_at(
+            &config_path,
+            &format!(
+                r#"
+[features]
+parallel = true
+parallel_worktree = true
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+                repo.display(),
+                wt_root.display()
+            ),
+        );
+
+        // Create MAX_WORKTREES + 1 tasks — should exceed cap.
+        let tasks: Vec<PlannedTask> = (0..MAX_WORKTREES + 1)
+            .map(|i| make_planned_task(&format!("task-{i}")))
+            .collect();
+
+        let plan = make_run_plan(&repo, tasks);
+
+        let err = prepare_parallel_workspace_layout(&plan, &loaded).unwrap_err();
+        assert!(
+            err.to_string().contains("maximum"),
+            "expected cap error: {err}"
+        );
+    }
+
+    #[test]
+    fn prepare_layout_falls_back_to_copy_when_worktree_disabled() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt_root = temp.path().join("workspaces");
+        let config_path = repo.join("yarli.toml");
+        let loaded = write_test_config_at(
+            &config_path,
+            &format!(
+                r#"
+[features]
+parallel = true
+parallel_worktree = false
+
+[execution]
+working_dir = "{}"
+worktree_root = "{}"
+"#,
+                repo.display(),
+                wt_root.display()
+            ),
+        );
+
+        let plan = make_run_plan(&repo, vec![make_planned_task("alpha")]);
+
+        let layout = prepare_parallel_workspace_layout(&plan, &loaded)
+            .unwrap()
+            .expect("layout should be Some");
+
+        assert_eq!(layout.mode, ParallelWorkspaceMode::FileCopy);
+        assert!(layout.worktree_branches.is_empty());
+    }
+
+    #[test]
+    fn cleanup_worktree_removes_worktrees_and_branches() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let run_root = wt_root.join("run-test");
+        std::fs::create_dir_all(&run_root).unwrap();
+
+        let wt1 = run_root.join("001-alpha");
+        let wt1_str = wt1.display().to_string();
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/test/001-alpha",
+                &wt1_str,
+                "HEAD",
+            ],
+        );
+
+        let layout = ParallelWorkspaceLayout {
+            run_workspace_root: run_root.clone(),
+            task_workspace_dirs: vec![wt1],
+            source_head_at_creation: None,
+            mode: ParallelWorkspaceMode::GitWorktree,
+            worktree_branches: vec!["yarli/test/001-alpha".to_string()],
+            source_workdir: Some(repo.clone()),
+        };
+
+        cleanup_parallel_workspace(&layout);
+
+        // Only main worktree should remain.
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
+        assert!(!run_root.exists());
+    }
+
+    #[test]
+    fn cleanup_copy_mode_removes_dir_tree() {
+        let temp = TempDir::new().unwrap();
+        let run_root = temp.path().join("run-test");
+        std::fs::create_dir_all(run_root.join("001-task")).unwrap();
+        std::fs::write(run_root.join("001-task/file.txt"), "content").unwrap();
+
+        let layout = ParallelWorkspaceLayout {
+            run_workspace_root: run_root.clone(),
+            task_workspace_dirs: vec![run_root.join("001-task")],
+            source_head_at_creation: None,
+            mode: ParallelWorkspaceMode::FileCopy,
+            worktree_branches: Vec::new(),
+            source_workdir: None,
+        };
+
+        cleanup_parallel_workspace(&layout);
+        assert!(!run_root.exists());
+    }
+
+    #[test]
+    fn worktree_merge_flow_commits_and_merges_branch() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let run_root = wt_root.join("run-merge-test");
+        std::fs::create_dir_all(&run_root).unwrap();
+
+        let wt1 = run_root.join("001-alpha");
+        let wt1_str = wt1.display().to_string();
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/merge/001-alpha",
+                &wt1_str,
+                "HEAD",
+            ],
+        );
+
+        // Make changes in the worktree.
+        std::fs::write(wt1.join("new_file.txt"), "new content from alpha").unwrap();
+
+        let resolution_config = MergeResolutionConfig {
+            strategy: crate::config::MergeConflictResolution::Fail,
+            repair_command: None,
+            repair_timeout_seconds: 300,
+        };
+        let task_workspaces = vec![("alpha".to_string(), wt1.clone())];
+        let branches = vec!["yarli/merge/001-alpha".to_string()];
+        let mut telemetry = Vec::new();
+
+        let report = merge_worktree_workspace_results(
+            &repo,
+            Uuid::now_v7(),
+            &task_workspaces,
+            &branches,
+            &resolution_config,
+            &mut telemetry,
+        )
+        .unwrap();
+
+        assert_eq!(report.merged_task_keys, vec!["alpha"]);
+        assert!(report.skipped_task_keys.is_empty());
+
+        // Verify the file exists in the main repo.
+        assert!(repo.join("new_file.txt").exists());
+        let content = std::fs::read_to_string(repo.join("new_file.txt")).unwrap();
+        assert_eq!(content, "new content from alpha");
+
+        // Check git log shows merge commit.
+        let (ok, log_output, _) = run_git(&repo, &["log", "--oneline", "-5"]);
+        assert!(ok);
+        assert!(log_output.contains("merge alpha"), "git log: {log_output}");
+    }
+
+    #[test]
+    fn auto_commit_stages_state_files_only() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".yarli")).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        // Create state files and an unrelated file.
+        std::fs::write(repo.join(".yarli/continuation.json"), "{}").unwrap();
+        std::fs::write(repo.join(".yarli/tranches.toml"), "").unwrap();
+        std::fs::write(repo.join("unrelated.txt"), "should not be committed").unwrap();
+
+        let committed =
+            auto_commit_state_files(&repo, "tranche-001", "run-123", 1, 3, None).unwrap();
+        assert!(committed);
+
+        // Verify only state files were committed.
+        let (ok, diff_output, _) = run_git(&repo, &["diff", "--name-only", "HEAD~1..HEAD"]);
+        assert!(ok, "git diff should succeed");
+        assert!(diff_output.contains(".yarli/continuation.json"));
+        assert!(diff_output.contains(".yarli/tranches.toml"));
+        assert!(
+            !diff_output.contains("unrelated.txt"),
+            "unrelated.txt should not be committed: {diff_output}"
+        );
+
+        // Verify commit message.
+        let (ok, log, _) = run_git(&repo, &["log", "-1", "--pretty=%s"]);
+        assert!(ok);
+        assert!(log.contains("tranche-001"), "commit message: {log}");
+        assert!(log.contains("1/3"), "commit message: {log}");
+    }
+
+    #[test]
+    fn worktree_merge_stashes_dirty_state_before_merge() {
+        // Reproduces the real failure: dirty `.yarli/tranches.toml` in the main
+        // worktree blocks `git merge --no-ff` because git refuses to overwrite
+        // local modifications.
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".yarli")).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        std::fs::write(repo.join(".yarli/tranches.toml"), "initial").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        // Create worktree.
+        let wt_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let run_root = wt_root.join("run-stash-test");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let wt1 = run_root.join("001-task");
+        let wt1_str = wt1.display().to_string();
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/stash/001-task",
+                &wt1_str,
+                "HEAD",
+            ],
+        );
+
+        // Make changes in the worktree that touch the same file.
+        std::fs::write(wt1.join(".yarli/tranches.toml"), "modified by task").unwrap();
+        std::fs::write(wt1.join("new_file.txt"), "task output").unwrap();
+
+        // NOW dirty the main worktree — this is the scenario that caused the failure.
+        std::fs::write(repo.join(".yarli/tranches.toml"), "dirty local state").unwrap();
+
+        let resolution_config = MergeResolutionConfig {
+            strategy: crate::config::MergeConflictResolution::Fail,
+            repair_command: None,
+            repair_timeout_seconds: 300,
+        };
+        let task_workspaces = vec![("task".to_string(), wt1.clone())];
+        let branches = vec!["yarli/stash/001-task".to_string()];
+        let mut telemetry = Vec::new();
+
+        // This should succeed (stash dirty state, merge, pop stash).
+        let report = merge_worktree_workspace_results(
+            &repo,
+            Uuid::now_v7(),
+            &task_workspaces,
+            &branches,
+            &resolution_config,
+            &mut telemetry,
+        )
+        .unwrap();
+
+        assert_eq!(report.merged_task_keys, vec!["task"]);
+
+        // Verify the task output was merged.
+        assert!(repo.join("new_file.txt").exists());
+        let content = std::fs::read_to_string(repo.join("new_file.txt")).unwrap();
+        assert_eq!(content, "task output");
+
+        // Verify git log shows merge + reapply commits.
+        let (ok, log, _) = run_git(&repo, &["log", "--oneline", "-5"]);
+        assert!(ok);
+        assert!(log.contains("merge task"), "git log: {log}");
+        assert!(
+            log.contains("reapply pre-existing"),
+            "should reapply stashed state: {log}"
+        );
+
+        // Verify no stash entries remain.
+        let (ok, stash_list, _) = run_git(&repo, &["stash", "list"]);
+        assert!(ok);
+        assert!(
+            stash_list.trim().is_empty(),
+            "stash should be empty: {stash_list}"
+        );
+    }
+
+    #[test]
+    fn worktree_merge_stash_popped_even_on_merge_failure() {
+        // Ensures the stash is restored even when the merge fails, so the
+        // working tree isn't left in a stashed state.
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        // Create worktree.
+        let wt_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let run_root = wt_root.join("run-fail-test");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let wt1 = run_root.join("001-conflict");
+        let wt1_str = wt1.display().to_string();
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/fail/001-conflict",
+                &wt1_str,
+                "HEAD",
+            ],
+        );
+
+        // Commit conflicting change on main branch first, so the worktree branch
+        // diverges and `git merge --no-ff` will produce a real conflict.
+        std::fs::write(repo.join("shared.txt"), "changed on main").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "main diverges"]);
+
+        // Make conflicting change in worktree.
+        std::fs::write(wt1.join("shared.txt"), "changed in worktree").unwrap();
+
+        // Also dirty the main worktree so the stash codepath activates.
+        std::fs::write(repo.join("dirty_local.txt"), "dirty").unwrap();
+
+        let resolution_config = MergeResolutionConfig {
+            strategy: crate::config::MergeConflictResolution::Fail,
+            repair_command: None,
+            repair_timeout_seconds: 300,
+        };
+        let task_workspaces = vec![("conflict".to_string(), wt1.clone())];
+        let branches = vec!["yarli/fail/001-conflict".to_string()];
+        let mut telemetry = Vec::new();
+
+        // This should fail due to merge conflict with Fail strategy.
+        let result = merge_worktree_workspace_results(
+            &repo,
+            Uuid::now_v7(),
+            &task_workspaces,
+            &branches,
+            &resolution_config,
+            &mut telemetry,
+        );
+        assert!(result.is_err(), "should fail on merge conflict");
+
+        // Verify no stash entries remain (stash was popped despite error).
+        let (ok, stash_list, _) = run_git(&repo, &["stash", "list"]);
+        assert!(ok);
+        assert!(
+            stash_list.trim().is_empty(),
+            "stash should be empty after error: {stash_list}"
+        );
+
+        // Verify the dirty file is back in the working tree.
+        assert!(
+            repo.join("dirty_local.txt").exists(),
+            "dirty local file should be restored from stash"
         );
     }
 }

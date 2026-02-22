@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{de::Deserializer, Deserialize, Serialize};
-use yarli_core::entities::continuation::TaskHealthAction;
 use yarli_core::domain::SafeMode;
+use yarli_core::entities::continuation::TaskHealthAction;
 use yarli_observability::JsonlAuditSink;
 use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, TaskQueue};
 use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
@@ -466,9 +466,7 @@ pub(crate) fn preflight_cli_backend(invocation: &CliInvocationConfig) -> Result<
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .with_context(|| {
-            format!("CLI backend preflight failed to execute: {cmd}")
-        })?;
+        .with_context(|| format!("CLI backend preflight failed to execute: {cmd}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -754,12 +752,18 @@ fn default_checkpoint_interval() -> u32 {
 pub struct FeaturesConfig {
     #[serde(default = "default_features_parallel")]
     pub parallel: bool,
+    /// Use git worktrees instead of full directory copies for parallel workspaces.
+    ///
+    /// Falls back to copy mode when git worktrees are unavailable.
+    #[serde(default = "default_true")]
+    pub parallel_worktree: bool,
 }
 
 impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
             parallel: default_features_parallel(),
+            parallel_worktree: true,
         }
     }
 }
@@ -1047,6 +1051,15 @@ pub struct RunConfig {
     /// Serialized as `[run.plan_guard]`.
     #[serde(default)]
     pub plan_guard: Option<RunPlanGuardConfig>,
+    /// Commit YARLI state files after every N tranches. `0` disables auto-commit.
+    ///
+    /// Default is `1` (commit after every tranche).
+    #[serde(default = "default_auto_commit_interval")]
+    pub auto_commit_interval: u32,
+    /// Template for auto-commit messages. Placeholders: `{tranche_key}`,
+    /// `{run_id}`, `{tranches_completed}`, `{tranches_total}`.
+    #[serde(default)]
+    pub auto_commit_message: Option<String>,
     /// The default named pace used by shorthand commands like `yarli run batch`.
     #[serde(default)]
     pub default_pace: Option<String>,
@@ -1123,6 +1136,8 @@ impl Default for RunConfig {
             merge_repair_timeout_seconds: default_merge_repair_timeout_seconds(),
             tasks: Vec::new(),
             tranches: Vec::new(),
+            auto_commit_interval: default_auto_commit_interval(),
+            auto_commit_message: None,
             plan_guard: None,
             default_pace: None,
             paces: std::collections::BTreeMap::new(),
@@ -1146,6 +1161,10 @@ pub enum MergeConflictResolution {
 
 fn default_merge_repair_timeout_seconds() -> u64 {
     300
+}
+
+fn default_auto_commit_interval() -> u32 {
+    1
 }
 
 fn deserialize_merge_conflict_resolution<'de, D>(
@@ -1488,6 +1507,7 @@ mod tests {
             "event_loop.idle_timeout_secs",
             "event_loop.checkpoint_interval",
             "features.parallel",
+            "features.parallel_worktree",
             "queue.claim_batch_size",
             "queue.lease_ttl_seconds",
             "queue.heartbeat_interval_seconds",
@@ -1526,6 +1546,8 @@ mod tests {
             "run.merge_conflict_resolution",
             "run.merge_repair_command",
             "run.merge_repair_timeout_seconds",
+            "run.auto_commit_interval",
+            "run.auto_commit_message",
             "run.tasks",
             "run.tranches",
             "run.plan_guard.target",
@@ -1692,7 +1714,10 @@ env_unset = ["BAD-NAME"]
         assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 0);
         assert!(!loaded.config().run.allow_stable_auto_advance);
         assert_eq!(loaded.config().run.soft_token_cap_ratio, 0.9);
-        assert_eq!(loaded.config().run.task_health, RunTaskHealthConfig::default());
+        assert_eq!(
+            loaded.config().run.task_health,
+            RunTaskHealthConfig::default()
+        );
         assert_eq!(
             loaded.config().run.auto_advance_policy,
             AutoAdvancePolicy::StableOk
@@ -2080,10 +2105,7 @@ allow_in_memory_writes = true
         };
         let err = preflight_cli_backend(&invocation).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("preflight failed"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("preflight failed"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -2096,10 +2118,7 @@ allow_in_memory_writes = true
         };
         let err = preflight_cli_backend(&invocation).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("preflight failed"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("preflight failed"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -2180,7 +2199,9 @@ merge_conflict_resolution = "agentic"
             "unexpected root error: {root_msg}"
         );
         assert!(
-            root_msg.contains("expected one of: \"fail\", \"manual\", \"auto-repair\", \"llm-assisted\""),
+            root_msg.contains(
+                "expected one of: \"fail\", \"manual\", \"auto-repair\", \"llm-assisted\""
+            ),
             "unexpected root error: {root_msg}"
         );
         assert!(root_msg.contains("agentic"));
@@ -2256,5 +2277,57 @@ merge_repair_timeout_seconds = 120
             };
             config.validate_merge_repair_config().unwrap();
         }
+    }
+
+    #[test]
+    fn parallel_worktree_defaults_to_true() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        let loaded = LoadedConfig::load(&path).unwrap();
+        assert!(loaded.config().features.parallel_worktree);
+    }
+
+    #[test]
+    fn parallel_worktree_can_be_disabled() {
+        let loaded = write_test_config(
+            r#"
+[features]
+parallel_worktree = false
+"#,
+        );
+        assert!(!loaded.config().features.parallel_worktree);
+    }
+
+    #[test]
+    fn auto_commit_interval_defaults_to_one() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        let loaded = LoadedConfig::load(&path).unwrap();
+        assert_eq!(loaded.config().run.auto_commit_interval, 1);
+    }
+
+    #[test]
+    fn auto_commit_interval_zero_disables() {
+        let loaded = write_test_config(
+            r#"
+[run]
+auto_commit_interval = 0
+"#,
+        );
+        assert_eq!(loaded.config().run.auto_commit_interval, 0);
+    }
+
+    #[test]
+    fn auto_commit_message_template_parsed() {
+        let loaded = write_test_config(
+            r#"
+[run]
+auto_commit_message = "checkpoint: {tranche_key}"
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.auto_commit_message.as_deref(),
+            Some("checkpoint: {tranche_key}")
+        );
     }
 }

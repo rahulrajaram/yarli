@@ -194,7 +194,8 @@ pub(crate) fn collect_run_resource_totals(
                     totals.total_cpu_user_ticks = totals.total_cpu_user_ticks.saturating_add(value);
                 }
                 if let Some(value) = usage.cpu_system_ticks {
-                    totals.total_cpu_system_ticks = totals.total_cpu_system_ticks.saturating_add(value);
+                    totals.total_cpu_system_ticks =
+                        totals.total_cpu_system_ticks.saturating_add(value);
                 }
                 if let Some(value) = usage.io_read_bytes {
                     totals.total_io_read_bytes = totals.total_io_read_bytes.saturating_add(value);
@@ -214,11 +215,11 @@ pub(crate) fn collect_run_resource_totals(
 }
 
 pub(crate) fn run_state_from_event(event: &Event) -> Option<RunState> {
-        event
-            .payload
-            .get("to")
-            .and_then(|v| v.as_str())
-            .and_then(crate::parse_run_state)
+    event
+        .payload
+        .get("to")
+        .and_then(|v| v.as_str())
+        .and_then(crate::parse_run_state)
         .or(match event.event_type.as_str() {
             "run.activated" => Some(RunState::RunActive),
             "run.blocked" => Some(RunState::RunBlocked),
@@ -258,7 +259,10 @@ pub(crate) fn event_reason(event: &Event) -> Option<String> {
 }
 
 fn event_string_list(payload: Option<&Value>, key: &str) -> Vec<String> {
-    let Some(values) = payload.and_then(|value| value.get(key)).and_then(Value::as_array) else {
+    let Some(values) = payload
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_array)
+    else {
         return Vec::new();
     };
     let mut entries = values
@@ -770,16 +774,32 @@ pub(crate) fn load_run_projection(
             {
                 detail_lines.push(format!("source_workdir={source_workdir}"));
             }
-            if let Some(task_key) = event.payload.get("task_key").and_then(|value| value.as_str()) {
+            if let Some(task_key) = event
+                .payload
+                .get("task_key")
+                .and_then(|value| value.as_str())
+            {
                 detail_lines.push(format!("task_key={task_key}"));
             }
-            if let Some(patch_path) = event.payload.get("patch_path").and_then(|value| value.as_str()) {
+            if let Some(patch_path) = event
+                .payload
+                .get("patch_path")
+                .and_then(|value| value.as_str())
+            {
                 detail_lines.push(format!("patch_path={patch_path}"));
             }
-            if let Some(workspace_path) = event.payload.get("workspace_path").and_then(|value| value.as_str()) {
+            if let Some(workspace_path) = event
+                .payload
+                .get("workspace_path")
+                .and_then(|value| value.as_str())
+            {
                 detail_lines.push(format!("workspace_path={workspace_path}"));
             }
-            if let Some(repo_status) = event.payload.get("repo_status").and_then(|value| value.as_str()) {
+            if let Some(repo_status) = event
+                .payload
+                .get("repo_status")
+                .and_then(|value| value.as_str())
+            {
                 detail_lines.push("repo_status:".to_string());
                 for line in repo_status.lines() {
                     detail_lines.push(format!("- {line}"));

@@ -4,18 +4,18 @@
 //! transitions and output chunks as events (Invariant 4: every transition
 //! persisted before side effects continue).
 
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::fs::OpenOptions;
 
 use chrono::Utc;
 use uuid::Uuid;
 
+use tracing::warn;
 use yarli_core::domain::{EntityType, Event};
 use yarli_core::entities::command_execution::{StreamChunk, StreamType};
 use yarli_observability::audit::{AuditEntry, AuditSink};
 use yarli_store::EventStore;
-use tracing::warn;
 
 use crate::error::ExecError;
 use crate::runner::{CommandRequest, CommandResult, CommandRunner};
@@ -205,7 +205,7 @@ fn serialize_chunks(chunks: &[StreamChunk]) -> serde_json::Value {
                     "data": c.data,
                 })
             })
-                .collect(),
+            .collect(),
     )
 }
 
@@ -266,7 +266,9 @@ fn persist_task_output_artifact(
             "captured_at": chunk.captured_at.to_rfc3339(),
         });
         let record = serde_json::to_string(&line).map_err(|err| {
-            ExecError::Journal(format!("failed to serialize output chunk for task {task_id}: {err}"))
+            ExecError::Journal(format!(
+                "failed to serialize output chunk for task {task_id}: {err}"
+            ))
         })?;
 
         writeln!(&mut file, "{record}").map_err(|err| {

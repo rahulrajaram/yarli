@@ -20,6 +20,9 @@ args = ["exec", "--json"]
 [features]
 # Parallel execution is enabled by default.
 parallel = true
+# Use git worktrees instead of full directory copies for parallel workspaces.
+# Falls back to copy mode when git worktrees are unavailable.
+# parallel_worktree = true
 
 [queue]
 claim_batch_size = 4
@@ -86,6 +89,10 @@ max_grouped_tasks_per_tranche = 0
 enforce_plan_tranche_allowed_paths = false
 # Merge strategy for parallel workspace patch conflicts: fail | manual | auto-repair
 # merge_conflict_resolution = "fail"
+# Auto-commit YARLI state files after every N tranches (0 = disabled).
+# auto_commit_interval = 1
+# Template for auto-commit messages.
+# auto_commit_message = "yarli: checkpoint after {tranche_key} ({tranches_completed}/{tranches_total})"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"

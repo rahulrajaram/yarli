@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde_json::Value;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -440,12 +440,7 @@ struct ToolOutcomeObservation {
 }
 
 impl ToolOutcomeObservation {
-    fn as_payload(
-        &self,
-        task_id: Uuid,
-        task_key: &str,
-        run_id: Uuid,
-    ) -> serde_json::Value {
+    fn as_payload(&self, task_id: Uuid, task_key: &str, run_id: Uuid) -> serde_json::Value {
         serde_json::json!({
             "task_id": task_id,
             "task_key": task_key,
@@ -526,7 +521,13 @@ impl TaskHealthArtifactObserver {
         &mut self,
         task_id: Uuid,
         path: &PathBuf,
-    ) -> Option<Vec<(ToolOutcomeObservation, Option<Uuid>, chrono::DateTime<chrono::Utc>)>> {
+    ) -> Option<
+        Vec<(
+            ToolOutcomeObservation,
+            Option<Uuid>,
+            chrono::DateTime<chrono::Utc>,
+        )>,
+    > {
         let cursor = self.tail.get(&task_id).cloned()?;
         let mut file = OpenOptions::new().read(true).open(path).ok()?;
 
@@ -604,10 +605,7 @@ fn expand_tool_outcome_payload_candidates(value: &serde_json::Value) -> Vec<serd
             candidates.push(parsed);
         }
     }
-    if let Some(inner) = value
-        .get("data")
-        .filter(|value| Value::is_object(value))
-    {
+    if let Some(inner) = value.get("data").filter(|value| Value::is_object(value)) {
         candidates.push(inner.to_owned());
     }
 
@@ -670,13 +668,23 @@ fn parse_tool_health_observation(value: &serde_json::Value) -> Option<ToolOutcom
         .get("metric")
         .and_then(|value| value.as_str())
         .map(ToString::to_string)
-        .or_else(|| value.get("metric").and_then(|value| value.as_str()).map(ToString::to_string));
+        .or_else(|| {
+            value
+                .get("metric")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        });
 
     let detail = outcome
         .get("detail")
         .and_then(|value| value.as_str())
         .map(ToString::to_string)
-        .or_else(|| value.get("message").and_then(|value| value.as_str()).map(ToString::to_string));
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        });
 
     Some(ToolOutcomeObservation {
         tool,
@@ -1070,11 +1078,7 @@ impl DeteriorationObserverState {
     }
 
     fn failure_drift_score(&self) -> f64 {
-        let failures: Vec<&str> = self
-            .failure_signatures
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let failures: Vec<&str> = self.failure_signatures.iter().map(String::as_str).collect();
         if failures.len() < 2 {
             return 0.0;
         }
@@ -1175,7 +1179,9 @@ impl DeteriorationObserverState {
         std::mem::take(&mut self.latest_deterioration_detected)
     }
 
-    fn detect_repeated_failure_signature(&mut self) -> Option<DeteriorationDetectedSignatureSignal> {
+    fn detect_repeated_failure_signature(
+        &mut self,
+    ) -> Option<DeteriorationDetectedSignatureSignal> {
         let signature = self.failure_signatures.back()?;
         let mut repeat_count = 0usize;
         for known in self.failure_signatures.iter().rev() {
@@ -1324,9 +1330,7 @@ fn deterioration_cycle_signature(pattern: &[DeteriorationTrend], repeat_count: u
     format!("{repeat_count}:{joined}")
 }
 
-fn detect_signature_cycle(
-    failure_signatures: &VecDeque<String>,
-) -> Option<FailureSignatureCycle> {
+fn detect_signature_cycle(failure_signatures: &VecDeque<String>) -> Option<FailureSignatureCycle> {
     if failure_signatures.len() < 4 {
         return None;
     }
@@ -1342,7 +1346,9 @@ fn detect_signature_cycle(
     let last_two_start = failure_signatures.len().saturating_sub(2);
     let pattern = vec![
         failure_signatures.get(last_two_start)?.to_owned(),
-        failure_signatures.get(last_two_start.saturating_add(1))?.to_owned(),
+        failure_signatures
+            .get(last_two_start.saturating_add(1))?
+            .to_owned(),
     ];
 
     if pattern[0] == pattern[1] {
@@ -1518,7 +1524,10 @@ fn normalize_task_health_error_signature(event: &Event) -> String {
         if normalized.contains("timed out") || normalized.contains("timeout") {
             return format!("{status}:{tool}:{metric}:timeout");
         }
-        if normalized.contains("exit code") || normalized.contains("exited with code") || normalized.contains("nonzero") {
+        if normalized.contains("exit code")
+            || normalized.contains("exited with code")
+            || normalized.contains("nonzero")
+        {
             return format!("{status}:{tool}:{metric}:nonzero_exit");
         }
         if normalized.contains("execution error") || normalized.contains("permission") {
@@ -1795,7 +1804,10 @@ mod tests {
         assert_eq!(observation.tool, "runner");
         assert_eq!(observation.status, "pass");
         assert_eq!(observation.score, Some(0.77));
-        assert_eq!(observation.detail.as_deref(), Some("nested parsed from data payload"));
+        assert_eq!(
+            observation.detail.as_deref(),
+            Some("nested parsed from data payload")
+        );
     }
 
     #[test]
@@ -1872,12 +1884,15 @@ mod tests {
             payload.get("signal").and_then(Value::as_str),
             Some("backend_failure_repeated_signature")
         );
-        assert_eq!(payload.get("signature_count").and_then(Value::as_u64), Some(3));
+        assert_eq!(
+            payload.get("signature_count").and_then(Value::as_u64),
+            Some(3)
+        );
         assert_eq!(
             payload
                 .get("signatures")
                 .and_then(Value::as_array)
-                .and_then(|values| values.get(0))
+                .and_then(|values| values.first())
                 .and_then(Value::as_str),
             Some("fail:lint:quality:nonzero_exit")
         );
@@ -1943,7 +1958,10 @@ mod tests {
                 "fail:test:quality:timeout"
             ]
         );
-        assert_eq!(payload.get("signature_count").and_then(Value::as_u64), Some(4));
+        assert_eq!(
+            payload.get("signature_count").and_then(Value::as_u64),
+            Some(4)
+        );
     }
 
     #[test]
@@ -2000,14 +2018,26 @@ mod tests {
             .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload.get("tool").and_then(|v| v.as_str()), Some("lint"));
-        assert_eq!(events[0].payload.get("status").and_then(|v| v.as_str()), Some("pass"));
+        assert_eq!(
+            events[0].payload.get("tool").and_then(|v| v.as_str()),
+            Some("lint")
+        );
+        assert_eq!(
+            events[0].payload.get("status").and_then(|v| v.as_str()),
+            Some("pass")
+        );
         assert_eq!(
             events[0].causation_id,
             Some(first_command_id),
             "first line causation id is preserved"
         );
-        assert_eq!(events[0].payload.get("metric").and_then(|value| value.as_str()), Some("quality"));
+        assert_eq!(
+            events[0]
+                .payload
+                .get("metric")
+                .and_then(|value| value.as_str()),
+            Some("quality")
+        );
 
         let second_payload = serde_json::json!({
             "tool": "lint",
@@ -2066,7 +2096,10 @@ mod tests {
         assert_eq!(cycle.repeat_count, 2);
         assert_eq!(
             cycle.pattern,
-            vec![DeteriorationTrend::Stable, DeteriorationTrend::Deteriorating]
+            vec![
+                DeteriorationTrend::Stable,
+                DeteriorationTrend::Deteriorating
+            ]
         );
     }
 

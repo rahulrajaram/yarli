@@ -16,12 +16,12 @@ use uuid::Uuid;
 use yarli_core::domain::{EntityType, Event};
 #[cfg(feature = "debug-api")]
 use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
-#[cfg(feature = "debug-api")]
-use yarli_queue::TaskQueue;
 use yarli_core::explain::DeteriorationReport;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 use yarli_observability::{encode_metrics, YarliMetrics};
+#[cfg(feature = "debug-api")]
+use yarli_queue::TaskQueue;
 use yarli_store::event_store::EventQuery;
 use yarli_store::{EventStore, StoreError};
 
@@ -686,7 +686,10 @@ fn collect_api_resource_budgets(events: &[Event]) -> ResourceUsageBudget {
     let Some(snapshot) = latest_snapshot else {
         return ResourceUsageBudget::default();
     };
-    let budgets = match snapshot.get("config").and_then(|value| value.get("budgets")) {
+    let budgets = match snapshot
+        .get("config")
+        .and_then(|value| value.get("budgets"))
+    {
         Some(value) => value,
         None => return ResourceUsageBudget::default(),
     };
@@ -698,7 +701,9 @@ fn collect_api_resource_budgets(events: &[Event]) -> ResourceUsageBudget {
         max_run_cpu_system_ticks: budgets
             .get("max_run_cpu_system_ticks")
             .and_then(|value| value.as_u64()),
-        max_run_io_read_bytes: budgets.get("max_run_io_read_bytes").and_then(|value| value.as_u64()),
+        max_run_io_read_bytes: budgets
+            .get("max_run_io_read_bytes")
+            .and_then(|value| value.as_u64()),
         max_run_io_write_bytes: budgets
             .get("max_run_io_write_bytes")
             .and_then(|value| value.as_u64()),
@@ -733,20 +738,17 @@ fn collect_api_resource_totals(events: &[Event]) -> ResourceUsageTotals {
         if let Some(raw_usage) = event.payload.get("resource_usage") {
             if let Ok(usage) = serde_json::from_value::<CommandResourceUsage>(raw_usage.clone()) {
                 if let Some(value) = usage.cpu_user_ticks {
-                    totals.total_cpu_user_ticks =
-                        totals.total_cpu_user_ticks.saturating_add(value);
+                    totals.total_cpu_user_ticks = totals.total_cpu_user_ticks.saturating_add(value);
                 }
                 if let Some(value) = usage.cpu_system_ticks {
                     totals.total_cpu_system_ticks =
                         totals.total_cpu_system_ticks.saturating_add(value);
                 }
                 if let Some(value) = usage.io_read_bytes {
-                    totals.total_io_read_bytes =
-                        totals.total_io_read_bytes.saturating_add(value);
+                    totals.total_io_read_bytes = totals.total_io_read_bytes.saturating_add(value);
                 }
                 if let Some(value) = usage.io_write_bytes {
-                    totals.total_io_write_bytes =
-                        totals.total_io_write_bytes.saturating_add(value);
+                    totals.total_io_write_bytes = totals.total_io_write_bytes.saturating_add(value);
                 }
                 if let Some(value) = usage.max_rss_bytes {
                     totals.peak_rss_bytes = totals.peak_rss_bytes.max(value);

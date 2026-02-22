@@ -176,19 +176,26 @@ impl HeadlessRenderer {
                 }
 
                 if let Some(quality_gate) = payload.quality_gate.as_ref() {
-                    if matches!(quality_gate.task_health_action, TaskHealthAction::ForcePivot) {
-                        if let Some(guidance) =
-                            force_pivot_guidance(quality_gate.trend.as_ref())
-                        {
+                    if matches!(
+                        quality_gate.task_health_action,
+                        TaskHealthAction::ForcePivot
+                    ) {
+                        if let Some(guidance) = force_pivot_guidance(quality_gate.trend.as_ref()) {
                             let _ = writeln!(io::stderr(), "{guidance}");
                         }
                     }
-                    if matches!(quality_gate.task_health_action, TaskHealthAction::StopAndSummarize) {
+                    if matches!(
+                        quality_gate.task_health_action,
+                        TaskHealthAction::StopAndSummarize
+                    ) {
                         let guidance =
                             format!("  Stop-and-summarize guidance: {}", quality_gate.reason);
                         let _ = writeln!(io::stderr(), "{guidance}");
                     }
-                    if matches!(quality_gate.task_health_action, TaskHealthAction::CheckpointNow) {
+                    if matches!(
+                        quality_gate.task_health_action,
+                        TaskHealthAction::CheckpointNow
+                    ) {
                         let guidance =
                             format!("  Checkpoint-now guidance: {}", quality_gate.reason);
                         let _ = writeln!(io::stderr(), "{guidance}");

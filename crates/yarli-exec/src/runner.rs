@@ -189,7 +189,11 @@ impl CommandRunner for LocalCommandRunner {
 
         let capture_start = Instant::now();
         let monitor = child.id().map(spawn_resource_monitor);
-        self.record_overhead(request.command_class, "resource_capture_init", capture_start.elapsed());
+        self.record_overhead(
+            request.command_class,
+            "resource_capture_init",
+            capture_start.elapsed(),
+        );
 
         // Transition: CmdQueued → CmdStarted
         execution
@@ -876,8 +880,7 @@ mod tests {
     async fn test_live_output_tx_receives_chunks_as_they_arrive() {
         let runner = LocalCommandRunner::new();
         let cancel = CancellationToken::new();
-        let (live_tx, mut live_rx) =
-            tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
         let mut req = make_request("printf 'line1\nline2\nline3\n'");
         req.live_output_tx = Some(live_tx);
 

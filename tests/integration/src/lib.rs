@@ -24,7 +24,8 @@ pub struct TestDatabase {
 
 impl TestDatabase {
     pub async fn create(admin_database_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let admin_pool = connect_postgres(admin_database_url, "TestDatabase::create(admin)").await?;
+        let admin_pool =
+            connect_postgres(admin_database_url, "TestDatabase::create(admin)").await?;
 
         let database_name = format!("yarli_test_{}", Uuid::now_v7().simple());
         sqlx::query(&format!(r#"CREATE DATABASE "{database_name}""#))
@@ -45,7 +46,8 @@ impl TestDatabase {
     }
 
     pub async fn drop(self) -> Result<(), Box<dyn std::error::Error>> {
-        let admin_pool = connect_postgres(&self.admin_database_url, "TestDatabase::drop(admin)").await?;
+        let admin_pool =
+            connect_postgres(&self.admin_database_url, "TestDatabase::drop(admin)").await?;
 
         sqlx::query(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
@@ -128,13 +130,14 @@ async fn connect_postgres_with_timeout(
     let redacted_url = redact_database_url(database_url);
     eprintln!("[{context}] attempting Postgres connect to {redacted_url} with timeout {timeout:?}");
 
-    let connect = PgPoolOptions::new().max_connections(5).connect(database_url);
+    let connect = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url);
     match tokio::time::timeout(timeout, connect).await {
         Ok(Ok(pool)) => Ok(pool),
-        Ok(Err(err)) => Err(format!(
-            "[{context}] Postgres connect failed for {redacted_url}: {err}"
-        )
-        .into()),
+        Ok(Err(err)) => {
+            Err(format!("[{context}] Postgres connect failed for {redacted_url}: {err}").into())
+        }
         Err(err) => Err(format!(
             "[{context}] Postgres connect timed out after {timeout:?}: {redacted_url}: {err}"
         )

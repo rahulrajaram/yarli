@@ -480,7 +480,10 @@ impl StreamRenderer {
         }
 
         if let Some(quality_gate) = payload.quality_gate.as_ref() {
-            if matches!(quality_gate.task_health_action, TaskHealthAction::ForcePivot) {
+            if matches!(
+                quality_gate.task_health_action,
+                TaskHealthAction::ForcePivot
+            ) {
                 if let Some(guidance) = Self::force_pivot_guidance(quality_gate.trend.as_ref()) {
                     let guidance_line =
                         Line::from(vec![Span::styled(guidance, Tier::Urgent.style())]);
@@ -489,17 +492,20 @@ impl StreamRenderer {
                     })?;
                 }
             }
-            if matches!(quality_gate.task_health_action, TaskHealthAction::StopAndSummarize) {
-                let guidance = format!(
-                    "  Stop-and-summarize guidance: {}",
-                    quality_gate.reason
-                );
+            if matches!(
+                quality_gate.task_health_action,
+                TaskHealthAction::StopAndSummarize
+            ) {
+                let guidance = format!("  Stop-and-summarize guidance: {}", quality_gate.reason);
                 let guidance_line = Line::from(vec![Span::styled(guidance, Tier::Urgent.style())]);
                 self.terminal.insert_before(1, |buf| {
                     Paragraph::new(guidance_line).render(buf.area, buf);
                 })?;
             }
-            if matches!(quality_gate.task_health_action, TaskHealthAction::CheckpointNow) {
+            if matches!(
+                quality_gate.task_health_action,
+                TaskHealthAction::CheckpointNow
+            ) {
                 let guidance = format!("  Checkpoint-now guidance: {}", quality_gate.reason);
                 let guidance_line = Line::from(vec![Span::styled(guidance, Tier::Urgent.style())]);
                 self.terminal.insert_before(1, |buf| {
@@ -511,16 +517,16 @@ impl StreamRenderer {
         Ok(())
     }
 
-fn force_pivot_guidance(trend: Option<&DeteriorationTrend>) -> Option<String> {
-    if matches!(trend, Some(DeteriorationTrend::Deteriorating)) {
-        Some(
+    fn force_pivot_guidance(trend: Option<&DeteriorationTrend>) -> Option<String> {
+        if matches!(trend, Some(DeteriorationTrend::Deteriorating)) {
+            Some(
             "  Force-pivot guidance: sequence quality is deteriorating; narrow scope and shift task focus before continuing."
                 .to_string(),
         )
-    } else {
-        None
+        } else {
+            None
+        }
     }
-}
 
     /// Redraw the inline viewport with current task status.
     fn draw_viewport(&mut self) -> io::Result<()> {
@@ -621,6 +627,17 @@ fn force_pivot_guidance(trend: Option<&DeteriorationTrend>) -> Option<String> {
         Ok(())
     }
 
+    /// Clean up the inline viewport and reposition the cursor below it.
+    ///
+    /// Call this when the stream event loop is done to leave the terminal
+    /// in a usable state. Also invoked automatically via `Drop`.
+    pub fn restore(&mut self) -> io::Result<()> {
+        // Clear the inline viewport area so leftover spinner lines don't linger.
+        self.terminal.clear()?;
+        io::stdout().flush()?;
+        Ok(())
+    }
+
     /// Get mutable access to the terminal (for cleanup, etc.).
     pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
@@ -666,6 +683,12 @@ fn force_pivot_guidance(trend: Option<&DeteriorationTrend>) -> Option<String> {
             }
         }
         snapshot
+    }
+}
+
+impl Drop for StreamRenderer {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 

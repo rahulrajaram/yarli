@@ -21,6 +21,7 @@ use uuid::Uuid;
 use yarli_core::domain::{
     CommandClass, EntityType, Event, ExitReason, PolicyDecision, PolicyOutcome, RunId, TaskId,
 };
+use yarli_core::entities::command_execution::StreamChunk;
 use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
 use yarli_core::entities::run::Run;
 use yarli_core::entities::task::{BlockerCode, Task};
@@ -28,7 +29,6 @@ use yarli_core::explain::GateType;
 use yarli_core::fsm::command::CommandState;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
-use yarli_core::entities::command_execution::StreamChunk;
 use yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError};
 use yarli_gates::{all_passed, collect_failures, evaluate_all, GateContext};
 use yarli_observability::{AuditEntry, AuditSink};
@@ -331,10 +331,7 @@ impl Default for TaskRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MergeFinalizationState {
     Succeeded,
-    Failed {
-        reason: String,
-        is_conflict: bool,
-    },
+    Failed { reason: String, is_conflict: bool },
 }
 
 /// The scheduler loop orchestrator.
@@ -454,7 +451,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         payload
             .get("failure_kind")
             .and_then(|kind| kind.as_str())
-            .is_some_and(|kind| matches!(kind, "merge_conflict" | "MergeConflict" | "MERGE_CONFLICT"))
+            .is_some_and(|kind| {
+                matches!(kind, "merge_conflict" | "MergeConflict" | "MERGE_CONFLICT")
+            })
             || reason.to_lowercase().contains("merge conflict")
     }
 
@@ -463,13 +462,11 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         run_id: RunId,
     ) -> Result<Option<MergeFinalizationState>, SchedulerError> {
         let run_id = run_id.to_string();
-        let events = self
-            .store
-            .query(&EventQuery {
-                entity_type: Some(EntityType::Run),
-                entity_id: Some(run_id),
-                ..Default::default()
-            })?;
+        let events = self.store.query(&EventQuery {
+            entity_type: Some(EntityType::Run),
+            entity_id: Some(run_id),
+            ..Default::default()
+        })?;
 
         let mut merge_finalization_state = None;
         for event in events {
@@ -484,10 +481,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         .and_then(|value| value.as_str())
                         .unwrap_or("parallel merge failed")
                         .to_string();
-                    let is_conflict = Self::classify_merge_failure_reason(
-                        &reason,
-                        &event.payload,
-                    );
+                    let is_conflict = Self::classify_merge_failure_reason(&reason, &event.payload);
                     merge_finalization_state = Some(MergeFinalizationState::Failed {
                         reason,
                         is_conflict,
@@ -578,10 +572,12 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     ) -> Result<TickResult, SchedulerError> {
         #[cfg(feature = "chaos")]
         if let Some(chaos) = &self.chaos {
-            chaos
-                .inject("scheduler_tick_start")
-                .await
-                .map_err(|e| SchedulerError::Exec(ExecError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))))?;
+            chaos.inject("scheduler_tick_start").await.map_err(|e| {
+                SchedulerError::Exec(ExecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e,
+                )))
+            })?;
         }
 
         let _tick_span = info_span!(
@@ -622,10 +618,12 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
         #[cfg(feature = "chaos")]
         if let Some(chaos) = &self.chaos {
-            chaos
-                .inject("scheduler_tick_claimed")
-                .await
-                .map_err(|e| SchedulerError::Exec(ExecError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))))?;
+            chaos.inject("scheduler_tick_claimed").await.map_err(|e| {
+                SchedulerError::Exec(ExecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e,
+                )))
+            })?;
         }
 
         if result.claimed == 0 && result.promoted == 0 {
@@ -969,7 +967,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             let tid = task_id;
             tokio::spawn(async move {
                 while let Some(chunk) = task_rx.recv().await {
-                    let _ = scheduler_tx.send(LiveOutputEvent { task_id: tid, chunk });
+                    let _ = scheduler_tx.send(LiveOutputEvent {
+                        task_id: tid,
+                        chunk,
+                    });
                 }
             });
             task_tx
@@ -994,12 +995,14 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
         // Handle result
         let outcome = match &cmd_result {
-            Ok(result) => self
-                .handle_command_success(task_id, queue_id, command_class, result)
-                .await?,
-            Err(e) => self
-                .handle_command_failure(task_id, queue_id, command_class, e)
-                .await?,
+            Ok(result) => {
+                self.handle_command_success(task_id, queue_id, command_class, result)
+                    .await?
+            }
+            Err(e) => {
+                self.handle_command_failure(task_id, queue_id, command_class, e)
+                    .await?
+            }
         };
 
         // Remove lease tracking
@@ -1726,14 +1729,14 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             }),
             correlation_id,
             causation_id: None,
-                actor: self.config.worker_id.clone(),
-                idempotency_key: Some(format!("{task_id}:failed:{}", task.attempt_no)),
-            })?;
+            actor: self.config.worker_id.clone(),
+            idempotency_key: Some(format!("{task_id}:failed:{}", task.attempt_no)),
+        })?;
 
-            self.record_task_transition(TaskState::TaskFailed, command_class, task_id);
-            self.fail_queue_entry(queue_id, &self.config.worker_id)?;
-            self.maybe_retry(task, task_id, correlation_id)?;
-            self.record_command_metrics(command_class, "exec_error");
+        self.record_task_transition(TaskState::TaskFailed, command_class, task_id);
+        self.fail_queue_entry(queue_id, &self.config.worker_id)?;
+        self.maybe_retry(task, task_id, correlation_id)?;
+        self.record_command_metrics(command_class, "exec_error");
         self.record_command_duration(command_class, None);
 
         warn!(task_id = %task_id, error = %error, "task execution error");
@@ -1741,7 +1744,12 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     }
 
     /// If the task has retries remaining, transition Failed → Ready and re-enqueue.
-    fn maybe_retry(&self, task: &mut Task, task_id: TaskId, correlation_id: Uuid) -> Result<(), SchedulerError> {
+    fn maybe_retry(
+        &self,
+        task: &mut Task,
+        task_id: TaskId,
+        correlation_id: Uuid,
+    ) -> Result<(), SchedulerError> {
         if task.attempt_no < task.max_attempts {
             let next_attempt = task.attempt_no + 1;
             let transition = task.transition(
@@ -1974,7 +1982,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                                 None,
                             )?;
 
-                        self.store.append(Event {
+                            self.store.append(Event {
                                 event_id: transition.event_id,
                                 occurred_at: transition.occurred_at,
                                 entity_type: EntityType::Run,
@@ -2202,9 +2210,17 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         }
     }
 
-    fn record_task_transition(&self, state: TaskState, command_class: CommandClass, _task_id: TaskId) {
+    fn record_task_transition(
+        &self,
+        state: TaskState,
+        command_class: CommandClass,
+        _task_id: TaskId,
+    ) {
         if let Some(metrics) = self.metrics.as_ref() {
-            metrics.record_task_transition(task_state_label(state), command_class_label(command_class));
+            metrics.record_task_transition(
+                task_state_label(state),
+                command_class_label(command_class),
+            );
         }
     }
 
@@ -2220,7 +2236,11 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         }
     }
 
-    fn record_command_duration(&self, command_class: CommandClass, duration: Option<chrono::Duration>) {
+    fn record_command_duration(
+        &self,
+        command_class: CommandClass,
+        duration: Option<chrono::Duration>,
+    ) {
         if let (Some(metrics), Some(duration)) = (self.metrics.as_ref(), duration) {
             let secs = (duration.num_milliseconds().max(0) as f64) / 1000.0;
             metrics.record_command_duration(command_class_label(command_class), secs);
@@ -2233,14 +2253,26 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         };
 
         let run_id = run_id.to_string();
-        metrics.set_run_resource_usage(&run_id, "total_cpu_user_ticks", run_totals.total_cpu_user_ticks);
+        metrics.set_run_resource_usage(
+            &run_id,
+            "total_cpu_user_ticks",
+            run_totals.total_cpu_user_ticks,
+        );
         metrics.set_run_resource_usage(
             &run_id,
             "total_cpu_system_ticks",
             run_totals.total_cpu_system_ticks,
         );
-        metrics.set_run_resource_usage(&run_id, "total_io_read_bytes", run_totals.total_io_read_bytes);
-        metrics.set_run_resource_usage(&run_id, "total_io_write_bytes", run_totals.total_io_write_bytes);
+        metrics.set_run_resource_usage(
+            &run_id,
+            "total_io_read_bytes",
+            run_totals.total_io_read_bytes,
+        );
+        metrics.set_run_resource_usage(
+            &run_id,
+            "total_io_write_bytes",
+            run_totals.total_io_write_bytes,
+        );
         metrics.set_run_resource_usage(&run_id, "peak_rss_bytes", run_totals.peak_rss_bytes);
         metrics.set_run_token_usage(&run_id, "total_tokens", run_totals.total_tokens);
     }
@@ -2409,7 +2441,9 @@ fn command_exit_reason_label(
         }
         CommandState::CmdTimedOut => "timeout",
         CommandState::CmdKilled => "killed",
-        CommandState::CmdQueued | CommandState::CmdStarted | CommandState::CmdStreaming => "unknown",
+        CommandState::CmdQueued | CommandState::CmdStarted | CommandState::CmdStreaming => {
+            "unknown"
+        }
     }
 }
 
@@ -2761,9 +2795,7 @@ mod tests {
 
         {
             let mut reg = sched.registry().write().await;
-            let task = reg
-                .get_task_mut(&task_id)
-                .expect("task should be present");
+            let task = reg.get_task_mut(&task_id).expect("task should be present");
             task.state = TaskState::TaskComplete;
         }
 
@@ -2814,9 +2846,7 @@ mod tests {
 
         {
             let mut reg = sched.registry().write().await;
-            let task = reg
-                .get_task_mut(&task_id)
-                .expect("task should be present");
+            let task = reg.get_task_mut(&task_id).expect("task should be present");
             task.state = TaskState::TaskComplete;
         }
 

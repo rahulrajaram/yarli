@@ -66,8 +66,8 @@ use crate::persistence::*;
 use crate::plan::*;
 use crate::projection::*;
 use cli::{
-    AuditAction, Cli, Commands, GateAction, MergeAction, PlanAction, RunAction, TaskAction,
-    TrancheAction, WorktreeAction, DebugAction,
+    AuditAction, Cli, Commands, DebugAction, GateAction, MergeAction, PlanAction, RunAction,
+    TaskAction, TrancheAction, WorktreeAction,
 };
 use commands::*;
 
@@ -93,7 +93,10 @@ async fn main() {
         }
     }
 
-    let tracing_config = TracingConfig { target: false, ..Default::default() };
+    let tracing_config = TracingConfig {
+        target: false,
+        ..Default::default()
+    };
     if let Err(err) = init_tracing(&tracing_config) {
         error!(error = %err, "tracing initialization failed");
     }
@@ -340,9 +343,7 @@ async fn run() -> Result<()> {
         Commands::Debug { action } => match action {
             DebugAction::QueueDepth => cmd_debug_queue_depth(),
             DebugAction::ActiveLeases => cmd_debug_active_leases(),
-            DebugAction::ResourceUsage { run_id } => {
-                cmd_debug_resource_usage(&run_id)
-            }
+            DebugAction::ResourceUsage { run_id } => cmd_debug_resource_usage(&run_id),
         },
         Commands::Init { .. } => unreachable!("init command handled before runtime config load"),
         Commands::Info => {

@@ -2,10 +2,9 @@
 //!
 //! Provides traits and implementations for injecting faults into the runtime.
 
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
 
 /// A specific failure mode that can be injected.
 #[async_trait]
