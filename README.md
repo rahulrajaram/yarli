@@ -74,3 +74,4 @@ cargo test -p yarli-cli --test postgres_integration
 ## Operations
 
 Operational setup, migration steps, and local runbook details are documented in `docs/OPERATIONS.md`.
+CI/CD API workflow examples are in `docs/CI_CD_INTEGRATION_EXAMPLES.md`.

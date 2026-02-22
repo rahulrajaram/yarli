@@ -66,8 +66,8 @@ use crate::persistence::*;
 use crate::plan::*;
 use crate::projection::*;
 use cli::{
-    AuditAction, Cli, Commands, DebugAction, GateAction, MergeAction, PlanAction, RunAction,
-    TaskAction, TrancheAction, WorktreeAction,
+    AuditAction, Cli, Commands, DebugAction, GateAction, MergeAction, MigrateAction, PlanAction,
+    RunAction, TaskAction, TrancheAction, WorktreeAction,
 };
 use commands::*;
 
@@ -344,6 +344,18 @@ async fn run() -> Result<()> {
             DebugAction::QueueDepth => cmd_debug_queue_depth(),
             DebugAction::ActiveLeases => cmd_debug_active_leases(),
             DebugAction::ResourceUsage { run_id } => cmd_debug_resource_usage(&run_id),
+        },
+        Commands::Migrate { action } => match action {
+            MigrateAction::Status => cmd_migrate_status(&loaded_config).await,
+            MigrateAction::Up { target } => cmd_migrate_up(&loaded_config, target.as_deref()).await,
+            MigrateAction::Down {
+                target,
+                backup_label,
+            } => cmd_migrate_down(&loaded_config, target.as_deref(), backup_label.as_deref()).await,
+            MigrateAction::Backup { label } => {
+                cmd_migrate_backup(&loaded_config, label.as_deref()).await
+            }
+            MigrateAction::Restore { label } => cmd_migrate_restore(&loaded_config, &label).await,
         },
         Commands::Init { .. } => unreachable!("init command handled before runtime config load"),
         Commands::Info => {

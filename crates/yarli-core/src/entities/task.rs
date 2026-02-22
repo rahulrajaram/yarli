@@ -69,8 +69,12 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     /// When the task last changed state.
     pub updated_at: DateTime<Utc>,
-    /// Priority for queue ordering (1 = highest).
+    /// Priority for queue ordering (0-100, higher is more urgent).
     pub priority: u32,
+}
+
+fn clamp_task_priority(priority: u32) -> u32 {
+    priority.min(100)
 }
 
 impl Task {
@@ -111,9 +115,9 @@ impl Task {
         }
     }
 
-    /// Set the task priority (1 = highest).
+    /// Set the task priority (0-100, higher is more urgent).
     pub fn with_priority(mut self, priority: u32) -> Self {
-        self.priority = priority;
+        self.priority = clamp_task_priority(priority);
         self
     }
 

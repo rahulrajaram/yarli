@@ -34,6 +34,7 @@ pub(crate) struct PlannedTask {
     pub(crate) command_class: CommandClass,
     pub(crate) tranche_key: Option<String>,
     pub(crate) tranche_group: Option<String>,
+    pub(crate) depends_on: Vec<String>,
     pub(crate) allowed_paths: Vec<String>,
 }
 
@@ -262,6 +263,7 @@ pub(crate) fn resolve_run_plan(
             command_class: CommandClass::Io,
             tranche_key: None,
             tranche_group: None,
+            depends_on: Vec::new(),
             allowed_paths: Vec::new(),
         })
         .collect::<Vec<_>>();
@@ -548,6 +550,7 @@ pub(crate) fn build_plan_driven_run_sequence(
             command_class: CommandClass::Tool,
             tranche_key: Some(tranche.key.clone()),
             tranche_group: tranche.tranche_group.clone(),
+            depends_on: Vec::new(),
             allowed_paths: tranche.allowed_paths.clone(),
         });
         entry_task_pairs.push((tranche.clone(), task_key));
@@ -570,6 +573,7 @@ pub(crate) fn build_plan_driven_run_sequence(
         command_class: CommandClass::Tool,
         tranche_key: Some("verification".to_string()),
         tranche_group: None,
+        depends_on: Vec::new(),
         allowed_paths: Vec::new(),
     });
     tranche_plan.push(PlannedTranche {
@@ -596,6 +600,7 @@ pub(crate) fn build_plain_prompt_run_sequence(
         command_class: CommandClass::Tool,
         tranche_key: Some("prompt".to_string()),
         tranche_group: None,
+        depends_on: Vec::new(),
         allowed_paths: Vec::new(),
     }];
     let tranche_plan = vec![PlannedTranche {
@@ -746,6 +751,7 @@ pub(crate) fn build_task_catalog_from_run_spec(
                 command_class: class,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: t.depends_on.clone(),
                 allowed_paths: Vec::new(),
             })
         })
@@ -898,6 +904,16 @@ pub(crate) fn parse_task_catalog_from_snapshot(
                         .and_then(|value| value.as_str())
                         .map(ToString::to_string)
                         .filter(|value| !value.trim().is_empty()),
+                    depends_on: task
+                        .get("depends_on")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(ToString::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
                     allowed_paths: task
                         .get("allowed_paths")
                         .and_then(|value| value.as_array())
@@ -1338,6 +1354,7 @@ pub(crate) fn build_plan_from_continuation_tranche(
                     command_class: CommandClass::Io,
                     tranche_key: None,
                     tranche_group: None,
+                    depends_on: Vec::new(),
                     allowed_paths: Vec::new(),
                 }
             }

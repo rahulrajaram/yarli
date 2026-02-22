@@ -5,7 +5,7 @@
 //! - `PROMPT.md` may contain `@include <path>` directives (repo-confined).
 //! - A single fenced code block with info string `yarli-run` defines what to execute.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -41,6 +41,8 @@ pub struct RunSpecTask {
     pub cmd: String,
     #[serde(default)]
     pub class: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -248,6 +250,8 @@ pub fn validate_run_spec(run_spec: &RunSpec) -> Result<()> {
         }
     }
 
+    validate_run_spec_task_dependencies(&run_spec.tasks)?;
+
     if let Some(tranches) = run_spec.tranches.as_ref() {
         if tranches.items.is_empty() {
             bail!("run spec tranches.items must be non-empty when [tranches] is present");
@@ -290,6 +294,87 @@ pub fn validate_run_spec(run_spec: &RunSpec) -> Result<()> {
             bail!("run spec plan_guard.target must be non-empty");
         }
     }
+    Ok(())
+}
+
+fn validate_run_spec_task_dependencies(tasks: &[RunSpecTask]) -> Result<()> {
+    let available_keys: BTreeSet<_> = tasks.iter().map(|task| task.key.as_str()).collect();
+    let mut dependency_graph: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for task in tasks {
+        let task_key = task.key.trim();
+        if task_key.is_empty() {
+            continue;
+        }
+
+        let mut normalized_deps = Vec::new();
+        for dep in &task.depends_on {
+            let dep = dep.trim();
+            if dep.is_empty() {
+                bail!("run spec task {} has empty depends_on entry", task.key);
+            }
+            if dep == task_key {
+                bail!("run spec task {} cannot depend on itself", task.key);
+            }
+            if !available_keys.contains(dep) {
+                bail!(
+                    "run spec task {} depends on unknown task key: {}",
+                    task.key,
+                    dep
+                );
+            }
+            normalized_deps.push(dep);
+        }
+        dependency_graph.insert(task_key, normalized_deps);
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut visiting = Vec::new();
+    let mut in_stack = BTreeSet::new();
+
+    for task_key in available_keys {
+        if !visited.contains(task_key) {
+            detect_task_dependency_cycle(task_key, &dependency_graph, &mut visited, &mut in_stack, &mut in_stack.clone())?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detect_task_dependency_cycle(
+    task_key: &str,
+    dependency_graph: &HashMap<&str, Vec<&str>>,
+    visited: &mut BTreeSet<&str>,
+    visiting_stack: &mut Vec<&str>,
+    visiting_lookup: &mut BTreeSet<&str>,
+) -> Result<()> {
+    if visited.contains(task_key) {
+        return Ok(());
+    }
+    if visiting_lookup.contains(task_key) {
+        let cycle_start = visiting_stack
+            .iter()
+            .position(|value| *value == task_key)
+            .unwrap_or(0);
+        let cycle: Vec<&str> = visiting_stack[cycle_start..]
+            .iter()
+            .chain(std::iter::once(&task_key))
+            .copied()
+            .collect();
+        bail!("run spec has cyclic task dependency: {}", cycle.join(" -> "));
+    }
+
+    visiting_lookup.insert(task_key);
+    visiting_stack.push(task_key);
+
+    for dep in dependency_graph.get(task_key).into_iter().flatten() {
+        detect_task_dependency_cycle(dep, dependency_graph, visited, visiting_stack, visiting_lookup)?;
+    }
+
+    visiting_lookup.remove(task_key);
+    visiting_stack.pop();
+    visited.insert(task_key);
     Ok(())
 }
 

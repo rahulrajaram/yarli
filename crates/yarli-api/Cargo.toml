@@ -14,7 +14,9 @@ yarli-gates = { workspace = true }
 prometheus-client = { workspace = true }
 yarli-policy = { workspace = true }
 yarli-observability = { workspace = true }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+futures-util = { version = "0.3", features = ["sink"] }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

@@ -199,6 +199,9 @@ pub(crate) fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<
                     hints.query_text
                 )?;
             }
+            if !task.depends_on.is_empty() {
+                writeln!(&mut out, "    depends_on: {}", task.depends_on.join(", "))?;
+            }
         }
     }
 
@@ -1415,8 +1418,9 @@ mod tests {
 
         let entries = stream_task_catalog_entries(&event);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], (task_a, "first".to_string()));
+        assert_eq!(entries[0], (task_a, "first".to_string(), Vec::new()));
         assert_eq!(entries[1].0, task_b);
+        assert_eq!(entries[1].2, Vec::<String>::new());
     }
 
     #[test]
@@ -1473,17 +1477,27 @@ mod tests {
         }
 
         match rx.try_recv().expect("task A discovery") {
-            StreamEvent::TaskDiscovered { task_id, task_name } => {
+            StreamEvent::TaskDiscovered {
+                task_id,
+                task_name,
+                depends_on,
+            } => {
                 assert_eq!(task_id, task_a);
                 assert_eq!(task_name, "tranche-001");
+                assert!(depends_on.is_empty());
             }
             other => panic!("expected task discovered event, got {other:?}"),
         }
 
         match rx.try_recv().expect("task B discovery") {
-            StreamEvent::TaskDiscovered { task_id, task_name } => {
+            StreamEvent::TaskDiscovered {
+                task_id,
+                task_name,
+                depends_on,
+            } => {
                 assert_eq!(task_id, task_b);
                 assert_eq!(task_name, "tranche-002");
+                assert!(depends_on.is_empty());
             }
             other => panic!("expected task discovered event, got {other:?}"),
         }

@@ -156,8 +156,25 @@ yarli run --stream
 #
 # [postgres]
 # database_url = "postgres://postgres:postgres@localhost:5432/yarli"
+# database_url_file = "/run/secrets/yarli-postgres-url"
 #
-# Apply migrations (see docs/OPERATIONS.md), then:
+# Or provide DATABASE_URL at runtime (recommended for container deployments):
+# export DATABASE_URL="postgres://postgres:postgres@localhost:5432/yarli"
+#
+### Postgres migration control
+
+Use the new migration tooling for durable mode:
+
+```bash
+yarli migrate status
+yarli migrate up
+yarli migrate backup --label <label>   # optional manual checkpoint
+yarli migrate down --target 0001
+yarli migrate restore --label <label>
+```
+
+Apply schema migrations (or restore from a snapshot) before running durable CLI write commands.
+ 
 yarli run --stream
 ```
 
@@ -496,10 +513,27 @@ If you see errors indicating in-memory writes are blocked, either:
 
 1. Configure durable mode:
    - `core.backend = "postgres"`
-   - `postgres.database_url = "..."` and apply migrations
+   - Set one of these:
+     - `DATABASE_URL = "..."` in process env
+     - `[postgres].database_url = "..."`
+     - `[postgres].database_url_file = "/run/secrets/..."`
+   - apply migrations
 2. Or explicitly opt into ephemeral writes (local throwaway usage only):
    - `core.backend = "in-memory"`
    - `core.allow_in_memory_writes = true`
+
+### Secret rotation workflow
+
+For zero-downtime secret rotation, update one of these inputs:
+
+- Set a new `DATABASE_URL` value in process environment before restart.
+- Point `postgres.database_url_file` to a new Kubernetes secret file and trigger a rollout.
+
+Recommended pattern:
+
+1. Mount credentials as files in a dedicated secret volume (for example `/run/secrets/...`).
+2. Set `postgres.database_url_file` to that mounted path in `yarli.toml`.
+3. Update the secret, then restart YARLI (`kubectl rollout restart ...`) so startup resolves the new URL.
 
 ### Stream requested but "headless mode"
 

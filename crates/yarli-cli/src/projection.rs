@@ -49,6 +49,7 @@ pub(crate) struct TaskProjection {
     pub(crate) tranche_key: Option<String>,
     pub(crate) tranche_group: Option<String>,
     pub(crate) allowed_paths: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +456,7 @@ pub(crate) struct TaskCatalogProjection {
     pub(crate) tranche_key: Option<String>,
     pub(crate) tranche_group: Option<String>,
     pub(crate) allowed_paths: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
 }
 
 pub(crate) fn task_catalog_entries_from_event(
@@ -505,6 +507,16 @@ pub(crate) fn task_catalog_entries_from_event(
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
+                    let depends_on = task
+                        .get("depends_on")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(ToString::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     Some((
                         task_id,
                         TaskCatalogProjection {
@@ -513,6 +525,7 @@ pub(crate) fn task_catalog_entries_from_event(
                             tranche_key,
                             tranche_group,
                             allowed_paths,
+                            depends_on,
                         },
                     ))
                 })
@@ -552,6 +565,7 @@ pub(crate) fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> 
             tranche_key: None,
             tranche_group: None,
             allowed_paths: Vec::new(),
+            depends_on: Vec::new(),
         });
 
         entry.correlation_id = event.correlation_id;
@@ -861,6 +875,7 @@ pub(crate) fn load_run_projection(
             if task.allowed_paths.is_empty() {
                 task.allowed_paths = metadata.allowed_paths.clone();
             }
+            task.depends_on = metadata.depends_on.clone();
         }
     }
 

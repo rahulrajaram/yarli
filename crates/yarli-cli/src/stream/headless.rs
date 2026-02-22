@@ -57,6 +57,7 @@ impl HeadlessRenderer {
             StreamEvent::TaskDiscovered {
                 task_id: _,
                 task_name: _,
+                depends_on: _,
             } => {
                 // Catalog/discovery event only; no terminal transition yet.
             }

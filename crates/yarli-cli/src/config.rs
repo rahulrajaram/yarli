@@ -5,9 +5,11 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use serde::{de::Deserializer, Deserialize, Serialize};
+use sqlx::postgres::PgConnectOptions;
 use yarli_core::domain::SafeMode;
 use yarli_core::entities::continuation::TaskHealthAction;
 use yarli_observability::JsonlAuditSink;
@@ -15,6 +17,7 @@ use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, TaskQueue};
 use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
 
 pub const DEFAULT_CONFIG_PATH: &str = "yarli.toml";
+const DATABASE_URL_ENV: &str = "DATABASE_URL";
 
 pub(crate) fn cmd_init(
     path: PathBuf,
@@ -65,7 +68,7 @@ pub(crate) fn ensure_write_backend_guard(
     ) && !loaded_config.config().core.allow_in_memory_writes
     {
         bail!(
-            "`{command_name}` refuses in-memory write mode. Configure durable storage with [core] backend = \"postgres\" and [postgres] database_url, or explicitly opt in with [core] allow_in_memory_writes = true."
+            "`{command_name}` refuses in-memory write mode. Configure durable storage with [core] backend = \"postgres\" and set DATABASE_URL (or [postgres].database_url / [postgres].database_url_file), or explicitly opt in with [core] allow_in_memory_writes = true."
         );
     }
     Ok(())
@@ -522,17 +525,21 @@ pub struct LoadedConfig {
 
 impl LoadedConfig {
     pub fn load_default() -> Result<Self> {
-        Self::load(DEFAULT_CONFIG_PATH)
+        let loaded = Self::load(DEFAULT_CONFIG_PATH)?;
+        loaded.validate()?;
+        Ok(loaded)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
-            return Ok(Self {
+            let loaded = Self {
                 path,
                 source: ConfigSource::Defaults,
                 config: YarliConfig::default(),
-            });
+            };
+            loaded.validate()?;
+            return Ok(loaded);
         }
 
         let raw = fs::read_to_string(&path)
@@ -540,11 +547,20 @@ impl LoadedConfig {
         let config: YarliConfig = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
 
-        Ok(Self {
+        let loaded = Self {
             path,
             source: ConfigSource::File,
             config,
-        })
+        };
+        loaded.validate()?;
+        Ok(loaded)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.config.core.backend == BackendKind::Postgres {
+            self.resolve_postgres_database_url()?;
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -563,18 +579,7 @@ impl LoadedConfig {
         match self.config.core.backend {
             BackendKind::InMemory => Ok(BackendSelection::InMemory),
             BackendKind::Postgres => {
-                let database_url = self
-                    .config
-                    .postgres
-                    .database_url
-                    .clone()
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "core.backend=postgres requires postgres.database_url in {}",
-                            self.path.display()
-                        )
-                    })?;
+                let database_url = self.resolve_postgres_database_url()?;
                 Ok(BackendSelection::Postgres { database_url })
             }
         }
@@ -582,6 +587,49 @@ impl LoadedConfig {
 
     pub fn snapshot(&self) -> Result<serde_json::Value> {
         serde_json::to_value(&self.config).context("failed to serialize config snapshot")
+    }
+
+    fn resolve_postgres_database_url(&self) -> Result<String> {
+        if let Ok(value) = env::var(DATABASE_URL_ENV) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return validate_postgres_database_url("DATABASE_URL env var", value);
+            }
+        }
+
+        if let Some(database_url) = self
+            .config
+            .postgres
+            .database_url
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return validate_postgres_database_url("[postgres].database_url", database_url);
+        }
+
+        if let Some(database_url_path) = self
+            .config
+            .postgres
+            .database_url_file
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            let raw_url = fs::read_to_string(database_url_path).with_context(|| {
+                format!("failed to read postgres.database_url_file {database_url_path}")
+            })?;
+            let database_url = raw_url.trim();
+            if database_url.is_empty() {
+                bail!("postgres.database_url_file {database_url_path} is empty");
+            }
+            return validate_postgres_database_url("postgres.database_url_file", database_url);
+        }
+
+        bail!(
+            "core.backend=postgres requires DATABASE_URL, [postgres].database_url, or [postgres].database_url_file in {}",
+            self.path.display()
+        )
     }
 }
 
@@ -680,6 +728,17 @@ fn default_safe_mode() -> SafeMode {
 pub struct PostgresConfig {
     #[serde(default)]
     pub database_url: Option<String>,
+    #[serde(default)]
+    pub database_url_file: Option<String>,
+}
+
+fn validate_postgres_database_url(source: &str, database_url: &str) -> Result<String> {
+    PgConnectOptions::from_str(database_url).with_context(|| {
+        format!(
+            "invalid postgres database url in {source}: expected a valid Postgres connection URI"
+        )
+    })?;
+    Ok(database_url.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1422,8 +1481,18 @@ mod tests {
     use clap::CommandFactory;
     use std::io::Write;
     use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    static DATABASE_URL_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_database_url_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        DATABASE_URL_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("database URL env lock should be obtainable")
+    }
 
     fn write_test_config(contents: &str) -> LoadedConfig {
         let temp_dir = TempDir::new().unwrap();
@@ -1498,6 +1567,7 @@ mod tests {
             "core.safe_mode",
             "core.worker_id",
             "postgres.database_url",
+            "postgres.database_url_file",
             "cli.backend",
             "cli.prompt_mode",
             "cli.command",
@@ -1965,16 +2035,85 @@ mode = "stream"
     fn postgres_backend_requires_database_url() {
         let mut config = YarliConfig::default();
         config.core.backend = BackendKind::Postgres;
+        let _guard = with_database_url_env_lock();
+        std::env::remove_var(DATABASE_URL_ENV);
         let loaded = LoadedConfig {
             path: PathBuf::from("yarli.toml"),
             source: ConfigSource::Defaults,
             config,
         };
         let err = loaded.backend_selection().unwrap_err();
-        assert!(
-            err.to_string().contains("postgres.database_url"),
-            "unexpected error: {err}"
+        assert!(err.to_string().contains("DATABASE_URL"));
+    }
+
+    #[test]
+    fn postgres_backend_prefers_environment_database_url() {
+        let mut config = YarliConfig::default();
+        config.core.backend = BackendKind::Postgres;
+        let _guard = with_database_url_env_lock();
+        std::env::set_var(
+            DATABASE_URL_ENV,
+            "postgres://postgres:postgres@localhost:5432/env-var",
         );
+        let loaded = LoadedConfig {
+            path: PathBuf::from("yarli.toml"),
+            source: ConfigSource::Defaults,
+            config,
+        };
+
+        let selection = loaded.backend_selection().unwrap();
+        assert_eq!(
+            selection,
+            BackendSelection::Postgres {
+                database_url: "postgres://postgres:postgres@localhost:5432/env-var".to_string()
+            }
+        );
+        std::env::remove_var(DATABASE_URL_ENV);
+    }
+
+    #[test]
+    fn postgres_backend_prefers_configured_database_url_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let secret_path = temp_dir.path().join("database-url");
+        std::fs::write(
+            &secret_path,
+            "postgres://postgres:postgres@localhost:5432/file-backed",
+        )
+        .unwrap();
+        let loaded = write_test_config(&format!(
+            r#"
+[core]
+backend = "postgres"
+
+[postgres]
+database_url_file = "{}"
+"#,
+            secret_path.display()
+        ));
+
+        let selection = loaded.backend_selection().unwrap();
+        assert_eq!(
+            selection,
+            BackendSelection::Postgres {
+                database_url: "postgres://postgres:postgres@localhost:5432/file-backed".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn postgres_backend_rejects_invalid_database_url() {
+        let _guard = with_database_url_env_lock();
+        std::env::remove_var(DATABASE_URL_ENV);
+        let mut config = YarliConfig::default();
+        config.core.backend = BackendKind::Postgres;
+        config.postgres.database_url = Some("not-a-valid-url".to_string());
+        let loaded = LoadedConfig {
+            path: PathBuf::from("yarli.toml"),
+            source: ConfigSource::Defaults,
+            config,
+        };
+        let err = loaded.backend_selection().unwrap_err();
+        assert!(err.to_string().contains("invalid postgres database url"));
     }
 
     #[test]

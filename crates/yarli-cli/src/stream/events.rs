@@ -18,7 +18,11 @@ use yarli_core::fsm::task::TaskState;
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// A task is known/planned for this run before transitions are emitted.
-    TaskDiscovered { task_id: TaskId, task_name: String },
+    TaskDiscovered {
+        task_id: TaskId,
+        task_name: String,
+        depends_on: Vec<String>,
+    },
 
     /// A task changed state (Section 33: single structured line per transition).
     TaskTransition {

@@ -56,6 +56,8 @@ Configuration sections and properties you can tune:
 
 [postgres]
 - postgres.database_url (required when core.backend = "postgres")
+- postgres.database_url_file (file containing DSN; Kubernetes secret volume pattern)
+- or DATABASE_URL env var for deployment-time secret injection
 
 Recommended for consumers: use Postgres (`core.backend = "postgres"`) for durable runs.
 `core.backend = "in-memory"` is intended for local throwaway usage only and blocks write
@@ -220,6 +222,8 @@ safe_mode = "execute"
 [postgres]
 # Required when core.backend = "postgres".
 # database_url = "postgres://postgres:postgres@localhost:5432/yarli"
+# Alternatively set a file path mounted from a secret:
+# database_url_file = "/run/secrets/yarli-postgres-url"
 
 # --- CLI_BACKEND_BEGIN ---
 [cli]
@@ -577,6 +581,29 @@ pub(crate) enum Commands {
     Debug {
         #[command(subcommand)]
         action: DebugAction,
+    },
+    #[command(
+        about = "Manage Postgres migration lifecycle and rollback safety",
+        long_about = "Manage Postgres migrations for YARLI durable storage.
+
+Examples:
+- `yarli migrate status`
+- `yarli migrate up`
+- `yarli migrate up --target 0002_init`
+- `yarli migrate down`
+- `yarli migrate down --target 0001`
+- `yarli migrate backup`
+- `yarli migrate restore --label 20260222_120000`
+
+`status`: show applied migrations vs code-defined pending migrations.
+`up`: apply pending migrations in order.
+`down`: apply reverse migrations to a target checkpoint (creates a backup first).
+`backup`: capture a schema-level snapshot for rollback safety.
+`restore`: copy a previous backup snapshot back into live schema tables."
+    )]
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
     },
     #[command(
         about = "Initialize yarli.toml with a documented template",
@@ -1018,5 +1045,71 @@ pub(crate) enum DebugAction {
     ResourceUsage {
         /// Run ID (UUID).
         run_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MigrateAction {
+    #[command(
+        about = "Show migration status and pending/applied deltas",
+        long_about = "Show the migration status for the durable Postgres store.
+
+This command reports each migration entry in code order and whether it is
+currently applied in the target database."
+    )]
+    Status,
+
+    #[command(
+        about = "Apply pending migrations",
+        long_about = "Apply pending migrations to the target Postgres database.
+
+Use --target to stop at a specific migration version. If omitted, all pending
+migrations are applied."
+    )]
+    Up {
+        /// Stop after applying this migration (for example 0001 or 0001_init).
+        #[arg(short, long)]
+        target: Option<String>,
+    },
+
+    #[command(
+        about = "Revert migrations to a target checkpoint",
+        long_about = "Revert migrations in reverse order to the target migration.
+
+If --target is omitted, the system rolls back exactly one migration.
+Before rollback, the command automatically creates a labeled backup snapshot
+in `yarli_migration_backups` to support manual restore if needed."
+    )]
+    Down {
+        /// Target checkpoint (for example 0001 or 0001_init). Defaults to one step back.
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Optional backup label used for rollback restore. Defaults to timestamp.
+        #[arg(short, long)]
+        backup_label: Option<String>,
+    },
+
+    #[command(
+        about = "Create a backup snapshot for migration rollback safety",
+        long_about = "Create a full data snapshot of migration-related tables.
+
+Backup snapshots are stored in `yarli_migration_backups.<label>` and can be
+restored with `yarli migrate restore --label <label>`."
+    )]
+    Backup {
+        /// Backup label (defaults to timestamp-based label).
+        #[arg(short, long)]
+        label: Option<String>,
+    },
+
+    #[command(
+        about = "Restore data from a migration backup snapshot",
+        long_about = "Restore known migration-related tables from a backup snapshot
+captured by `yarli migrate backup`. This command only restores tables in the
+snapshot schema and writes a warning when schemas differ."
+    )]
+    Restore {
+        /// Snapshot label to restore from.
+        label: String,
     },
 }

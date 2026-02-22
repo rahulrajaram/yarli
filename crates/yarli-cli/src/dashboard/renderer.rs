@@ -88,9 +88,13 @@ impl DashboardRenderer {
     /// Process a stream event and update internal state.
     pub fn handle_event(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::TaskDiscovered { task_id, task_name } => {
+            StreamEvent::TaskDiscovered {
+                task_id,
+                task_name,
+                depends_on,
+            } => {
                 self.state
-                    .update_task(task_id, &task_name, TaskState::TaskOpen, None);
+                    .update_task(task_id, &task_name, TaskState::TaskOpen, None, Some(depends_on));
             }
             StreamEvent::TaskTransition {
                 task_id,
@@ -102,7 +106,8 @@ impl DashboardRenderer {
                 detail: _,
                 at: _,
             } => {
-                self.state.update_task(task_id, &task_name, to, elapsed);
+                self.state
+                    .update_task(task_id, &task_name, to, elapsed, None);
                 if to == TaskState::TaskExecuting {
                     self.spinners.entry(task_id).or_default();
                 }
@@ -509,12 +514,16 @@ pub fn build_task_list_lines<'a>(
             Style::default()
         };
 
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(cursor.to_string(), cursor_style),
             Span::styled(format!("{glyph} "), tier.style()),
             Span::styled(format!("{:<14}", task.name), tier.style()),
             Span::styled(format!(" {:<6}", elapsed_str), Tier::Contextual.style()),
-        ]));
+        ];
+        if let Some(by) = task.blocked_by.as_deref() {
+            spans.push(Span::styled(format!(" blocked_by={by}"), Tier::Contextual.style()));
+        }
+        lines.push(Line::from(spans));
     }
 
     if lines.is_empty() {
@@ -727,18 +736,21 @@ mod tests {
             "lint",
             TaskState::TaskComplete,
             Some(Duration::from_secs(3)),
+            None,
         );
         state.update_task(
             Uuid::new_v4(),
             "build",
             TaskState::TaskExecuting,
             Some(Duration::from_secs(34)),
+            None,
         );
         state.update_task(
             Uuid::new_v4(),
             "test",
             TaskState::TaskFailed,
             Some(Duration::from_secs(14)),
+            None,
         );
 
         let spinners = std::collections::HashMap::new();
@@ -757,7 +769,7 @@ mod tests {
     fn build_output_lines_with_content() {
         let mut state = PanelManager::new();
         let id = Uuid::new_v4();
-        state.update_task(id, "t1", TaskState::TaskExecuting, None);
+        state.update_task(id, "t1", TaskState::TaskExecuting, None, None);
         state.append_output(id, "Compiling crate1".into());
         state.append_output(id, "Compiling crate2".into());
 

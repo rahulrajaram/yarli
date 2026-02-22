@@ -30,7 +30,7 @@ const CLAIM_CANDIDATES_SQL: &str = r#"
     FROM task_queue
     WHERE status = 'pending'
       AND available_at <= $1
-    ORDER BY priority ASC, available_at ASC, queue_id ASC
+    ORDER BY (priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60)) DESC, priority DESC, available_at ASC, queue_id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $2
 "#;
@@ -47,7 +47,7 @@ const CLAIM_CANDIDATES_SCOPED_SQL: &str = r#"
     WHERE status = 'pending'
       AND available_at <= $1
       AND run_id = ANY($3::uuid[])
-    ORDER BY priority ASC, available_at ASC, queue_id ASC
+    ORDER BY (priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60)) DESC, priority DESC, available_at ASC, queue_id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $2
 "#;
@@ -467,6 +467,33 @@ impl TaskQueue for PostgresTaskQueue {
         let worker_id = worker_id.to_string();
         self.run_async(async move {
             transition_leased_entry_async(&pool, queue_id, &worker_id, QueueStatus::Failed).await
+        })
+    }
+
+    fn override_priority(&self, task_id: TaskId, priority: u32) -> Result<(), QueueError> {
+        let pool = self.pool.clone();
+        self.run_async(async move {
+            let now = Utc::now();
+            let result = sqlx::query(
+                r#"
+                UPDATE task_queue
+                SET priority = $1,
+                    updated_at = $2
+                WHERE task_id = $3
+                "#,
+            )
+            .bind(priority as i32)
+            .bind(now)
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .map_err(|error| QueueError::Database(error.to_string()))?;
+
+            if result.rows_affected() == 0 {
+                return Err(QueueError::NotFound(task_id));
+            }
+
+            Ok(())
         })
     }
 

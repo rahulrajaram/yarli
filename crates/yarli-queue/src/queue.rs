@@ -43,7 +43,7 @@ pub struct QueueEntry {
     pub task_id: TaskId,
     /// The run this task belongs to (for per-run concurrency caps).
     pub run_id: RunId,
-    /// Priority for ordering (1 = highest, higher numbers = lower priority).
+    /// Priority for ordering (0-100 scale; higher numbers are more urgent).
     pub priority: u32,
     /// Earliest time this entry becomes available for claiming.
     pub available_at: DateTime<Utc>,
@@ -158,7 +158,7 @@ pub trait TaskQueue: Send + Sync {
         available_at: Option<DateTime<Utc>>,
     ) -> Result<Uuid, QueueError>;
 
-    /// Claim up to `limit` pending tasks, ordered by priority ASC then available_at ASC.
+    /// Claim up to `limit` pending tasks, ordered by priority DESC (with aging).
     ///
     /// Implements `SELECT ... FOR UPDATE SKIP LOCKED LIMIT N` semantics:
     /// only returns entries that are `Pending`, not claimed by another worker,
@@ -188,6 +188,9 @@ pub trait TaskQueue: Send + Sync {
     /// Mark a leased entry as failed. Only the lease owner can fail.
     fn fail(&self, queue_id: Uuid, worker_id: &str) -> Result<(), QueueError>;
 
+    /// Override priority for all known entries belonging to a task.
+    ///
+    /// Returns `QueueError::NotFound(task_id)` when no rows match the task id.
     /// Cancel a pending or leased entry. Cancelled entries are not retried.
     fn cancel(&self, queue_id: Uuid) -> Result<(), QueueError>;
 
@@ -205,6 +208,11 @@ pub trait TaskQueue: Send + Sync {
     /// The snapshot is best-effort and suitable for read-only debug/introspection
     /// surfaces. Entries are ordered according to underlying storage semantics.
     fn entries(&self) -> Vec<QueueEntry>;
+
+    /// Update priority for all entries for a task.
+    ///
+    /// Returns an error when the task has no queue rows.
+    fn override_priority(&self, task_id: TaskId, priority: u32) -> Result<(), QueueError>;
 
     /// Return the number of currently leased entries for a given run.
     fn leased_count_for_run(&self, run_id: RunId) -> usize;

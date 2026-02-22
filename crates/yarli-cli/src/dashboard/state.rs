@@ -298,7 +298,15 @@ impl PanelManager {
         name: &str,
         state: TaskState,
         elapsed: Option<Duration>,
+        blocked_by: Option<Vec<String>>,
     ) {
+        let blocked_by = blocked_by.and_then(|depends_on| {
+            if depends_on.is_empty() {
+                None
+            } else {
+                Some(depends_on.join(", "))
+            }
+        });
         if !self.task_order.contains(&task_id) {
             self.task_order.push(task_id);
         }
@@ -309,11 +317,14 @@ impl PanelManager {
             state,
             elapsed,
             last_output_line: None,
-            blocked_by: None,
+            blocked_by: blocked_by.clone(),
             worker_id: None,
         });
         view.state = state;
         view.elapsed = elapsed;
+        if blocked_by.is_some() {
+            view.blocked_by = blocked_by;
+        }
     }
 
     /// Append an output line for a task.
@@ -490,8 +501,8 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
 
-        mgr.update_task(id1, "task-1", TaskState::TaskExecuting, None);
-        mgr.update_task(id2, "task-2", TaskState::TaskReady, None);
+        mgr.update_task(id1, "task-1", TaskState::TaskExecuting, None, None);
+        mgr.update_task(id2, "task-2", TaskState::TaskReady, None, None);
 
         assert_eq!(mgr.selected_task_idx, 0);
         assert_eq!(mgr.selected_task().unwrap().name, "task-1");
@@ -530,11 +541,11 @@ mod tests {
     #[test]
     fn task_summary_counts() {
         let mut mgr = PanelManager::new();
-        mgr.update_task(Uuid::new_v4(), "t1", TaskState::TaskComplete, None);
-        mgr.update_task(Uuid::new_v4(), "t2", TaskState::TaskFailed, None);
-        mgr.update_task(Uuid::new_v4(), "t3", TaskState::TaskExecuting, None);
-        mgr.update_task(Uuid::new_v4(), "t4", TaskState::TaskBlocked, None);
-        mgr.update_task(Uuid::new_v4(), "t5", TaskState::TaskOpen, None);
+        mgr.update_task(Uuid::new_v4(), "t1", TaskState::TaskComplete, None, None);
+        mgr.update_task(Uuid::new_v4(), "t2", TaskState::TaskFailed, None, None);
+        mgr.update_task(Uuid::new_v4(), "t3", TaskState::TaskExecuting, None, None);
+        mgr.update_task(Uuid::new_v4(), "t4", TaskState::TaskBlocked, None, None);
+        mgr.update_task(Uuid::new_v4(), "t5", TaskState::TaskOpen, None, None);
 
         let s = mgr.task_summary();
         assert_eq!(s.total, 5);
@@ -550,8 +561,8 @@ mod tests {
         let mut mgr = PanelManager::new();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        mgr.update_task(id1, "t1", TaskState::TaskExecuting, None);
-        mgr.update_task(id2, "t2", TaskState::TaskExecuting, None);
+        mgr.update_task(id1, "t1", TaskState::TaskExecuting, None, None);
+        mgr.update_task(id2, "t2", TaskState::TaskExecuting, None, None);
 
         // Selected task is t1 (idx 0).
         mgr.append_output(id1, "line1".into());
@@ -568,8 +579,8 @@ mod tests {
         let mut mgr = PanelManager::new();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        mgr.update_task(id1, "t1", TaskState::TaskExecuting, None);
-        mgr.update_task(id2, "t2", TaskState::TaskExecuting, None);
+        mgr.update_task(id1, "t1", TaskState::TaskExecuting, None, None);
+        mgr.update_task(id2, "t2", TaskState::TaskExecuting, None, None);
 
         // Append output to t1 (selected).
         mgr.append_output(id1, "t1-line1".into());

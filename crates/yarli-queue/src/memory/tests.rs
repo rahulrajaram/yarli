@@ -112,16 +112,45 @@ fn claim_respects_priority_ordering() {
 
     let low_pri = Uuid::now_v7();
     let high_pri = Uuid::now_v7();
-    q.enqueue(low_pri, run_id, 5, CommandClass::Io, None)
+    q.enqueue(low_pri, run_id, 10, CommandClass::Io, None)
         .unwrap();
-    q.enqueue(high_pri, run_id, 1, CommandClass::Io, None)
+    q.enqueue(high_pri, run_id, 100, CommandClass::Io, None)
         .unwrap();
 
-    // Claim only 1 — should get the high-priority one.
+    // Claim only 1 — should get the high-priority one (higher number).
     let req = ClaimRequest::single("w1");
     let claimed = q.claim(&req, &cfg).unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, high_pri);
+}
+
+#[test]
+fn claim_supports_priority_aging_fairness() {
+    let q = InMemoryTaskQueue::new();
+    let run_id = make_run_id();
+    let cfg = default_config();
+
+    let long_wait_task = Uuid::now_v7();
+    let fresh_task = Uuid::now_v7();
+
+    q.enqueue(
+        long_wait_task,
+        run_id,
+        10,
+        CommandClass::Io,
+        Some(Utc::now() - Duration::hours(2)),
+    )
+    .unwrap();
+
+    q.enqueue(fresh_task, run_id, 100, CommandClass::Io, Some(Utc::now()))
+        .unwrap();
+
+    // Fresh task is higher priority but waiting task should eventually
+    // outrank it via aging after sustained wait-time.
+    let req = ClaimRequest::single("w1");
+    let claimed = q.claim(&req, &cfg).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].task_id, long_wait_task);
 }
 
 #[test]
@@ -493,6 +522,43 @@ fn cancel_completed_entry_rejected() {
 
     let err = q.cancel(qid).unwrap_err();
     assert!(matches!(err, QueueError::InvalidStatus { .. }));
+}
+
+// ─── Override Priority ───────────────────────────────────────────────────
+
+#[test]
+fn override_priority_updates_matching_entries() {
+    let q = InMemoryTaskQueue::new();
+    let run_id = make_run_id();
+
+    let task_id = Uuid::now_v7();
+    let _ = q
+        .enqueue(task_id, run_id, 5, CommandClass::Io, None)
+        .unwrap();
+    let _ = q
+        .enqueue(Uuid::now_v7(), run_id, 1, CommandClass::Io, None)
+        .unwrap();
+
+    q.override_priority(task_id, 1).unwrap();
+
+    let entries = q.entries();
+    let priority_for_target = entries
+        .into_iter()
+        .find(|entry| entry.task_id == task_id)
+        .expect("task row should exist")
+        .priority;
+    assert_eq!(priority_for_target, 1);
+}
+
+#[test]
+fn override_priority_returns_not_found_when_task_missing() {
+    let q = InMemoryTaskQueue::new();
+    let run_id = make_run_id();
+    q.enqueue(Uuid::now_v7(), run_id, 5, CommandClass::Io, None)
+        .unwrap();
+
+    let err = q.override_priority(Uuid::now_v7(), 1).unwrap_err();
+    assert!(matches!(err, QueueError::NotFound(_)));
 }
 
 // ─── Reclaim Stale ───────────────────────────────────────────────────────
@@ -892,6 +958,56 @@ fn cancel_for_run_returns_zero_when_no_active_entries() {
 
     let cancelled = q.cancel_for_run(run_a).unwrap();
     assert_eq!(cancelled, 0);
+}
+
+#[test]
+fn override_priority_updates_pending_and_failed_rows() {
+    let q = InMemoryTaskQueue::new();
+    let run_id = make_run_id();
+    let task_id = Uuid::now_v7();
+    let cfg = default_config();
+
+    q.enqueue(task_id, run_id, 7, CommandClass::Io, None)
+        .unwrap();
+    assert!(q
+        .enqueue(task_id, run_id, 9, CommandClass::Io, None)
+        .is_err());
+
+    let req = ClaimRequest::new("worker", 1, Duration::seconds(30));
+    let claimed = q.claim(&req, &cfg).unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let queue_id = claimed[0].queue_id;
+    q.fail(queue_id, "worker").unwrap();
+
+    q.enqueue(task_id, run_id, 9, CommandClass::Io, None)
+        .unwrap();
+
+    q.override_priority(task_id, 2).unwrap();
+    let entries = q.entries();
+    assert!(entries
+        .iter()
+        .all(|entry| entry.task_id != task_id || entry.priority == 2));
+
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.task_id == task_id && entry.status == QueueStatus::Failed)
+        .expect("failed entry should still be present after override");
+    assert_eq!(entry.priority, 2);
+
+    let entries = q.entries();
+    assert!(entries
+        .iter()
+        .any(|entry| entry.task_id == task_id && entry.status == QueueStatus::Pending));
+}
+
+#[test]
+fn override_priority_errors_for_missing_task() {
+    let q = InMemoryTaskQueue::new();
+    let missing = Uuid::now_v7();
+
+    let result = q.override_priority(missing, 1);
+    assert!(matches!(result, Err(QueueError::NotFound(id)) if id == missing));
 }
 
 #[test]

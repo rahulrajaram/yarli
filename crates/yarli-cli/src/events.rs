@@ -23,11 +23,12 @@ pub(crate) fn emit_initial_stream_state(
         let _ = tx.send(StreamEvent::TaskDiscovered {
             task_id: *task_id,
             task_name: task_name.clone(),
+            depends_on: Vec::new(),
         });
     }
 }
 
-pub(crate) fn stream_task_catalog_entries(event: &Event) -> Vec<(Uuid, String)> {
+pub(crate) fn stream_task_catalog_entries(event: &Event) -> Vec<(Uuid, String, Vec<String>)> {
     if event.event_type != "run.task_catalog" {
         return Vec::new();
     }
@@ -45,7 +46,17 @@ pub(crate) fn stream_task_catalog_entries(event: &Event) -> Vec<(Uuid, String)> 
                         .and_then(|value| value.as_str())
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| task_id.to_string()[..8].to_string());
-                    Some((task_id, task_name))
+                    let depends_on = task
+                        .get("depends_on")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(ToString::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    Some((task_id, task_name, depends_on))
                 })
                 .collect()
         })

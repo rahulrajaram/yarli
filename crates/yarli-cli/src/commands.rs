@@ -23,6 +23,9 @@ use yarli_core::domain::ExitReason;
 use yarli_core::entities::continuation::{
     ContinuationIntervention, ContinuationInterventionKind, TaskHealthAction,
 };
+use yarli_store::{
+    MIGRATION_0001_DOWN, MIGRATION_0001_INIT, MIGRATION_0002_DOWN, MIGRATION_0002_INDEXES,
+};
 
 fn collect_telemetry_string_values(metadata: Option<&serde_json::Value>) -> Vec<String> {
     let Some(values) = metadata.and_then(|value| value.as_array()) else {
@@ -911,19 +914,86 @@ where
     let run_span = tracing::info_span!("run_execution", run_id = %run_id);
     let _enter = run_span.enter();
 
-    let tasks: Vec<Task> = plan
-        .tasks
+    let mut tasks: Vec<Task> = Vec::with_capacity(plan.tasks.len());
+    let mut task_key_to_id: HashMap<String, Uuid> = HashMap::with_capacity(plan.tasks.len());
+    for planned in &plan.tasks {
+        let task = Task::new(
+            run_id,
+            planned.task_key.clone(),
+            &planned.command,
+            planned.command_class,
+            correlation_id,
+        );
+        task_key_to_id.insert(planned.task_key.clone(), task.id);
+        tasks.push(task);
+    }
+
+    let mut indegree = HashMap::with_capacity(plan.tasks.len());
+    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+    for planned in &plan.tasks {
+        indegree
+            .entry(planned.task_key.clone())
+            .or_insert(0usize);
+        for depends_on_key in &planned.depends_on {
+            if !task_key_to_id.contains_key(depends_on_key) {
+                bail!(
+                    "task {} depends_on unknown task key {}",
+                    planned.task_key,
+                    depends_on_key
+                );
+            }
+            indegree
+                .entry(planned.task_key.clone())
+                .and_modify(|degree| *degree += 1)
+                .or_insert(1);
+            dependents
+                .entry(depends_on_key.clone())
+                .or_default()
+                .push(planned.task_key.clone());
+        }
+    }
+
+    let mut ready: std::collections::VecDeque<String> = indegree
         .iter()
-        .map(|t| {
-            Task::new(
-                run_id,
-                t.task_key.clone(),
-                &t.command,
-                t.command_class,
-                correlation_id,
-            )
-        })
+        .filter_map(|(key, degree)| (*degree == 0).then_some(key.clone()))
         .collect();
+    let mut resolved_count = 0usize;
+    while let Some(key) = ready.pop_front() {
+        resolved_count += 1;
+        if let Some(children) = dependents.get(&key) {
+            for child in children {
+                let degree = indegree
+                    .get_mut(child)
+                    .ok_or_else(|| anyhow!("internal error: missing task in dependency index"))?;
+                *degree = degree.saturating_sub(1);
+                if *degree == 0 {
+                    ready.push_back(child.clone());
+                }
+            }
+        }
+    }
+    if resolved_count != plan.tasks.len() {
+        bail!("run has cyclic task dependency graph");
+    }
+
+    for planned in &plan.tasks {
+        let task_id = *task_key_to_id
+            .get(&planned.task_key)
+            .ok_or_else(|| anyhow!("failed to resolve task id for {}", planned.task_key))?;
+        let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) else {
+            continue;
+        };
+        for depends_on_key in &planned.depends_on {
+            let dependency_id = *task_key_to_id.get(depends_on_key).ok_or_else(|| {
+                anyhow!(
+                    "task {} depends_on unknown task key {}",
+                    planned.task_key,
+                    depends_on_key
+                )
+            })?;
+            task.depends_on(dependency_id);
+        }
+    }
 
     let mut task_workspace_by_id: HashMap<Uuid, String> = HashMap::new();
     if let Some(layout) = parallel_workspace_layout.as_ref() {
@@ -981,6 +1051,7 @@ where
                     "task_key": planned.task_key,
                     "tranche_key": planned.tranche_key,
                     "tranche_group": planned.tranche_group,
+                    "depends_on": planned.depends_on,
                     "allowed_paths": planned.allowed_paths,
                     "workspace_dir": task_workspace_by_id.get(&task.id),
                 }))
@@ -1570,7 +1641,7 @@ pub(crate) async fn seed_postgres_run_state_if_needed(
     .bind(&run.config_snapshot)
     .bind(run.created_at)
     .bind(run.updated_at)
-    .execute(&mut *tx)
+    .execute(tx.as_mut())
     .await
     .context("failed to seed runs table row for scheduler submission")?;
 
@@ -1598,7 +1669,7 @@ pub(crate) async fn seed_postgres_run_state_if_needed(
         .bind(task.priority as i32)
         .bind(task.created_at)
         .bind(task.updated_at)
-        .execute(&mut *tx)
+        .execute(tx.as_mut())
         .await
         .with_context(|| format!("failed to seed task row {}", task.id))?;
     }
@@ -1735,7 +1806,7 @@ where
     .bind(run_state)
     .bind(exit_reason)
     .bind(run_id)
-    .execute(&mut *tx)
+    .execute(tx.as_mut())
     .await
     .context("sync_postgres_state: update runs")?;
 
@@ -1750,7 +1821,7 @@ where
         )
         .bind(*state)
         .bind(*task_id)
-        .execute(&mut *tx)
+        .execute(tx.as_mut())
         .await
         .with_context(|| format!("sync_postgres_state: update task {task_id}"))?;
     }
@@ -1764,6 +1835,645 @@ where
         "synced postgres state"
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MigrationDefinition {
+    version: i32,
+    name: &'static str,
+    up_sql: &'static str,
+    down_sql: &'static str,
+}
+
+const MIGRATION_DATA_TABLES: &[&str] = &[
+    "runs",
+    "tasks",
+    "task_dependencies",
+    "worktrees",
+    "merge_intents",
+    "commands",
+    "command_stream_chunks",
+    "events",
+    "evidence",
+    "gates",
+    "gate_results",
+    "policy_decisions",
+    "leases",
+    "task_queue",
+    "yarli_schema_migrations",
+];
+
+const MIGRATION_TABLE_NAME: &str = "yarli_schema_migrations";
+const MIGRATION_BACKUP_SCHEMA: &str = "yarli_migration_backups";
+const MIGRATION_LOCK_KEY: i64 = 6_021_202_602;
+
+const MIGRATIONS: [MigrationDefinition; 2] = [
+    MigrationDefinition {
+        version: 1,
+        name: "0001_init",
+        up_sql: MIGRATION_0001_INIT,
+        down_sql: MIGRATION_0001_DOWN,
+    },
+    MigrationDefinition {
+        version: 2,
+        name: "0002_indexes",
+        up_sql: MIGRATION_0002_INDEXES,
+        down_sql: MIGRATION_0002_DOWN,
+    },
+];
+
+pub(crate) async fn cmd_migrate_status(loaded_config: &LoadedConfig) -> Result<()> {
+    let database_url = postgres_database_url(loaded_config, "status")?;
+    let pool =
+        connect_postgres_for_migration(&database_url, "yarli migrate status failed to connect")
+            .await?;
+    ensure_migration_metadata(&pool).await?;
+
+    let applied = load_applied_migrations(&pool).await?;
+    let unknown_count = applied
+        .iter()
+        .filter(|migration| find_migration_definition(migration.version).is_none())
+        .count();
+
+    let mut lines = String::new();
+    lines.push_str("Migration status:\n");
+    lines.push_str("version | name          | state   | applied\n");
+    lines.push_str("--------+---------------+---------+-------------------------------\n");
+
+    for migration in MIGRATIONS.iter() {
+        let status = applied
+            .iter()
+            .find(|applied| applied.version == migration.version)
+            .map(|applied| format!("applied @ {}", applied.applied_at))
+            .unwrap_or_else(|| "pending".into());
+        lines.push_str(&format!(
+            "{:<7} | {:<13} | {:<7} | {}\n",
+            migration.version,
+            migration.name,
+            if status.starts_with("applied") {
+                "ok"
+            } else {
+                "pending"
+            },
+            status
+        ));
+    }
+
+    if unknown_count > 0 {
+        lines.push_str(&format!(
+            "\nwarning: {unknown_count} migrations are recorded in {MIGRATION_TABLE_NAME} but not known to this binary\n"
+        ));
+    }
+
+    if lines.ends_with('\n') {
+        lines.pop();
+    }
+    println!("{lines}");
+    Ok(())
+}
+
+pub(crate) async fn cmd_migrate_up(
+    loaded_config: &LoadedConfig,
+    target: Option<&str>,
+) -> Result<()> {
+    let target_version = parse_migration_target(target, false)?;
+    let target_version =
+        target_version.unwrap_or_else(|| MIGRATIONS.last().expect("known migrations").version);
+    let database_url = postgres_database_url(loaded_config, "up")?;
+    let pool =
+        connect_postgres_for_migration(&database_url, "yarli migrate up failed to connect").await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start migration transaction")?;
+
+    ensure_migration_metadata_tx(&mut tx).await?;
+    acquire_migration_lock(&mut tx).await?;
+
+    let applied = load_applied_migrations_tx(&mut tx).await?;
+    let applied_versions: Vec<i32> = applied.iter().map(|row| row.version).collect();
+    let pending: Vec<&MigrationDefinition> = MIGRATIONS
+        .iter()
+        .filter(|definition| {
+            definition.version <= target_version && !applied_versions.contains(&definition.version)
+        })
+        .collect();
+
+    if pending.is_empty() {
+        println!("No pending migrations to apply.");
+        return Ok(());
+    }
+
+    for migration in pending {
+        execute_migration_sql(&mut tx, migration.version, migration.name, migration.up_sql).await?;
+        sqlx::query(
+            "INSERT INTO yarli_schema_migrations (version, name) VALUES ($1, $2) \
+             ON CONFLICT (version) DO UPDATE SET name = EXCLUDED.name, applied_at = now()",
+        )
+        .bind(migration.version)
+        .bind(migration.name)
+        .execute(tx.as_mut())
+        .await
+        .context("failed to record applied migration metadata")?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit migration transaction")?;
+
+    println!(
+        "Applied migration(s) up to {}.",
+        migration_name(target_version)
+    );
+    Ok(())
+}
+
+pub(crate) async fn cmd_migrate_down(
+    loaded_config: &LoadedConfig,
+    target: Option<&str>,
+    backup_label: Option<&str>,
+) -> Result<()> {
+    let target_version = parse_migration_target(target, true)?;
+    let backup_label = sanitize_backup_label(backup_label.unwrap_or(""));
+
+    let database_url = postgres_database_url(loaded_config, "down")?;
+    let pool =
+        connect_postgres_for_migration(&database_url, "yarli migrate down failed to connect")
+            .await?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start migration transaction")?;
+    ensure_migration_metadata_tx(&mut tx).await?;
+    acquire_migration_lock(&mut tx).await?;
+
+    let applied = load_applied_migrations_tx(&mut tx).await?;
+    let current_version = applied.iter().map(|row| row.version).max().unwrap_or(0);
+    let target_version = target_version.unwrap_or_else(|| current_version.saturating_sub(1));
+
+    if current_version == 0 {
+        println!("No migrations are applied.");
+        return Ok(());
+    }
+
+    if target_version >= current_version {
+        println!(
+            "Already at or above target version {}.",
+            migration_name(target_version)
+        );
+        return Ok(());
+    }
+
+    create_migration_backup(&mut tx, &backup_label, current_version).await?;
+    let rollback_plan: Vec<&MigrationDefinition> = MIGRATIONS
+        .iter()
+        .filter(|definition| {
+            definition.version > target_version && definition.version <= current_version
+        })
+        .rev()
+        .collect();
+
+    if rollback_plan.is_empty() {
+        println!(
+            "No migrations to rollback for target {}.",
+            migration_name(target_version)
+        );
+        return Ok(());
+    }
+
+    for migration in rollback_plan {
+        execute_migration_sql(
+            &mut tx,
+            migration.version,
+            migration.name,
+            migration.down_sql,
+        )
+        .await?;
+        sqlx::query("DELETE FROM yarli_schema_migrations WHERE version = $1")
+            .bind(migration.version)
+            .execute(tx.as_mut())
+            .await
+            .with_context(|| {
+                format!("failed to remove migration metadata {}", migration.version)
+            })?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit rollback migration transaction")?;
+
+    println!(
+        "Rolled back migration(s) down to {}. Backup captured as {}.",
+        migration_name(target_version),
+        backup_label
+    );
+    Ok(())
+}
+
+pub(crate) async fn cmd_migrate_backup(
+    loaded_config: &LoadedConfig,
+    label: Option<&str>,
+) -> Result<()> {
+    let database_url = postgres_database_url(loaded_config, "backup")?;
+    let pool =
+        connect_postgres_for_migration(&database_url, "yarli migrate backup failed to connect")
+            .await?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start migration transaction")?;
+    ensure_migration_metadata_tx(&mut tx).await?;
+    acquire_migration_lock(&mut tx).await?;
+
+    let applied = load_applied_migrations_tx(&mut tx).await?;
+    let current_version = applied.iter().map(|row| row.version).max().unwrap_or(0);
+    let label = sanitize_backup_label(label.unwrap_or(""));
+    create_migration_backup(&mut tx, &label, current_version).await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit migration backup transaction")?;
+
+    println!("Created migration backup snapshot '{label}'.");
+    Ok(())
+}
+
+pub(crate) async fn cmd_migrate_restore(loaded_config: &LoadedConfig, label: &str) -> Result<()> {
+    let label = sanitize_backup_label(label);
+    let database_url = postgres_database_url(loaded_config, "restore")?;
+    let pool =
+        connect_postgres_for_migration(&database_url, "yarli migrate restore failed to connect")
+            .await?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start migration transaction")?;
+    ensure_migration_metadata_tx(&mut tx).await?;
+    acquire_migration_lock(&mut tx).await?;
+
+    verify_backup_label(&mut tx, &label).await?;
+    restore_from_migration_backup(&mut tx, &label).await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit migration restore transaction")?;
+
+    println!("Restored migration snapshot '{label}'.");
+    Ok(())
+}
+
+fn migration_name(version: i32) -> String {
+    if let Some(definition) = find_migration_definition(version) {
+        definition.name.to_string()
+    } else if version == 0 {
+        "clean".to_string()
+    } else {
+        format!("unknown ({version})")
+    }
+}
+
+fn find_migration_definition(version: i32) -> Option<&'static MigrationDefinition> {
+    MIGRATIONS.iter().find(|entry| entry.version == version)
+}
+
+fn parse_migration_target(value: Option<&str>, allow_zero: bool) -> Result<Option<i32>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    let normalized = raw.split('_').next().unwrap_or("").trim_start_matches("v");
+    let version = normalized
+        .parse::<i32>()
+        .with_context(|| format!("invalid migration target '{raw}'"))?;
+
+    if version == 0 && allow_zero {
+        return Ok(Some(0));
+    }
+
+    if version <= 0 || find_migration_definition(version).is_none() {
+        let known = MIGRATIONS
+            .iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("unknown migration target '{raw}'; expected one of: {known}");
+    }
+
+    Ok(Some(version))
+}
+
+fn postgres_database_url(loaded_config: &LoadedConfig, command_name: &str) -> Result<String> {
+    let BackendSelection::Postgres { database_url } = loaded_config.backend_selection()? else {
+        bail!("`migrate {command_name}` requires core.backend = \"postgres\"");
+    };
+    Ok(database_url)
+}
+
+#[derive(Debug)]
+struct AppliedMigration {
+    version: i32,
+    applied_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn load_applied_migrations(pool: &sqlx::PgPool) -> Result<Vec<AppliedMigration>> {
+    sqlx::query_as::<_, (i32, String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT version, name, applied_at FROM yarli_schema_migrations ORDER BY version ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(version, _, applied_at)| AppliedMigration {
+                version,
+                applied_at,
+            })
+            .collect()
+    })
+    .context("failed to read migration metadata")
+}
+
+async fn load_applied_migrations_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<AppliedMigration>> {
+    sqlx::query_as::<_, (i32, String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT version, name, applied_at FROM yarli_schema_migrations ORDER BY version ASC",
+    )
+    .fetch_all(tx.as_mut())
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(version, _, applied_at)| AppliedMigration {
+                version,
+                applied_at,
+            })
+            .collect()
+    })
+    .context("failed to read migration metadata")
+}
+
+async fn ensure_migration_metadata(pool: &sqlx::PgPool) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start metadata transaction")?;
+    ensure_migration_metadata_tx(&mut tx).await?;
+    tx.commit()
+        .await
+        .context("failed to commit migration metadata initialization")?;
+    Ok(())
+}
+
+async fn ensure_migration_metadata_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS yarli_schema_migrations (
+            version integer PRIMARY KEY,
+            name text NOT NULL,
+            applied_at timestamptz NOT NULL DEFAULT now()
+        )",
+    )
+    .execute(tx.as_mut())
+    .await
+    .context("failed to ensure migration metadata table")?;
+
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS yarli_migration_backups")
+        .execute(tx.as_mut())
+        .await
+        .context("failed to ensure migration backup schema")?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS yarli_migration_backups.labels (
+            label text PRIMARY KEY,
+            source_version integer NOT NULL,
+            source_version_name text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )",
+    )
+    .execute(tx.as_mut())
+    .await
+    .context("failed to ensure migration backup label metadata table")?;
+
+    Ok(())
+}
+
+async fn acquire_migration_lock(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+    let (acquired,) = sqlx::query_as::<_, (bool,)>("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(MIGRATION_LOCK_KEY)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("failed to acquire migration lock")?;
+
+    if !acquired {
+        bail!("another migration operation is already in progress");
+    }
+
+    Ok(())
+}
+
+async fn execute_migration_sql(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    version: i32,
+    migration_name: &str,
+    sql: &str,
+) -> Result<()> {
+    for statement in split_sql_statements(sql) {
+        sqlx::query(statement)
+            .execute(tx.as_mut())
+            .await
+            .with_context(|| {
+                format!("failed to apply migration {version} ({migration_name}) statement")
+            })?;
+    }
+    Ok(())
+}
+
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    sql.split(';')
+        .map(|statement| statement.trim())
+        .filter(|statement| !statement.is_empty())
+        .collect()
+}
+
+async fn create_migration_backup(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    label: &str,
+    source_version: i32,
+) -> Result<()> {
+    let source_version_name = migration_name(source_version);
+
+    let source_version_row = load_single_row(
+        "SELECT COUNT(*)::bigint FROM yarli_migration_backups.labels WHERE label = $1",
+        label,
+        tx,
+    )
+    .await?;
+    if source_version_row > 0 {
+        bail!("backup label '{label}' already exists");
+    }
+
+    sqlx::query(
+        "INSERT INTO yarli_migration_backups.labels (label, source_version, source_version_name)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(label)
+    .bind(source_version)
+    .bind(source_version_name)
+    .execute(tx.as_mut())
+    .await
+    .context("failed to register migration backup metadata")?;
+
+    for table in MIGRATION_DATA_TABLES {
+        let backup_table = format!(
+            "{}.{}",
+            quote_identifier(MIGRATION_BACKUP_SCHEMA),
+            quote_identifier(&format!("{label}_{}", table))
+        );
+        let create_statement = format!(
+            "CREATE TABLE IF NOT EXISTS {backup_table} AS TABLE {}",
+            quote_identifier(table)
+        );
+        sqlx::query(&create_statement)
+            .execute(tx.as_mut())
+            .await
+            .with_context(|| format!("failed to back up table {table}"))?;
+    }
+
+    Ok(())
+}
+
+async fn verify_backup_label(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    label: &str,
+) -> Result<()> {
+    let exists = load_scalar_bool(
+        "SELECT EXISTS(SELECT 1 FROM yarli_migration_backups.labels WHERE label = $1)",
+        label,
+        tx,
+    )
+    .await?;
+    if !exists {
+        bail!("backup label '{label}' not found");
+    }
+
+    Ok(())
+}
+
+async fn restore_from_migration_backup(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    label: &str,
+) -> Result<()> {
+    let mut restore_list = String::new();
+    for (index, table) in MIGRATION_DATA_TABLES.iter().enumerate() {
+        let backup_table_name = quote_identifier(&format!("{label}_{}", table));
+        let qualified = format!("{MIGRATION_BACKUP_SCHEMA}.{backup_table_name}");
+        let backup_exists =
+            load_scalar_bool("SELECT to_regclass($1)::text IS NOT NULL", &qualified, tx).await?;
+        if !backup_exists {
+            bail!("backup table for {table} is missing in snapshot '{label}'");
+        }
+
+        if index > 0 {
+            restore_list.push_str(", ");
+        }
+        restore_list.push_str(&quote_identifier(table));
+    }
+
+    sqlx::query(&format!("TRUNCATE TABLE {restore_list};"))
+        .execute(tx.as_mut())
+        .await
+        .context("failed to clear tables before restore")?;
+
+    for table in MIGRATION_DATA_TABLES.iter().rev() {
+        let backup_table = quote_identifier(&format!("{label}_{}", table));
+        let qualified_source = format!(
+            "{}.{}",
+            quote_identifier(MIGRATION_BACKUP_SCHEMA),
+            backup_table
+        );
+        let statement = format!(
+            "INSERT INTO {} SELECT * FROM {}",
+            quote_identifier(table),
+            qualified_source
+        );
+        sqlx::query(&statement)
+            .execute(tx.as_mut())
+            .await
+            .with_context(|| format!("failed to restore table {table} from snapshot '{label}'"))?;
+    }
+
+    Ok(())
+}
+
+async fn connect_postgres_for_migration(database_url: &str, context: &str) -> Result<sqlx::PgPool> {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(database_url)
+        .await
+        .with_context(|| format!("{context}: {database_url}"))
+}
+
+async fn load_scalar_bool(
+    query: &str,
+    value: &str,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<bool> {
+    let (result,) = sqlx::query_as::<_, (bool,)>(query)
+        .bind(value)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("failed to evaluate migration backup metadata query")?;
+    Ok(result)
+}
+
+async fn load_single_row(
+    query: &str,
+    value: &str,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64> {
+    let (value,) = sqlx::query_as::<_, (i64,)>(query)
+        .bind(value)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("failed to inspect migration backup metadata")?;
+    Ok(value)
+}
+
+fn sanitize_backup_label(label: &str) -> String {
+    let filtered = label
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect::<String>()
+        .to_lowercase();
+
+    let trimmed = filtered.trim_matches('_');
+    let mut result = if trimmed.is_empty() {
+        chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    if result
+        .chars()
+        .next()
+        .is_some_and(|value| value.is_ascii_digit())
+    {
+        result.insert(0, 'b');
+    }
+
+    result
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1795,6 +2505,7 @@ pub(crate) fn build_run_config_snapshot(
                 "command_class": format!("{:?}", t.command_class),
                 "tranche_key": &t.tranche_key,
                 "tranche_group": &t.tranche_group,
+                "depends_on": &t.depends_on,
                 "allowed_paths": &t.allowed_paths,
             })).collect::<Vec<_>>(),
             "task_catalog": task_catalog.iter().map(|t| serde_json::json!({
@@ -1803,6 +2514,7 @@ pub(crate) fn build_run_config_snapshot(
                 "command_class": format!("{:?}", t.command_class),
                 "tranche_key": &t.tranche_key,
                 "tranche_group": &t.tranche_group,
+                "depends_on": &t.depends_on,
                 "allowed_paths": &t.allowed_paths,
             })).collect::<Vec<_>>(),
             "tranche_plan": tranche_plan.iter().map(|t| serde_json::json!({
@@ -2299,6 +3011,13 @@ where
             }
             _ = tick_interval.tick() => {
                 tick_count += 1;
+                if let Ok(Some(run_projection)) = load_run_projection(store.as_ref(), run_id) {
+                    if run_projection.state == RunState::RunBlocked && !paused {
+                        paused = true;
+                    } else if run_projection.state == RunState::RunActive {
+                        paused = false;
+                    }
+                }
 
                 if paused {
                     zero_progress_ticks += 1;
@@ -2518,8 +3237,12 @@ pub(crate) fn emit_new_stream_events<S: EventStore>(
     let new_events = cursor.read_new_events(store.as_ref())?;
 
     for event in &new_events {
-        for (task_id, task_name) in stream_task_catalog_entries(event) {
-            let _ = tx.send(StreamEvent::TaskDiscovered { task_id, task_name });
+        for (task_id, task_name, depends_on) in stream_task_catalog_entries(event) {
+            let _ = tx.send(StreamEvent::TaskDiscovered {
+                task_id,
+                task_name,
+                depends_on,
+            });
         }
         if let (Ok(task_id), Some(worker_id)) = (
             event.entity_id.parse::<Uuid>(),
@@ -7500,6 +8223,170 @@ mod tests {
                 && event.payload.get("reason").and_then(|v| v.as_str())
                     == Some("maintenance complete")
         }));
+    }
+
+    #[tokio::test]
+    async fn drive_scheduler_drains_without_claiming_new_tasks_during_pause() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+
+        let config = SchedulerConfig {
+            claim_batch_size: 1,
+            tick_interval: Duration::from_millis(25),
+            ..SchedulerConfig::default()
+        };
+
+        let mut scheduler = Scheduler::new(queue, store.clone(), runner, config.clone());
+
+        let run = Run::new("drain and resume", yarli_core::domain::SafeMode::Execute);
+        let run_id = run.id;
+        let correlation_id = run.correlation_id;
+        let primary_task = Task::new(
+            run_id,
+            "primary",
+            "sleep 1",
+            CommandClass::Io,
+            correlation_id,
+        );
+        let queued_task = Task::new(
+            run_id,
+            "queued",
+            "sleep 2",
+            CommandClass::Io,
+            correlation_id,
+        );
+        let primary_task_id = primary_task.id;
+        let queued_task_id = queued_task.id;
+        let task_names = vec![
+            (primary_task_id, "primary".to_string()),
+            (queued_task_id, "queued".to_string()),
+        ];
+
+        scheduler
+            .submit_run(run, vec![primary_task, queued_task])
+            .await
+            .unwrap();
+
+        let shutdown = ShutdownController::new();
+        let cancel = shutdown.token();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store_for_scheduler = store.clone();
+
+        let run_handle = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(12),
+                drive_scheduler(
+                    &mut scheduler,
+                    &store_for_scheduler,
+                    shutdown,
+                    cancel,
+                    tx,
+                    run_id,
+                    correlation_id,
+                    &task_names,
+                    AutoAdvancePolicy::StableOk,
+                    config::RunTaskHealthConfig::default(),
+                    None,
+                    0.9,
+                    false,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("drive_scheduler timed out")
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(primary_projection) =
+                    load_task_projection(store.as_ref(), primary_task_id).unwrap()
+                {
+                    if primary_projection.state == TaskState::TaskExecuting {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("primary task did not start executing");
+
+        execute_run_pause_control(store.as_ref(), run_id, "maintenance window").unwrap();
+        assert_eq!(
+            load_run_projection(store.as_ref(), run_id)
+                .unwrap()
+                .expect("run projection")
+                .state,
+            RunState::RunBlocked,
+        );
+
+        let mut queued_task_held = false;
+        let mut primary_task_completed = false;
+        let mut observed = 0;
+        while observed < 80 {
+            let primary_projection = load_task_projection(store.as_ref(), primary_task_id)
+                .unwrap()
+                .expect("primary task projection");
+            let queued_projection = load_task_projection(store.as_ref(), queued_task_id)
+                .unwrap()
+                .expect("queued task projection");
+
+            if primary_projection.state == TaskState::TaskComplete {
+                primary_task_completed = true;
+            }
+
+            if matches!(
+                queued_projection.state,
+                TaskState::TaskReady | TaskState::TaskOpen | TaskState::TaskVerifying
+            ) {
+                queued_task_held = true;
+            }
+            assert_ne!(
+                queued_projection.state,
+                TaskState::TaskExecuting,
+                "paused run must not claim additional tasks"
+            );
+
+            if primary_task_completed {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            observed += 1;
+        }
+
+        assert!(
+            primary_task_completed,
+            "primary task should complete while paused"
+        );
+        assert!(
+            queued_task_held,
+            "queued task should remain ready while paused"
+        );
+
+        execute_run_resume_control(store.as_ref(), run_id, "maintenance complete").unwrap();
+        let payload = run_handle
+            .await
+            .expect("scheduler loop panicked")
+            .expect("scheduler loop failed");
+
+        assert_eq!(payload.exit_state, RunState::RunCompleted);
+        assert_eq!(
+            load_run_projection(store.as_ref(), run_id)
+                .unwrap()
+                .expect("run projection")
+                .state,
+            RunState::RunCompleted,
+        );
+        assert_eq!(
+            load_task_projection(store.as_ref(), queued_task_id)
+                .unwrap()
+                .expect("queued task projection")
+                .state,
+            TaskState::TaskComplete,
+        );
     }
 
     #[test]

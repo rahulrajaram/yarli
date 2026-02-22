@@ -9,7 +9,7 @@
 //! 6. Promote run state transitions based on task states.
 //! 7. Heartbeat active leases and reclaim stale ones.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -752,6 +752,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     async fn promote_tasks(&self) -> Result<usize, SchedulerError> {
         let mut reg = self.registry.write().await;
         let mut promoted = 0;
+        let mut inherited_priority_cache = HashMap::<TaskId, u32>::new();
 
         // Collect task IDs that are in TaskOpen state
         let open_task_ids: Vec<TaskId> = reg
@@ -762,23 +763,33 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             .collect();
 
         for task_id in open_task_ids {
-            // Check dependencies using a snapshot of completion status
-            let deps_satisfied = {
+            // Check dependencies using a snapshot of completion status.
+            let deps_satisfied;
+            let run_id;
+            let command_class;
+            let correlation_id;
+            let inherited_priority;
+            {
                 let task = reg.tasks.get(&task_id).unwrap();
-                task.dependencies_satisfied(|dep_id| {
+                deps_satisfied = task.dependencies_satisfied(|dep_id| {
                     reg.tasks
                         .get(dep_id)
                         .map(|t| t.state == TaskState::TaskComplete)
                         .unwrap_or(false)
-                })
-            };
+                });
+                run_id = task.run_id;
+                command_class = task.command_class;
+                correlation_id = task.correlation_id;
+                inherited_priority = Self::task_inherited_priority(
+                    task_id,
+                    &reg,
+                    &mut inherited_priority_cache,
+                    &mut HashSet::new(),
+                );
+            }
 
             if deps_satisfied {
-                let task = reg.tasks.get_mut(&task_id).unwrap();
-                let correlation_id = task.correlation_id;
-                let run_id = task.run_id;
-                let priority = task.priority;
-                let command_class = task.command_class;
+                let task = reg.get_task_mut(&task_id).unwrap();
                 let transition = task.transition(
                     TaskState::TaskReady,
                     "dependencies satisfied",
@@ -803,7 +814,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 })?;
 
                 // Enqueue into the task queue now that the task is Ready
-                match self.enqueue_task(task_id, run_id, priority, command_class) {
+                match self.enqueue_task(task_id, run_id, inherited_priority, command_class) {
                     Ok(_) => {
                         promoted += 1;
                         self.record_task_transition(TaskState::TaskReady, command_class, task_id);
@@ -1290,6 +1301,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     ) -> Result<TaskOutcome, SchedulerError> {
         let exit_code = result.execution.exit_code.unwrap_or(-1);
         let cmd_state = result.execution.state;
+        let inherited_retry_priority = {
+            let reg = self.registry.read().await;
+            Self::task_inherited_priority(task_id, &reg, &mut HashMap::new(), &mut HashSet::new())
+        };
 
         let mut reg = self.registry.write().await;
         let run_totals = reg.accumulate_usage(
@@ -1566,7 +1581,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     }
 
                     self.fail_queue_entry(queue_id, &self.config.worker_id)?;
-                    self.maybe_retry(task, task_id, correlation_id)?;
+                    self.maybe_retry(task, task_id, correlation_id, inherited_retry_priority)?;
                     command_exit_reason = "gate_failed";
 
                     warn!(task_id = %task_id, "task failed gate verification: {}", failure_reasons.join("; "));
@@ -1604,7 +1619,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             })?;
             self.record_task_transition(TaskState::TaskFailed, command_class, task_id);
             self.fail_queue_entry(queue_id, &self.config.worker_id)?;
-            self.maybe_retry(task, task_id, correlation_id)?;
+            self.maybe_retry(task, task_id, correlation_id, inherited_retry_priority)?;
             command_exit_reason = "timeout";
 
             warn!(task_id = %task_id, "task timed out");
@@ -1640,7 +1655,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             })?;
             self.record_task_transition(TaskState::TaskFailed, command_class, task_id);
             self.fail_queue_entry(queue_id, &self.config.worker_id)?;
-            self.maybe_retry(task, task_id, correlation_id)?;
+            self.maybe_retry(task, task_id, correlation_id, inherited_retry_priority)?;
             command_exit_reason = "killed";
 
             warn!(task_id = %task_id, "task killed");
@@ -1677,7 +1692,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             })?;
             self.record_task_transition(TaskState::TaskFailed, command_class, task_id);
             self.fail_queue_entry(queue_id, &self.config.worker_id)?;
-            self.maybe_retry(task, task_id, correlation_id)?;
+            self.maybe_retry(task, task_id, correlation_id, inherited_retry_priority)?;
             command_exit_reason = "nonzero_exit";
 
             warn!(task_id = %task_id, exit_code, "task failed with nonzero exit");
@@ -1697,6 +1712,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         command_class: CommandClass,
         error: &ExecError,
     ) -> Result<TaskOutcome, SchedulerError> {
+        let inherited_retry_priority = {
+            let reg = self.registry.read().await;
+            Self::task_inherited_priority(task_id, &reg, &mut HashMap::new(), &mut HashSet::new())
+        };
         let mut reg = self.registry.write().await;
         let task = reg
             .get_task_mut(&task_id)
@@ -1735,7 +1754,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
         self.record_task_transition(TaskState::TaskFailed, command_class, task_id);
         self.fail_queue_entry(queue_id, &self.config.worker_id)?;
-        self.maybe_retry(task, task_id, correlation_id)?;
+        self.maybe_retry(task, task_id, correlation_id, inherited_retry_priority)?;
         self.record_command_metrics(command_class, "exec_error");
         self.record_command_duration(command_class, None);
 
@@ -1749,6 +1768,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         task: &mut Task,
         task_id: TaskId,
         correlation_id: Uuid,
+        queue_priority: u32,
     ) -> Result<(), SchedulerError> {
         if task.attempt_no < task.max_attempts {
             let next_attempt = task.attempt_no + 1;
@@ -1778,7 +1798,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 idempotency_key: Some(format!("{task_id}:retry:{}", task.attempt_no)),
             })?;
 
-            self.enqueue_task(task_id, task.run_id, task.priority, task.command_class)?;
+            self.enqueue_task(task_id, task.run_id, queue_priority, task.command_class)?;
 
             info!(
                 task_id = %task_id,
@@ -2202,6 +2222,42 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         self.queue.fail(queue_id, worker_id)?;
         self.record_queue_depth();
         Ok(())
+    }
+
+    fn task_inherited_priority(
+        task_id: TaskId,
+        registry: &TaskRegistry,
+        memo: &mut HashMap<TaskId, u32>,
+        visiting: &mut HashSet<TaskId>,
+    ) -> u32 {
+        if let Some(priority) = memo.get(&task_id) {
+            return *priority;
+        }
+
+        let Some(task) = registry.get_task(&task_id) else {
+            return 0;
+        };
+
+        if !visiting.insert(task_id) {
+            return task.priority;
+        }
+
+        let mut effective = task.priority;
+        for candidate in registry.tasks.values() {
+            if candidate.state == TaskState::TaskComplete {
+                continue;
+            }
+            if !candidate.depends_on.contains(&task_id) {
+                continue;
+            }
+
+            let inherited = Self::task_inherited_priority(candidate.id, registry, memo, visiting);
+            effective = effective.max(inherited);
+        }
+
+        visiting.remove(&task_id);
+        memo.insert(task_id, effective);
+        effective
     }
 
     fn record_run_transition(&self, state: RunState) {
@@ -2733,6 +2789,40 @@ mod tests {
         // Run should be completed
         let run = reg.get_run(&run_id).unwrap();
         assert_eq!(run.state, RunState::RunCompleted);
+    }
+
+    #[tokio::test]
+    async fn test_dependency_inheritance_boosts_prerequisite_priority() {
+        let (sched, _store) = test_scheduler();
+        let run = make_run("inherited dependency priority");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+
+        let ancestor = make_task(run_id, "ancestor", "echo ancestor", corr_id).with_priority(10);
+        let ancestor_id = ancestor.id;
+
+        let mut child = make_task(run_id, "child", "echo child", corr_id).with_priority(85);
+        child.depends_on(ancestor_id);
+
+        let mut grandchild =
+            make_task(run_id, "grandchild", "echo grandchild", corr_id).with_priority(30);
+        grandchild.depends_on(child.id);
+
+        sched
+            .submit_run(run, vec![ancestor, child, grandchild])
+            .await
+            .unwrap();
+
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.promoted, 1);
+
+        let promoted_entry = sched
+            .queue
+            .entries()
+            .into_iter()
+            .find(|entry| entry.task_id == ancestor_id)
+            .expect("ancestor should have been enqueued first");
+        assert_eq!(promoted_entry.priority, 85);
     }
 
     #[tokio::test]

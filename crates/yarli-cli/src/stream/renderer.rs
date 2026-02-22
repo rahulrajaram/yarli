@@ -99,7 +99,16 @@ impl StreamRenderer {
     /// Process a stream event: update state, push scrollback, refresh viewport.
     pub fn handle_event(&mut self, event: StreamEvent) -> io::Result<()> {
         match event {
-            StreamEvent::TaskDiscovered { task_id, task_name } => {
+            StreamEvent::TaskDiscovered {
+                task_id,
+                task_name,
+                depends_on,
+            } => {
+                let blocked_by = if depends_on.is_empty() {
+                    None
+                } else {
+                    Some(depends_on.join(", "))
+                };
                 if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(task_id) {
                     self.task_order.push(task_id);
                     e.insert(TaskView {
@@ -108,7 +117,7 @@ impl StreamRenderer {
                         state: TaskState::TaskOpen,
                         elapsed: None,
                         last_output_line: None,
-                        blocked_by: None,
+                        blocked_by,
                         worker_id: None,
                     });
                 }

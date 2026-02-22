@@ -1,0 +1,8 @@
+.git
+.gitignore
+.github
+target
+**/target
+**/*.rs.bk
+**/*.tmp
+**/.DS_Store

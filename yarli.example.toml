@@ -4,7 +4,9 @@ backend = "postgres"
 safe_mode = "execute"
 
 [postgres]
-# Replace with your deployment DSN.
+# Replace with your deployment DSN, or set DATABASE_URL in the runtime environment.
+# For Kubernetes, mount credentials as a file and set this instead:
+# database_url_file = "/run/secrets/yarli-postgres-url"
 database_url = "postgres://postgres:postgres@localhost:5432/yarli"
 
 [cli]

@@ -16,6 +16,14 @@ use crate::queue::{
     ClaimRequest, ConcurrencyConfig, QueueEntry, QueueStats, QueueStatus, TaskQueue,
 };
 
+const PRIORITY_AGING_WINDOW_SECONDS: i64 = 60;
+
+fn priority_for_claim(priority: u32, available_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    let age_seconds = (now - available_at).num_seconds().max(0);
+    let age_boost = age_seconds / PRIORITY_AGING_WINDOW_SECONDS;
+    priority as i64 + age_boost
+}
+
 /// Thread-safe in-memory task queue.
 pub struct InMemoryTaskQueue {
     inner: RwLock<QueueInner>,
@@ -107,7 +115,7 @@ impl TaskQueue for InMemoryTaskQueue {
             }
         }
 
-        // Collect indices of claimable entries, sorted by (priority ASC, available_at ASC).
+        // Collect indices of claimable entries, sorted by priority DESC with aging.
         let allowed = &request.allowed_run_ids;
         let mut candidates: Vec<usize> = inner
             .entries
@@ -124,9 +132,11 @@ impl TaskQueue for InMemoryTaskQueue {
         candidates.sort_by(|&a, &b| {
             let ea = &inner.entries[a];
             let eb = &inner.entries[b];
-            ea.priority
-                .cmp(&eb.priority)
+            priority_for_claim(eb.priority, eb.available_at, now)
+                .cmp(&priority_for_claim(ea.priority, ea.available_at, now))
+                .then(eb.priority.cmp(&ea.priority))
                 .then(ea.available_at.cmp(&eb.available_at))
+                .then(ea.queue_id.cmp(&eb.queue_id))
         });
 
         let mut claimed = Vec::new();
@@ -289,6 +299,26 @@ impl TaskQueue for InMemoryTaskQueue {
         inner.active_tasks.remove(&task_id);
 
         Ok(())
+    }
+
+    fn override_priority(&self, task_id: TaskId, priority: u32) -> Result<(), QueueError> {
+        let mut inner = self.inner.write().unwrap();
+        let now = Utc::now();
+        let mut found = false;
+
+        for entry in &mut inner.entries {
+            if entry.task_id == task_id {
+                entry.priority = priority;
+                entry.updated_at = now;
+                found = true;
+            }
+        }
+
+        if found {
+            Ok(())
+        } else {
+            Err(QueueError::NotFound(task_id))
+        }
     }
 
     fn cancel(&self, queue_id: Uuid) -> Result<(), QueueError> {

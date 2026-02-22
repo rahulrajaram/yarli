@@ -11,6 +11,38 @@ For memory behavior (when YARLI stores/queries memories), see `docs/MEMORY_POLIC
 - Rust toolchain compatible with workspace `rust-version` (currently 1.75+).
 - PostgreSQL accessible from the local machine.
 - `psql` client for manual migration execution.
+- CI/CD pipeline integrations for API-triggered runs are documented in
+  `docs/CI_CD_INTEGRATION_EXAMPLES.md` with GitHub Actions, GitLab CI, Jenkins, and wait-for-completion scripts.
+
+## Production Deployment Prerequisites
+
+- Kubernetes:
+  - Kubernetes `v1.27+` cluster.
+  - `kubectl` matching cluster version.
+- Container tooling:
+  - `helm` `v3+`.
+  - Container runtime tooling for image signing/build reproducibility.
+- Event store:
+  - PostgreSQL `16+` for production deployments.
+  - Stable connectivity from all scheduler pods to the database.
+  - Database role policy allowing migration execution and backup tooling.
+  - Backups and restore drills included in runbook cadence.
+- Runtime:
+  - Secrets mounted from platform vault/secret manager for DB credentials.
+  - At least one namespace boundary around scheduler and operator tooling.
+
+Deployment prerequisites before first rollout:
+
+- Set `core.backend = "postgres"` in effective config.
+- Set one of `DATABASE_URL` or `postgres.database_url_file`.
+- Run `yarli migrate status` and confirm no unapplied mandatory migrations.
+- Validate `cargo test --workspace` in a clean environment before release packaging.
+
+## Zero-Drift Deployment Hygiene
+
+- Use immutable image tags for scheduler and api images.
+- Keep migration execution and scheduler startup in separate rollout steps.
+- Preserve `run` and `task` identifiers in event store evidence.
 
 ## Required Environment Variables
 
@@ -18,6 +50,9 @@ For memory behavior (when YARLI stores/queries memories), see `docs/MEMORY_POLIC
   - Required when running Postgres integration tests locally.
   - CI uses: `postgres://postgres:postgres@localhost:5432/postgres`.
   - Must point to an admin database that can create and drop temporary databases.
+- `DATABASE_URL`
+  - Optional for durable runtime.
+  - If set, overrides `postgres.database_url` and `postgres.database_url_file`.
 - `YARLI_REQUIRE_POSTGRES_TESTS`
   - Set to `1` for strict mode.
   - In strict mode, missing `YARLI_TEST_DATABASE_URL` is a hard failure (never a skip-success).
@@ -106,9 +141,67 @@ backend = "postgres"
 
 [postgres]
 database_url = "postgres://postgres:postgres@localhost:5432/yarli"
+# or
+database_url_file = "/run/secrets/yarli-postgres-url"
 ```
 
 `core.backend = "in-memory"` is supported only for explicit ephemeral workflows, and write commands are blocked unless `core.allow_in_memory_writes = true`.
+
+### Secret rotation for durable deployments
+
+To avoid rebuilding images when credentials rotate:
+
+- Set `DATABASE_URL` in the runtime environment and rely on deployment restart/reload.
+- Or mount credentials at `postgres.database_url_file` and rotate the mounted secret.
+
+### API key management and rotation
+
+API keys control optional API authentication when `YARLI_API_KEYS` is set in the runtime environment.
+
+- Set `YARLI_API_KEYS` to a comma-separated list of allowed API keys.
+- Set `YARLI_API_RATE_LIMIT_PER_MINUTE` (default: `120`) to tune per-key request throttling.
+- Rotate keys by updating the environment value and restarting or reloading the API process.
+
+Authentication is required when `YARLI_API_KEYS` is non-empty and applies to all non-health/metrics routes.
+
+### Zero-downtime scheduler upgrades (blue/green)
+
+Use this runbook for minor/patch upgrades and scheduler-safe rollouts:
+
+1. Build and validate the upgraded image as `yarli-scheduler:<new-version>`.
+2. Deploy the upgraded scheduler as a green replica (same queue/postgres view, no traffic yet).
+3. Pause active work on the blue scheduler: `yarli run pause --all-active --reason "pre-upgrade drain"`.
+4. Wait for in-flight tasks to reach a natural checkpoint (`TaskComplete` or explicit operator-reviewed pause state).
+5. Stop the blue scheduler process after queue drain progress indicates no additional claims.
+6. Shift traffic to green (`kubectl rollout`, service selector swap, or equivalent).
+7. Resume paused runs: `yarli run resume --all-paused --reason "upgrade complete"`.
+
+If green shows stable health and queue progress resumes, proceed. If not, swap traffic back to blue and use
+`yarli run pause`/`yarli run cancel` to contain impact while diagnostics run.
+
+Operational checkpoint before rollout:
+
+- `yarli run status --all` shows bounded backlog growth and no unexpected `TaskFailed` spikes.
+- Existing active run IDs remain visible and resumable from `run status` and `run explain-exit`.
+- Queue lease owner identities should only be from the active scheduler deployment.
+
+### Event schema compatibility matrix
+
+YARLI does not require coordinated downtime for additive event-schema changes.
+
+| Producer schema | Consumer schema | Additive fields only | Backward reads | Breaking reads |
+| --- | --- | --- | --- | --- |
+| 1.0 | 1.0 | allowed | allowed | blocked |
+| 1.1 (schema extension) | 1.0 | allowed | allowed | blocked |
+| 1.0 | 1.1 | allowed | allowed | blocked |
+| 1.1 | 1.2 | allowed | allowed with defaults | blocked |
+| 1.2 | 1.1 | required | blocked | blocked |
+
+Guidance:
+
+- Keep event consumers resilient to optional/new fields.
+- For breaking payload changes, land a compatibility shim before enabling mixed-version rollouts.
+- Record any approved schema bump in `docs/ACCEPTANCE_RUBRIC.md` and rollback plan.
 
 ## Execution Backend Selection
 
@@ -328,17 +421,113 @@ Expected behavior:
 
 YARLI schema SQL lives under `crates/yarli-store/migrations/`.
 
-Apply migrations in order:
+Use CLI migration workflow:
 
 ```bash
-psql "$DATABASE_URL" -f crates/yarli-store/migrations/0001_init.sql
-psql "$DATABASE_URL" -f crates/yarli-store/migrations/0002_indexes.sql
+yarli migrate status
+yarli migrate up
+yarli migrate backup --label <label>   # optional before maintenance windows
+yarli migrate down --target 0002         # optional rollback (creates backup)
+yarli migrate restore --label <label>     # rollback recovery
 ```
 
 Recommended:
 
 - Use a dedicated database for YARLI runtime data.
 - Apply migrations before running durable CLI write commands.
+
+## Event Store Backup and Restore for Production
+
+YARLI’s source of truth is the Postgres event store and queue state.
+
+Recommended production backup policy:
+
+- Daily validated dump.
+- Timely incremental backup or PITR according to retention policy.
+- Quarterly restore drill in a non-production cluster.
+
+Example full backup command:
+
+```bash
+export YARLI_DB_URL="postgres://postgres:postgres@postgres.example.internal:5432/yarli"
+export BACKUP_FILE="/var/backups/yarli-eventstore-$(date -u +%Y%m%dT%H%M%SZ).dump"
+pg_dump -Fc "$YARLI_DB_URL" > "$BACKUP_FILE"
+sha256sum "$BACKUP_FILE" > "${BACKUP_FILE}.sha256"
+```
+
+Example restore validation workflow:
+
+```bash
+export YARLI_RESTORE_DB_URL="postgres://postgres:postgres@postgres.example.internal:5432/yarli_restore"
+createdb -h postgres.example.internal -U postgres yarli_restore
+pg_restore --clean --if-exists --no-owner --no-privileges --dbname "$YARLI_RESTORE_DB_URL" "$BACKUP_FILE"
+export DATABASE_URL="$YARLI_RESTORE_DB_URL"
+yarli migrate status
+```
+
+Validation rules:
+
+- Restore commands complete without ownership/permission warnings.
+- `yarli migrate status` shows a healthy, readable event store.
+- `yarli run status --all` works against restored data.
+
+## Scaling Strategy for Queue and Scheduler Capacity
+
+- Use `yarli run status --all` and run-level backlog patterns as first indicators.
+- Horizontal scale first when sustained backlog grows across multiple active runs:
+  - `helm upgrade <release> deploy/helm/yarli --set scheduler.replicas=<N>`
+- Vertical tuning when backlog remains with healthy pod counts:
+  - update scheduler CPU/memory in `deploy/helm/yarli/values.yaml` (`scheduler.resources`).
+- Throughput tuning for event-driven claim bursts:
+  - `queue.per_run_cap`
+  - `queue.io_cap`
+  - `queue.cpu_cap`
+  - `queue.git_cap`
+  - `queue.tool_cap`
+- Vertical and horizontal changes should be paired with post-scale verification.
+
+## Incident Response Playbook
+
+Use this flow for production incidents requiring operator action without code changes.
+
+### 1) Stuck runs
+
+1. `yarli run status --all`
+2. For the affected run:
+   - `yarli run explain-exit <run-id>`
+   - `yarli task list <run-id>`
+   - `yarli task explain <task-id>`
+3. Pull recent operator telemetry:
+   - `yarli audit tail`
+4. If the run must be stopped:
+   - `yarli run pause --all-active --reason "incident triage"`
+   - fix root cause, then `yarli run resume --all-paused --reason "triage complete"`
+
+### 2) Queue backlogs
+
+1. Confirm queue behavior:
+   - `yarli run status --all`
+2. Correlate with `run` and `task` telemetry:
+   - `yarli audit tail`
+3. Contain and recover:
+   - reduce new claim pressure if needed
+   - increase scheduler replicas
+   - pause and drain if the backlog is destabilizing critical workloads
+4. Resume in a controlled mode after scheduler and DB signals stabilize.
+
+### 3) Budget breaches
+
+1. Detect breach and isolate impact:
+   - `yarli task explain <task-id>`
+   - `yarli run explain-exit <run-id>`
+2. Preserve incident evidence:
+   - `yarli run status <run-id>`
+   - `yarli run explain-exit <run-id>`
+   - `yarli audit tail`
+3. Corrective actions:
+   - `yarli run pause <run-id>` if mitigation needs immediate human hold
+   - adjust `[budgets]` for rerun
+   - `yarli run continue` after intent review.
 
 ## Deterministic Local Strict Postgres Verification Workflow
 
