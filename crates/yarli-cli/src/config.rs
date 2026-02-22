@@ -1020,8 +1020,18 @@ pub struct RunConfig {
     /// `fail` (default): hard-fail on merge conflicts.
     /// `auto-repair`: attempt a deterministic automated repair before failing.
     /// `manual`: preserve conflicted workspaces and emit operator instructions.
+    /// `llm-assisted`: invoke a user-configured shell command to resolve conflicts.
     #[serde(default, deserialize_with = "deserialize_merge_conflict_resolution")]
     pub merge_conflict_resolution: MergeConflictResolution,
+    /// Shell command for LLM-assisted merge conflict repair.
+    ///
+    /// Required when `merge_conflict_resolution = "llm-assisted"`.
+    /// Runs via `sh -c` in the source workdir. Should edit conflicted files in place.
+    #[serde(default)]
+    pub merge_repair_command: Option<String>,
+    /// Timeout in seconds for the repair command. Default: 300. 0 = no timeout.
+    #[serde(default = "default_merge_repair_timeout_seconds")]
+    pub merge_repair_timeout_seconds: u64,
     /// Optional project-level task catalog for run-spec execution.
     ///
     /// Serialized as `[[run.tasks]]`.
@@ -1066,6 +1076,21 @@ impl Default for RunTaskHealthConfig {
 }
 
 impl RunConfig {
+    pub fn validate_merge_repair_config(&self) -> Result<()> {
+        if self.merge_conflict_resolution == MergeConflictResolution::LlmAssisted {
+            match &self.merge_repair_command {
+                None => bail!(
+                    "merge_conflict_resolution = \"llm-assisted\" requires a non-empty [run].merge_repair_command"
+                ),
+                Some(cmd) if cmd.trim().is_empty() => bail!(
+                    "merge_conflict_resolution = \"llm-assisted\" requires a non-empty [run].merge_repair_command"
+                ),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn effective_auto_advance_policy(&self) -> AutoAdvancePolicy {
         if self.auto_advance_policy != AutoAdvancePolicy::ImprovingOnly {
             return self.auto_advance_policy;
@@ -1094,6 +1119,8 @@ impl Default for RunConfig {
             enforce_plan_tranche_allowed_paths: false,
             allow_recursive_run: false,
             merge_conflict_resolution: MergeConflictResolution::Fail,
+            merge_repair_command: None,
+            merge_repair_timeout_seconds: default_merge_repair_timeout_seconds(),
             tasks: Vec::new(),
             tranches: Vec::new(),
             plan_guard: None,
@@ -1113,6 +1140,12 @@ pub enum MergeConflictResolution {
     AutoRepair,
     /// Preserve conflicted workspaces and emit operator instructions.
     Manual,
+    /// Invoke an LLM-assisted repair command to resolve conflicts.
+    LlmAssisted,
+}
+
+fn default_merge_repair_timeout_seconds() -> u64 {
+    300
 }
 
 fn deserialize_merge_conflict_resolution<'de, D>(
@@ -1126,8 +1159,9 @@ where
         "fail" => Ok(MergeConflictResolution::Fail),
         "auto-repair" => Ok(MergeConflictResolution::AutoRepair),
         "manual" => Ok(MergeConflictResolution::Manual),
+        "llm-assisted" => Ok(MergeConflictResolution::LlmAssisted),
         _ => Err(serde::de::Error::custom(format!(
-            "invalid [run].merge_conflict_resolution = {raw:?}; expected one of: \"fail\", \"manual\", \"auto-repair\""
+            "invalid [run].merge_conflict_resolution = {raw:?}; expected one of: \"fail\", \"manual\", \"auto-repair\", \"llm-assisted\""
         ))),
     }
 }
@@ -1490,6 +1524,8 @@ mod tests {
             "run.max_grouped_tasks_per_tranche",
             "run.enforce_plan_tranche_allowed_paths",
             "run.merge_conflict_resolution",
+            "run.merge_repair_command",
+            "run.merge_repair_timeout_seconds",
             "run.tasks",
             "run.tranches",
             "run.plan_guard.target",
@@ -2144,7 +2180,7 @@ merge_conflict_resolution = "agentic"
             "unexpected root error: {root_msg}"
         );
         assert!(
-            root_msg.contains("expected one of: \"fail\", \"manual\", \"auto-repair\""),
+            root_msg.contains("expected one of: \"fail\", \"manual\", \"auto-repair\", \"llm-assisted\""),
             "unexpected root error: {root_msg}"
         );
         assert!(root_msg.contains("agentic"));
@@ -2157,5 +2193,68 @@ merge_conflict_resolution = "agentic"
             loaded.config().run.merge_conflict_resolution,
             MergeConflictResolution::Fail
         );
+    }
+
+    #[test]
+    fn merge_conflict_resolution_parses_llm_assisted_with_command() {
+        let loaded = write_test_config(
+            r#"
+[run]
+merge_conflict_resolution = "llm-assisted"
+merge_repair_command = "claude --print"
+merge_repair_timeout_seconds = 120
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.merge_conflict_resolution,
+            MergeConflictResolution::LlmAssisted
+        );
+        assert_eq!(
+            loaded.config().run.merge_repair_command.as_deref(),
+            Some("claude --print")
+        );
+        assert_eq!(loaded.config().run.merge_repair_timeout_seconds, 120);
+    }
+
+    #[test]
+    fn merge_repair_config_defaults() {
+        let loaded = write_test_config("[run]\n");
+        assert_eq!(loaded.config().run.merge_repair_command, None);
+        assert_eq!(loaded.config().run.merge_repair_timeout_seconds, 300);
+    }
+
+    #[test]
+    fn validate_merge_repair_config_rejects_llm_assisted_without_command() {
+        let config = RunConfig {
+            merge_conflict_resolution: MergeConflictResolution::LlmAssisted,
+            merge_repair_command: None,
+            ..RunConfig::default()
+        };
+        let err = config.validate_merge_repair_config().unwrap_err();
+        assert!(err.to_string().contains("merge_repair_command"));
+
+        let config_empty = RunConfig {
+            merge_conflict_resolution: MergeConflictResolution::LlmAssisted,
+            merge_repair_command: Some("  ".to_string()),
+            ..RunConfig::default()
+        };
+        let err = config_empty.validate_merge_repair_config().unwrap_err();
+        assert!(err.to_string().contains("merge_repair_command"));
+    }
+
+    #[test]
+    fn validate_merge_repair_config_allows_non_llm_assisted_without_command() {
+        for strategy in [
+            MergeConflictResolution::Fail,
+            MergeConflictResolution::AutoRepair,
+            MergeConflictResolution::Manual,
+        ] {
+            let config = RunConfig {
+                merge_conflict_resolution: strategy,
+                merge_repair_command: None,
+                ..RunConfig::default()
+            };
+            config.validate_merge_repair_config().unwrap();
+        }
     }
 }

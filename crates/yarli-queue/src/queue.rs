@@ -200,6 +200,12 @@ pub trait TaskQueue: Send + Sync {
     /// Return the number of entries in each status.
     fn stats(&self) -> QueueStats;
 
+    /// Return a snapshot of all known queue entries.
+    ///
+    /// The snapshot is best-effort and suitable for read-only debug/introspection
+    /// surfaces. Entries are ordered according to underlying storage semantics.
+    fn entries(&self) -> Vec<QueueEntry>;
+
     /// Return the number of currently leased entries for a given run.
     fn leased_count_for_run(&self, run_id: RunId) -> usize;
 

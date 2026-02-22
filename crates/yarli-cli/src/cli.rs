@@ -117,7 +117,9 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.enable_plan_tranche_grouping (default: false; group adjacent plan entries by shared tranche_group metadata)
 - run.max_grouped_tasks_per_tranche (default: 0; 0 = unlimited tasks per grouped tranche)
 - run.enforce_plan_tranche_allowed_paths (default: false; surface `allowed_paths=` plan metadata as scope constraints)
-- run.merge_conflict_resolution (default: "fail"; values: fail|manual|auto-repair)
+- run.merge_conflict_resolution (default: "fail"; values: fail|manual|auto-repair|llm-assisted)
+- run.merge_repair_command (optional; shell command for llm-assisted conflict repair)
+- run.merge_repair_timeout_seconds (default: 300; 0 = no timeout)
 - run.tasks (optional; array-of-table `[[run.tasks]]` entries with key/cmd/class)
 - run.tranches (optional; array-of-table `[[run.tranches]]` entries with key/objective/task_keys)
 - run.plan_guard.target (optional; when set, enforces plan target contract)
@@ -311,8 +313,12 @@ enable_plan_tranche_grouping = false
 max_grouped_tasks_per_tranche = 0
 # Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
 enforce_plan_tranche_allowed_paths = false
-# Merge conflict resolution strategy: fail | manual | auto-repair
+# Merge conflict resolution strategy: fail | manual | auto-repair | llm-assisted
 # merge_conflict_resolution = "fail"
+# Shell command for LLM-assisted merge conflict repair (required when llm-assisted).
+# merge_repair_command = "claude --print"
+# Timeout in seconds for the repair command (0 = no timeout).
+# merge_repair_timeout_seconds = 300
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"
@@ -553,6 +559,14 @@ pub(crate) enum Commands {
     Plan {
         #[command(subcommand)]
         action: PlanAction,
+    },
+    #[command(
+        about = "Inspect live scheduler state (run-level and queue internals)",
+        long_about = "Inspect live scheduler state from persisted and in-memory surfaces.\n\nExamples:\n  yarli debug queue-depth\n  yarli debug active-leases\n  yarli debug resource-usage <run-id>"
+    )]
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
     },
     #[command(
         about = "Initialize yarli.toml with a documented template",
@@ -868,6 +882,52 @@ pub(crate) enum AuditAction {
         #[arg(short, long)]
         category: Option<String>,
     },
+    #[command(
+        about = "Query the JSONL audit log",
+        long_about = "Query the JSONL audit log.\n\nFilter by run ID, task ID, category, actor, and time range.\nSupports multiple output formats and pagination.\n\nCategories:\n  policy_decision      — policy engine allow/deny decisions\n  destructive_attempt   — blocked destructive git operations\n  token_consumed        — LLM token usage records\n  gate_evaluation      — gate pass/fail results\n  command_execution    — command execution terminal events\n\nOutput formats:\n  table (default), json, csv\n\nExamples:\n  yarli audit query --category policy_decision\n  yarli audit query --run-id 019577a5-... --format table\n  yarli audit query --since 2026-02-20T00:00:00Z --before 2026-02-22T23:59:59Z\n  yarli audit query --after 019577a5-... --limit 25 --format csv"
+    )]
+    Query {
+        /// Path to the audit JSONL file.
+        #[arg(short, long, default_value = ".yarl/audit.jsonl")]
+        file: String,
+        /// Filter by run ID.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Filter by task ID.
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Filter by category.
+        #[arg(short, long)]
+        category: Option<String>,
+        /// Filter by actor.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Include entries on or after this UTC timestamp (RFC 3339 or YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+        /// Include entries on or before this UTC timestamp (RFC 3339 or YYYY-MM-DD).
+        #[arg(long)]
+        before: Option<String>,
+        /// Cursor-based pagination. Start after this audit ID.
+        #[arg(long)]
+        after: Option<String>,
+        /// Offset entries before returning the page.
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Max entries to return (0 = all).
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Output format.
+        #[arg(short, long, default_value_t = AuditOutputFormat::Table, value_enum)]
+        format: AuditOutputFormat,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AuditOutputFormat {
+    Table,
+    Json,
+    Csv,
 }
 
 #[derive(Subcommand)]
@@ -926,5 +986,27 @@ pub(crate) enum TrancheAction {
         /// Tranche key to remove.
         #[arg(short, long)]
         key: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DebugAction {
+    #[command(
+        about = "Show queue depth by run and command class",
+        long_about = "Show live queue depth grouped by run and command class.\n\nUseful to identify backlog growth or class-level saturation.\n\nExamples:\n  yarli debug queue-depth"
+    )]
+    QueueDepth,
+    #[command(
+        about = "Show active task leases and TTL",
+        long_about = "Show currently leased tasks with owner and lease expiry.\n\nExamples:\n  yarli debug active-leases"
+    )]
+    ActiveLeases,
+    #[command(
+        about = "Show aggregated resource usage for a run",
+        long_about = "Show current run-level resource usage totals and per-budget comparison.\n\nExamples:\n  yarli debug resource-usage 019577a2-..."
+    )]
+    ResourceUsage {
+        /// Run ID (UUID).
+        run_id: String,
     },
 }

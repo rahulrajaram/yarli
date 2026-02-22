@@ -1,0 +1,50 @@
+   Compiling yarli-cli v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c861c-8e35-75c1-8910-a5197276cb34/001-tranche-001-card-r12-04/crates/yarli-cli)
+warning: unused variable: `run_id`
+   --> crates/yarli-cli/tests/parallel_merge_integration.rs:626:9
+    |
+626 |     let run_id = parse_run_id(&run_stdout).expect("failed to parse run id from command output");
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_run_id`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `yarli-cli` (test "parallel_merge_integration") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.48s
+     Running unittests src/lib.rs (target/debug/deps/yarli_cli-b62163872977b41b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 142 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/yarli-1c802ada857484e4)
+
+running 3 tests
+test render::tests::render_task_explain_surfaces_budget_breach_and_token_usage ... ok
+test render::tests::render_run_explain_surfaces_budget_breach ... ok
+test render::tests::render_run_status_surfaces_budget_exceeded_and_token_usage ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 253 filtered out; finished in 0.00s
+
+     Running tests/parallel_merge_integration.rs (target/debug/deps/parallel_merge_integration-c08464754f82e98e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-48ceb0e390f61b6b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/tranches_preflight_integration.rs (target/debug/deps/tranches_preflight_integration-52e9462fbdfd13ab)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+   Doc-tests yarli_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

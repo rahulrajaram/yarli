@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "debug-api")]
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -7,24 +9,51 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use prometheus_client::registry::Registry;
 use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 use yarli_core::domain::{EntityType, Event};
+#[cfg(feature = "debug-api")]
+use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
+#[cfg(feature = "debug-api")]
+use yarli_queue::TaskQueue;
 use yarli_core::explain::DeteriorationReport;
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
+use yarli_observability::{encode_metrics, YarliMetrics};
 use yarli_store::event_store::EventQuery;
 use yarli_store::{EventStore, StoreError};
 
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<dyn EventStore>,
+    metrics_registry: Arc<Registry>,
+    #[cfg(feature = "debug-api")]
+    queue: Option<Arc<dyn TaskQueue>>,
 }
 
 impl ApiState {
     pub fn new(store: Arc<dyn EventStore>) -> Self {
-        Self { store }
+        let mut metrics_registry = Registry::default();
+        let _ = YarliMetrics::new(&mut metrics_registry);
+        Self {
+            store,
+            metrics_registry: Arc::new(metrics_registry),
+            #[cfg(feature = "debug-api")]
+            queue: None,
+        }
+    }
+
+    #[cfg(feature = "debug-api")]
+    pub fn new_with_queue(store: Arc<dyn EventStore>, queue: Arc<dyn TaskQueue>) -> Self {
+        let mut metrics_registry = Registry::default();
+        let _ = YarliMetrics::new(&mut metrics_registry);
+        Self {
+            store,
+            metrics_registry: Arc::new(metrics_registry),
+            queue: Some(queue),
+        }
     }
 }
 
@@ -37,9 +66,23 @@ pub enum ApiServerError {
 pub fn router(store: Arc<dyn EventStore>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/runs/:run_id/status", get(run_status))
         .route("/v1/tasks/:task_id", get(task_status))
         .with_state(ApiState::new(store))
+}
+
+#[cfg(feature = "debug-api")]
+pub fn router_with_queue(store: Arc<dyn EventStore>, queue: Arc<dyn TaskQueue>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/v1/runs/:run_id/status", get(run_status))
+        .route("/v1/tasks/:task_id", get(task_status))
+        .route("/debug/queue-depth", get(debug_queue_depth))
+        .route("/debug/active-leases", get(debug_active_leases))
+        .route("/debug/resource-usage/:run_id", get(debug_resource_usage))
+        .with_state(ApiState::new_with_queue(store, queue))
 }
 
 pub async fn serve(
@@ -51,6 +94,17 @@ pub async fn serve(
         .map_err(ApiServerError::Serve)
 }
 
+#[cfg(feature = "debug-api")]
+pub async fn serve_with_queue(
+    listener: tokio::net::TcpListener,
+    store: Arc<dyn EventStore>,
+    queue: Arc<dyn TaskQueue>,
+) -> Result<(), ApiServerError> {
+    axum::serve(listener, router_with_queue(store, queue))
+        .await
+        .map_err(ApiServerError::Serve)
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     status: &'static str,
@@ -58,6 +112,10 @@ pub struct HealthResponse {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn metrics(State(state): State<ApiState>) -> String {
+    encode_metrics(&state.metrics_registry)
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +156,112 @@ pub struct TaskStatusSummary {
     cancelled: usize,
 }
 
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Default)]
+struct QueueDepthTotals {
+    pending: usize,
+    leased: usize,
+    completed: usize,
+    failed: usize,
+    cancelled: usize,
+}
+
+#[cfg(feature = "debug-api")]
+impl QueueDepthTotals {
+    fn add(&mut self, status: &str) {
+        match status {
+            "pending" => self.pending = self.pending.saturating_add(1),
+            "leased" => self.leased = self.leased.saturating_add(1),
+            "completed" => self.completed = self.completed.saturating_add(1),
+            "failed" => self.failed = self.failed.saturating_add(1),
+            "cancelled" => self.cancelled = self.cancelled.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.pending
+            .saturating_add(self.leased)
+            .saturating_add(self.completed)
+            .saturating_add(self.failed)
+            .saturating_add(self.cancelled)
+    }
+}
+
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Default, Serialize)]
+struct ResourceUsageBudget {
+    max_run_total_tokens: Option<u64>,
+    max_run_peak_rss_bytes: Option<u64>,
+    max_run_cpu_user_ticks: Option<u64>,
+    max_run_cpu_system_ticks: Option<u64>,
+    max_run_io_read_bytes: Option<u64>,
+    max_run_io_write_bytes: Option<u64>,
+}
+
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Default, Serialize)]
+struct ResourceUsageTotals {
+    total_cpu_user_ticks: u64,
+    total_cpu_system_ticks: u64,
+    total_io_read_bytes: u64,
+    total_io_write_bytes: u64,
+    total_tokens: u64,
+    peak_rss_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budgets: Option<ResourceUsageBudget>,
+}
+
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Serialize)]
+struct QueueDepthEntry {
+    key: String,
+    pending: usize,
+    leased: usize,
+    completed: usize,
+    failed: usize,
+    cancelled: usize,
+    total: usize,
+}
+
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Serialize)]
+struct QueueDepthResponse {
+    overall: QueueDepthEntry,
+    by_run: Vec<QueueDepthEntry>,
+    by_class: Vec<QueueDepthEntry>,
+}
+
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Serialize)]
+struct ActiveLeaseResponse {
+    queue_id: Uuid,
+    run_id: Uuid,
+    task_id: Uuid,
+    owner: Option<String>,
+    command_class: String,
+    attempt_no: u32,
+    lease_expires_at: Option<DateTime<Utc>>,
+    ttl_seconds: Option<i64>,
+    available_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+}
+
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Serialize)]
+struct ActiveLeasesResponse {
+    active_leases: Vec<ActiveLeaseResponse>,
+    count: usize,
+}
+
+#[cfg(feature = "debug-api")]
+#[derive(Debug, Serialize)]
+struct ResourceUsageResponse {
+    run_id: Uuid,
+    correlation_id: Uuid,
+    totals: ResourceUsageTotals,
+}
+
 async fn run_status(
     Path(run_id): Path<String>,
     State(state): State<ApiState>,
@@ -118,6 +282,145 @@ async fn task_status(
     let status =
         load_task_status(state.store.as_ref(), task_id)?.ok_or(ApiError::TaskNotFound(task_id))?;
     Ok(Json(status))
+}
+
+#[cfg(feature = "debug-api")]
+async fn debug_queue_depth(
+    State(state): State<ApiState>,
+) -> Result<Json<QueueDepthResponse>, ApiError> {
+    let Some(queue) = state.queue.as_ref() else {
+        return Err(ApiError::DebugQueueMissing);
+    };
+
+    let entries = queue.entries();
+    let mut overall = QueueDepthTotals::default();
+    let mut by_run: BTreeMap<Uuid, QueueDepthTotals> = BTreeMap::new();
+    let mut by_class: BTreeMap<String, QueueDepthTotals> = BTreeMap::new();
+
+    for entry in entries {
+        let status = entry.status;
+        let status_key = match status {
+            yarli_queue::queue::QueueStatus::Pending => "pending",
+            yarli_queue::queue::QueueStatus::Leased => "leased",
+            yarli_queue::queue::QueueStatus::Completed => "completed",
+            yarli_queue::queue::QueueStatus::Failed => "failed",
+            yarli_queue::queue::QueueStatus::Cancelled => "cancelled",
+        };
+
+        overall.add(status_key);
+        by_run.entry(entry.run_id).or_default().add(status_key);
+        by_class
+            .entry(format!("{:?}", entry.command_class))
+            .or_default()
+            .add(status_key);
+    }
+
+    Ok(Json(QueueDepthResponse {
+        overall: QueueDepthEntry {
+            key: "overall".to_string(),
+            pending: overall.pending,
+            leased: overall.leased,
+            completed: overall.completed,
+            failed: overall.failed,
+            cancelled: overall.cancelled,
+            total: overall.total(),
+        },
+        by_run: by_run
+            .into_iter()
+            .map(|(run_id, totals)| QueueDepthEntry {
+                key: run_id.to_string(),
+                pending: totals.pending,
+                leased: totals.leased,
+                completed: totals.completed,
+                failed: totals.failed,
+                cancelled: totals.cancelled,
+                total: totals.total(),
+            })
+            .collect(),
+        by_class: by_class
+            .into_iter()
+            .map(|(class, totals)| QueueDepthEntry {
+                key: class,
+                pending: totals.pending,
+                leased: totals.leased,
+                completed: totals.completed,
+                failed: totals.failed,
+                cancelled: totals.cancelled,
+                total: totals.total(),
+            })
+            .collect(),
+    }))
+}
+
+#[cfg(feature = "debug-api")]
+async fn debug_active_leases(
+    State(state): State<ApiState>,
+) -> Result<Json<ActiveLeasesResponse>, ApiError> {
+    let Some(queue) = state.queue.as_ref() else {
+        return Err(ApiError::DebugQueueMissing);
+    };
+    let now = Utc::now();
+
+    let active_leases = queue
+        .entries()
+        .into_iter()
+        .filter(|entry| matches!(entry.status, yarli_queue::queue::QueueStatus::Leased))
+        .map(|entry| ActiveLeaseResponse {
+            queue_id: entry.queue_id,
+            run_id: entry.run_id,
+            task_id: entry.task_id,
+            owner: entry.lease_owner,
+            command_class: format!("{:?}", entry.command_class),
+            attempt_no: entry.attempt_no,
+            lease_expires_at: entry.lease_expires_at,
+            ttl_seconds: entry
+                .lease_expires_at
+                .map(|expires_at| expires_at.signed_duration_since(now).num_seconds()),
+            available_at: entry.available_at,
+            created_at: entry.created_at,
+        })
+        .collect::<Vec<_>>();
+
+    let count = active_leases.len();
+    Ok(Json(ActiveLeasesResponse {
+        active_leases,
+        count,
+    }))
+}
+
+#[cfg(feature = "debug-api")]
+async fn debug_resource_usage(
+    Path(run_id): Path<String>,
+    State(state): State<ApiState>,
+) -> Result<Json<ResourceUsageResponse>, ApiError> {
+    let run_id = run_id.parse::<Uuid>().map_err(|_| ApiError::InvalidRunId)?;
+    let run_events = state
+        .store
+        .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+        .map_err(ApiError::Store)?;
+    if run_events.is_empty() {
+        return Err(ApiError::RunNotFound(run_id));
+    }
+    let correlation_id = run_events[run_events.len() - 1].correlation_id;
+    let events = state
+        .store
+        .query(&EventQuery::by_correlation(correlation_id))
+        .map_err(ApiError::Store)?;
+    let budgets = collect_api_resource_budgets(&events);
+    let totals = collect_api_resource_totals(&events);
+    Ok(Json(ResourceUsageResponse {
+        run_id,
+        correlation_id,
+        totals: ResourceUsageTotals {
+            total_cpu_user_ticks: totals.total_cpu_user_ticks,
+            total_cpu_system_ticks: totals.total_cpu_system_ticks,
+            total_io_read_bytes: totals.total_io_read_bytes,
+            total_io_write_bytes: totals.total_io_write_bytes,
+            total_tokens: totals.total_tokens,
+            peak_rss_bytes: totals.peak_rss_bytes,
+            budgets: Some(budgets),
+        },
+    }))
 }
 
 fn load_run_status(
@@ -247,8 +550,10 @@ fn summarize_tasks(
         states.insert(task_id, next_state);
     }
 
-    let mut summary = TaskStatusSummary::default();
-    summary.total = states.len();
+    let mut summary = TaskStatusSummary {
+        total: states.len(),
+        ..Default::default()
+    };
     for state in states.values() {
         match state {
             TaskState::TaskOpen => summary.open += 1,
@@ -272,7 +577,7 @@ fn run_state_from_event(event: &Event) -> Option<RunState> {
         .get("to")
         .and_then(|value| value.as_str())
         .and_then(parse_run_state)
-        .or_else(|| match event.event_type.as_str() {
+        .or(match event.event_type.as_str() {
             "run.activated" => Some(RunState::RunActive),
             "run.verifying" => Some(RunState::RunVerifying),
             "run.completed" => Some(RunState::RunCompleted),
@@ -288,7 +593,7 @@ fn task_state_from_event(event: &Event) -> Option<TaskState> {
         .get("to")
         .and_then(|value| value.as_str())
         .and_then(parse_task_state)
-        .or_else(|| match event.event_type.as_str() {
+        .or(match event.event_type.as_str() {
             "task.ready" | "task.retrying" | "task.unblocked" => Some(TaskState::TaskReady),
             "task.executing" => Some(TaskState::TaskExecuting),
             "task.verifying" => Some(TaskState::TaskVerifying),
@@ -340,6 +645,9 @@ enum ApiError {
     TaskNotFound(Uuid),
     #[error("task {0} has no correlated run events")]
     CorrelatedRunMissing(Uuid),
+    #[error("debug endpoint is not wired with queue access")]
+    #[cfg_attr(not(feature = "debug-api"), allow(dead_code))]
+    DebugQueueMissing,
     #[error("failed to read persisted state")]
     Store(StoreError),
 }
@@ -356,6 +664,7 @@ impl IntoResponse for ApiError {
             ApiError::InvalidTaskId => (StatusCode::BAD_REQUEST, self.to_string()),
             ApiError::RunNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::TaskNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            ApiError::DebugQueueMissing => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::CorrelatedRunMissing(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
@@ -363,6 +672,96 @@ impl IntoResponse for ApiError {
         };
         (status, Json(ErrorResponse { error: message })).into_response()
     }
+}
+
+#[cfg(feature = "debug-api")]
+fn collect_api_resource_budgets(events: &[Event]) -> ResourceUsageBudget {
+    let mut latest_snapshot = None;
+    for event in events {
+        if event.event_type == "run.config_snapshot" {
+            latest_snapshot = event.payload.get("config_snapshot");
+        }
+    }
+
+    let Some(snapshot) = latest_snapshot else {
+        return ResourceUsageBudget::default();
+    };
+    let budgets = match snapshot.get("config").and_then(|value| value.get("budgets")) {
+        Some(value) => value,
+        None => return ResourceUsageBudget::default(),
+    };
+
+    ResourceUsageBudget {
+        max_run_cpu_user_ticks: budgets
+            .get("max_run_cpu_user_ticks")
+            .and_then(|value| value.as_u64()),
+        max_run_cpu_system_ticks: budgets
+            .get("max_run_cpu_system_ticks")
+            .and_then(|value| value.as_u64()),
+        max_run_io_read_bytes: budgets.get("max_run_io_read_bytes").and_then(|value| value.as_u64()),
+        max_run_io_write_bytes: budgets
+            .get("max_run_io_write_bytes")
+            .and_then(|value| value.as_u64()),
+        max_run_total_tokens: budgets
+            .get("max_run_total_tokens")
+            .and_then(|value| value.as_u64()),
+        max_run_peak_rss_bytes: budgets
+            .get("max_run_peak_rss_bytes")
+            .and_then(|value| value.as_u64()),
+    }
+}
+
+#[cfg(feature = "debug-api")]
+fn collect_api_resource_totals(events: &[Event]) -> ResourceUsageTotals {
+    let mut totals = ResourceUsageTotals::default();
+    let mut seen_command_ids = HashSet::new();
+
+    for event in events {
+        if event.entity_type != EntityType::Command {
+            continue;
+        }
+        if !matches!(
+            event.event_type.as_str(),
+            "command.exited" | "command.timed_out" | "command.killed" | "command.completed"
+        ) {
+            continue;
+        }
+        if !seen_command_ids.insert(event.entity_id.clone()) {
+            continue;
+        }
+
+        if let Some(raw_usage) = event.payload.get("resource_usage") {
+            if let Ok(usage) = serde_json::from_value::<CommandResourceUsage>(raw_usage.clone()) {
+                if let Some(value) = usage.cpu_user_ticks {
+                    totals.total_cpu_user_ticks =
+                        totals.total_cpu_user_ticks.saturating_add(value);
+                }
+                if let Some(value) = usage.cpu_system_ticks {
+                    totals.total_cpu_system_ticks =
+                        totals.total_cpu_system_ticks.saturating_add(value);
+                }
+                if let Some(value) = usage.io_read_bytes {
+                    totals.total_io_read_bytes =
+                        totals.total_io_read_bytes.saturating_add(value);
+                }
+                if let Some(value) = usage.io_write_bytes {
+                    totals.total_io_write_bytes =
+                        totals.total_io_write_bytes.saturating_add(value);
+                }
+                if let Some(value) = usage.max_rss_bytes {
+                    totals.peak_rss_bytes = totals.peak_rss_bytes.max(value);
+                }
+            }
+        }
+
+        if let Some(raw_tokens) = event.payload.get("token_usage") {
+            if let Ok(usage) = serde_json::from_value::<TokenUsage>(raw_tokens.clone()) {
+                totals.total_tokens = totals.total_tokens.saturating_add(usage.total_tokens);
+            }
+        }
+    }
+
+    totals
 }
 
 #[cfg(test)]
@@ -391,6 +790,25 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload, json!({"status":"ok"}));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_format() {
+        let response = router(Arc::new(InMemoryEventStore::new()))
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = std::str::from_utf8(&body).unwrap();
+
+        assert!(payload.contains("yarli_queue_depth"));
     }
 
     #[tokio::test]

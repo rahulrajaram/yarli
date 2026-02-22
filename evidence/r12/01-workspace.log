@@ -1,0 +1,888 @@
+warning: unused variable: `run_id`
+   --> crates/yarli-cli/tests/parallel_merge_integration.rs:626:9
+    |
+626 |     let run_id = parse_run_id(&run_stdout).expect("failed to parse run ...
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_run_id`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+   Compiling yarli-cli v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c861c-8e35-75c1-8910-a5197276cb34/001-tranche-001-card-r12-04/crates/yarli-cli)
+warning: `yarli-cli` (test "parallel_merge_integration") generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.54s
+     Running unittests src/lib.rs (target/debug/deps/yarli_api-783b1f4c3ca4a28c)
+
+running 7 tests
+test server::tests::metrics_endpoint_returns_prometheus_format ... ok
+test server::tests::task_status_endpoint_rejects_invalid_task_id ... ok
+test server::tests::task_status_endpoint_returns_not_found_for_unknown_task ... ok
+test server::tests::health_endpoint_returns_ok ... ok
+test server::tests::run_status_endpoint_returns_not_found_for_unknown_run ... ok
+test server::tests::task_status_endpoint_replays_persisted_task_events ... ok
+test server::tests::run_status_endpoint_replays_persisted_events ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-0cc271455680e782)
+
+running 1 test
+test run_and_task_status_reflect_writes_from_postgres ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+
+     Running unittests src/lib.rs (target/debug/deps/yarli_cli-68da8c1ad34cfafd)
+
+running 142 tests
+test dashboard::copy_mode::tests::activate_sets_active ... ok
+test dashboard::copy_mode::tests::banner_when_inactive ... ok
+test dashboard::copy_mode::tests::banner_when_active ... ok
+test dashboard::copy_mode::tests::deactivate_clears_active ... ok
+test dashboard::copy_mode::tests::new_is_inactive ... ok
+test dashboard::copy_mode::tests::status_indicator_when_active ... ok
+test dashboard::copy_mode::tests::status_indicator_when_inactive ... ok
+test dashboard::copy_mode::tests::default_is_inactive ... ok
+test dashboard::copy_mode::tests::strip_borders_follows_active ... ok
+test dashboard::input::tests::collapse_expand_keys ... ok
+test dashboard::input::tests::ctrl_c_always_quits ... ok
+test dashboard::input::tests::ctrl_d_u_half_page ... ok
+test dashboard::input::tests::esc_dismisses_overlay ... ok
+test dashboard::input::tests::g_and_shift_g_scroll_extremes ... ok
+test dashboard::input::tests::jk_scroll_in_output_panel ... ok
+test dashboard::input::tests::jk_select_in_task_list ... ok
+test dashboard::input::tests::number_keys_jump_to_panel ... ok
+test dashboard::input::tests::q_quits ... ok
+test dashboard::input::tests::shift_tab_cycles_backward ... ok
+test dashboard::input::tests::tab_cycles_focus ... ok
+test dashboard::input::tests::toggle_copy_mode ... ok
+test dashboard::input::tests::toggle_help ... ok
+test dashboard::input::tests::unknown_key_returns_none ... ok
+test dashboard::overlay::tests::clear_removes_all ... ok
+test dashboard::overlay::tests::compute_rect_centered ... ok
+test dashboard::overlay::tests::compute_rect_small_terminal ... ok
+test dashboard::overlay::tests::confirm_entry_content ... ok
+test dashboard::overlay::tests::default_stack_is_empty ... ok
+test dashboard::overlay::tests::dismiss_by_kind ... ok
+test dashboard::overlay::tests::pop_removes_topmost ... ok
+test dashboard::overlay::tests::push_replaces_same_kind ... ok
+test dashboard::overlay::tests::push_stacks_different_kinds ... ok
+test dashboard::overlay::tests::new_stack_is_empty ... ok
+test dashboard::renderer::tests::build_help_text_not_empty ... ok
+test dashboard::overlay::tests::toggle_dismisses_when_present ... ok
+test dashboard::overlay::tests::iter_returns_bottom_to_top ... ok
+test dashboard::renderer::tests::build_explain_line_with_summary ... ok
+test dashboard::overlay::tests::push_and_top ... ok
+test dashboard::renderer::tests::build_key_hints_contains_shortcuts ... ok
+test dashboard::overlay::tests::overlay_kind_titles ... ok
+test dashboard::overlay::tests::gate_detail_entry_content ... ok
+test dashboard::renderer::tests::build_key_hints_copy_mode ... ok
+test dashboard::renderer::tests::build_gate_lines_empty ... ok
+test dashboard::overlay::tests::toggle_pushes_when_absent ... ok
+test dashboard::renderer::tests::build_gate_lines_with_results ... ok
+test dashboard::renderer::tests::build_explain_line_without_summary ... ok
+test dashboard::renderer::tests::build_help_text_contains_shortcuts ... ok
+test dashboard::renderer::tests::build_output_lines_empty ... ok
+test dashboard::renderer::tests::build_explain_line_with_transient_status ... ok
+test dashboard::renderer::tests::build_task_list_empty ... ok
+test dashboard::renderer::tests::build_output_lines_with_content ... ok
+test dashboard::renderer::tests::format_compact_duration_hours ... ok
+test dashboard::renderer::tests::build_task_list_with_tasks ... ok
+test dashboard::renderer::tests::format_compact_duration_minutes ... ok
+test dashboard::state::tests::focus_panel_by_shortcut ... ok
+test dashboard::state::tests::focus_panel_ignores_hidden ... ok
+test dashboard::state::tests::focus_prev_cycling ... ok
+test dashboard::state::tests::focus_skips_hidden_panels ... ok
+test dashboard::state::tests::output_auto_scroll_disengages_on_scroll_up ... ok
+test dashboard::renderer::tests::format_compact_duration_seconds ... ok
+test dashboard::state::tests::collapse_focused_moves_focus_when_hidden ... ok
+test dashboard::renderer::tests::build_title_line_with_run ... ok
+test dashboard::state::tests::focus_cycling ... ok
+test dashboard::renderer::tests::build_title_line_no_run ... ok
+test dashboard::state::tests::append_output_for_selected_task ... ok
+test dashboard::state::tests::output_persists_across_task_switch ... ok
+test dashboard::state::tests::panel_state_collapse_cycle ... ok
+test dashboard::state::tests::panel_id_titles_and_shortcuts ... ok
+test dashboard::state::tests::panel_state_expand_cycle ... ok
+test dashboard::state::tests::restore_all_resets_panels ... ok
+test dashboard::state::tests::scroll_up_down ... ok
+test dashboard::state::tests::task_selection ... ok
+test dashboard::state::tests::task_summary_counts ... ok
+test dashboard::widgets::tests::borderless_min_height ... ok
+test dashboard::widgets::tests::borderless_renders_without_borders ... ok
+test dashboard::widgets::tests::collapsed_renders_in_one_line ... ok
+test dashboard::widgets::tests::min_height_by_state ... ok
+test dashboard::widgets::tests::hidden_renders_nothing ... ok
+test dashboard::widgets::tests::expanded_renders_block_with_content ... ok
+test mode::tests::auto_detect_large_tty_returns_dashboard ... ok
+test mode::tests::auto_detect_narrow_returns_stream ... ok
+test dashboard::widgets::tests::scroll_offset_skips_lines ... ok
+test mode::tests::auto_detect_pipe_returns_stream ... ok
+test mode::tests::auto_detect_short_returns_stream ... ok
+test mode::tests::auto_detect_small_tty_returns_stream ... ok
+test mode::tests::exact_minimum_supports_dashboard ... ok
+test mode::tests::force_stream_always_stream ... ok
+test mode::tests::force_stream_wins_over_tui ... ok
+test mode::tests::force_tui_errors_on_small_terminal ... ok
+test mode::tests::force_tui_returns_dashboard_on_large_tty ... ok
+test mode::tests::large_tty_supports_dashboard ... ok
+test mode::tests::narrow_tty_does_not_support_dashboard ... ok
+  [test mode::tests::pipe_does_not_support_dashboard ... buildok] 
+Compiling yarli v0.1.0
+test mode::tests::short_tty_does_not_support_dashboard ... ok
+test mode::tests::small_tty_does_not_support_dashboard ... ok
+16:16:49 run/b8116fb67ef5 RunOpen -> RunActive (started)
+{"run_id":"019c8623-a89e-76f1-b7d7-99687584f442","objective":"test","exit_state":"RunOpen","exit_reason":null,"cancellation_source":null,"cancellation_provenance":null,"completed_at":"2026-02-22T16:16:49.822301149Z","tasks":[{"task_id":"019c8623-a89e-76f1-b7d7-9984f3dc37c9","task_key":"build","state":"TASK_COMPLETE","attempt_no":1,"last_error":null,"blocker":null}],"summary":{"total":1,"completed":1,"failed":0,"cancelled":0,"pending":0},"next_tranche":null,"quality_gate":null}
+test mode::tests::terminal_info_detect_does_not_panic ... ok
+test stream::events::tests::task_view_terminal_states ... ok
+test stream::headless::tests::headless_forwards_command_output ... ok
+16:16:49 task/build TaskExecuting -> TaskComplete (5.0s), exit 0 [f73b0ae1-2554-4af0-9568-36d48ac395d4]
+16:16:49 task/test TaskExecuting -> TaskFailed (2.0s), exit 1, nonzero exit [62458d3b-d8a2-48bb-8fd5-88b6cf8c2255]
+test stream::headless::tests::headless_handles_run_transition ... ok
+test stream::headless::tests::headless_handles_run_exited_without_panic ... ok
+16:16:49 run/af9ab2632b75 started: test
+test prompt::tests::extracts_single_run_spec_block ... 16:16:49 task/task TaskExecuting -> TaskComplete, exit 0 [4566f2a3-bdce-4c4c-948f-366a01d82457]ok
+
+16:16:49 task/task TaskExecuting -> TaskComplete, exit 0 [ed596996-b1de-4b42-b479-1d662bc5fff0]
+16:16:49 task/task TaskExecuting -> TaskComplete, exit 0 [ebfa6364-effa-4ab4-b183-8b3363f96b89]
+test stream::events::tests::task_view_active_states ... ok
+test stream::headless::tests::headless_counts_complete_tasks ... ok
+test prompt::tests::optional_loader_accepts_plain_prompt_without_run_spec_block ... 16:16:49 run/ed5bc779d0fb started: build everythingok
+
+16:16:49 task/fail TaskExecuting -> TaskFailed, exit 1 [620acb0f-f8a1-45f6-8c0f-eb2de40aed89]
+test stream::headless::tests::headless_counts_failed_tasks ... ok
+16:16:49 task/cancel TaskExecuting -> TaskCancelled [a6bb0d90-3021-4bc6-aed3-2ae29a24d0b4]
+16:16:49 task/build TaskExecuting -> TaskComplete, exit 0 [76663c38-3a33-4db9-99a7-8b0f73559c73]
+test stream::renderer::tests::ascii_progress_counts_all_terminal_states ... ok
+test stream::renderer::tests::ascii_progress_formats_empty_snapshot ... ok
+test stream::renderer::tests::format_duration_long ... ok
+test stream::renderer::tests::ascii_progress_formats_partial_completion ... ok
+test stream::headless::tests::headless_records_run_id_from_run_started ... ok
+16:16:49 task/retryable TaskExecuting -> TaskFailed, exit 1 [a7fad67f-3574-4bef-b161-1649ed890a93]
+test prompt::tests::accepts_minimal_run_spec_without_tasks_for_config_first_mode ... ok
+test stream::renderer::tests::format_duration_short ... ok
+{"run_id":"3dec7011-5e30-4c2f-bb8a-1dec3ffb006c","objective":"retry flow","exit_state":"RunCompleted","exit_reason":null,"cancellation_source":null,"cancellation_provenance":null,"completed_at":"2026-02-22T16:16:49.822995019Z","tasks":[],"summary":{"total":1,"completed":1,"failed":0,"cancelled":0,"pending":0},"next_tranche":{"suggested_objective":"next","kind":"planned_next","retry_task_keys":[],"unfinished_task_keys":[],"planned_task_keys":["t2"],"planned_tranche_key":"t2","cursor":null,"config_snapshot":{},"interventions":[]},"quality_gate":null}
+test stream::headless::tests::headless_summary_reflects_all_events ... ok
+test stream::headless::tests::headless_summary_includes_run_id ... ok
+test stream::renderer::tests::format_duration_zero ... ok
+test stream::renderer::tests::display_run_id_uses_compact_prefix ... ok
+test prompt::tests::strict_loader_still_rejects_missing_run_spec_block ... ok
+test stream::renderer::tests::tier_for_complete_task ... ok
+test stream::renderer::tests::tier_for_completed_run ... ok
+test prompt::tests::accepts_explicit_tranche_sequence ... ok
+test prompt::tests::rejects_multiple_run_spec_blocks ... ok
+test stream::renderer::tests::tier_for_active_run ... ok
+test stream::renderer::tests::tier_for_blocked_run ... ok
+test stream::renderer::tests::format_duration_medium ... ok
+test stream::renderer::tests::tier_for_executing_task ... ok
+test stream::renderer::tests::tier_for_failed_task ... ok
+test stream::headless::tests::run_exited_summary_overrides_transition_failure_counts ... ok
+test stream::renderer::tests::transient_status_line_always_emits_operator_messages ... ok
+test prompt::tests::parses_plan_guard_verify_only_mode ... ok
+test stream::renderer::tests::transient_status_line_throttles_regular_heartbeats ... ok
+test stream::spinner::tests::spinner_cycles_through_frames ... ok
+test prompt::tests::rejects_empty_plan_guard_target ... ok
+test stream::spinner::tests::all_frames_are_unique ... ok
+test stream::spinner::tests::spinner_wraps_around ... ok
+test stream::style::tests::active_accent_is_cyan ... ok
+test stream::style::tests::active_is_bold_white ... ok
+test prompt::tests::include_expands_and_is_confined ... ok
+test stream::style::tests::background_is_dim_dark_gray ... ok
+test stream::style::tests::contextual_is_dark_gray ... ok
+test stream::style::tests::urgent_accent_is_yellow ... ok
+test stream::style::tests::urgent_is_bold_red ... ok
+test prompt::tests::rejects_duplicate_tranche_task_keys ... ok
+
+test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/yarli-9737a069dfda63e4)
+
+running 256 tests
+test commands::tests::all_gate_names_covers_all_gate_types ... ok
+test commands::tests::cmd_audit_tail_nonexistent_file ... ok
+test commands::tests::cmd_audit_tail_empty_file ... ok
+test commands::tests::cmd_audit_query_rejects_invalid_filters ... ok
+test commands::tests::cmd_gate_list_task_level ... ok
+test commands::tests::cmd_gate_list_run_level ... ok
+test commands::tests::cmd_audit_query_filters_to_json ... ok
+test commands::tests::cmd_gate_rerun_blocks_in_memory_writes_by_default ... ok
+test commands::tests::cmd_gate_rerun_accepts_valid_gate ... ok
+test commands::tests::cmd_audit_tail_reads_entries ... ok
+test commands::tests::cmd_audit_tail_limits_output ... ok
+test commands::tests::cmd_audit_tail_all_entries_with_zero_limit ... ok
+test commands::tests::cmd_audit_tail_filters_by_category ... ok
+test commands::tests::cmd_gate_rerun_rejects_invalid_uuid ... ok
+test commands::tests::cmd_merge_approve_rejects_invalid_uuid ... ok
+test commands::tests::cmd_merge_request_rejects_invalid_uuid ... ok
+test commands::tests::cmd_task_unblock_rejects_invalid_uuid ... ok
+test commands::tests::cmd_worktree_status_rejects_invalid_uuid ... ok
+test commands::tests::cmd_worktree_recover_rejects_invalid_action ... ok
+test commands::tests::cmd_merge_status_rejects_invalid_uuid ... ok
+test commands::tests::cmd_merge_reject_rejects_invalid_uuid ... ok
+test commands::tests::cmd_task_explain_rejects_invalid_uuid ... ok
+test commands::tests::cmd_task_list_rejects_invalid_uuid ... ok
+test commands::tests::cmd_gate_rerun_rejects_unknown_gate ... ok
+test commands::tests::cmd_merge_request_rejects_invalid_strategy ... ok
+test commands::tests::cmd_worktree_recover_blocks_in_memory_writes_by_default ... ok
+test commands::tests::cmd_task_unblock_blocks_in_memory_writes_by_default ... ok
+test commands::tests::cmd_run_explain_rejects_invalid_uuid ... ok
+test commands::tests::cmd_run_status_rejects_invalid_uuid ... ok
+test commands::tests::cmd_merge_request_blocks_in_memory_writes_by_default ... ok
+test commands::tests::execute_run_pause_and_resume_controls_append_operator_transitions ... ok
+test commands::tests::execute_merge_approve_in_observe_mode_blocks_and_audits ... ok
+test commands::tests::operator_control_signal_ignores_non_operator_actor ... ok
+test commands::tests::parse_gate_type_unknown_returns_none ... ok
+test commands::tests::incremental_event_cursor_reads_only_new_events ... ok
+test commands::tests::execute_task_unblock_appends_unblocked_event ... ok
+test commands::tests::execute_merge_request_persists_requested_event ... ok
+test commands::tests::parse_gate_type_valid_names ... ok
+test commands::tests::merge_apply_conflict_metadata_includes_workspace_path_and_repo_status ... ok
+test commands::tests::resolve_render_mode_cli_flags_override_configured_ui_mode ... ok
+test commands::tests::resolve_render_mode_uses_configured_ui_mode_when_flags_absent ... ok
+test commands::tests::execute_gate_rerun_persists_all_default_task_gates ... ok
+test commands::tests::execute_gate_rerun_persists_single_gate_evaluation ... ok
+test config::tests::backend_kind_as_str ... ok
+test commands::tests::cancel_active_run_persists_cancelled_transitions ... ok
+test config::tests::backend_selection_for_in_memory ... ok
+test config::tests::build_cli_command_applies_env_unset_prefix ... ok
+test config::tests::ensure_write_backend_guard_blocks_in_memory_writes_by_default ... ok
+test config::tests::cmd_init_refuses_overwrite_without_force ... ok
+test commands::tests::execute_run_cancel_control_cancels_non_terminal_tasks_and_queue_entries ... ok
+test config::tests::cmd_init_force_overwrites_existing_file ... ok
+test config::tests::cmd_init_writes_documented_config_template ... ok
+test config::tests::ensure_write_backend_guard_allows_explicit_ephemeral_override ... ok
+test config::tests::missing_file_uses_defaults ... ok
+test config::tests::merge_conflict_resolution_rejects_unknown_values_with_clear_error ... ok
+test config::tests::merge_repair_config_defaults ... ok
+test config::tests::merge_conflict_resolution_parses_llm_assisted_with_command ... ok
+test config::tests::parallel_workspace_contract_allows_parallel_disabled_without_worktree_root ... ok
+test config::tests::merge_conflict_resolution_defaults_to_fail ... ok
+test config::tests::postgres_backend_requires_database_url ... ok
+test config::tests::parallel_workspace_contract_requires_worktree_root_when_parallel_enabled ... ok
+test config::tests::merge_conflict_resolution_config_parses_all_variants ... ok
+test config::tests::run_effective_auto_advance_policy_respects_explicit_policy_and_legacy_toggle ... ok
+test config::tests::preflight_cli_backend_fails_on_bad_exit_code ... ok
+test config::tests::preflight_cli_backend_fails_on_missing_binary ... ok
+test config::tests::resolve_execution_path_from_cwd_expands_tilde_prefix ... ok
+test commands::tests::version_includes_build_provenance_fields ... ok
+test config::tests::validate_merge_repair_config_allows_non_llm_assisted_without_command ... ok
+test config::tests::snapshot_serializes_all_sections ... ok
+test config::tests::preflight_cli_backend_fails_when_marker_missing ... ok
+test config::tests::validate_merge_repair_config_rejects_llm_assisted_without_command ... ok
+test observers::tests::detect_deterioration_cycle_reports_patterns ... ok
+test config::tests::preflight_cli_backend_succeeds_with_echo_command ... ok
+test config::tests::resolve_cli_invocation_config_rejects_invalid_env_unset_entries ... ok
+test config::tests::resolve_execution_path_from_cwd_expands_env_tokens ... ok
+test observers::tests::deterioration_detected_for_alternating_backend_failure_signatures ... ok
+test observers::tests::deterioration_detected_for_repeated_backend_failure_signatures ... ok
+test observers::tests::normalize_error_signature_handles_noisy_failure_details ... ok
+test observers::tests::normalize_error_signature_handles_backend_task_health ... ok
+test observers::tests::deterioration_observer_emits_incremental_events ... ok
+test observers::tests::stable_trend_does_not_trigger_cycle ... ok
+test observers::tests::parse_tool_health_observation_reads_nested_tool_payload ... ok
+test observers::tests::failure_signature_ring_is_bounded ... ok
+test observers::tests::task_health_observer_reads_task_output_artifact_incrementally ... ok
+test persistence::tests::read_continuation_payload_from_file_if_exists_returns_none_for_missing_file ... ok
+test plan::tests::auto_advance_requires_planned_next_and_allowed_quality_gate ... ok
+test persistence::tests::load_latest_continuation_payload_prefers_most_recent_event ... ok
+test plan::tests::build_continuation_payload_after_previous_pivot_cycles_stops_and_summarizes ... ok
+test persistence::tests::load_latest_continuation_payload_skips_malformed_latest_event ... ok
+test persistence::tests::read_continuation_payload_from_file_if_exists_reads_payload ... ok
+test plan::tests::compute_quality_gate_blocks_stable_when_policy_disabled ... ok
+test plan::tests::build_continuation_payload_force_pivot_appends_checkpoint_intervention ... ok
+test commands::tests::run_help_mentions_prompt_resolution_precedence ... ok
+test plan::tests::compute_quality_gate_allows_stable_when_policy_enabled ... ok
+test persistence::tests::continuation_payload_round_trips_through_file ... ok
+test plan::tests::compute_quality_gate_soft_token_cap_forces_checkpoint ... ok
+test plan::tests::compute_quality_gate_soft_token_cap_can_be_disabled ... ok
+test plan::tests::compute_quality_gate_soft_token_cap_overrides_stable_report_blocking_policy ... ok
+test plan::tests::compute_quality_gate_soft_token_cap_overrides_deterioration_report ... ok
+test plan::tests::continuation_no_tranche_when_all_complete ... ok
+test plan::tests::continuation_tranche_includes_failed_and_unfinished ... ok
+test observers::tests::deterioration_scoring_distinguishes_stable_vs_deteriorating_trails ... ok
+test plan::tests::merge_run_specs_applies_prompt_overrides_on_top_of_config_defaults ... ok
+test config::tests::parses_required_sections ... ok
+test commands::tests::root_help_mentions_prompt_default_behavior ... ok
+test plan::tests::continuation_planned_next_appends_strategy_pivot_checkpoint_prompt ... ok
+test plan::tests::continuation_planned_next_resolves_command_from_task_catalog ... ok
+test plan::tests::plan_driven_tranche_prompt_includes_contract_fields ... ok
+test plan::tests::plain_prompt_sequence_dispatches_expanded_prompt_text ... ok
+test plan::tests::resolve_prompt_defaults_to_prompt_md_lookup ... ok
+test plan::tests::resolve_prompt_cli_override_wins_over_config ... ok
+test plan::tests::plan_driven_sequence_surfaces_allowed_paths_scope_when_enforced ... ok
+test plan::tests::plan_driven_sequence_builds_open_tranches_plus_verification ... ok
+test plan::tests::plan_driven_sequence_groups_adjacent_entries_by_tranche_group_when_enabled ... ok
+test plan::tests::plan_driven_sequence_runs_verification_only_when_no_open_tranches ... ok
+test plan::tests::plan_driven_sequence_grouping_respects_max_grouped_tasks_per_tranche_cap ... ok
+test plan::tests::resolve_prompt_rejects_empty_config_prompt_file ... ok
+test plan::tests::plan_driven_sequence_ignores_stale_keys_in_non_header_evidence_lines ... ok
+test plan::tests::plan_driven_sequence_errors_on_malformed_structured_tranches_file ... ok
+test plan::tests::resolve_prompt_missing_configured_file_error_includes_resolved_path ... ok
+test plan::tests::resolve_prompt_relative_paths_fallback_to_config_dir_without_repo_root ... ok
+test plan::tests::resolve_run_plan_rejects_cmd_and_pace ... ok
+test plan::tests::resolve_prompt_relative_paths_use_repo_root_before_config_dir ... ok
+test plan::tests::plan_driven_sequence_uses_tranches_file_near_resolved_plan_not_cwd ... ok
+test plan::tests::resolve_prompt_uses_config_prompt_file_when_set ... ok
+test plan::tests::resolve_run_plan_batch_falls_back_to_default_pace_when_batch_not_defined ... ok
+test plan::tests::resolve_run_plan_start_without_cmd_uses_run_default_pace ... ok
+test render::tests::event_to_stream_event_maps_command_output_chunks_to_task_output ... ok
+test plan::tests::resolve_run_plan_batch_defaults_to_batch_pace_name ... ok
+test render::tests::emit_initial_stream_state_emits_run_and_task_discovery ... ok
+test render::tests::event_to_stream_event_maps_observer_progress_to_transient_status ... ok
+test render::tests::event_to_stream_event_skips_empty_command_output_chunks ... ok
+test render::tests::list_runs_by_latest_state_ignores_non_transition_events ... ok
+test render::tests::render_merge_status_reads_persisted_events ... ok
+test render::tests::render_run_explain_reads_persisted_gate_failures ... ok
+test plan::tests::resolve_run_plan_uses_named_pace_for_commands_and_overrides ... ok
+test render::tests::render_run_explain_surfaces_budget_breach ... ok
+test render::tests::render_run_list_empty_store ... ok
+test plan::tests::tranches_file_to_entries_preserves_contract_fields ... ok
+test plan::tests::run_spec_from_run_config_maps_tasks_tranches_and_plan_guard ... ok
+test render::tests::render_run_explain_surfaces_merge_finalization_blockers ... ok
+test render::tests::render_run_explain_surfaces_deterioration_report ... ok
+test render::tests::render_run_list_counts_tasks ... ok
+test render::tests::render_run_list_shows_active_run ... ok
+test render::tests::render_run_list_updated_tracks_latest_task_event ... ok
+test render::tests::render_run_status_surfaces_budget_exceeded_and_token_usage ... ok
+test render::tests::render_run_status_reconstructs_persisted_state ... ok
+test render::tests::render_run_status_surfaces_deterioration_report ... ok
+test render::tests::render_run_status_updated_tracks_latest_task_activity ... ok
+test render::tests::render_run_status_surfaces_tranche_group_task_worker_mapping ... ok
+test render::tests::render_task_explain_reads_persisted_gate_failures ... ok
+test render::tests::render_task_explain_surfaces_budget_breach_and_token_usage ... ok
+test render::tests::resolve_run_id_input_accepts_unique_prefix ... ok
+test plan::tests::run_config_snapshot_records_resolved_prompt_entry_path ... ok
+test plan::tests::run_config_has_run_spec_data_detects_configured_sections ... ok
+test render::tests::render_run_status_surfaces_memory_hints ... ok
+test render::tests::resolve_run_id_input_rejects_ambiguous_prefix ... ok
+test render::tests::resolve_run_id_input_rejects_unknown_prefix ... ok
+test render::tests::render_worktree_status_reads_persisted_events ... ok
+test render::tests::stream_task_catalog_entries_extracts_task_ids_and_keys ... ok
+test render::tests::run_status_displays_blocker_detail ... ok
+test render::tests::render_task_output_uses_task_artifact_when_available ... ok
+test tranche::tests::auto_advance_blocks_gate_retry_tranche ... ok
+test render::tests::task_annotate_nonexistent_task_returns_not_found ... ok
+test render::tests::task_catalog_entries_from_event_extracts_workspace_dir ... ok
+test render::tests::run_status_surfaces_merge_finalization_blockers ... ok
+test tranche::tests::auto_advance_blocks_stable_quality_gate ... ok
+test render::tests::task_annotate_persists_and_displays_in_explain ... ok
+test render::tests::unique_run_id_prefixes_expand_on_collision ... ok
+test render::tests::task_explain_displays_last_error ... ok
+test render::tests::run_status_displays_last_error ... ok
+test tranche::tests::auto_advance_respects_max_tranche_cap ... ok
+test tranche::tests::auto_advance_policy_always_overrides_quality_gate ... ok
+test render::tests::run_status_and_explain_surface_cancel_provenance_summary ... ok
+test tranche::tests::discover_plan_dispatch_entries_falls_back_when_section_missing ... ok
+test tranche::tests::discover_plan_dispatch_entries_i_prefix_backward_compat ... ok
+test tranche::tests::discover_plan_dispatch_entries_parses_tp_keys_under_next_work_tranches ... ok
+test tranche::tests::discover_plan_dispatch_entries_mixed_complete_and_pending ... ok
+test tranche::tests::discover_plan_dispatch_entries_prefers_next_work_tranches_section ... ok
+test tranche::tests::discover_plan_dispatch_entries_recognizes_next_priority_actions_header ... ok
+test tranche::tests::looks_like_uuid_detects_valid_uuids ... ok
+test tranche::tests::discover_plan_entries_extracts_tranche_group_metadata ... ok
+test tranche::tests::discover_plan_entries_extracts_allowed_paths_metadata ... ok
+test tranche::tests::auto_complete_structured_tranche_skips_verification_tranche ... ok
+test tranche::tests::parse_plan_tranche_header_line_rejects_uuid_keys ... ok
+test tranche::tests::plan_target_completion_state_detects_status ... ok
+test tranche::tests::plan_target_completion_state_supports_common_non_checkbox_format ... ok
+test tranche::tests::tranches_file_to_entries_conversion ... ok
+test tranche::tests::validate_tranche_definition_rejects_alpha_only ... ok
+test tranche::tests::validate_tranche_definition_accepts_good_summaries ... ok
+test tranche::tests::validate_tranche_definition_accepts_valid_keys ... ok
+test tranche::tests::validate_tranche_definition_rejects_empty_summary ... ok
+test tranche::tests::validate_tranche_definition_rejects_reserved_prefix ... ok
+test tranche::tests::validate_tranche_definition_rejects_placeholder_phrases ... ok
+test tranche::tests::validate_tranche_definition_rejects_short_summary ... ok
+test tranche::tests::tranches_file_toml_roundtrip ... ok
+test tranche::tests::validate_tranche_definition_rejects_uuid ... ok
+test tranche::tests::validate_tranche_keys_allows_valid_keys ... ok
+test tranche::tests::validate_tranche_keys_rejects_app_prefix ... ok
+test tranche::tests::validate_tranche_keys_rejects_empty ... ok
+test tranche::tests::validate_tranche_keys_rejects_run_prefix ... ok
+test tranche::tests::validate_tranche_keys_rejects_target_prefix ... ok
+test tranche::tests::structured_fallback_to_markdown ... ok
+test tranche::tests::validate_tranche_keys_rejects_uuid ... ok
+test tranche::tests::plan_guard_verify_only_requires_verification_objective_text ... ok
+test tranche::tests::plan_guard_preflight_allows_completed_target_with_verify_only_override ... ok
+test tranche::tests::verification_only_dispatch_detects_single_verification_tranche ... ok
+test tranche::tests::verification_only_dispatch_rejects_multi_tranche_plan ... ok
+test tranche::tests::build_plan_driven_prefers_structured_file ... ok
+test tranche::tests::plan_guard_post_run_allows_same_prompt_after_completion ... ok
+test config::tests::init_help_lists_all_tunable_properties ... ok
+test tranche::tests::auto_complete_structured_tranche_marks_matching_key_using_prompt_root ... ok
+test tranche::tests::validate_structured_tranches_preflight_reports_parse_details ... ok
+test tranche::tests::plan_guard_preflight_allows_completed_implement_target_for_auto_verify ... ok
+test workspace::tests::apply_workspace_patch_to_source_auto_repair_prefers_workspace_version ... ok
+test commands::tests::execute_merge_reject_persists_rejected_transition ... ok
+test commands::tests::execute_worktree_recover_manual_block_persists_recovering_state ... ok
+test commands::tests::execute_worktree_recover_abort_persists_state_and_updates_status_projection ... ok
+test commands::tests::drive_scheduler_captures_sw4rm_preemption_cancellation_source ... ok
+test commands::tests::drive_scheduler_captures_sigterm_cancellation_source ... ok
+test workspace::tests::merge_parallel_workspace_results_applies_committed_permission_only_changes ... ok
+test workspace::tests::merge_parallel_workspace_results_applies_permission_only_changes ... ok
+test workspace::tests::merge_parallel_workspace_results_applies_non_conflicting_workspace_changes ... ok
+test workspace::tests::merge_parallel_workspace_results_ignores_build_artifacts ... ok
+test workspace::tests::merge_parallel_workspace_results_detects_committed_changes ... ok
+test workspace::tests::merge_parallel_workspace_results_handles_mixed_committed_and_uncommitted ... ok
+test workspace::tests::merge_parallel_workspace_results_merges_staged_only_workspace_changes ... ok
+test workspace::tests::merge_parallel_workspace_results_rejects_non_descendant_workspace ... ok
+test workspace::tests::merge_parallel_workspace_results_ignores_baseline_untracked_artifacts ... ok
+test workspace::tests::merge_parallel_workspace_results_multiple_commits_in_workspace ... ok
+test workspace::tests::merge_parallel_workspace_results_merges_non_overlapping_hunks_in_same_file ... ok
+test commands::tests::execute_merge_approve_persists_policy_and_transition_events ... ok
+test workspace::tests::merge_parallel_workspace_results_ignores_unrelated_tracked_drift ... ok
+test workspace::tests::prepare_parallel_workspace_layout_creates_task_workspaces ... ok
+test workspace::tests::prepare_parallel_workspace_layout_ignores_excluded_names_in_repo_ancestors ... ok
+test workspace::tests::merge_parallel_workspace_results_returns_error_on_conflicting_workspace_changes ... ok
+test workspace::tests::prepare_parallel_workspace_layout_rejects_equal_root_and_workdir ... ok
+test workspace::tests::resolve_workspace_copy_exclusions_supports_paths_and_dir_names ... ok
+test workspace::tests::parallel_workspace_edge_cases_combined ... ok
+test workspace::tests::merge_parallel_workspace_results_restores_workspace_head_after_failed_apply ... ok
+test workspace::tests::parallel_workspace_merge_dirty_state_overlapping_with_workspace ... ok
+test workspace::tests::parallel_workspace_merge_with_prior_dirty_state_and_context_drift ... ok
+test workspace::tests::parallel_workspace_merge_overlapping_new_files_and_edits ... ok
+test tranche::tests::write_tranches_file_in_round_trips_without_parse_failures ... ok
+test workspace::tests::parallel_workspace_merge_with_preexisting_uncommitted_dirty_state ... ok
+test workspace::tests::parallel_worktree_end_to_end_conflicting_edits ... ok
+test workspace::tests::parallel_workspace_merge_three_workspaces_with_new_file ... ok
+test workspace::tests::parallel_worktree_end_to_end_create_execute_merge ... ok
+test workspace::tests::llm_assisted_command_fails ... ok
+test workspace::tests::llm_assisted_conflict_markers_check ... ok
+test workspace::tests::llm_assisted_leaves_conflicts ... ok
+test workspace::tests::llm_assisted_context_files_written ... ok
+test workspace::tests::llm_assisted_resolves_conflict ... ok
+test workspace::tests::llm_assisted_env_vars_set ... ok
+test commands::tests::drive_scheduler_captures_operator_cancellation_source ... ok
+test workspace::tests::llm_assisted_timeout ... ok
+
+test result: ok. 256 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running tests/parallel_merge_integration.rs (target/debug/deps/parallel_merge_integration-bc7b9527c92e1181)
+
+running 8 tests
+test run_start_parallel_merge_auto_repair_resolves_overlap_and_completes ... ok
+test run_start_parallel_merge_applies_committed_workspace_changes ... ok
+test run_start_parallel_merge_lineage_failure_preserves_workspace_and_escalates ... ok
+test run_start_parallel_merge_cleans_workspace_root_when_all_tasks_merge ... ok
+test run_start_parallel_merge_ignores_untracked_rust_target_artifact ... ok
+test run_start_parallel_merge_preserves_workspace_root_when_task_is_skipped ... ok
+test run_start_parallel_merge_conflict_preserves_unmerged_artifacts_and_escalates ... ok
+test run_start_parallel_merge_auto_repair_fails_and_preserves_conflict_state ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.22s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-b450a72873919ab6)
+
+running 8 tests
+test run_projection_state_consistency_roundtrip_against_postgres ... FAILED
+test merge_request_and_status_roundtrip_against_postgres ... ok
+test run_start_and_status_roundtrip_against_postgres ... ok
+test run_timeout_hardening_roundtrip_against_postgres ... FAILED
+test run_cancel_hardening_roundtrip_against_postgres ... FAILED
+test overwatch_runner_failure_roundtrip_against_postgres has been running for over 60 seconds
+test overwatch_runner_hardening_roundtrip_against_postgres has been running for over 60 seconds
+test run_cancel_load_hardening_roundtrip_against_postgres has been running for over 60 seconds
+test overwatch_runner_hardening_roundtrip_against_postgres ... FAILED
+test overwatch_runner_failure_roundtrip_against_postgres ... FAILED
+test run_cancel_load_hardening_roundtrip_against_postgres ... FAILED
+
+failures:
+
+---- run_projection_state_consistency_roundtrip_against_postgres stdout ----
+[TestDatabase::create(admin)] attempting Postgres connect to postgres://postgres:***@localhost:55432/postgres with timeout 5s
+[apply_migrations] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11ac1dff0286c?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+[run_projection_state_consistency_roundtrip] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11ac1dff0286c?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+Error: Database(PgDatabaseError { severity: Error, code: "42883", message: "operator does not exist: text = uuid", detail: None, hint: Some("No operator matches the given name and argument types. You might need to add explicit type casts."), position: Some(Original(99)), where: None, schema: None, table: None, column: None, data_type: None, constraint: None, file: Some("parse_oper.c"), line: Some(647), routine: Some("op_error") })
+
+---- run_timeout_hardening_roundtrip_against_postgres stdout ----
+[TestDatabase::create(admin)] attempting Postgres connect to postgres://postgres:***@localhost:55432/postgres with timeout 5s
+[apply_migrations] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11aaa4f4898d6?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+[run_timeout_hardening_roundtrip] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11aaa4f4898d6?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+
+thread 'run_timeout_hardening_roundtrip_against_postgres' panicked at crates/yarli-cli/tests/postgres_integration.rs:487:5:
+run start command failed before timeout validation
+stdout:
+[2m2026-02-22T16:16:53.869374Z[0m [32m INFO[0m loaded runtime config [3mconfig_path[0m[2m=[0myarli.toml [3mconfig_source[0m[2m=[0m"file" [3mbackend[0m[2m=[0m"postgres"
+Using backend: postgres
+[2m2026-02-22T16:16:53.952994Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m[1mscheduler.submit_run[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mcorrelation_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d13efd3b7f4 [3mtask_count[0m[2m=[0m1[1m}[0m[2m:[0m run submitted and activated [3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181
+[2m2026-02-22T16:16:53.953056Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m run started [3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mobjective[0m[2m=[0mpostgres timeout hardening
+[6n[2m2026-02-22T16:16:54.065788Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mcorrelation_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d13efd3b7f4 [3mcommand[0m[2m=[0msleep 10[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8623-b931-72b2-90cc-5f215e855fa8 [3mpid[0m[2m=[0mSome(1674822)
+[2m2026-02-22T16:16:55.066529Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mcorrelation_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d13efd3b7f4 [3mcommand[0m[2m=[0msleep 10[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8623-b931-72b2-90cc-5f215e855fa8 [3mtimeout[0m[2m=[0m1s
+[2m2026-02-22T16:16:55.081099Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mattempt[0m[2m=[0m2 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:16:55.081153Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39
+[2m2026-02-22T16:16:55.081271Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m1 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:16:55.094152Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mcorrelation_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d13efd3b7f4 [3mcommand[0m[2m=[0msleep 10[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8623-bd35-7031-9021-66c5b74599db [3mpid[0m[2m=[0mSome(1674910)
+[2m2026-02-22T16:16:55.955439Z[0m [32m INFO[0m 16:16:53 run/019c8623b86e started: postgres timeout hardening
+[2m2026-02-22T16:16:55.955483Z[0m [32m INFO[0m 16:16:53 run/019c8623b86e RunOpen -> RunActive (scheduler: run submitted)
+[2m2026-02-22T16:16:55.955494Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:55.955502Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:55.955509Z[0m [33m WARN[0m 16:16:55 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:55.955516Z[0m [32m INFO[0m 16:16:55 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:56.095442Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mcorrelation_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d13efd3b7f4 [3mcommand[0m[2m=[0msleep 10[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8623-bd35-7031-9021-66c5b74599db [3mtimeout[0m[2m=[0m1s
+[2m2026-02-22T16:16:56.133730Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mattempt[0m[2m=[0m3 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:16:56.133767Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39
+[2m2026-02-22T16:16:56.133828Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:16:56.135646Z[0m [32m INFO[0m 16:16:55 task/task-1 TaskReady -> TaskExecuting [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:56.135673Z[0m [33m WARN[0m 16:16:56 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:56.135685Z[0m [32m INFO[0m 16:16:56 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:56.144896Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mcorrelation_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d13efd3b7f4 [3mcommand[0m[2m=[0msleep 10[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8623-c150-7f33-87ca-560fd7b371ec [3mpid[0m[2m=[0mSome(1674975)
+[2m2026-02-22T16:16:57.146523Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181 [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mcorrelation_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d13efd3b7f4 [3mcommand[0m[2m=[0msleep 10[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8623-c150-7f33-87ca-560fd7b371ec [3mtimeout[0m[2m=[0m1s
+[2m2026-02-22T16:16:57.155874Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m task permanently failed (max attempts reached) [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39 [3mattempts[0m[2m=[0m3
+[2m2026-02-22T16:16:57.155943Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d2b1c83de39
+[2m2026-02-22T16:16:57.157575Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m run failed due to permanently failed task [3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181
+[2m2026-02-22T16:16:57.158012Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:16:57.159129Z[0m [32m INFO[0m 16:16:56 task/task-1 TaskReady -> TaskExecuting [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:57.159151Z[0m [33m WARN[0m 16:16:57 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+[2m2026-02-22T16:16:57.159164Z[0m [32m INFO[0m 16:16:57 run/019c8623b86e RunActive -> RunFailed (task permanently failed)
+[2m2026-02-22T16:16:57.162830Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m run reached terminal state [3mstate[0m[2m=[0mRunFailed [3mticks[0m[2m=[0m3
+[2m2026-02-22T16:16:57.194752Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b86e-7e43-b5ce-7d0160f46181[1m}[0m[2m:[0m wrote continuation file [3mpath[0m[2m=[0m.yarli/continuation.json
+{"run_id":"019c8623-b86e-7e43-b5ce-7d0160f46181","objective":"postgres timeout hardening","exit_state":"RunFailed","exit_reason":"failed_runtime_error","cancellation_source":null,"cancellation_provenance":null,"completed_at":"2026-02-22T16:16:57.163914485Z","tasks":[{"task_id":"019c8623-b86e-7e43-b5ce-7d2b1c83de39","task_key":"task-1","state":"TASK_FAILED","attempt_no":3,"last_error":"command timed out","blocker":null}],"summary":{"total":1,"completed":0,"failed":1,"cancelled":0,"pending":0},"next_tranche":{"suggested_objective":"Retry failed tasks: task-1","kind":"retry_unfinished","retry_task_keys":["task-1"],"unfinished_task_keys":[],"planned_task_keys":[],"planned_tranche_key":null,"cursor":{"current_tranche_index":null,"next_tranche_index":null},"config_snapshot":{"backend":"postgres","config":{"budgets":{"max_run_cpu_system_ticks":null,"max_run_cpu_user_ticks":null,"max_run_io_read_bytes":null,"max_run_io_write_bytes":null,"max_run_peak_rss_bytes":null,"max_run_total_tokens":null,"max_task_cpu_system_ticks":null,"max_task_cpu_user_ticks":null,"max_task_io_read_bytes":null,"max_task_io_write_bytes":null,"max_task_rss_bytes":null,"max_task_total_tokens":null},"cli":{"args":[],"backend":null,"command":null,"env_unset":[],"prompt_mode":"arg"},"core":{"allow_in_memory_writes":false,"backend":"postgres","safe_mode":"execute","worker_id":null},"event_loop":{"checkpoint_interval":5,"idle_timeout_secs":1800,"max_iterations":5,"max_runtime_seconds":14400},"execution":{"command_timeout_seconds":300,"overwatch":{"max_log_bytes":null,"profile":null,"service_url":"http://127.0.0.1:8089","silent_timeout_seconds":null,"soft_timeout_seconds":null},"runner":"native","tick_interval_ms":100,"working_dir":".","worktree_exclude_paths":[".yarl/workspaces",".yarli","target","node_modules",".venv","venv","__pycache__"],"worktree_root":null},"features":{"parallel":false},"git":{"default_target_branch":"main","destructive_default_deny":true},"memory":{"enabled":null,"memory-backend":{"command":"memory-backend","enabled":false,"endpoint":null,"inject_on_failure":true,"inject_on_run_start":true,"project_dir":null,"query_limit":8},"project_id":null},"observability":{"audit_file":".yarl/audit.jsonl","log_level":null},"policy":{"audit_decisions":true,"enforce_policies":true},"postgres":{"database_url":"postgres://postgres:postgres@localhost:55432/yarli_test_019c8623b5c57ad297a11aaa4f4898d6?sslmode=prefer&statement-cache-capacity=100"},"queue":{"claim_batch_size":4,"cpu_cap":4,"git_cap":2,"heartbeat_interval_seconds":5,"io_cap":16,"lease_ttl_seconds":30,"per_run_cap":8,"reclaim_grace_seconds":5,"reclaim_interval_seconds":10,"tool_cap":8},"run":{"allow_recursive_run":false,"allow_stable_auto_advance":false,"auto_advance_policy":"stable-ok","continue_wait_timeout_seconds":0,"default_pace":null,"enable_plan_tranche_grouping":false,"enforce_plan_tranche_allowed_paths":false,"max_auto_advance_tranches":0,"max_grouped_tasks_per_tranche":0,"merge_conflict_resolution":"fail","merge_repair_command":null,"merge_repair_timeout_seconds":300,"objective":null,"paces":{},"plan_guard":null,"prompt_file":null,"soft_token_cap_ratio":0.9,"task_health":{"deteriorating":"continue","improving":"continue","stable":"continue"},"tasks":[],"tranches":[]},"ui":{"cancellation_diagnostics":false,"mode":"auto","verbose_output":false}},"config_path":"yarli.toml","config_source":"file","runtime":{"current_tranche_index":null,"pace":null,"prompt":null,"run_spec":null,"task_catalog":[{"allowed_paths":[],"command":"sleep 10","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null}],"task_count":1,"tasks":[{"allowed_paths":[],"command":"sleep 10","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null}],"timeout_secs":1,"tranche_plan":[],"working_dir":"."}},"interventions":[]},"quality_gate":{"allow_auto_advance":true,"reason":"deterioration trend stable (policy allows auto-advance)","trend":"stable","score":0.639985014985015,"task_health_action":"continue"}}
+[2m2026-02-22T16:16:57.196192Z[0m [32m INFO[0m --- Run FAILED [019c8623b86e]: 0 complete, 1 failed, 0 cancelled (9 transitions) ---
+
+═══ Run Summary ═══════════════════════════════════════════════════════════
+  Run ID:      019c8623-b86e-7e43-b5ce-7d0160f46181
+  Objective:   postgres timeout hardening
+  Exit state:  RunFailed
+  Exit reason: failed_runtime_error
+  Cancel src:  none
+  Tasks:       0 completed, 1 failed, 0 pending
+  Tokens:      total=6 (prompt=6 completion=0)
+  Duration:    3s
+  Failed:      task-1 (command timed out)
+═══════════════════════════════════════════════════════════════════════════
+
+[2m2026-02-22T16:16:57.196483Z[0m [31mERROR[0m Run 019c8623-b86e-7e43-b5ce-7d0160f46181 failed.
+
+stderr:
+warning: stream renderer unavailable (The cursor position could not be read within a normal duration); continuing in headless mode
+16:16:53 run/019c8623b86e started: postgres timeout hardening
+16:16:55 status heartbeat: pending=0 leased=0 tick=0 zero_progress_ticks=0
+16:16:53 run/019c8623b86e RunOpen -> RunActive (scheduler: run submitted)
+16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:55 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:55 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:55 task/task-1 TaskReady -> TaskExecuting [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:56 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:56 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:56 task/task-1 TaskReady -> TaskExecuting [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:57 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b86e-7e43-b5ce-7d2b1c83de39]
+16:16:57 run/019c8623b86e RunActive -> RunFailed (task permanently failed)
+--- Run FAILED [019c8623b86e]: 0 complete, 1 failed, 0 cancelled (9 transitions) ---
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- run_cancel_hardening_roundtrip_against_postgres stdout ----
+[TestDatabase::create(admin)] attempting Postgres connect to postgres://postgres:***@localhost:55432/postgres with timeout 5s
+[apply_migrations] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11a90bf09586a?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+[run_cancel_hardening_roundtrip] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11a90bf09586a?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+Error: "timed out waiting for run 019c8623-b85e-7253-9362-efabd27b88da state in [\"RUN_ACTIVE\", \"RUN_VERIFYING\"]"
+
+---- overwatch_runner_hardening_roundtrip_against_postgres stdout ----
+[TestDatabase::create(admin)] attempting Postgres connect to postgres://postgres:***@localhost:55432/postgres with timeout 5s
+[apply_migrations] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11a61581ea860?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+[overwatch_runner_hardening_roundtrip] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11a61581ea860?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+
+thread 'overwatch_runner_hardening_roundtrip_against_postgres' panicked at crates/yarli-cli/tests/postgres_integration.rs:572:5:
+run start command failed with overwatch backend
+stdout:
+[2m2026-02-22T16:16:53.794805Z[0m [32m INFO[0m loaded runtime config [3mconfig_path[0m[2m=[0myarli.toml [3mconfig_source[0m[2m=[0m"file" [3mbackend[0m[2m=[0m"postgres"
+Using backend: postgres
+[2m2026-02-22T16:16:53.887653Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m[1mscheduler.submit_run[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5 [3mcorrelation_id[0m[2m=[0m019c8623-b824-7150-9171-7bfd38c3b349 [3mtask_count[0m[2m=[0m1[1m}[0m[2m:[0m run submitted and activated [3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5
+[2m2026-02-22T16:16:53.887773Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m run started [3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5 [3mobjective[0m[2m=[0mpostgres overwatch hardening
+[6n[2m2026-02-22T16:16:55.888474Z[0m [32m INFO[0m 16:16:53 run/019c8623b824 started: postgres overwatch hardening
+[2m2026-02-22T16:17:24.069781Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b824-7150-9171-7c05690edb83 [3mattempt[0m[2m=[0m2 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:17:24.069854Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m task execution error [3mtask_id[0m[2m=[0m019c8623-b824-7150-9171-7c05690edb83 [3merror[0m[2m=[0mhttp error: error sending request for url (http://127.0.0.1:41927/run)
+[2m2026-02-22T16:17:24.069929Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m1 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m1 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:17:24.072031Z[0m [32m INFO[0m 16:16:53 run/019c8623b824 RunOpen -> RunActive (scheduler: run submitted)
+[2m2026-02-22T16:17:24.072070Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:17:24.072082Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:17:24.072092Z[0m [33m WARN[0m 16:17:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:41927/run) [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:17:24.072103Z[0m [32m INFO[0m 16:17:24 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:17:54.193517Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b824-7150-9171-7c05690edb83 [3mattempt[0m[2m=[0m3 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:17:54.193628Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m task execution error [3mtask_id[0m[2m=[0m019c8623-b824-7150-9171-7c05690edb83 [3merror[0m[2m=[0mhttp error: error sending request for url (http://127.0.0.1:41927/run)
+[2m2026-02-22T16:17:54.193750Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m1 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:17:54.197608Z[0m [32m INFO[0m 16:17:24 task/task-1 TaskReady -> TaskExecuting [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:17:54.197652Z[0m [33m WARN[0m 16:17:54 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:41927/run) [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:17:54.197680Z[0m [32m INFO[0m 16:17:54 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:18:24.440025Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m task permanently failed (max attempts reached) [3mtask_id[0m[2m=[0m019c8623-b824-7150-9171-7c05690edb83 [3mattempts[0m[2m=[0m3
+[2m2026-02-22T16:18:24.440106Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m task execution error [3mtask_id[0m[2m=[0m019c8623-b824-7150-9171-7c05690edb83 [3merror[0m[2m=[0mhttp error: error sending request for url (http://127.0.0.1:41927/run)
+[2m2026-02-22T16:18:24.442441Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m run failed due to permanently failed task [3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5
+[2m2026-02-22T16:18:24.443868Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m1 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:18:24.446008Z[0m [32m INFO[0m 16:17:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:18:24.446046Z[0m [33m WARN[0m 16:18:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:41927/run) [019c8623-b824-7150-9171-7c05690edb83]
+[2m2026-02-22T16:18:24.446070Z[0m [32m INFO[0m 16:18:24 run/019c8623b824 RunActive -> RunFailed (task permanently failed)
+[2m2026-02-22T16:18:24.452589Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m run reached terminal state [3mstate[0m[2m=[0mRunFailed [3mticks[0m[2m=[0m3
+[2m2026-02-22T16:18:24.511332Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b824-7150-9171-7bef69c065d5[1m}[0m[2m:[0m wrote continuation file [3mpath[0m[2m=[0m.yarli/continuation.json
+{"run_id":"019c8623-b824-7150-9171-7bef69c065d5","objective":"postgres overwatch hardening","exit_state":"RunFailed","exit_reason":"failed_runtime_error","cancellation_source":null,"cancellation_provenance":null,"completed_at":"2026-02-22T16:18:24.454643340Z","tasks":[{"task_id":"019c8623-b824-7150-9171-7c05690edb83","task_key":"task-1","state":"TASK_FAILED","attempt_no":3,"last_error":"execution error: http error: error sending request for url (http://127.0.0.1:41927/run)","blocker":null}],"summary":{"total":1,"completed":0,"failed":1,"cancelled":0,"pending":0},"next_tranche":{"suggested_objective":"Retry failed tasks: task-1","kind":"retry_unfinished","retry_task_keys":["task-1"],"unfinished_task_keys":[],"planned_task_keys":[],"planned_tranche_key":null,"cursor":{"current_tranche_index":null,"next_tranche_index":null},"config_snapshot":{"backend":"postgres","config":{"budgets":{"max_run_cpu_system_ticks":null,"max_run_cpu_user_ticks":null,"max_run_io_read_bytes":null,"max_run_io_write_bytes":null,"max_run_peak_rss_bytes":null,"max_run_total_tokens":null,"max_task_cpu_system_ticks":null,"max_task_cpu_user_ticks":null,"max_task_io_read_bytes":null,"max_task_io_write_bytes":null,"max_task_rss_bytes":null,"max_task_total_tokens":null},"cli":{"args":[],"backend":null,"command":null,"env_unset":[],"prompt_mode":"arg"},"core":{"allow_in_memory_writes":false,"backend":"postgres","safe_mode":"execute","worker_id":null},"event_loop":{"checkpoint_interval":5,"idle_timeout_secs":1800,"max_iterations":5,"max_runtime_seconds":14400},"execution":{"command_timeout_seconds":300,"overwatch":{"max_log_bytes":null,"profile":null,"service_url":"http://127.0.0.1:41927","silent_timeout_seconds":null,"soft_timeout_seconds":null},"runner":"overwatch","tick_interval_ms":100,"working_dir":".","worktree_exclude_paths":[".yarl/workspaces",".yarli","target","node_modules",".venv","venv","__pycache__"],"worktree_root":null},"features":{"parallel":false},"git":{"default_target_branch":"main","destructive_default_deny":true},"memory":{"enabled":null,"memory-backend":{"command":"memory-backend","enabled":false,"endpoint":null,"inject_on_failure":true,"inject_on_run_start":true,"project_dir":null,"query_limit":8},"project_id":null},"observability":{"audit_file":".yarl/audit.jsonl","log_level":null},"policy":{"audit_decisions":true,"enforce_policies":true},"postgres":{"database_url":"postgres://postgres:postgres@localhost:55432/yarli_test_019c8623b5c57ad297a11a61581ea860?sslmode=prefer&statement-cache-capacity=100"},"queue":{"claim_batch_size":4,"cpu_cap":4,"git_cap":2,"heartbeat_interval_seconds":5,"io_cap":16,"lease_ttl_seconds":30,"per_run_cap":8,"reclaim_grace_seconds":5,"reclaim_interval_seconds":10,"tool_cap":8},"run":{"allow_recursive_run":false,"allow_stable_auto_advance":false,"auto_advance_policy":"stable-ok","continue_wait_timeout_seconds":0,"default_pace":null,"enable_plan_tranche_grouping":false,"enforce_plan_tranche_allowed_paths":false,"max_auto_advance_tranches":0,"max_grouped_tasks_per_tranche":0,"merge_conflict_resolution":"fail","merge_repair_command":null,"merge_repair_timeout_seconds":300,"objective":null,"paces":{},"plan_guard":null,"prompt_file":null,"soft_token_cap_ratio":0.9,"task_health":{"deteriorating":"continue","improving":"continue","stable":"continue"},"tasks":[],"tranches":[]},"ui":{"cancellation_diagnostics":false,"mode":"auto","verbose_output":false}},"config_path":"yarli.toml","config_source":"file","runtime":{"current_tranche_index":null,"pace":null,"prompt":null,"run_spec":null,"task_catalog":[{"allowed_paths":[],"command":"echo overwatch smoke","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null}],"task_count":1,"tasks":[{"allowed_paths":[],"command":"echo overwatch smoke","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null}],"timeout_secs":300,"tranche_plan":[],"working_dir":"."}},"interventions":[]},"quality_gate":{"allow_auto_advance":true,"reason":"deterioration trend stable (policy allows auto-advance)","trend":"stable","score":0.625,"task_health_action":"continue"}}
+[2m2026-02-22T16:18:24.514638Z[0m [32m INFO[0m --- Run FAILED [019c8623b824]: 0 complete, 1 failed, 0 cancelled (9 transitions) ---
+
+═══ Run Summary ═══════════════════════════════════════════════════════════
+  Run ID:      019c8623-b824-7150-9171-7bef69c065d5
+  Objective:   postgres overwatch hardening
+  Exit state:  RunFailed
+  Exit reason: failed_runtime_error
+  Cancel src:  none
+  Tasks:       0 completed, 1 failed, 0 pending
+  Tokens:      total=0 (prompt=0 completion=0)
+  Duration:    1m 30s
+  Failed:      task-1 (execution error: http error: error sending request for url (http://127.0.0.1:41927/run))
+═══════════════════════════════════════════════════════════════════════════
+
+[2m2026-02-22T16:18:24.521026Z[0m [31mERROR[0m Run 019c8623-b824-7150-9171-7bef69c065d5 failed.
+
+stderr:
+warning: stream renderer unavailable (The cursor position could not be read within a normal duration); continuing in headless mode
+16:16:53 run/019c8623b824 started: postgres overwatch hardening
+16:16:55 status heartbeat: pending=0 leased=0 tick=0 zero_progress_ticks=0
+16:16:53 run/019c8623b824 RunOpen -> RunActive (scheduler: run submitted)
+16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b824-7150-9171-7c05690edb83]
+16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b824-7150-9171-7c05690edb83]
+16:17:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:41927/run) [019c8623-b824-7150-9171-7c05690edb83]
+16:17:24 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b824-7150-9171-7c05690edb83]
+16:17:54 status heartbeat: pending=1 leased=0 tick=1 zero_progress_ticks=0
+16:17:24 task/task-1 TaskReady -> TaskExecuting [019c8623-b824-7150-9171-7c05690edb83]
+16:17:54 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:41927/run) [019c8623-b824-7150-9171-7c05690edb83]
+16:17:54 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b824-7150-9171-7c05690edb83]
+16:18:24 status heartbeat: pending=1 leased=0 tick=2 zero_progress_ticks=0
+16:17:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b824-7150-9171-7c05690edb83]
+16:18:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:41927/run) [019c8623-b824-7150-9171-7c05690edb83]
+16:18:24 run/019c8623b824 RunActive -> RunFailed (task permanently failed)
+--- Run FAILED [019c8623b824]: 0 complete, 1 failed, 0 cancelled (9 transitions) ---
+
+
+---- overwatch_runner_failure_roundtrip_against_postgres stdout ----
+[TestDatabase::create(admin)] attempting Postgres connect to postgres://postgres:***@localhost:55432/postgres with timeout 5s
+[apply_migrations] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11ab95ac0e52d?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+[overwatch_runner_failure_roundtrip] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5c57ad297a11ab95ac0e52d?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+
+thread 'overwatch_runner_failure_roundtrip_against_postgres' panicked at crates/yarli-cli/tests/postgres_integration.rs:658:5:
+run start command failed with failing overwatch backend
+stdout:
+[2m2026-02-22T16:16:53.874056Z[0m [32m INFO[0m loaded runtime config [3mconfig_path[0m[2m=[0myarli.toml [3mconfig_source[0m[2m=[0m"file" [3mbackend[0m[2m=[0m"postgres"
+Using backend: postgres
+[2m2026-02-22T16:16:54.046776Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m[1mscheduler.submit_run[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c [3mcorrelation_id[0m[2m=[0m019c8623-b872-7362-b097-6ada35930a83 [3mtask_count[0m[2m=[0m1[1m}[0m[2m:[0m run submitted and activated [3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c
+[2m2026-02-22T16:16:54.046833Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m run started [3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c [3mobjective[0m[2m=[0mpostgres overwatch failure hardening
+[6n[2m2026-02-22T16:16:56.047462Z[0m [32m INFO[0m 16:16:54 run/019c8623b872 started: postgres overwatch failure hardening
+[2m2026-02-22T16:17:24.186800Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b873-7a00-8e62-d5781d86987d [3mattempt[0m[2m=[0m2 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:17:24.186859Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m task execution error [3mtask_id[0m[2m=[0m019c8623-b873-7a00-8e62-d5781d86987d [3merror[0m[2m=[0mhttp error: error sending request for url (http://127.0.0.1:40877/run)
+[2m2026-02-22T16:17:24.186912Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m1 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m1 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:17:24.189047Z[0m [32m INFO[0m 16:16:54 run/019c8623b872 RunOpen -> RunActive (scheduler: run submitted)
+[2m2026-02-22T16:17:24.189082Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:17:24.189093Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:17:24.189103Z[0m [33m WARN[0m 16:17:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:40877/run) [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:17:24.189113Z[0m [32m INFO[0m 16:17:24 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:17:54.319958Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b873-7a00-8e62-d5781d86987d [3mattempt[0m[2m=[0m3 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:17:54.320079Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m task execution error [3mtask_id[0m[2m=[0m019c8623-b873-7a00-8e62-d5781d86987d [3merror[0m[2m=[0mhttp error: error sending request for url (http://127.0.0.1:40877/run)
+[2m2026-02-22T16:17:54.320213Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m1 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:17:54.324059Z[0m [32m INFO[0m 16:17:24 task/task-1 TaskReady -> TaskExecuting [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:17:54.324121Z[0m [33m WARN[0m 16:17:54 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:40877/run) [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:17:54.324166Z[0m [32m INFO[0m 16:17:54 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:18:24.552673Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m task permanently failed (max attempts reached) [3mtask_id[0m[2m=[0m019c8623-b873-7a00-8e62-d5781d86987d [3mattempts[0m[2m=[0m3
+[2m2026-02-22T16:18:24.552759Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m task execution error [3mtask_id[0m[2m=[0m019c8623-b873-7a00-8e62-d5781d86987d [3merror[0m[2m=[0mhttp error: error sending request for url (http://127.0.0.1:40877/run)
+[2m2026-02-22T16:18:24.555138Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m run failed due to permanently failed task [3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c
+[2m2026-02-22T16:18:24.556688Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m1 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:18:24.559386Z[0m [32m INFO[0m 16:17:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:18:24.559424Z[0m [33m WARN[0m 16:18:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:40877/run) [019c8623-b873-7a00-8e62-d5781d86987d]
+[2m2026-02-22T16:18:24.559441Z[0m [32m INFO[0m 16:18:24 run/019c8623b872 RunActive -> RunFailed (task permanently failed)
+[2m2026-02-22T16:18:24.566299Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m run reached terminal state [3mstate[0m[2m=[0mRunFailed [3mticks[0m[2m=[0m3
+[2m2026-02-22T16:18:24.632510Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b872-7362-b097-6acba4405c8c[1m}[0m[2m:[0m wrote continuation file [3mpath[0m[2m=[0m.yarli/continuation.json
+{"run_id":"019c8623-b872-7362-b097-6acba4405c8c","objective":"postgres overwatch failure hardening","exit_state":"RunFailed","exit_reason":"failed_runtime_error","cancellation_source":null,"cancellation_provenance":null,"completed_at":"2026-02-22T16:18:24.568384351Z","tasks":[{"task_id":"019c8623-b873-7a00-8e62-d5781d86987d","task_key":"task-1","state":"TASK_FAILED","attempt_no":3,"last_error":"execution error: http error: error sending request for url (http://127.0.0.1:40877/run)","blocker":null}],"summary":{"total":1,"completed":0,"failed":1,"cancelled":0,"pending":0},"next_tranche":{"suggested_objective":"Retry failed tasks: task-1","kind":"retry_unfinished","retry_task_keys":["task-1"],"unfinished_task_keys":[],"planned_task_keys":[],"planned_tranche_key":null,"cursor":{"current_tranche_index":null,"next_tranche_index":null},"config_snapshot":{"backend":"postgres","config":{"budgets":{"max_run_cpu_system_ticks":null,"max_run_cpu_user_ticks":null,"max_run_io_read_bytes":null,"max_run_io_write_bytes":null,"max_run_peak_rss_bytes":null,"max_run_total_tokens":null,"max_task_cpu_system_ticks":null,"max_task_cpu_user_ticks":null,"max_task_io_read_bytes":null,"max_task_io_write_bytes":null,"max_task_rss_bytes":null,"max_task_total_tokens":null},"cli":{"args":[],"backend":null,"command":null,"env_unset":[],"prompt_mode":"arg"},"core":{"allow_in_memory_writes":false,"backend":"postgres","safe_mode":"execute","worker_id":null},"event_loop":{"checkpoint_interval":5,"idle_timeout_secs":1800,"max_iterations":5,"max_runtime_seconds":14400},"execution":{"command_timeout_seconds":300,"overwatch":{"max_log_bytes":null,"profile":null,"service_url":"http://127.0.0.1:40877","silent_timeout_seconds":null,"soft_timeout_seconds":null},"runner":"overwatch","tick_interval_ms":100,"working_dir":".","worktree_exclude_paths":[".yarl/workspaces",".yarli","target","node_modules",".venv","venv","__pycache__"],"worktree_root":null},"features":{"parallel":false},"git":{"default_target_branch":"main","destructive_default_deny":true},"memory":{"enabled":null,"memory-backend":{"command":"memory-backend","enabled":false,"endpoint":null,"inject_on_failure":true,"inject_on_run_start":true,"project_dir":null,"query_limit":8},"project_id":null},"observability":{"audit_file":".yarl/audit.jsonl","log_level":null},"policy":{"audit_decisions":true,"enforce_policies":true},"postgres":{"database_url":"postgres://postgres:postgres@localhost:55432/yarli_test_019c8623b5c57ad297a11ab95ac0e52d?sslmode=prefer&statement-cache-capacity=100"},"queue":{"claim_batch_size":4,"cpu_cap":4,"git_cap":2,"heartbeat_interval_seconds":5,"io_cap":16,"lease_ttl_seconds":30,"per_run_cap":8,"reclaim_grace_seconds":5,"reclaim_interval_seconds":10,"tool_cap":8},"run":{"allow_recursive_run":false,"allow_stable_auto_advance":false,"auto_advance_policy":"stable-ok","continue_wait_timeout_seconds":0,"default_pace":null,"enable_plan_tranche_grouping":false,"enforce_plan_tranche_allowed_paths":false,"max_auto_advance_tranches":0,"max_grouped_tasks_per_tranche":0,"merge_conflict_resolution":"fail","merge_repair_command":null,"merge_repair_timeout_seconds":300,"objective":null,"paces":{},"plan_guard":null,"prompt_file":null,"soft_token_cap_ratio":0.9,"task_health":{"deteriorating":"continue","improving":"continue","stable":"continue"},"tasks":[],"tranches":[]},"ui":{"cancellation_diagnostics":false,"mode":"auto","verbose_output":false}},"config_path":"yarli.toml","config_source":"file","runtime":{"current_tranche_index":null,"pace":null,"prompt":null,"run_spec":null,"task_catalog":[{"allowed_paths":[],"command":"echo overwatch failure","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null}],"task_count":1,"tasks":[{"allowed_paths":[],"command":"echo overwatch failure","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null}],"timeout_secs":300,"tranche_plan":[],"working_dir":"."}},"interventions":[]},"quality_gate":{"allow_auto_advance":true,"reason":"deterioration trend stable (policy allows auto-advance)","trend":"stable","score":0.625,"task_health_action":"continue"}}
+[2m2026-02-22T16:18:24.635153Z[0m [32m INFO[0m --- Run FAILED [019c8623b872]: 0 complete, 1 failed, 0 cancelled (9 transitions) ---
+
+═══ Run Summary ═══════════════════════════════════════════════════════════
+  Run ID:      019c8623-b872-7362-b097-6acba4405c8c
+  Objective:   postgres overwatch failure hardening
+  Exit state:  RunFailed
+  Exit reason: failed_runtime_error
+  Cancel src:  none
+  Tasks:       0 completed, 1 failed, 0 pending
+  Tokens:      total=0 (prompt=0 completion=0)
+  Duration:    1m 30s
+  Failed:      task-1 (execution error: http error: error sending request for url (http://127.0.0.1:40877/run))
+═══════════════════════════════════════════════════════════════════════════
+
+[2m2026-02-22T16:18:24.640977Z[0m [31mERROR[0m Run 019c8623-b872-7362-b097-6acba4405c8c failed.
+
+stderr:
+warning: stream renderer unavailable (The cursor position could not be read within a normal duration); continuing in headless mode
+16:16:54 run/019c8623b872 started: postgres overwatch failure hardening
+16:16:56 status heartbeat: pending=0 leased=0 tick=0 zero_progress_ticks=0
+16:16:54 run/019c8623b872 RunOpen -> RunActive (scheduler: run submitted)
+16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b873-7a00-8e62-d5781d86987d]
+16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b873-7a00-8e62-d5781d86987d]
+16:17:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:40877/run) [019c8623-b873-7a00-8e62-d5781d86987d]
+16:17:24 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b873-7a00-8e62-d5781d86987d]
+16:17:54 status heartbeat: pending=1 leased=0 tick=1 zero_progress_ticks=0
+16:17:24 task/task-1 TaskReady -> TaskExecuting [019c8623-b873-7a00-8e62-d5781d86987d]
+16:17:54 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:40877/run) [019c8623-b873-7a00-8e62-d5781d86987d]
+16:17:54 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b873-7a00-8e62-d5781d86987d]
+16:18:24 status heartbeat: pending=1 leased=0 tick=2 zero_progress_ticks=0
+16:17:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b873-7a00-8e62-d5781d86987d]
+16:18:24 task/task-1 TaskExecuting -> TaskFailed, execution error: http error: error sending request for url (http://127.0.0.1:40877/run) [019c8623-b873-7a00-8e62-d5781d86987d]
+16:18:24 run/019c8623b872 RunActive -> RunFailed (task permanently failed)
+--- Run FAILED [019c8623b872]: 0 complete, 1 failed, 0 cancelled (9 transitions) ---
+
+
+---- run_cancel_load_hardening_roundtrip_against_postgres stdout ----
+[TestDatabase::create(admin)] attempting Postgres connect to postgres://postgres:***@localhost:55432/postgres with timeout 5s
+[apply_migrations] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5b37eb29c727c49648d2d3e?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+[run_cancel_load_hardening_roundtrip] attempting Postgres connect to postgres://postgres:***@localhost:55432/yarli_test_019c8623b5b37eb29c727c49648d2d3e?sslmode=prefer&statement-cache-capacity=100 with timeout 5s
+
+thread 'run_cancel_load_hardening_roundtrip_against_postgres' panicked at crates/yarli-cli/tests/postgres_integration.rs:370:5:
+run start command failed before cancellation load
+stdout:
+[2m2026-02-22T16:16:53.822481Z[0m [32m INFO[0m loaded runtime config [3mconfig_path[0m[2m=[0myarli.toml [3mconfig_source[0m[2m=[0m"file" [3mbackend[0m[2m=[0m"postgres"
+Using backend: postgres
+[2m2026-02-22T16:16:53.921446Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mscheduler.submit_run[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mtask_count[0m[2m=[0m4[1m}[0m[2m:[0m run submitted and activated [3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde
+[2m2026-02-22T16:16:53.921536Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m run started [3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mobjective[0m[2m=[0mpostgres cancellation load hardening
+[6n[2m2026-02-22T16:16:54.046198Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8623-b91d-7462-bf7e-8a65da2a82a5 [3mpid[0m[2m=[0mSome(1674816)
+[2m2026-02-22T16:16:55.923468Z[0m [32m INFO[0m 16:16:53 run/019c8623b83f started: postgres cancellation load hardening
+[2m2026-02-22T16:17:14.048005Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8623-b91d-7462-bf7e-8a65da2a82a5 [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:17:14.106360Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mattempt[0m[2m=[0m2 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:17:14.106412Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4
+[2m2026-02-22T16:17:14.106524Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m4 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:17:14.108728Z[0m [32m INFO[0m 16:16:53 run/019c8623b83f RunOpen -> RunActive (scheduler: run submitted)
+[2m2026-02-22T16:17:14.108785Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:17:14.108816Z[0m [32m INFO[0m 16:16:54 task/task-4 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-067460a1580d]
+[2m2026-02-22T16:17:14.108844Z[0m [32m INFO[0m 16:16:54 task/task-3 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-06679e20bd4e]
+[2m2026-02-22T16:17:14.108872Z[0m [32m INFO[0m 16:16:54 task/task-2 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+[2m2026-02-22T16:17:14.108902Z[0m [32m INFO[0m 16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:17:14.108933Z[0m [33m WARN[0m 16:17:14 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:17:14.108962Z[0m [32m INFO[0m 16:17:14 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:17:14.138334Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8624-0799-7e73-81d1-e1395cc2c266 [3mpid[0m[2m=[0mSome(1677515)
+[2m2026-02-22T16:17:34.140111Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8624-0799-7e73-81d1-e1395cc2c266 [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:17:34.165151Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d [3mattempt[0m[2m=[0m2 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:17:34.165242Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d
+[2m2026-02-22T16:17:34.165365Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:17:34.167920Z[0m [32m INFO[0m 16:17:14 task/task-4 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-067460a1580d]
+[2m2026-02-22T16:17:34.167974Z[0m [33m WARN[0m 16:17:34 task/task-4 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-067460a1580d]
+[2m2026-02-22T16:17:34.168013Z[0m [32m INFO[0m 16:17:34 task/task-4 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-067460a1580d]
+[2m2026-02-22T16:17:34.191351Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8624-55ee-7312-8d6d-08914758ba91 [3mpid[0m[2m=[0mSome(1679681)
+[2m2026-02-22T16:17:54.192376Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8624-55ee-7312-8d6d-08914758ba91 [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:17:54.332212Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e [3mattempt[0m[2m=[0m2 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:17:54.332283Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e
+[2m2026-02-22T16:17:54.332387Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:17:54.335001Z[0m [32m INFO[0m 16:17:34 task/task-3 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06679e20bd4e]
+[2m2026-02-22T16:17:54.335060Z[0m [33m WARN[0m 16:17:54 task/task-3 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06679e20bd4e]
+[2m2026-02-22T16:17:54.335098Z[0m [32m INFO[0m 16:17:54 task/task-3 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-06679e20bd4e]
+[2m2026-02-22T16:17:54.530696Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8624-a562-78f1-ad30-47a61f21e2e9 [3mpid[0m[2m=[0mSome(1681623)
+[2m2026-02-22T16:18:14.532254Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8624-a562-78f1-ad30-47a61f21e2e9 [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:18:14.543778Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f [3mattempt[0m[2m=[0m2 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:18:14.543819Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f
+[2m2026-02-22T16:18:14.543865Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:18:14.544705Z[0m [32m INFO[0m 16:17:54 task/task-2 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+[2m2026-02-22T16:18:14.544732Z[0m [33m WARN[0m 16:18:14 task/task-2 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+[2m2026-02-22T16:18:14.544752Z[0m [32m INFO[0m 16:18:14 task/task-2 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+[2m2026-02-22T16:18:14.562007Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8624-f3a1-7531-b130-de85d03a573f [3mpid[0m[2m=[0mSome(1683681)
+[2m2026-02-22T16:18:34.563515Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8624-f3a1-7531-b130-de85d03a573f [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:18:34.574263Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mattempt[0m[2m=[0m3 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:18:34.574299Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4
+[2m2026-02-22T16:18:34.574352Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:18:34.575142Z[0m [32m INFO[0m 16:18:14 task/task-1 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:18:34.575172Z[0m [33m WARN[0m 16:18:34 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:18:34.575190Z[0m [32m INFO[0m 16:18:34 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:18:34.589534Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8625-41dd-7a93-9909-5473c4efbb11 [3mpid[0m[2m=[0mSome(1687629)
+[2m2026-02-22T16:18:54.590807Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8625-41dd-7a93-9909-5473c4efbb11 [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:18:54.601524Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d [3mattempt[0m[2m=[0m3 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:18:54.601567Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-067460a1580d
+[2m2026-02-22T16:18:54.601643Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:18:54.603031Z[0m [32m INFO[0m 16:18:34 task/task-4 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-067460a1580d]
+[2m2026-02-22T16:18:54.603058Z[0m [33m WARN[0m 16:18:54 task/task-4 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-067460a1580d]
+[2m2026-02-22T16:18:54.603075Z[0m [32m INFO[0m 16:18:54 task/task-4 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-067460a1580d]
+[2m2026-02-22T16:18:54.619532Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8625-901b-75b1-befc-7f8f8363ae1f [3mpid[0m[2m=[0mSome(1691289)
+[2m2026-02-22T16:19:14.620249Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8625-901b-75b1-befc-7f8f8363ae1f [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:19:14.632156Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e [3mattempt[0m[2m=[0m3 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:19:14.632188Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06679e20bd4e
+[2m2026-02-22T16:19:14.632240Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:19:14.633235Z[0m [32m INFO[0m 16:18:54 task/task-3 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06679e20bd4e]
+[2m2026-02-22T16:19:14.633265Z[0m [33m WARN[0m 16:19:14 task/task-3 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06679e20bd4e]
+[2m2026-02-22T16:19:14.633284Z[0m [32m INFO[0m 16:19:14 task/task-3 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-06679e20bd4e]
+[2m2026-02-22T16:19:14.652817Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8625-de5c-7093-99e5-88cf9b247f9e [3mpid[0m[2m=[0mSome(1694024)
+[2m2026-02-22T16:19:34.654012Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8625-de5c-7093-99e5-88cf9b247f9e [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:19:34.664711Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task scheduled for retry [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f [3mattempt[0m[2m=[0m3 [3mmax[0m[2m=[0m3
+[2m2026-02-22T16:19:34.664742Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06550bfe9b2f
+[2m2026-02-22T16:19:34.664790Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:19:34.665739Z[0m [32m INFO[0m 16:19:14 task/task-2 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+[2m2026-02-22T16:19:34.665763Z[0m [33m WARN[0m 16:19:34 task/task-2 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+[2m2026-02-22T16:19:34.665781Z[0m [32m INFO[0m 16:19:34 task/task-2 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+[2m2026-02-22T16:19:34.680317Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command started [3mcmd_id[0m[2m=[0m019c8626-2c98-7442-bad3-8a49e6f11460 [3mpid[0m[2m=[0mSome(1695299)
+[2m2026-02-22T16:19:54.681435Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m[1mrun[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mcorrelation_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06318807cd90 [3mcommand[0m[2m=[0msleep 20[1m}[0m[2m:[0m command timed out [3mcmd_id[0m[2m=[0m019c8626-2c98-7442-bad3-8a49e6f11460 [3mtimeout[0m[2m=[0m20s
+[2m2026-02-22T16:19:54.688414Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task permanently failed (max attempts reached) [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4 [3mattempts[0m[2m=[0m3
+[2m2026-02-22T16:19:54.688443Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m task timed out [3mtask_id[0m[2m=[0m019c8623-b83f-7b10-a00d-0641a65707e4
+[2m2026-02-22T16:19:54.689878Z[0m [33m WARN[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m run failed due to permanently failed task [3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde
+[2m2026-02-22T16:19:54.691272Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m tick complete [3mpromoted[0m[2m=[0m0 [3mclaimed[0m[2m=[0m1 [3mexecuted[0m[2m=[0m1 [3msucceeded[0m[2m=[0m0 [3mfailed[0m[2m=[0m0 [3merrors[0m[2m=[0m0 [3mruns_completed[0m[2m=[0m0
+[2m2026-02-22T16:19:54.692352Z[0m [32m INFO[0m 16:19:34 task/task-1 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:19:54.692380Z[0m [33m WARN[0m 16:19:54 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-0641a65707e4]
+[2m2026-02-22T16:19:54.692400Z[0m [32m INFO[0m 16:19:54 run/019c8623b83f RunActive -> RunFailed (task permanently failed)
+[2m2026-02-22T16:19:54.695842Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m run reached terminal state [3mstate[0m[2m=[0mRunFailed [3mticks[0m[2m=[0m9
+[2m2026-02-22T16:19:54.725590Z[0m [32m INFO[0m [1mrun_execution[0m[1m{[0m[3mrun_id[0m[2m=[0m019c8623-b83f-7b10-a00d-06232e7ecfde[1m}[0m[2m:[0m wrote continuation file [3mpath[0m[2m=[0m.yarli/continuation.json
+{"run_id":"019c8623-b83f-7b10-a00d-06232e7ecfde","objective":"postgres cancellation load hardening","exit_state":"RunFailed","exit_reason":"failed_runtime_error","cancellation_source":null,"cancellation_provenance":null,"completed_at":"2026-02-22T16:19:54.697755952Z","tasks":[{"task_id":"019c8623-b83f-7b10-a00d-0641a65707e4","task_key":"task-1","state":"TASK_FAILED","attempt_no":3,"last_error":"command timed out","blocker":null},{"task_id":"019c8623-b83f-7b10-a00d-06550bfe9b2f","task_key":"task-2","state":"TASK_READY","attempt_no":3,"last_error":"command timed out","blocker":null},{"task_id":"019c8623-b83f-7b10-a00d-06679e20bd4e","task_key":"task-3","state":"TASK_READY","attempt_no":3,"last_error":"command timed out","blocker":null},{"task_id":"019c8623-b83f-7b10-a00d-067460a1580d","task_key":"task-4","state":"TASK_READY","attempt_no":3,"last_error":"command timed out","blocker":null}],"summary":{"total":4,"completed":0,"failed":1,"cancelled":0,"pending":3},"next_tranche":{"suggested_objective":"Retry failed tasks: task-1","kind":"retry_unfinished","retry_task_keys":["task-1"],"unfinished_task_keys":["task-2","task-3","task-4"],"planned_task_keys":[],"planned_tranche_key":null,"cursor":{"current_tranche_index":null,"next_tranche_index":null},"config_snapshot":{"backend":"postgres","config":{"budgets":{"max_run_cpu_system_ticks":null,"max_run_cpu_user_ticks":null,"max_run_io_read_bytes":null,"max_run_io_write_bytes":null,"max_run_peak_rss_bytes":null,"max_run_total_tokens":null,"max_task_cpu_system_ticks":null,"max_task_cpu_user_ticks":null,"max_task_io_read_bytes":null,"max_task_io_write_bytes":null,"max_task_rss_bytes":null,"max_task_total_tokens":null},"cli":{"args":[],"backend":null,"command":null,"env_unset":[],"prompt_mode":"arg"},"core":{"allow_in_memory_writes":false,"backend":"postgres","safe_mode":"execute","worker_id":null},"event_loop":{"checkpoint_interval":5,"idle_timeout_secs":1800,"max_iterations":5,"max_runtime_seconds":14400},"execution":{"command_timeout_seconds":300,"overwatch":{"max_log_bytes":null,"profile":null,"service_url":"http://127.0.0.1:8089","silent_timeout_seconds":null,"soft_timeout_seconds":null},"runner":"native","tick_interval_ms":100,"working_dir":".","worktree_exclude_paths":[".yarl/workspaces",".yarli","target","node_modules",".venv","venv","__pycache__"],"worktree_root":null},"features":{"parallel":false},"git":{"default_target_branch":"main","destructive_default_deny":true},"memory":{"enabled":null,"memory-backend":{"command":"memory-backend","enabled":false,"endpoint":null,"inject_on_failure":true,"inject_on_run_start":true,"project_dir":null,"query_limit":8},"project_id":null},"observability":{"audit_file":".yarl/audit.jsonl","log_level":null},"policy":{"audit_decisions":true,"enforce_policies":true},"postgres":{"database_url":"postgres://postgres:postgres@localhost:55432/yarli_test_019c8623b5b37eb29c727c49648d2d3e?sslmode=prefer&statement-cache-capacity=100"},"queue":{"claim_batch_size":4,"cpu_cap":4,"git_cap":2,"heartbeat_interval_seconds":5,"io_cap":16,"lease_ttl_seconds":30,"per_run_cap":8,"reclaim_grace_seconds":5,"reclaim_interval_seconds":10,"tool_cap":8},"run":{"allow_recursive_run":false,"allow_stable_auto_advance":false,"auto_advance_policy":"stable-ok","continue_wait_timeout_seconds":0,"default_pace":null,"enable_plan_tranche_grouping":false,"enforce_plan_tranche_allowed_paths":false,"max_auto_advance_tranches":0,"max_grouped_tasks_per_tranche":0,"merge_conflict_resolution":"fail","merge_repair_command":null,"merge_repair_timeout_seconds":300,"objective":null,"paces":{},"plan_guard":null,"prompt_file":null,"soft_token_cap_ratio":0.9,"task_health":{"deteriorating":"continue","improving":"continue","stable":"continue"},"tasks":[],"tranches":[]},"ui":{"cancellation_diagnostics":false,"mode":"auto","verbose_output":false}},"config_path":"yarli.toml","config_source":"file","runtime":{"current_tranche_index":null,"pace":null,"prompt":null,"run_spec":null,"task_catalog":[{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null},{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-2","tranche_group":null,"tranche_key":null},{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-3","tranche_group":null,"tranche_key":null},{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-4","tranche_group":null,"tranche_key":null}],"task_count":4,"tasks":[{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-1","tranche_group":null,"tranche_key":null},{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-2","tranche_group":null,"tranche_key":null},{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-3","tranche_group":null,"tranche_key":null},{"allowed_paths":[],"command":"sleep 20","command_class":"Io","task_key":"task-4","tranche_group":null,"tranche_key":null}],"timeout_secs":20,"tranche_plan":[],"working_dir":"."}},"interventions":[]},"quality_gate":{"allow_auto_advance":true,"reason":"deterioration trend stable (policy allows auto-advance)","trend":"stable","score":2.5,"task_health_action":"continue"}}
+[2m2026-02-22T16:19:54.728131Z[0m [32m INFO[0m --- Run FAILED [019c8623b83f]: 0 complete, 1 failed, 0 cancelled (30 transitions) ---
+
+═══ Run Summary ═══════════════════════════════════════════════════════════
+  Run ID:      019c8623-b83f-7b10-a00d-06232e7ecfde
+  Objective:   postgres cancellation load hardening
+  Exit state:  RunFailed
+  Exit reason: failed_runtime_error
+  Cancel src:  none
+  Tasks:       0 completed, 1 failed, 3 pending
+  Tokens:      total=18 (prompt=18 completion=0)
+  Duration:    3m 00s
+  Failed:      task-1 (command timed out)
+═══════════════════════════════════════════════════════════════════════════
+
+[2m2026-02-22T16:19:54.728441Z[0m [31mERROR[0m Run 019c8623-b83f-7b10-a00d-06232e7ecfde failed.
+
+stderr:
+warning: stream renderer unavailable (The cursor position could not be read within a normal duration); continuing in headless mode
+16:16:53 run/019c8623b83f started: postgres cancellation load hardening
+16:16:55 status heartbeat: pending=0 leased=0 tick=0 zero_progress_ticks=0
+16:16:53 run/019c8623b83f RunOpen -> RunActive (scheduler: run submitted)
+16:16:54 task/task-1 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:16:54 task/task-4 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-067460a1580d]
+16:16:54 task/task-3 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-06679e20bd4e]
+16:16:54 task/task-2 TaskOpen -> TaskReady [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+16:16:54 task/task-1 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:17:14 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:17:14 task/task-1 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:17:34 status heartbeat: pending=4 leased=0 tick=1 zero_progress_ticks=0
+16:17:14 task/task-4 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-067460a1580d]
+16:17:34 task/task-4 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-067460a1580d]
+16:17:34 task/task-4 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-067460a1580d]
+16:17:34 task/task-3 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06679e20bd4e]
+16:17:54 task/task-3 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06679e20bd4e]
+16:17:54 task/task-3 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-06679e20bd4e]
+16:18:14 status heartbeat: pending=4 leased=0 tick=3 zero_progress_ticks=0
+16:17:54 task/task-2 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+16:18:14 task/task-2 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+16:18:14 task/task-2 TaskFailed -> TaskReady, retry attempt 2/3 [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+16:18:14 task/task-1 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:18:34 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:18:34 task/task-1 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:18:54 status heartbeat: pending=4 leased=0 tick=5 zero_progress_ticks=0
+16:18:34 task/task-4 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-067460a1580d]
+16:18:54 task/task-4 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-067460a1580d]
+16:18:54 task/task-4 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-067460a1580d]
+16:18:54 task/task-3 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06679e20bd4e]
+16:19:14 task/task-3 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06679e20bd4e]
+16:19:14 task/task-3 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-06679e20bd4e]
+16:19:34 status heartbeat: pending=4 leased=0 tick=7 zero_progress_ticks=0
+16:19:14 task/task-2 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+16:19:34 task/task-2 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+16:19:34 task/task-2 TaskFailed -> TaskReady, retry attempt 3/3 [019c8623-b83f-7b10-a00d-06550bfe9b2f]
+16:19:34 task/task-1 TaskReady -> TaskExecuting [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:19:54 task/task-1 TaskExecuting -> TaskFailed, command timed out [019c8623-b83f-7b10-a00d-0641a65707e4]
+16:19:54 run/019c8623b83f RunActive -> RunFailed (task permanently failed)
+--- Run FAILED [019c8623b83f]: 0 complete, 1 failed, 0 cancelled (30 transitions) ---
+
+
+
+failures:
+    overwatch_runner_failure_roundtrip_against_postgres
+    overwatch_runner_hardening_roundtrip_against_postgres
+    run_cancel_hardening_roundtrip_against_postgres
+    run_cancel_load_hardening_roundtrip_against_postgres
+    run_projection_state_consistency_roundtrip_against_postgres
+    run_timeout_hardening_roundtrip_against_postgres
+
+test result: FAILED. 2 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 181.60s
+
+error: test failed, to rerun pass `-p yarli-cli --test postgres_integration`

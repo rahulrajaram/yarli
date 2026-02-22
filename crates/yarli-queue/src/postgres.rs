@@ -607,6 +607,33 @@ impl TaskQueue for PostgresTaskQueue {
         }
     }
 
+    fn entries(&self) -> Vec<QueueEntry> {
+        let pool = self.pool.clone();
+        match self.run_async(async move {
+            let rows = sqlx::query(
+                "SELECT queue_id, task_id, run_id, priority, available_at, attempt_no, command_class, status, lease_owner, lease_expires_at, last_heartbeat, created_at, updated_at FROM task_queue ORDER BY created_at DESC, queue_id ASC"
+            )
+                .fetch_all(&pool)
+                .await
+                .map_err(|error| QueueError::Database(error.to_string()))?;
+
+            let entries = rows
+                .into_iter()
+                .filter_map(|row| row_to_queue_entry(row).ok())
+                .collect::<Vec<_>>();
+            Ok(entries)
+        }) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to read queue entries; returning empty list"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     fn leased_count_for_run(&self, run_id: RunId) -> usize {
         let pool = self.pool.clone();
         match self.run_async(async move {

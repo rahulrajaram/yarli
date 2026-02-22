@@ -12,7 +12,7 @@
 
 use std::fs;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -20,6 +20,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use yarli_observability::YarliMetrics;
 
 use yarli_core::domain::{CommandClass, CorrelationId, RunId, TaskId};
 use yarli_core::entities::command_execution::{
@@ -90,18 +91,38 @@ pub trait CommandRunner: Send + Sync {
 pub struct LocalCommandRunner {
     /// Default timeout if not specified per-command.
     pub default_timeout: Option<Duration>,
+    /// Optional metrics registry for telemetry.
+    pub metrics: Option<std::sync::Arc<YarliMetrics>>,
 }
 
 impl LocalCommandRunner {
     pub fn new() -> Self {
         Self {
             default_timeout: None,
+            metrics: None,
         }
     }
 
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
         self
+    }
+
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<YarliMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn record_overhead(&self, class: CommandClass, phase: &str, duration: Duration) {
+        if let Some(metrics) = &self.metrics {
+            let label = match class {
+                CommandClass::Io => "io",
+                CommandClass::Cpu => "cpu",
+                CommandClass::Git => "git",
+                CommandClass::Tool => "tool",
+            };
+            metrics.record_command_overhead_duration(label, phase, duration.as_secs_f64());
+        }
     }
 }
 
@@ -112,6 +133,15 @@ impl Default for LocalCommandRunner {
 }
 
 impl CommandRunner for LocalCommandRunner {
+    #[tracing::instrument(
+        skip(self, request, cancel),
+        fields(
+            run_id = %request.run_id,
+            task_id = %request.task_id,
+            correlation_id = %request.correlation_id,
+            command = %request.command
+        )
+    )]
     async fn run(
         &self,
         request: CommandRequest,
@@ -140,6 +170,7 @@ impl CommandRunner for LocalCommandRunner {
         // Spawn the child process.
         debug!(command = %request.command, working_dir = %request.working_dir, "spawning command");
 
+        let spawn_start = Instant::now();
         // TODO(phase1): Before spawn, create cgroup sandbox and set resource limits.
         //   After spawn, obtain pidfd for race-free lifecycle management.
         //   See IMPLEMENTATION_PLAN.md Section 18 sections 5.1, 5.2, 6.
@@ -154,8 +185,11 @@ impl CommandRunner for LocalCommandRunner {
             .kill_on_drop(true)
             .spawn()
             .map_err(ExecError::SpawnFailed)?;
+        self.record_overhead(request.command_class, "spawn", spawn_start.elapsed());
 
+        let capture_start = Instant::now();
         let monitor = child.id().map(spawn_resource_monitor);
+        self.record_overhead(request.command_class, "resource_capture_init", capture_start.elapsed());
 
         // Transition: CmdQueued → CmdStarted
         execution

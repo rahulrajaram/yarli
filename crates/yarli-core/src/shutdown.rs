@@ -482,6 +482,7 @@ fn default_actor_detail(
 }
 
 #[cfg(unix)]
+#[allow(clippy::type_complexity)]
 fn capture_process_context() -> (
     Option<u32>,
     Option<u32>,

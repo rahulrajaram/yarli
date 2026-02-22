@@ -414,3 +414,99 @@ Use `docs/ACCEPTANCE_RUBRIC.md` to determine a binary outcome:
 
 - `PASS`: all required checks are proven with tracked evidence.
 - `UNVERIFIED`: any required check is missing, failing, or not evidenced.
+
+## Telemetry and Observability
+
+YARLI exports structured telemetry via OpenTelemetry (OTLP) when configured. This enables deep introspection into scheduler performance, command execution latency, and resource utilization.
+
+### OTLP Collector Setup (Local Example)
+
+To capture and visualize telemetry locally using Jaeger (traces) and Prometheus (metrics):
+
+1. **Start the collector stack (Jaeger + Prometheus + OTel Collector):**
+
+   ```bash
+   docker run -d --name jaeger \
+     -e COLLECTOR_ZIPKIN_HOST_PORT=:9411 \
+     -p 5775:5775/udp \
+     -p 6831:6831/udp \
+     -p 6832:6832/udp \
+     -p 5778:5778 \
+     -p 16686:16686 \
+     -p 14268:14268 \
+     -p 14250:14250 \
+     -p 9411:9411 \
+     jaegertracing/all-in-one:1.60
+
+   # (Optional) Prometheus and OTel Collector would go here for a full stack.
+   # For basic tracing, Jaeger all-in-one accepts OTLP over gRPC at 4317 if configured,
+   # or you can point YARLI directly to a collector.
+   ```
+
+2. **Configure YARLI to export telemetry:**
+
+   Set environment variables before running `yarli run`:
+
+   ```bash
+   export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
+   export OTEL_SERVICE_NAME="yarli-scheduler"
+   export RUST_LOG="info,yarli=debug" # Optional: enable debug logs for correlation
+   ```
+
+3. **Visualize Traces:**
+   Open http://localhost:16686/ in your browser.
+
+### Metric and Trace Conventions
+
+**Metrics (Prometheus format):**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `yarli_queue_depth` | Gauge | - | Current tasks in queue (pending + leased). |
+| `yarli_runs_total` | Counter | `state` | Run state transitions. |
+| `yarli_tasks_total` | Counter | `state`, `command_class` | Task state transitions. |
+| `yarli_commands_total` | Counter | `command_class`, `exit_reason` | Command execution outcomes. |
+| `yarli_command_duration_seconds` | Histogram | `command_class` | End-to-end command duration. |
+| `yarli_command_overhead_duration_seconds` | Histogram | `command_class`, `phase` | Internal overhead (spawn, capture). |
+| `yarli_scheduler_tick_duration_seconds` | Histogram | `stage` | Scheduler loop timing (`scan`, `claim`, etc). |
+| `yarli_store_duration_seconds` | Histogram | `operation` | Event store latency (`append`, `query`). |
+| `yarli_store_slow_queries` | Counter | `operation` | Database operations exceeding 1s. |
+
+**Traces (Spans):**
+
+- `run_execution`: Root span for a `yarli run` invocation.
+- `scheduler.tick`: Wraps a single scheduler loop iteration.
+- `scheduler.execute_task`: Wraps a task execution attempt.
+- `command.execute`: Wraps the low-level process spawn and wait.
+- `store.append`, `store.query`: Wraps database operations.
+
+### Recommended Alerting Thresholds
+
+For production deployments, monitor these signals:
+
+1. **Stalled Queue:**
+   - Alert if `yarli_queue_depth > 0` and `yarli_scheduler_tick_duration_seconds_count` stops increasing for 5m.
+   - Indicates scheduler hang or crash.
+
+2. **High Failure Rate:**
+   - Alert if `rate(yarli_commands_total{exit_reason!="success"}[5m]) / rate(yarli_commands_total[5m]) > 0.1`.
+   - Indicates systemic failure (bad config, network down).
+
+3. **Slow Database:**
+   - Alert if `rate(yarli_store_slow_queries[5m]) > 0`.
+   - Indicates DB performance degradation affecting scheduler throughput.
+
+4. **Resource Saturation:**
+   - Alert if `yarli_run_resource_usage` approaches configured budget limits.
+
+### Troubleshooting Telemetry
+
+**Missing Exports:**
+- Verify `OTEL_EXPORTER_OTLP_ENDPOINT` is reachable.
+- Check logs for "OpenTelemetry trace error" or "metrics export failed".
+- Ensure the collector accepts OTLP/gRPC (port 4317) or OTLP/HTTP (port 4318) matching your endpoint scheme.
+
+**High Cardinality:**
+- YARLI metrics use bounded label sets (enums).
+- Avoid adding unbounded labels (like `run_id` or `task_id`) to long-lived metrics.
+- `run_resource_usage` is an exception; it is labelled by `run_id` but should be transient or aggregated.

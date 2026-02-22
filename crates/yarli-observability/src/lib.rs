@@ -8,6 +8,6 @@ pub use audit::{
     AuditCategory, AuditEntry, AuditError, AuditSink, InMemoryAuditSink, JsonlAuditSink,
 };
 
-pub use metrics::{encode_metrics, YarliMetrics};
+pub use metrics::{encode_metrics, Registry, YarliMetrics};
 
 pub use tracing_init::{init_tracing, TracingConfig, TracingInitError};

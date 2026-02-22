@@ -1,0 +1,22 @@
+   Compiling yarli-queue v0.1.0 (/home/rahul/Documents/worktree/yarli/run-019c861c-8e35-75c1-8910-a5197276cb34/001-tranche-001-card-r12-04/crates/yarli-queue)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.92s
+     Running unittests src/lib.rs (target/debug/deps/yarli_queue-40f36d8bd7d31cfb)
+
+running 2 tests
+test scheduler::tests::test_budget_exceeded_transitions_run_to_failed ... ok
+test scheduler::tests::test_budget_exceeded_fails_task_without_retry ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.00s
+
+     Running tests/postgres_integration.rs (target/debug/deps/postgres_integration-6844d50ba4fb3b01)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+   Doc-tests yarli_queue
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

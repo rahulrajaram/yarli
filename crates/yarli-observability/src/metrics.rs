@@ -26,7 +26,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
-use prometheus_client::registry::Registry;
+pub use prometheus_client::registry::Registry;
 
 // ---------------------------------------------------------------------------
 // Label types
@@ -64,6 +64,31 @@ pub struct CommandClassLabel {
     pub command_class: String,
 }
 
+/// Labels for scheduler tick stages.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TickStageLabel {
+    pub stage: String,
+}
+
+/// Labels for command overhead phases.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CommandOverheadLabel {
+    pub command_class: String,
+    pub phase: String,
+}
+
+/// Labels for store operations.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StoreOpLabel {
+    pub operation: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RunMetricLabel {
+    pub run_id: String,
+    pub metric: String,
+}
+
 /// Labels for merge outcome metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct MergeOutcomeLabel {
@@ -83,13 +108,17 @@ pub struct ConflictTypeLabel {
 /// All YARLI Prometheus metrics, registered under a shared [`Registry`].
 ///
 /// Clone this struct freely — all metric handles are internally `Arc`-based.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct YarliMetrics {
     // -- Queue --
     /// Current number of tasks in the queue.
     pub queue_depth: Gauge,
     /// Total lease timeouts observed.
     pub queue_lease_timeouts_total: Counter,
+
+    // -- Scheduler --
+    /// Scheduler tick duration in seconds (labelled by stage).
+    pub scheduler_tick_duration_seconds: Family<TickStageLabel, Histogram>,
 
     // -- Runs --
     /// Total run state transitions (labelled by target state).
@@ -108,6 +137,14 @@ pub struct YarliMetrics {
     pub commands_total: Family<CommandLabel, Counter>,
     /// Command execution duration in seconds (labelled by class).
     pub command_duration_seconds: Family<CommandClassLabel, Histogram>,
+    /// Command overhead duration in seconds (labelled by class + phase).
+    pub command_overhead_duration_seconds: Family<CommandOverheadLabel, Histogram>,
+
+    // -- Store --
+    /// Store operation duration in seconds (labelled by operation).
+    pub store_duration_seconds: Family<StoreOpLabel, Histogram>,
+    /// Total slow queries observed (labelled by operation).
+    pub store_slow_queries_total: Family<StoreOpLabel, Counter>,
 
     // -- Git: Worktree --
     /// Total worktree state transitions (labelled by target state).
@@ -118,6 +155,12 @@ pub struct YarliMetrics {
     pub merge_attempts_total: Family<MergeOutcomeLabel, Counter>,
     /// Total merge conflicts (labelled by conflict type).
     pub merge_conflicts_total: Family<ConflictTypeLabel, Counter>,
+
+    // -- Run metrics --
+    /// Current run-level resource usage totals.
+    pub run_resource_usage: Family<RunMetricLabel, Gauge>,
+    /// Current run-level token usage totals.
+    pub run_token_usage: Family<RunMetricLabel, Gauge>,
 }
 
 impl YarliMetrics {
@@ -138,6 +181,18 @@ impl YarliMetrics {
             "yarli_queue_lease_timeouts",
             "Total number of lease timeouts",
             queue_lease_timeouts_total.clone(),
+        );
+
+        // -- Scheduler --
+        let scheduler_tick_duration_seconds =
+            Family::<TickStageLabel, Histogram>::new_with_constructor(|| {
+                // Microsecond resolution up to ~1s
+                Histogram::new(exponential_buckets(0.0001, 4.0, 8))
+            });
+        registry.register(
+            "yarli_scheduler_tick_duration_seconds",
+            "Scheduler tick duration in seconds by stage",
+            scheduler_tick_duration_seconds.clone(),
         );
 
         // -- Runs --
@@ -183,6 +238,36 @@ impl YarliMetrics {
             command_duration_seconds.clone(),
         );
 
+        let command_overhead_duration_seconds =
+            Family::<CommandOverheadLabel, Histogram>::new_with_constructor(|| {
+                // Millisecond resolution up to ~10s
+                Histogram::new(exponential_buckets(0.001, 4.0, 8))
+            });
+        registry.register(
+            "yarli_command_overhead_duration_seconds",
+            "Command overhead duration in seconds by phase",
+            command_overhead_duration_seconds.clone(),
+        );
+
+        // -- Store --
+        let store_duration_seconds =
+            Family::<StoreOpLabel, Histogram>::new_with_constructor(|| {
+                // Millisecond resolution up to ~10s
+                Histogram::new(exponential_buckets(0.001, 4.0, 8))
+            });
+        registry.register(
+            "yarli_store_duration_seconds",
+            "Store operation duration in seconds by operation",
+            store_duration_seconds.clone(),
+        );
+
+        let store_slow_queries_total = Family::<StoreOpLabel, Counter>::default();
+        registry.register(
+            "yarli_store_slow_queries",
+            "Total slow queries observed by operation",
+            store_slow_queries_total.clone(),
+        );
+
         // -- Git: Worktree --
         let worktree_state_total = Family::<StateLabel, Counter>::default();
         registry.register(
@@ -206,18 +291,43 @@ impl YarliMetrics {
             merge_conflicts_total.clone(),
         );
 
+        let run_resource_usage = Family::<RunMetricLabel, Gauge>::default();
+        registry.register(
+            "yarli_run_resource_usage",
+            "Current run-level resource usage totals",
+            run_resource_usage.clone(),
+        );
+
+        let run_token_usage = Family::<RunMetricLabel, Gauge>::default();
+        registry.register(
+            "yarli_run_token_usage",
+            "Current run-level token usage totals",
+            run_token_usage.clone(),
+        );
+
         Self {
             queue_depth,
             queue_lease_timeouts_total,
+            scheduler_tick_duration_seconds,
             runs_total,
             tasks_total,
             gate_failures_total,
             commands_total,
             command_duration_seconds,
+            command_overhead_duration_seconds,
+            store_duration_seconds,
+            store_slow_queries_total,
             worktree_state_total,
             merge_attempts_total,
             merge_conflicts_total,
+            run_resource_usage,
+            run_token_usage,
         }
+    }
+
+    /// Set the queue depth gauge.
+    pub fn set_queue_depth(&self, depth: usize) {
+        self.queue_depth.set(depth as i64);
     }
 
     // -- Convenience helpers --
@@ -292,6 +402,68 @@ impl YarliMetrics {
         self.merge_conflicts_total
             .get_or_create(&ConflictTypeLabel {
                 conflict_type: conflict_type.to_string(),
+            })
+            .inc();
+    }
+
+    /// Record current run-level resource usage.
+    pub fn set_run_resource_usage(&self, run_id: &str, metric: &str, value: u64) {
+        self.run_resource_usage
+            .get_or_create(&RunMetricLabel {
+                run_id: run_id.to_string(),
+                metric: metric.to_string(),
+            })
+            .set(value as i64);
+    }
+
+    /// Record current run-level token usage.
+    pub fn set_run_token_usage(&self, run_id: &str, metric: &str, value: u64) {
+        self.run_token_usage
+            .get_or_create(&RunMetricLabel {
+                run_id: run_id.to_string(),
+                metric: metric.to_string(),
+            })
+            .set(value as i64);
+    }
+
+    /// Record scheduler tick duration.
+    pub fn record_scheduler_tick_duration(&self, stage: &str, duration_secs: f64) {
+        self.scheduler_tick_duration_seconds
+            .get_or_create(&TickStageLabel {
+                stage: stage.to_string(),
+            })
+            .observe(duration_secs);
+    }
+
+    /// Record command overhead duration.
+    pub fn record_command_overhead_duration(
+        &self,
+        command_class: &str,
+        phase: &str,
+        duration_secs: f64,
+    ) {
+        self.command_overhead_duration_seconds
+            .get_or_create(&CommandOverheadLabel {
+                command_class: command_class.to_string(),
+                phase: phase.to_string(),
+            })
+            .observe(duration_secs);
+    }
+
+    /// Record store operation duration.
+    pub fn record_store_duration(&self, operation: &str, duration_secs: f64) {
+        self.store_duration_seconds
+            .get_or_create(&StoreOpLabel {
+                operation: operation.to_string(),
+            })
+            .observe(duration_secs);
+    }
+
+    /// Record a slow store query.
+    pub fn record_store_slow_query(&self, operation: &str) {
+        self.store_slow_queries_total
+            .get_or_create(&StoreOpLabel {
+                operation: operation.to_string(),
             })
             .inc();
     }
@@ -465,6 +637,46 @@ mod tests {
         assert!(output.contains("rename_rename"));
     }
 
+    // -- Scheduler metrics --
+
+    #[test]
+    fn scheduler_tick_duration_histogram() {
+        let (registry, metrics) = setup();
+        metrics.record_scheduler_tick_duration("scan", 0.1);
+        metrics.record_scheduler_tick_duration("claim", 0.05);
+        let output = encode_metrics(&registry);
+        assert!(output.contains("yarli_scheduler_tick_duration_seconds"));
+        assert!(output.contains("scan"));
+        assert!(output.contains("claim"));
+    }
+
+    // -- Command overhead metrics --
+
+    #[test]
+    fn command_overhead_duration_histogram() {
+        let (registry, metrics) = setup();
+        metrics.record_command_overhead_duration("io", "spawn", 0.01);
+        metrics.record_command_overhead_duration("cpu", "capture", 0.02);
+        let output = encode_metrics(&registry);
+        assert!(output.contains("yarli_command_overhead_duration_seconds"));
+        assert!(output.contains("spawn"));
+        assert!(output.contains("capture"));
+    }
+
+    // -- Store metrics --
+
+    #[test]
+    fn store_metrics() {
+        let (registry, metrics) = setup();
+        metrics.record_store_duration("append", 0.05);
+        metrics.record_store_slow_query("query");
+        let output = encode_metrics(&registry);
+        assert!(output.contains("yarli_store_duration_seconds"));
+        assert!(output.contains("yarli_store_slow_queries"));
+        assert!(output.contains("append"));
+        assert!(output.contains("query"));
+    }
+
     // -- Clone --
 
     #[test]
@@ -491,20 +703,30 @@ mod tests {
         metrics.record_worktree_transition("WT_CREATING");
         metrics.record_merge_attempt("done");
         metrics.record_merge_conflict("text");
+        metrics.record_scheduler_tick_duration("scan", 0.001);
+        metrics.record_command_overhead_duration("io", "spawn", 0.001);
+        metrics.record_store_duration("query", 0.001);
+        metrics.record_store_slow_query("append");
 
         let output = encode_metrics(&registry);
 
         let expected_names = [
             "yarli_queue_depth",
             "yarli_queue_lease_timeouts_total",
+            "yarli_scheduler_tick_duration_seconds",
             "yarli_runs_total",
             "yarli_tasks_total",
             "yarli_gate_failures_total",
             "yarli_commands_total",
             "yarli_command_duration_seconds",
+            "yarli_command_overhead_duration_seconds",
+            "yarli_store_duration_seconds",
+            "yarli_store_slow_queries",
             "yarli_worktree_state_total",
             "yarli_merge_attempts_total",
             "yarli_merge_conflicts_total",
+            "yarli_run_resource_usage",
+            "yarli_run_token_usage",
         ];
         for name in &expected_names {
             assert!(output.contains(name), "missing metric: {name}");

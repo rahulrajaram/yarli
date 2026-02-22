@@ -22,13 +22,20 @@ pub enum PanelId {
     Output,
     /// Gate/merge status panel.
     Gates,
+    /// Audit event panel.
+    Audit,
     /// Key hints bar (not focusable).
     KeyHints,
 }
 
 impl PanelId {
     /// Panels in focus-cycling order (Tab/Shift+Tab).
-    pub const FOCUSABLE: &[PanelId] = &[PanelId::TaskList, PanelId::Output, PanelId::Gates];
+    pub const FOCUSABLE: &[PanelId] = &[
+        PanelId::TaskList,
+        PanelId::Output,
+        PanelId::Gates,
+        PanelId::Audit,
+    ];
 
     /// Panel title for display.
     pub fn title(self) -> &'static str {
@@ -36,6 +43,7 @@ impl PanelId {
             PanelId::TaskList => "Tasks",
             PanelId::Output => "Output",
             PanelId::Gates => "Gates",
+            PanelId::Audit => "Audit",
             PanelId::KeyHints => "Keys",
         }
     }
@@ -46,6 +54,7 @@ impl PanelId {
             PanelId::TaskList => Some('1'),
             PanelId::Output => Some('2'),
             PanelId::Gates => Some('3'),
+            PanelId::Audit => Some('4'),
             PanelId::KeyHints => None,
         }
     }
@@ -128,6 +137,7 @@ impl PanelManager {
         panel_states.insert(PanelId::TaskList, PanelState::Expanded);
         panel_states.insert(PanelId::Output, PanelState::Expanded);
         panel_states.insert(PanelId::Gates, PanelState::Expanded);
+        panel_states.insert(PanelId::Audit, PanelState::Collapsed);
 
         Self {
             focused: PanelId::TaskList,
@@ -413,6 +423,8 @@ mod tests {
         mgr.focus_next();
         assert_eq!(mgr.focused, PanelId::Gates);
         mgr.focus_next();
+        assert_eq!(mgr.focused, PanelId::Audit);
+        mgr.focus_next();
         assert_eq!(mgr.focused, PanelId::TaskList); // wraps
     }
 
@@ -420,9 +432,9 @@ mod tests {
     fn focus_prev_cycling() {
         let mut mgr = PanelManager::new();
         mgr.focus_prev();
-        assert_eq!(mgr.focused, PanelId::Gates); // wraps backward
+        assert_eq!(mgr.focused, PanelId::Audit); // wraps backward
         mgr.focus_prev();
-        assert_eq!(mgr.focused, PanelId::Output);
+        assert_eq!(mgr.focused, PanelId::Gates); // Audit → Gates (backward)
     }
 
     #[test]
@@ -581,6 +593,7 @@ mod tests {
     fn panel_id_titles_and_shortcuts() {
         assert_eq!(PanelId::TaskList.title(), "Tasks");
         assert_eq!(PanelId::Output.title(), "Output");
+        assert_eq!(PanelId::Audit.title(), "Audit");
         assert_eq!(PanelId::TaskList.shortcut(), Some('1'));
         assert_eq!(PanelId::KeyHints.shortcut(), None);
     }

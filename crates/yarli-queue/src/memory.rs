@@ -317,6 +317,11 @@ impl TaskQueue for InMemoryTaskQueue {
         }
     }
 
+    fn entries(&self) -> Vec<QueueEntry> {
+        let inner = self.inner.read().unwrap();
+        inner.entries.clone()
+    }
+
     fn reclaim_stale(&self, grace_period: Duration) -> Result<usize, QueueError> {
         let mut inner = self.inner.write().unwrap();
         let now = Utc::now();

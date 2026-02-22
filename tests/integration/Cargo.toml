@@ -7,17 +7,19 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-[dev-dependencies]
+[dependencies]
 yarli-core = { path = "../../crates/yarli-core" }
-yarli-store = { path = "../../crates/yarli-store" }
-yarli-queue = { path = "../../crates/yarli-queue" }
-yarli-exec = { path = "../../crates/yarli-exec" }
+yarli-store = { path = "../../crates/yarli-store", features = ["chaos"] }
+yarli-queue = { path = "../../crates/yarli-queue", features = ["chaos"] }
+yarli-exec = { path = "../../crates/yarli-exec", features = ["chaos"] }
 yarli-gates = { path = "../../crates/yarli-gates" }
 yarli-policy = { path = "../../crates/yarli-policy" }
 yarli-observability = { path = "../../crates/yarli-observability" }
+yarli-chaos = { path = "../../crates/yarli-chaos" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 tokio-util = { workspace = true }
+sqlx = { workspace = true }

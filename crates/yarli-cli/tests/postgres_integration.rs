@@ -1161,7 +1161,7 @@ async fn expected_run_state_from_events(
     let row = sqlx::query(
         "SELECT event_type, (payload->>'to') AS to_state FROM events WHERE entity_type='run' AND entity_id = $1 ORDER BY occurred_at DESC, event_id DESC LIMIT 1",
     )
-    .bind(run_id)
+    .bind(run_id.to_string())
     .fetch_one(pool)
     .await?;
 
@@ -1179,7 +1179,7 @@ async fn expected_task_state_from_events(
     let row = sqlx::query(
         "SELECT event_type, (payload->>'to') AS to_state FROM events WHERE entity_type='task' AND entity_id = $1 ORDER BY occurred_at DESC, event_id DESC LIMIT 1",
     )
-    .bind(task_id)
+    .bind(task_id.to_string())
     .fetch_one(pool)
     .await?;
 
@@ -1302,6 +1302,9 @@ backend = "postgres"
 
 [postgres]
 database_url = "{escaped_database_url}"
+
+[execution]
+worktree_root = ".yarl/workspaces"
 "#
     );
     fs::write(dir.join("yarli.toml"), config)?;
@@ -1324,6 +1327,7 @@ database_url = "{escaped_database_url}"
 
 [execution]
 runner = "overwatch"
+worktree_root = ".yarl/workspaces"
 
 [execution.overwatch]
 service_url = "{escaped_overwatch_url}"

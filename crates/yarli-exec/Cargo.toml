@@ -10,6 +10,7 @@ license.workspace = true
 yarli-core = { workspace = true }
 yarli-store = { workspace = true }
 yarli-observability = { workspace = true }
+yarli-chaos = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -19,6 +20,9 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
+
+[features]
+chaos = ["dep:yarli-chaos"]
 
 [dev-dependencies]
 axum = "0.8"

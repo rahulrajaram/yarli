@@ -5,6 +5,8 @@ use yarli_exec::{
     OverwatchRunnerConfig,
 };
 use yarli_queue::scheduler::LiveOutputEvent;
+use yarli_queue::{QueueEntry, QueueStatus};
+use yarli_observability::{AuditCategory, Registry, YarliMetrics};
 
 use super::*;
 use crate::events::*;
@@ -14,9 +16,10 @@ use yarli_core::entities::continuation::{
     ContinuationIntervention, ContinuationInterventionKind, TaskHealthAction,
 };
 use yarli_core::domain::ExitReason;
+use crate::cli::AuditOutputFormat;
 use crate::workspace::{
     merge_parallel_workspace_results_with_resolution_with_events, prepare_parallel_workspace_layout,
-    MergeApplyTelemetryEvent, ParallelWorkspaceMergeApplyError,
+    MergeApplyTelemetryEvent, MergeResolutionConfig, ParallelWorkspaceMergeApplyError,
     ParallelWorkspaceMergeFailureKind, ParallelWorkspaceMergeReport,
 };
 
@@ -37,6 +40,257 @@ fn collect_telemetry_string_values(
     output
 }
 
+#[derive(Debug, Clone, Default)]
+struct RunResourceBudgetLimits {
+    max_run_cpu_user_ticks: Option<u64>,
+    max_run_cpu_system_ticks: Option<u64>,
+    max_run_io_read_bytes: Option<u64>,
+    max_run_io_write_bytes: Option<u64>,
+    max_run_total_tokens: Option<u64>,
+    max_run_peak_rss_bytes: Option<u64>,
+}
+
+fn collect_run_resource_limits(
+    store: &dyn EventStore,
+    correlation_id: Uuid,
+) -> Result<RunResourceBudgetLimits> {
+    let mut budget = RunResourceBudgetLimits::default();
+    let mut latest_snapshot: Option<serde_json::Value> = None;
+
+    for event in query_events(store, &EventQuery::by_correlation(correlation_id))? {
+        if event.event_type == "run.config_snapshot" {
+            latest_snapshot = event.payload.get("config_snapshot").cloned();
+        }
+    }
+
+    let Some(snapshot) = latest_snapshot else {
+        return Ok(budget);
+    };
+    let budgets = snapshot.get("config").and_then(|value| value.get("budgets"));
+    if budgets.is_none() {
+        return Ok(budget);
+    }
+    let budgets = budgets.expect("checked above");
+    budget.max_run_cpu_user_ticks = budgets
+        .get("max_run_cpu_user_ticks")
+        .and_then(serde_json::Value::as_u64);
+    budget.max_run_cpu_system_ticks = budgets
+        .get("max_run_cpu_system_ticks")
+        .and_then(serde_json::Value::as_u64);
+    budget.max_run_io_read_bytes = budgets.get("max_run_io_read_bytes").and_then(serde_json::Value::as_u64);
+    budget.max_run_io_write_bytes = budgets
+        .get("max_run_io_write_bytes")
+        .and_then(serde_json::Value::as_u64);
+    budget.max_run_total_tokens = budgets
+        .get("max_run_total_tokens")
+        .and_then(serde_json::Value::as_u64);
+    budget.max_run_peak_rss_bytes = budgets
+        .get("max_run_peak_rss_bytes")
+        .and_then(serde_json::Value::as_u64);
+    Ok(budget)
+}
+
+fn format_budget_value(current: u64, limit: Option<u64>) -> String {
+    match limit {
+        Some(limit) => {
+            let ratio = if limit == 0 {
+                "n/a".to_string()
+            } else {
+                format!(" ({:.1}%)", (current as f64 / limit as f64) * 100.0)
+            };
+            format!("{current} / {limit}{ratio}")
+        }
+        None => current.to_string(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct QueueDepthTotals {
+    pending: usize,
+    leased: usize,
+    completed: usize,
+    failed: usize,
+    cancelled: usize,
+}
+
+impl QueueDepthTotals {
+    fn add(&mut self, status: QueueStatus) {
+        match status {
+            QueueStatus::Pending => self.pending = self.pending.saturating_add(1),
+            QueueStatus::Leased => self.leased = self.leased.saturating_add(1),
+            QueueStatus::Completed => self.completed = self.completed.saturating_add(1),
+            QueueStatus::Failed => self.failed = self.failed.saturating_add(1),
+            QueueStatus::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.pending
+            .saturating_add(self.leased)
+            .saturating_add(self.completed)
+            .saturating_add(self.failed)
+            .saturating_add(self.cancelled)
+    }
+}
+
+fn class_label(class: yarli_core::domain::CommandClass) -> &'static str {
+    match class {
+        yarli_core::domain::CommandClass::Io => "io",
+        yarli_core::domain::CommandClass::Cpu => "cpu",
+        yarli_core::domain::CommandClass::Git => "git",
+        yarli_core::domain::CommandClass::Tool => "tool",
+    }
+}
+
+fn render_queue_depth(entries: &[QueueEntry]) -> String {
+    let mut total = QueueDepthTotals::default();
+    let mut by_run: BTreeMap<Uuid, QueueDepthTotals> = BTreeMap::new();
+    let mut by_class: BTreeMap<&'static str, QueueDepthTotals> = BTreeMap::new();
+
+    for entry in entries {
+        total.add(entry.status);
+        by_run.entry(entry.run_id).or_default().add(entry.status);
+        by_class
+            .entry(class_label(entry.command_class))
+            .or_default()
+            .add(entry.status);
+    }
+
+    let mut output = String::new();
+    output.push_str("Queue depth report\n");
+    output.push_str("----------------\n");
+    output.push_str(&format!(
+        "overall: total={} pending={} leased={} completed={} failed={} cancelled={}\n",
+        total.total(),
+        total.pending,
+        total.leased,
+        total.completed,
+        total.failed,
+        total.cancelled
+    ));
+
+    output.push('\n');
+    output.push_str("By run:\n");
+    if by_run.is_empty() {
+        output.push_str("  (no queue entries)\n");
+    } else {
+        for (run_id, tally) in by_run {
+            output.push_str(&format!(
+                "  {run_id}: total={} pending={} leased={} completed={} failed={} cancelled={}\n",
+                tally.total(),
+                tally.pending,
+                tally.leased,
+                tally.completed,
+                tally.failed,
+                tally.cancelled
+            ));
+        }
+    }
+
+    output.push('\n');
+    output.push_str("By command class:\n");
+    if by_class.is_empty() {
+        output.push_str("  (no queue entries)\n");
+    } else {
+        for (class, tally) in by_class {
+            output.push_str(&format!(
+                "  {class}: total={} pending={} leased={} completed={} failed={} cancelled={}\n",
+                tally.total(),
+                tally.pending,
+                tally.leased,
+                tally.completed,
+                tally.failed,
+                tally.cancelled
+            ));
+        }
+    }
+
+    output
+}
+
+fn render_active_leases(entries: &[QueueEntry], now: chrono::DateTime<chrono::Utc>) -> String {
+    let mut leases = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.status == QueueStatus::Leased) {
+        leases.push(entry);
+    }
+    leases.sort_by(|left, right| left.lease_expires_at.cmp(&right.lease_expires_at));
+
+    let mut output = String::new();
+    output.push_str("Active leases\n");
+    output.push_str("-------------\n");
+
+    if leases.is_empty() {
+        output.push_str("No active leases.\n");
+        return output;
+    }
+
+    for lease in leases {
+        let expires_at = lease
+            .lease_expires_at
+            .map(|expires| {
+                let ttl = expires.signed_duration_since(now);
+                let secs = ttl.num_seconds();
+                if secs <= 0 {
+                    format!("expired ({secs}s ago)")
+                } else {
+                    format!("{}s", secs)
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        output.push_str(&format!(
+            "{:<36} run={:<36} class={:<4} owner={:<16} task={} attempt={} ttl={}\n",
+            lease.queue_id,
+            lease.run_id,
+            class_label(lease.command_class),
+            lease.lease_owner.clone().unwrap_or_else(|| "-".to_string()),
+            lease.task_id,
+            lease.attempt_no,
+            expires_at
+        ));
+    }
+
+    output
+}
+
+fn render_resource_usage_summary(run_id: Uuid, totals: &RunResourceTotals, budgets: &RunResourceBudgetLimits) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Run resource usage for {run_id}\n"));
+    output.push_str("--------------------------\n");
+    output.push_str(&format!(
+        "CPU user:       {}\n",
+        format_budget_value(
+            totals.total_cpu_user_ticks,
+            budgets.max_run_cpu_user_ticks,
+        )
+    ));
+    output.push_str(&format!(
+        "CPU system:     {}\n",
+        format_budget_value(
+            totals.total_cpu_system_ticks,
+            budgets.max_run_cpu_system_ticks,
+        )
+    ));
+    output.push_str(&format!(
+        "IO read:        {}\n",
+        format_budget_value(totals.total_io_read_bytes, budgets.max_run_io_read_bytes)
+    ));
+    output.push_str(&format!(
+        "IO write:       {}\n",
+        format_budget_value(totals.total_io_write_bytes, budgets.max_run_io_write_bytes)
+    ));
+    output.push_str(&format!(
+        "Peak RSS bytes: {}\n",
+        format_budget_value(totals.peak_rss_bytes, budgets.max_run_peak_rss_bytes)
+    ));
+    output.push_str(&format!(
+        "Tokens:         {}\n",
+        format_budget_value(totals.total_tokens, budgets.max_run_total_tokens)
+    ));
+    output
+}
+
+#[allow(clippy::type_complexity)]
 fn merge_apply_conflict_metadata(
     telemetry: &[MergeApplyTelemetryEvent],
 ) -> (
@@ -122,6 +376,7 @@ pub(crate) fn resolve_render_mode(
     mode::select_render_mode(term_info, force_stream, force_tui).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+#[cfg(feature = "sw4rm")]
 fn sw4rm_verification_runner(loaded_config: &LoadedConfig) -> Result<SelectedCommandRunner> {
     match loaded_config.config().execution.runner {
         ExecutionRunner::Native => Ok(SelectedCommandRunner::Native(LocalCommandRunner::new())),
@@ -496,6 +751,9 @@ pub(crate) async fn cmd_run_start_with_backend<Q, S>(
     store: Arc<S>,
     queue: Arc<Q>,
     allow_recursive_run_override: bool,
+    metrics: Arc<YarliMetrics>,
+    #[cfg(feature = "chaos")]
+    chaos: Option<Arc<yarli_chaos::ChaosController>>,
 ) -> Result<RunExecutionOutcome>
 where
     Q: TaskQueue + 'static,
@@ -593,7 +851,14 @@ where
         max_run_io_write_bytes: loaded_config.config().budgets.max_run_io_write_bytes,
     };
 
-    let mut scheduler = Scheduler::new(queue, store.clone(), runner, config);
+    let mut scheduler =
+        Scheduler::new(queue, store.clone(), runner, config).with_metrics(metrics);
+
+    #[cfg(feature = "chaos")]
+    if let Some(c) = chaos {
+        scheduler = scheduler.with_chaos(c);
+    }
+
     if loaded_config.config().policy.audit_decisions {
         let audit_path = PathBuf::from(&loaded_config.config().observability.audit_file);
         if let Some(parent) = audit_path.parent() {
@@ -627,6 +892,10 @@ where
     );
     let run_id = run.id;
     let correlation_id = run.correlation_id;
+
+    // Start a run-level span now that we have an ID.
+    let run_span = tracing::info_span!("run_execution", run_id = %run_id);
+    let _enter = run_span.enter();
 
     let tasks: Vec<Task> = plan
         .tasks
@@ -732,8 +1001,11 @@ where
     // Spawn renderer task.
     let renderer_shutdown = shutdown.clone();
     let verbose_output = loaded_config.config().ui.verbose_output;
+    let audit_file = Some(PathBuf::from(
+        loaded_config.config().observability.audit_file.clone(),
+    ));
     let renderer_handle = tokio::task::spawn_blocking(move || {
-        run_renderer(rx, render_mode, renderer_shutdown, verbose_output)
+        run_renderer(rx, render_mode, renderer_shutdown, verbose_output, audit_file)
     });
 
     // Drive scheduler loop, emitting events to renderer channel.
@@ -776,6 +1048,9 @@ where
                     source_workdir.display()
                 )
             })?;
+            loaded_config.config().run.validate_merge_repair_config()?;
+            let resolution_config =
+                MergeResolutionConfig::from_run_config(&loaded_config.config().run);
             let mut merge_apply_telemetry = Vec::new();
             let task_workspaces = plan
                 .tasks
@@ -788,7 +1063,7 @@ where
                 run_id,
                 &layout.run_workspace_root,
                 &task_workspaces,
-                loaded_config.config().run.merge_conflict_resolution,
+                &resolution_config,
                 layout.source_head_at_creation.as_deref(),
                 &mut merge_apply_telemetry,
             ) {
@@ -1041,13 +1316,15 @@ where
         payload: continuation_payload.clone(),
     });
 
+    // Drop the sender BEFORE awaiting the renderer so the channel closes
+    // and the renderer's `blocking_recv` loop can terminate.
+    drop(tx);
+
     // Wait for renderer to finish.
     renderer_handle
         .await
         .context("renderer task panicked")?
         .context("renderer error")?;
-
-    drop(tx);
 
     Ok(RunExecutionOutcome {
         run_id,
@@ -1615,6 +1892,7 @@ pub(crate) fn persist_continuation_payload_event(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_continuation_payload(
     run: &Run,
     tasks: &[&yarli_core::entities::Task],
@@ -1831,7 +2109,7 @@ where
     // tick_with_cancel blocks on a long-running command.
     let stream_tx_live = tx.clone();
     let task_names_vec: Vec<(Uuid, String)> = task_names.to_vec();
-    tokio::spawn(async move {
+    let mut forwarder_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
         while let Some(event) = live_rx.recv().await {
             let name = task_names_vec
                 .iter()
@@ -1844,7 +2122,7 @@ where
                 line: event.chunk.data,
             });
         }
-    });
+    }));
 
     let mut zero_progress_ticks: u64 = 0;
     let mut paused = false;
@@ -1929,6 +2207,9 @@ where
                     )
                 };
                 scheduler.clear_live_output();
+                if let Some(h) = forwarder_handle.take() {
+                    let _ = h.await;
+                }
                 drop(tx);
                 return Ok(payload);
             }
@@ -2120,6 +2401,9 @@ where
                             )
                         };
                         scheduler.clear_live_output();
+                        if let Some(h) = forwarder_handle.take() {
+                            let _ = h.await;
+                        }
                         drop(tx);
                         return Ok(payload);
                     }
@@ -2162,6 +2446,9 @@ where
 
                 if let Some(payload) = terminal_payload {
                     scheduler.clear_live_output();
+                    if let Some(h) = forwarder_handle.take() {
+                        let _ = h.await;
+                    }
                     drop(tx);
                     return Ok(payload);
                 }
@@ -2169,6 +2456,9 @@ where
                 // Safety: bail after 10000 ticks (~16 min at 100ms) to prevent infinite loops.
                 if tick_count > 10_000 {
                     scheduler.clear_live_output();
+                    if let Some(h) = forwarder_handle.take() {
+                        let _ = h.await;
+                    }
                     drop(tx);
                     bail!("scheduler exceeded max ticks (10000)");
                 }
@@ -2517,6 +2807,7 @@ pub(crate) fn run_renderer(
     render_mode: RenderMode,
     shutdown: ShutdownController,
     verbose_output: bool,
+    audit_file: Option<PathBuf>,
 ) -> Result<()> {
     match render_mode {
         RenderMode::Stream => {
@@ -2543,7 +2834,7 @@ pub(crate) fn run_renderer(
         }
         RenderMode::Dashboard => {
             let config = DashboardConfig::default();
-            let mut renderer = match DashboardRenderer::new(config) {
+            let mut renderer = match DashboardRenderer::new(config, audit_file) {
                 Ok(renderer) => renderer,
                 Err(error) => {
                     eprintln!(
@@ -5088,6 +5379,356 @@ pub(crate) fn cmd_audit_tail(file: &str, lines: usize, category: Option<&str>) -
     Ok(())
 }
 
+#[derive(Debug)]
+struct ParsedAuditQuery {
+    run_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+    category: Option<AuditCategory>,
+    actor: Option<String>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    after: Option<Uuid>,
+    offset: usize,
+    limit: usize,
+    format: AuditOutputFormat,
+}
+
+fn parse_audit_category(category: &str) -> Result<AuditCategory> {
+    let normalized = category
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(" ", "");
+
+    match normalized.as_str() {
+        "policy_decision" => Ok(AuditCategory::PolicyDecision),
+        "destructive_attempt" => Ok(AuditCategory::DestructiveAttempt),
+        "token_consumed" => Ok(AuditCategory::TokenConsumed),
+        "gate_evaluation" => Ok(AuditCategory::GateEvaluation),
+        "command_execution" => Ok(AuditCategory::CommandExecution),
+        _ => bail!("invalid category '{category}'"),
+    }
+}
+
+fn parse_audit_time(value: &str, label: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(ts.with_timezone(&chrono::Utc));
+    }
+
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let midnight = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow::anyhow!("{label}: invalid timestamp '{value}'"))?;
+        return Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(midnight, chrono::Utc));
+    }
+
+    bail!(
+        "{label} must be RFC3339 timestamp or YYYY-MM-DD date (got '{value}')"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_audit_filters(
+    run_id: Option<&str>,
+    task_id: Option<&str>,
+    category: Option<&str>,
+    actor: Option<&str>,
+    since: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+    offset: usize,
+    limit: usize,
+    format: AuditOutputFormat,
+) -> Result<ParsedAuditQuery> {
+    let run_id = match run_id {
+        Some(value) => Some(
+            value
+                .parse::<Uuid>()
+                .with_context(|| format!("invalid run-id '{value}', expected UUID"))?,
+        ),
+        None => None,
+    };
+    let task_id = match task_id {
+        Some(value) => Some(
+            value
+                .parse::<Uuid>()
+                .with_context(|| format!("invalid task-id '{value}', expected UUID"))?,
+        ),
+        None => None,
+    };
+    let category = match category {
+        Some(value) => Some(parse_audit_category(value)?),
+        None => None,
+    };
+    let actor = actor.map(str::to_string);
+    let since = since
+        .map(|value| parse_audit_time(value, "since"))
+        .transpose()?;
+    let before = before
+        .map(|value| parse_audit_time(value, "before"))
+        .transpose()?;
+    let after = match after {
+        Some(value) => Some(
+            value
+                .parse::<Uuid>()
+                .with_context(|| format!("invalid after '{value}', expected UUID"))?,
+        ),
+        None => None,
+    };
+
+    Ok(ParsedAuditQuery {
+        run_id,
+        task_id,
+        category,
+        actor,
+        since,
+        before,
+        after,
+        offset,
+        limit,
+        format,
+    })
+}
+
+fn query_audit_entries(
+    path: &Path,
+    query: &ParsedAuditQuery,
+) -> Result<Vec<AuditEntry>> {
+    let sink = JsonlAuditSink::new(path);
+    let entries = match sink.read_all() {
+        Ok(entries) => entries,
+        Err(e) => bail!("failed to read audit log {}: {e}", path.display()),
+    };
+
+    let mut filtered: Vec<AuditEntry> = entries
+        .into_iter()
+        .filter(|entry| {
+            if let Some(run_id) = query.run_id {
+                if entry.run_id != Some(run_id) {
+                    return false;
+                }
+            }
+            if let Some(task_id) = query.task_id {
+                if entry.task_id != Some(task_id) {
+                    return false;
+                }
+            }
+            if let Some(category) = query.category {
+                if entry.category != category {
+                    return false;
+                }
+            }
+            if let Some(actor) = query.actor.as_deref() {
+                if entry.actor != actor {
+                    return false;
+                }
+            }
+            if let Some(since) = query.since {
+                if entry.timestamp < since {
+                    return false;
+                }
+            }
+            if let Some(before) = query.before {
+                if entry.timestamp > before {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    let start = if let Some(after) = query.after {
+        filtered
+            .iter()
+            .position(|entry| entry.audit_id == after)
+            .map(|idx| idx.saturating_add(1))
+            .unwrap_or(0)
+            .saturating_add(query.offset)
+    } else {
+        query.offset
+    };
+    let start = start.min(filtered.len());
+    let end = if query.limit == 0 {
+        filtered.len()
+    } else {
+        (start + query.limit).min(filtered.len())
+    };
+
+    filtered.truncate(end);
+    if start > 0 {
+        filtered.drain(0..start);
+    }
+
+    Ok(filtered)
+}
+
+fn csv_escape(value: &str) -> String {
+    let mut out = value.replace('\"', "\"\"");
+    if out.contains(',') || out.contains('\n') || out.contains('\r') || out.contains('\"') {
+        out = format!("\"{out}\"");
+    }
+    out
+}
+
+fn render_audit_json_lines(entries: &[AuditEntry]) -> Result<()> {
+    for entry in entries {
+        let line = serde_json::to_string(entry)?;
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn render_audit_csv(entries: &[AuditEntry]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "audit_id,timestamp,category,actor,action,outcome,rule_id,run_id,task_id,reason\n",
+    );
+    for entry in entries {
+        let line = format!(
+            "{},{},{},{},{},{},{},{},{},{}\n",
+            csv_escape(&entry.audit_id.to_string()),
+            csv_escape(&entry.timestamp.to_rfc3339()),
+            csv_escape(&format!("{:?}", entry.category)),
+            csv_escape(&entry.actor),
+            csv_escape(&entry.action),
+            csv_escape(&entry.outcome.map(|o| format!("{o:?}")).unwrap_or_default()),
+            csv_escape(entry.rule_id.as_deref().unwrap_or("")),
+            csv_escape(
+                &entry
+                    .run_id
+                    .map(|run_id| run_id.to_string())
+                    .unwrap_or_else(String::new),
+            ),
+            csv_escape(
+                &entry
+                    .task_id
+                    .map(|task_id| task_id.to_string())
+                    .unwrap_or_else(String::new),
+            ),
+            csv_escape(&entry.reason),
+        );
+        out.push_str(&line);
+    }
+    out
+}
+
+fn render_audit_table(entries: &[AuditEntry]) {
+    if entries.is_empty() {
+        println!("No audit entries found.");
+        return;
+    }
+
+    println!(
+        "{:<20} {:<20} {:<16} {:<24} {:<8} {:<36} {:<36} REASON",
+        "TIMESTAMP",
+        "CATEGORY",
+        "ACTOR",
+        "ACTION",
+        "OUTCOME",
+        "RUN ID",
+        "TASK ID",
+    );
+    for entry in entries {
+        let outcome = entry.outcome.map(|o| format!("{o:?}")).unwrap_or_default();
+        let run_id = entry
+            .run_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(String::new);
+        let task_id = entry
+            .task_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(String::new);
+        println!(
+            "{:<20} {:<20} {:<16} {:<24} {:<8} {:<36} {:<36} {}",
+            entry.timestamp.format("%Y-%m-%d %H:%M:%S"),
+            format!("{:?}", entry.category),
+            entry.actor,
+            entry.action,
+            outcome,
+            run_id,
+            task_id,
+            entry.reason
+        );
+    }
+}
+
+/// `yarli audit query` — query the JSONL audit log with filters.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_audit_query(
+    file: &str,
+    run_id: Option<&str>,
+    task_id: Option<&str>,
+    category: Option<&str>,
+    actor: Option<&str>,
+    since: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+    offset: usize,
+    limit: usize,
+    format: AuditOutputFormat,
+) -> Result<()> {
+    let query = parse_audit_filters(run_id, task_id, category, actor, since, before, after, offset, limit, format)?;
+    let path = PathBuf::from(file);
+    let entries = query_audit_entries(&path, &query)?;
+
+    if entries.is_empty() {
+        println!("No audit entries found.");
+        return Ok(());
+    }
+
+    match query.format {
+        AuditOutputFormat::Json => render_audit_json_lines(&entries),
+        AuditOutputFormat::Csv => {
+            let output = render_audit_csv(&entries);
+            print!("{output}");
+            Ok(())
+        }
+        AuditOutputFormat::Table => {
+            render_audit_table(&entries);
+            Ok(())
+        }
+    }
+}
+
+/// `yarli debug queue-depth` — show queue depth grouped by run/class.
+pub(crate) fn cmd_debug_queue_depth() -> Result<()> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store_and_queue(&loaded_config, |_, queue| {
+        let entries = queue.entries();
+        Ok::<_, anyhow::Error>(render_queue_depth(&entries))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli debug active-leases` — show currently leased tasks.
+pub(crate) fn cmd_debug_active_leases() -> Result<()> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store_and_queue(&loaded_config, |_, queue| {
+        let entries = queue.entries();
+        let now = chrono::Utc::now();
+        Ok::<_, anyhow::Error>(render_active_leases(&entries, now))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// `yarli debug resource-usage` — show run resource usage totals.
+pub(crate) fn cmd_debug_resource_usage(run_id_str: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_reads()?;
+    let output = with_event_store(&loaded_config, |store| {
+        let run_id = resolve_run_id_input(store, run_id_str)?;
+        let run = match load_run_projection(store, run_id)? {
+            Some(run) => run,
+            None => return Ok(format!("run {run_id} not found in persisted event log")),
+        };
+        let totals = collect_run_resource_totals(store, run.correlation_id)?;
+        let budgets = collect_run_resource_limits(store, run.correlation_id)?;
+        Ok::<_, anyhow::Error>(render_resource_usage_summary(run_id, &totals, &budgets))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -6339,6 +6980,98 @@ mod tests {
         // 0 = show all.
         let result = cmd_audit_tail(f.path().to_str().unwrap(), 0, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn cmd_audit_query_filters_to_json() {
+        let f = NamedTempFile::new().unwrap();
+        let sink = JsonlAuditSink::new(f.path());
+
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let denied = AuditEntry::destructive_attempt(
+            "scheduler",
+            "force_push",
+            "blocked by policy",
+            Some(run_id),
+            Some(task_id),
+            serde_json::json!({"rule": "no_force_push"}),
+        );
+        let allowed = AuditEntry::gate_evaluation(
+            "policy-allow",
+            true,
+            "policy allow",
+            run_id,
+            Some(task_id),
+        );
+        sink.append(&denied).unwrap();
+        sink.append(&allowed).unwrap();
+
+        let result = cmd_audit_query(
+            f.path().to_str().unwrap(),
+            Some(&run_id.to_string()),
+            Some(&task_id.to_string()),
+            Some("destructive_attempt"),
+            Some("scheduler"),
+            None,
+            None,
+            None,
+            0,
+            10,
+            AuditOutputFormat::Json,
+        );
+        assert!(result.is_ok());
+
+        let result = cmd_audit_query(
+            f.path().to_str().unwrap(),
+            Some(&run_id.to_string()),
+            None,
+            Some("gate_evaluation"),
+            None,
+            None,
+            None,
+            None,
+            10,
+            10,
+            AuditOutputFormat::Csv,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn cmd_audit_query_rejects_invalid_filters() {
+        let f = NamedTempFile::new().unwrap();
+        let path = f.path().to_str().unwrap();
+
+        let invalid = cmd_audit_query(
+            path,
+            Some("not-a-uuid"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            10,
+            10,
+            AuditOutputFormat::Table,
+        );
+        assert!(invalid.is_err());
+
+        let invalid_category = cmd_audit_query(
+            path,
+            None,
+            None,
+            Some("invalid_category"),
+            None,
+            None,
+            None,
+            None,
+            10,
+            10,
+            AuditOutputFormat::Table,
+        );
+        assert!(invalid_category.is_err());
     }
 
     #[tokio::test]

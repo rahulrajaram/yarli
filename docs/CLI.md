@@ -455,7 +455,8 @@ yarli merge status <merge-id>
 
 Purpose:
 
-- Tail the JSONL audit log emitted by policy decisions and governance accounting.
+- Tail and query the JSONL audit log emitted by policy decisions, governance accounting,
+  and command execution events.
 
 Examples:
 
@@ -468,6 +469,11 @@ yarli audit tail --file .yarl/audit.jsonl --lines 200
 
 # Filter by category.
 yarli audit tail --category policy_decision
+
+# Query with filters and structured output.
+yarli audit query --run-id <run-id> --task-id <task-id>
+yarli audit query --category gate_evaluation --since 2026-02-20T00:00:00Z --before 2026-02-22T23:59:59Z
+yarli audit query --category policy_decision --format csv --limit 50
 ```
 
 ### `yarli info`

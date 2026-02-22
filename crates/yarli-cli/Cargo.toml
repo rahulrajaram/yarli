@@ -42,9 +42,11 @@ hex = { workspace = true }
 
 yarli-sw4rm = { workspace = true, optional = true, features = ["test-support"] }
 sw4rm-sdk = { workspace = true, optional = true }
+yarli-chaos = { workspace = true, optional = true }
 
 [features]
 sw4rm = ["dep:yarli-sw4rm", "dep:sw4rm-sdk"]
+chaos = ["dep:yarli-chaos", "yarli-queue/chaos", "yarli-store/chaos", "yarli-exec/chaos"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -40,7 +40,7 @@ use yarli_core::shutdown::ShutdownController;
 use yarli_gates::{default_run_gates, default_task_gates, evaluate_all, GateContext};
 use yarli_git::error::{GitError, RecoveryAction};
 use yarli_git::{LocalMergeOrchestrator, LocalWorktreeManager, MergeOrchestrator, WorktreeManager};
-use yarli_observability::{AuditEntry, AuditSink, JsonlAuditSink};
+use yarli_observability::{init_tracing, AuditEntry, AuditSink, JsonlAuditSink, TracingConfig};
 use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use yarli_queue::{ResourceBudgetConfig, Scheduler, SchedulerConfig, TaskQueue};
 use yarli_store::event_store::EventQuery;
@@ -67,7 +67,7 @@ use crate::plan::*;
 use crate::projection::*;
 use cli::{
     AuditAction, Cli, Commands, GateAction, MergeAction, PlanAction, RunAction, TaskAction,
-    TrancheAction, WorktreeAction,
+    TrancheAction, WorktreeAction, DebugAction,
 };
 use commands::*;
 
@@ -87,14 +87,16 @@ const YARLI_VERSION: &str = concat!(
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing (env filter: YARLI_LOG=debug)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("YARLI_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_target(false)
-        .init();
+    if std::env::var("RUST_LOG").is_err() {
+        if let Ok(log_level) = std::env::var("YARLI_LOG") {
+            std::env::set_var("RUST_LOG", log_level);
+        }
+    }
+
+    let tracing_config = TracingConfig { target: false, ..Default::default() };
+    if let Err(err) = init_tracing(&tracing_config) {
+        error!(error = %err, "tracing initialization failed");
+    }
 
     if let Err(e) = run().await {
         error!("{e:#}");
@@ -284,6 +286,31 @@ async fn run() -> Result<()> {
                 lines,
                 category,
             } => cmd_audit_tail(&file, lines, category.as_deref()),
+            AuditAction::Query {
+                file,
+                run_id,
+                task_id,
+                category,
+                actor,
+                since,
+                before,
+                after,
+                offset,
+                limit,
+                format,
+            } => cmd_audit_query(
+                &file,
+                run_id.as_deref(),
+                task_id.as_deref(),
+                category.as_deref(),
+                actor.as_deref(),
+                since.as_deref(),
+                before.as_deref(),
+                after.as_deref(),
+                offset,
+                limit,
+                format,
+            ),
         },
         Commands::Plan { action } => match action {
             PlanAction::Tranche { action } => match action {
@@ -309,6 +336,13 @@ async fn run() -> Result<()> {
                 TrancheAction::Remove { key } => cmd_plan_tranche_remove(&key),
             },
             PlanAction::Validate => cmd_plan_validate(),
+        },
+        Commands::Debug { action } => match action {
+            DebugAction::QueueDepth => cmd_debug_queue_depth(),
+            DebugAction::ActiveLeases => cmd_debug_active_leases(),
+            DebugAction::ResourceUsage { run_id } => {
+                cmd_debug_resource_usage(&run_id)
+            }
         },
         Commands::Init { .. } => unreachable!("init command handled before runtime config load"),
         Commands::Info => {

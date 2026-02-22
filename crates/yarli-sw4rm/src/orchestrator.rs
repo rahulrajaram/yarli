@@ -254,20 +254,21 @@ where
         let runner = self.verification_runner.clone();
         let verification_commands = self.compose_verification_commands(additional_verification);
 
-        let mut sched_config = SchedulerConfig::default();
-        sched_config.working_dir = self.verification.working_dir.clone();
-
-        // Fix #6: wire gates into verification instead of disabling them
-        sched_config.task_gates = self
-            .verification
-            .task_gates
-            .clone()
-            .unwrap_or_else(yarli_gates::default_task_gates);
-        sched_config.run_gates = self
-            .verification
-            .run_gates
-            .clone()
-            .unwrap_or_else(yarli_gates::default_run_gates);
+        let sched_config = SchedulerConfig {
+            working_dir: self.verification.working_dir.clone(),
+            // Fix #6: wire gates into verification instead of disabling them
+            task_gates: self
+                .verification
+                .task_gates
+                .clone()
+                .unwrap_or_else(yarli_gates::default_task_gates),
+            run_gates: self
+                .verification
+                .run_gates
+                .clone()
+                .unwrap_or_else(yarli_gates::default_run_gates),
+            ..Default::default()
+        };
 
         let scheduler = Scheduler::new(queue.clone(), store.clone(), runner, sched_config);
 

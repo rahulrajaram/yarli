@@ -4,7 +4,9 @@
 //! `0001_init.sql`.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
@@ -12,6 +14,7 @@ use sqlx::Row;
 use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 use tracing::warn;
 use yarli_core::domain::{EntityType, Event, EventId};
+use yarli_observability::YarliMetrics;
 
 use crate::error::StoreError;
 use crate::event_store::{EventQuery, EventStore};
@@ -20,6 +23,7 @@ use crate::event_store::{EventQuery, EventStore};
 #[derive(Debug, Clone)]
 pub struct PostgresEventStore {
     pool: PgPool,
+    metrics: Option<Arc<YarliMetrics>>,
 }
 
 impl PostgresEventStore {
@@ -29,17 +33,39 @@ impl PostgresEventStore {
             .connect_lazy(database_url)
             .map_err(|error| StoreError::Database(error.to_string()))?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            metrics: None,
+        })
     }
 
     /// Construct from an existing pool.
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            metrics: None,
+        }
+    }
+
+    /// Attach metrics registry for telemetry.
+    pub fn with_metrics(mut self, metrics: Arc<YarliMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Access the underlying pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    fn record_duration(&self, operation: &str, start: Instant) {
+        if let Some(metrics) = &self.metrics {
+            let duration = start.elapsed().as_secs_f64();
+            metrics.record_store_duration(operation, duration);
+            if duration > 1.0 {
+                metrics.record_store_slow_query(operation);
+            }
+        }
     }
 
     fn run_async<T, Fut>(&self, fut: Fut) -> Result<T, StoreError>
@@ -80,8 +106,9 @@ impl PostgresEventStore {
 
 impl EventStore for PostgresEventStore {
     fn append(&self, event: Event) -> Result<(), StoreError> {
+        let start = Instant::now();
         let pool = self.pool.clone();
-        self.run_async(async move {
+        let result = self.run_async(async move {
             let event_id = event.event_id;
             let idempotency_key = event.idempotency_key.clone();
             let entity_type = entity_type_to_db(event.entity_type);
@@ -134,12 +161,16 @@ impl EventStore for PostgresEventStore {
                 }
                 Err(error) => Err(StoreError::Database(error.to_string())),
             }
-        })
+        });
+
+        self.record_duration("append", start);
+        result
     }
 
     fn get(&self, event_id: EventId) -> Result<Event, StoreError> {
+        let start = Instant::now();
         let pool = self.pool.clone();
-        self.run_async(async move {
+        let result = self.run_async(async move {
             let row = sqlx::query(
                 r#"
                 SELECT
@@ -166,10 +197,14 @@ impl EventStore for PostgresEventStore {
                 Some(row) => row_to_event(row),
                 None => Err(StoreError::EventNotFound(event_id)),
             }
-        })
+        });
+
+        self.record_duration("get", start);
+        result
     }
 
     fn query(&self, query: &EventQuery) -> Result<Vec<Event>, StoreError> {
+        let start = Instant::now();
         let pool = self.pool.clone();
         let entity_type = query.entity_type.map(entity_type_to_db);
         let entity_id = query.entity_id.clone();
@@ -178,7 +213,7 @@ impl EventStore for PostgresEventStore {
         let limit = query.limit.map(|value| value.min(i64::MAX as usize) as i64);
         let after_event_id = query.after_event_id;
 
-        self.run_async(async move {
+        let result = self.run_async(async move {
             let after_occurred_at = match after_event_id {
                 Some(anchor_id) => {
                     let anchor = sqlx::query(
@@ -244,12 +279,16 @@ impl EventStore for PostgresEventStore {
             .map_err(|error| StoreError::Database(error.to_string()))?;
 
             rows.into_iter().map(row_to_event).collect()
-        })
+        });
+
+        self.record_duration("query", start);
+        result
     }
 
     fn all(&self) -> Result<Vec<Event>, StoreError> {
+        let start = Instant::now();
         let pool = self.pool.clone();
-        self.run_async(async move {
+        let result = self.run_async(async move {
             let rows = sqlx::query(
                 r#"
                 SELECT
@@ -272,12 +311,16 @@ impl EventStore for PostgresEventStore {
             .map_err(|error| StoreError::Database(error.to_string()))?;
 
             rows.into_iter().map(row_to_event).collect()
-        })
+        });
+
+        self.record_duration("all", start);
+        result
     }
 
     fn len(&self) -> usize {
+        let start = Instant::now();
         let pool = self.pool.clone();
-        match self.run_async(async move {
+        let result = match self.run_async(async move {
             let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM events")
                 .fetch_one(&pool)
                 .await
@@ -292,7 +335,10 @@ impl EventStore for PostgresEventStore {
                 );
                 0
             }
-        }
+        };
+
+        self.record_duration("len", start);
+        result
     }
 }
 

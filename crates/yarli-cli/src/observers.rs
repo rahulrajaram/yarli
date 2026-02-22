@@ -521,6 +521,7 @@ impl TaskHealthArtifactObserver {
         emitted
     }
 
+    #[allow(clippy::type_complexity)]
     fn read_new_tool_outcomes(
         &mut self,
         task_id: Uuid,
@@ -631,15 +632,12 @@ fn parse_tool_health_observation(value: &serde_json::Value) -> Option<ToolOutcom
             | Some("tool-outcome")
     );
 
-    let Some(tool) = value
+    let tool = value
         .get("tool")
         .and_then(|value| value.as_str())
         .or_else(|| value.get("name").and_then(|value| value.as_str()))
         .or_else(|| value.get("source").and_then(|value| value.as_str()))
-        .map(ToString::to_string)
-    else {
-        return None;
-    };
+        .map(ToString::to_string)?;
 
     let status = value
         .get("status")
@@ -812,7 +810,10 @@ enum ObserverSignal {
     Runtime(RuntimeSample),
     Retry,
     Blocked,
-    Failure { reason_bucket: String },
+    Failure {
+        #[allow(dead_code)]
+        reason_bucket: String,
+    },
     Budget(BudgetSample),
 }
 
@@ -1175,9 +1176,7 @@ impl DeteriorationObserverState {
     }
 
     fn detect_repeated_failure_signature(&mut self) -> Option<DeteriorationDetectedSignatureSignal> {
-        let Some(signature) = self.failure_signatures.back() else {
-            return None;
-        };
+        let signature = self.failure_signatures.back()?;
         let mut repeat_count = 0usize;
         for known in self.failure_signatures.iter().rev() {
             if known == signature {

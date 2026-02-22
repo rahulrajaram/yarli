@@ -71,6 +71,24 @@ pub(crate) struct ParallelTaskMergeOutcome {
     pub(crate) patch_path: Option<String>,
 }
 
+/// Bundles resolution strategy with associated parameters for LLM-assisted repair.
+#[derive(Debug, Clone)]
+pub(crate) struct MergeResolutionConfig {
+    pub(crate) strategy: config::MergeConflictResolution,
+    pub(crate) repair_command: Option<String>,
+    pub(crate) repair_timeout_seconds: u64,
+}
+
+impl MergeResolutionConfig {
+    pub(crate) fn from_run_config(run: &config::RunConfig) -> Self {
+        Self {
+            strategy: run.merge_conflict_resolution,
+            repair_command: run.merge_repair_command.clone(),
+            repair_timeout_seconds: run.merge_repair_timeout_seconds,
+        }
+    }
+}
+
 pub(crate) fn path_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
@@ -733,11 +751,292 @@ fn repair_with_workspace_versions(
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct MergeConflictContext {
+    task_key: String,
+    conflicted_files: Vec<ConflictedFileContext>,
+    repo_status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConflictedFileContext {
+    path: String,
+    base: Option<String>,
+    ours: Option<String>,
+    theirs: Option<String>,
+    conflict_markers: String,
+}
+
+fn extract_stage_content(source_workdir: &Path, stage: u8, path: &str) -> Option<String> {
+    let spec = format!(":{stage}:{path}");
+    let output = run_git_capture(source_workdir, &["show", &spec]).ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        None
+    }
+}
+
+fn build_conflict_prompt(context: &MergeConflictContext) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("# Merge Conflict Resolution\n\n");
+    prompt.push_str(&format!(
+        "Task `{}` has merge conflicts in {} file(s).\n",
+        context.task_key,
+        context.conflicted_files.len()
+    ));
+    prompt.push_str("Your job is to resolve these conflicts by editing the files in place.\n\n");
+    prompt.push_str("## Instructions\n\n");
+    prompt.push_str("1. Edit each conflicted file to integrate changes from BOTH sides.\n");
+    prompt.push_str("2. Remove ALL conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).\n");
+    prompt.push_str("3. The result should compile/parse correctly.\n\n");
+
+    for file in &context.conflicted_files {
+        prompt.push_str(&format!("## File: `{}`\n\n", file.path));
+        if let Some(base) = &file.base {
+            prompt.push_str("### Base version (common ancestor)\n```\n");
+            prompt.push_str(base);
+            prompt.push_str("\n```\n\n");
+        }
+        if let Some(ours) = &file.ours {
+            prompt.push_str("### Ours (current branch)\n```\n");
+            prompt.push_str(ours);
+            prompt.push_str("\n```\n\n");
+        }
+        if let Some(theirs) = &file.theirs {
+            prompt.push_str("### Theirs (incoming patch)\n```\n");
+            prompt.push_str(theirs);
+            prompt.push_str("\n```\n\n");
+        }
+        prompt.push_str("### Current working tree (with conflict markers)\n```\n");
+        prompt.push_str(&file.conflict_markers);
+        prompt.push_str("\n```\n\n");
+    }
+
+    prompt
+}
+
+fn repair_with_llm_command(
+    source_workdir: &Path,
+    task_key: &str,
+    repair_command: &str,
+    timeout_seconds: u64,
+) -> Result<(), ParallelWorkspaceMergeApplyError> {
+    let conflicted_files = collect_conflicted_workspace_files(source_workdir);
+    if conflicted_files.is_empty() {
+        return Err(ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!(
+                "llm-assisted merge repair could not identify conflicted files for task {task_key}"
+            ),
+        ));
+    }
+
+    // Build structured context
+    let file_contexts: Vec<ConflictedFileContext> = conflicted_files
+        .iter()
+        .map(|path| {
+            let conflict_markers = fs::read_to_string(source_workdir.join(path))
+                .unwrap_or_else(|_| "(unable to read file)".to_string());
+            ConflictedFileContext {
+                path: path.clone(),
+                base: extract_stage_content(source_workdir, 1, path),
+                ours: extract_stage_content(source_workdir, 2, path),
+                theirs: extract_stage_content(source_workdir, 3, path),
+                conflict_markers,
+            }
+        })
+        .collect();
+
+    let repo_status = collect_workspace_status_snapshot(source_workdir);
+    let context = MergeConflictContext {
+        task_key: task_key.to_string(),
+        conflicted_files: file_contexts,
+        repo_status,
+    };
+
+    // Write artifacts to .yarli/ directory
+    let yarli_dir = source_workdir.join(".yarli");
+    fs::create_dir_all(&yarli_dir).map_err(|error| {
+        ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!("failed to create .yarli directory for merge context: {error}"),
+        )
+    })?;
+
+    let context_json_path = yarli_dir.join("merge-conflict-context.json");
+    let context_json = serde_json::to_string_pretty(&context).map_err(|error| {
+        ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!("failed to serialize merge conflict context: {error}"),
+        )
+    })?;
+    fs::write(&context_json_path, &context_json).map_err(|error| {
+        ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!("failed to write merge conflict context JSON: {error}"),
+        )
+    })?;
+
+    let prompt_text = build_conflict_prompt(&context);
+    let prompt_path = yarli_dir.join("merge-conflict-prompt.md");
+    fs::write(&prompt_path, &prompt_text).map_err(|error| {
+        ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!("failed to write merge conflict prompt: {error}"),
+        )
+    })?;
+
+    let files_list = conflicted_files.join(",");
+
+    // Spawn the repair command
+    let mut child = process::Command::new("sh")
+        .arg("-c")
+        .arg(repair_command)
+        .current_dir(source_workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("YARLI_CONFLICT_CONTEXT", &context_json_path)
+        .env("YARLI_CONFLICT_PROMPT", &prompt_path)
+        .env("YARLI_CONFLICTED_FILES", &files_list)
+        .env("YARLI_TASK_KEY", task_key)
+        .spawn()
+        .map_err(|error| {
+            ParallelWorkspaceMergeApplyError::new(
+                ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                true,
+                format!("failed to spawn llm-assisted repair command for task {task_key}: {error}"),
+            )
+        })?;
+
+    // Pipe the prompt to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt_text.as_bytes());
+        // drop stdin to close the pipe
+    }
+
+    // Wait with timeout
+    let status = if timeout_seconds == 0 {
+        child.wait().map_err(|error| {
+            ParallelWorkspaceMergeApplyError::new(
+                ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                true,
+                format!("failed to wait for llm-assisted repair command for task {task_key}: {error}"),
+            )
+        })?
+    } else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(ParallelWorkspaceMergeApplyError::new(
+                            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                            true,
+                            format!(
+                                "llm-assisted repair command timed out after {timeout_seconds}s for task {task_key}"
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(error) => {
+                    return Err(ParallelWorkspaceMergeApplyError::new(
+                        ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+                        true,
+                        format!(
+                            "failed to poll llm-assisted repair command for task {task_key}: {error}"
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+
+    if !status.success() {
+        let exit_code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        return Err(ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!(
+                "llm-assisted repair command exited with {exit_code} for task {task_key}"
+            ),
+        ));
+    }
+
+    // Safety check: scan resolved files for leftover conflict markers BEFORE staging.
+    for path in &conflicted_files {
+        let full_path = source_workdir.join(path);
+        if let Ok(content) = fs::read_to_string(&full_path) {
+            if content.contains("<<<<<<<") || content.contains(">>>>>>>") {
+                return Err(ParallelWorkspaceMergeApplyError::new(
+                    ParallelWorkspaceMergeFailureKind::MergeConflict,
+                    true,
+                    format!(
+                        "llm-assisted repair resolved git conflicts but left conflict markers in {path} for task {task_key}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Stage all resolved files (this clears the conflict state in the index)
+    let add_output = run_git_capture(source_workdir, &["add", "-A"]).map_err(|error| {
+        ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!(
+                "llm-assisted merge repair failed while staging resolved files for task {task_key}: {error}"
+            ),
+        )
+    })?;
+    ensure_git_success(
+        add_output,
+        source_workdir,
+        &["add", "-A"],
+        "llm-assisted merge repair staging",
+    )
+    .map_err(|error| {
+        ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+            true,
+            format!("llm-assisted merge repair failed for task {task_key}: {error}"),
+        )
+    })?;
+
+    // Verify: no remaining conflicted files after staging
+    let remaining_conflicts = collect_conflicted_workspace_files(source_workdir);
+    if !remaining_conflicts.is_empty() {
+        return Err(ParallelWorkspaceMergeApplyError::new(
+            ParallelWorkspaceMergeFailureKind::MergeConflict,
+            true,
+            format!(
+                "llm-assisted repair command completed but did not resolve all conflicts for task {task_key}: {}",
+                remaining_conflicts.join(", ")
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn apply_workspace_patch_to_source(
     source_workdir: &Path,
     task_key: &str,
     patch: &[u8],
-    merge_conflict_resolution: config::MergeConflictResolution,
+    resolution_config: &MergeResolutionConfig,
 ) -> Result<bool, ParallelWorkspaceMergeApplyError> {
     let backed_up_new_files = remove_conflicting_new_files_for_patch(source_workdir, patch).map_err(
         |error| {
@@ -802,13 +1101,24 @@ pub(crate) fn apply_workspace_patch_to_source(
     }
 
     // Not index-related — apply the merge conflict resolution strategy.
-    match merge_conflict_resolution {
+    match resolution_config.strategy {
         config::MergeConflictResolution::AutoRepair => {
             repair_with_workspace_versions(source_workdir, task_key)?;
             warn!(
                 task_key,
                 "merge_conflict_resolution=auto-repair resolved workspace conflicts by preferring patch side"
             );
+            warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
+            return Ok(true);
+        }
+        config::MergeConflictResolution::LlmAssisted => {
+            let command = resolution_config.repair_command.as_deref().unwrap_or("");
+            repair_with_llm_command(
+                source_workdir,
+                task_key,
+                command,
+                resolution_config.repair_timeout_seconds,
+            )?;
             warn_on_new_file_content_divergence(source_workdir, &backed_up_new_files);
             return Ok(true);
         }
@@ -1141,6 +1451,7 @@ pub(crate) fn restore_workspace_head_after_failed_merge(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_parallel_merge_lineage_recovery_note(
     run_id: Uuid,
     source_workdir: &Path,
@@ -1190,12 +1501,17 @@ pub(crate) fn merge_parallel_workspace_results(
     run_workspace_root: &Path,
     task_workspaces: &[(String, PathBuf)],
 ) -> Result<ParallelWorkspaceMergeReport> {
+    let resolution_config = MergeResolutionConfig {
+        strategy: config::MergeConflictResolution::Fail,
+        repair_command: None,
+        repair_timeout_seconds: 300,
+    };
     merge_parallel_workspace_results_with_resolution(
         source_workdir,
         run_id,
         run_workspace_root,
         task_workspaces,
-        config::MergeConflictResolution::Fail,
+        &resolution_config,
         None,
     )
 }
@@ -1215,12 +1531,13 @@ fn merge_apply_telemetry_event(
     });
 }
 
+#[allow(dead_code)]
 pub(crate) fn merge_parallel_workspace_results_with_resolution(
     source_workdir: &Path,
     run_id: Uuid,
     run_workspace_root: &Path,
     task_workspaces: &[(String, PathBuf)],
-    merge_conflict_resolution: config::MergeConflictResolution,
+    resolution_config: &MergeResolutionConfig,
     source_head_at_creation: Option<&str>,
 ) -> Result<ParallelWorkspaceMergeReport> {
     let mut apply_telemetry = Vec::new();
@@ -1229,7 +1546,7 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution(
         run_id,
         run_workspace_root,
         task_workspaces,
-        merge_conflict_resolution,
+        resolution_config,
         source_head_at_creation,
         &mut apply_telemetry,
     )?;
@@ -1241,7 +1558,7 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution_with_events(
     run_id: Uuid,
     run_workspace_root: &Path,
     task_workspaces: &[(String, PathBuf)],
-    merge_conflict_resolution: config::MergeConflictResolution,
+    resolution_config: &MergeResolutionConfig,
     source_head_at_creation: Option<&str>,
     apply_telemetry: &mut Vec<MergeApplyTelemetryEvent>,
 ) -> Result<ParallelWorkspaceMergeReport> {
@@ -1276,7 +1593,7 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution_with_events(
             "source_workdir": source_workdir.display().to_string(),
             "workspace_root": run_workspace_root.display().to_string(),
             "task_count": task_workspaces.len(),
-            "merge_conflict_resolution": format!("{:?}", merge_conflict_resolution),
+            "merge_conflict_resolution": format!("{:?}", resolution_config.strategy),
         }),
     );
 
@@ -1432,9 +1749,7 @@ Operator recovery steps:\n\
         }
 
         let restore_workspace_head_on_error = |error_context: &str| -> Option<String> {
-            let Some(original_head) = original_workspace_head_for_restore.as_deref() else {
-                return None;
-            };
+            let original_head = original_workspace_head_for_restore.as_deref()?;
             match restore_workspace_head_after_failed_merge(workspace_dir, original_head) {
                 Ok(()) => {
                     info!(
@@ -1537,7 +1852,7 @@ Operator recovery steps:\n\
             source_workdir,
             task_key,
             patch.as_bytes(),
-            merge_conflict_resolution,
+            resolution_config,
         ) {
             Ok(repaired) => {
                 if repaired {
@@ -1555,6 +1870,7 @@ Operator recovery steps:\n\
                             "source_head": source_head,
                             "workspace_head": ws_head,
                             "soft_reset_applied": soft_reset_applied,
+                            "repair_strategy": format!("{:?}", resolution_config.strategy),
                         }),
                     );
                 }
@@ -1577,6 +1893,7 @@ Operator recovery steps:\n\
                             "workspace_head": ws_head,
                             "soft_reset_applied": soft_reset_applied,
                             "reason": err.message,
+                            "repair_strategy": format!("{:?}", resolution_config.strategy),
                         }),
                     );
                 }
@@ -2852,11 +3169,16 @@ worktree_root = "{}"
         let (ok, patch, stderr) = run_git(&workspace, &["diff"]);
         assert!(ok, "failed to produce workspace patch: {stderr}");
 
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::AutoRepair,
+            repair_command: None,
+            repair_timeout_seconds: 300,
+        };
         let repaired = apply_workspace_patch_to_source(
             &source_repo,
             "task-auto-repair",
             patch.as_bytes(),
-            config::MergeConflictResolution::AutoRepair,
+            &resolution_config,
         )
         .unwrap();
         assert!(repaired);
@@ -3979,6 +4301,273 @@ worktree_root = "{}"
             note.exists(),
             "recovery note should exist at {}",
             note.display()
+        );
+    }
+
+    /// Helper: set up diverged source + workspace so that applying the workspace
+    /// patch with `--3way` will produce a merge conflict. Returns the source repo
+    /// path and the patch bytes (the patch is NOT pre-applied).
+    fn setup_diverged_repo_for_conflict(temp_dir: &TempDir) -> (PathBuf, String) {
+        let source_repo = temp_dir.path().join("source");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&source_repo).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("shared.txt"), "base\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        run_git_expect_ok(
+            temp_dir.path(),
+            &["clone", source_repo.to_str().unwrap(), workspace.to_str().unwrap()],
+        );
+
+        // Diverge source (commit a different change)
+        std::fs::write(source_repo.join("shared.txt"), "source update\n").unwrap();
+        run_git_expect_ok(&source_repo, &["add", "shared.txt"]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "source update"]);
+
+        // Diverge workspace (unstaged modification)
+        std::fs::write(workspace.join("shared.txt"), "workspace update\n").unwrap();
+        let (ok, patch, stderr) = run_git(&workspace, &["diff"]);
+        assert!(ok, "failed to produce workspace patch: {stderr}");
+
+        (source_repo, patch)
+    }
+
+    #[test]
+    fn llm_assisted_resolves_conflict() {
+        let temp_dir = TempDir::new().unwrap();
+        let (source_repo, patch) = setup_diverged_repo_for_conflict(&temp_dir);
+
+        // Repair command that simply writes resolved content
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::LlmAssisted,
+            repair_command: Some(
+                "printf 'resolved content\\n' > shared.txt".to_string(),
+            ),
+            repair_timeout_seconds: 10,
+        };
+        let repaired = apply_workspace_patch_to_source(
+            &source_repo,
+            "task-llm",
+            patch.as_bytes(),
+            &resolution_config,
+        )
+        .unwrap();
+        assert!(repaired);
+
+        let merged = std::fs::read_to_string(source_repo.join("shared.txt")).unwrap();
+        assert_eq!(merged, "resolved content\n");
+        // No conflict markers should remain
+        assert!(!merged.contains("<<<<<<<"));
+    }
+
+    #[test]
+    fn llm_assisted_command_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let (source_repo, patch) = setup_diverged_repo_for_conflict(&temp_dir);
+
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::LlmAssisted,
+            repair_command: Some("exit 1".to_string()),
+            repair_timeout_seconds: 10,
+        };
+        let err = apply_workspace_patch_to_source(
+            &source_repo,
+            "task-llm-fail",
+            patch.as_bytes(),
+            &resolution_config,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ParallelWorkspaceMergeFailureKind::RuntimeFailure);
+        assert!(
+            err.message.contains("exited with"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn llm_assisted_leaves_conflicts() {
+        let temp_dir = TempDir::new().unwrap();
+        let (source_repo, patch) = setup_diverged_repo_for_conflict(&temp_dir);
+
+        // Command succeeds (exit 0) but doesn't actually fix the conflicts —
+        // the file still has conflict markers, caught by the safety check.
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::LlmAssisted,
+            repair_command: Some("true".to_string()),
+            repair_timeout_seconds: 10,
+        };
+        let err = apply_workspace_patch_to_source(
+            &source_repo,
+            "task-llm-noop",
+            patch.as_bytes(),
+            &resolution_config,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ParallelWorkspaceMergeFailureKind::MergeConflict);
+        assert!(
+            err.message.contains("left conflict markers"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn llm_assisted_timeout() {
+        let temp_dir = TempDir::new().unwrap();
+        let (source_repo, patch) = setup_diverged_repo_for_conflict(&temp_dir);
+
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::LlmAssisted,
+            repair_command: Some("sleep 60".to_string()),
+            repair_timeout_seconds: 1,
+        };
+        let err = apply_workspace_patch_to_source(
+            &source_repo,
+            "task-llm-timeout",
+            patch.as_bytes(),
+            &resolution_config,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ParallelWorkspaceMergeFailureKind::RuntimeFailure);
+        assert!(
+            err.message.contains("timed out"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn llm_assisted_context_files_written() {
+        let temp_dir = TempDir::new().unwrap();
+        let (source_repo, patch) = setup_diverged_repo_for_conflict(&temp_dir);
+
+        // Command that resolves and lets us verify artifacts were written
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::LlmAssisted,
+            repair_command: Some(
+                "printf 'resolved\\n' > shared.txt".to_string(),
+            ),
+            repair_timeout_seconds: 10,
+        };
+        apply_workspace_patch_to_source(
+            &source_repo,
+            "task-ctx",
+            patch.as_bytes(),
+            &resolution_config,
+        )
+        .unwrap();
+
+        let context_path = source_repo.join(".yarli/merge-conflict-context.json");
+        assert!(
+            context_path.exists(),
+            "context JSON should exist at {}",
+            context_path.display()
+        );
+        let context_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&context_path).unwrap()).unwrap();
+        assert_eq!(context_json["task_key"], "task-ctx");
+        assert!(
+            context_json["conflicted_files"].as_array().unwrap().len() > 0,
+            "should have at least one conflicted file"
+        );
+        let first_file = &context_json["conflicted_files"][0];
+        assert_eq!(first_file["path"], "shared.txt");
+        // Should have conflict_markers content
+        assert!(
+            first_file["conflict_markers"]
+                .as_str()
+                .unwrap()
+                .contains("<<<<<<<"),
+            "conflict_markers should contain markers"
+        );
+
+        let prompt_path = source_repo.join(".yarli/merge-conflict-prompt.md");
+        assert!(
+            prompt_path.exists(),
+            "prompt markdown should exist at {}",
+            prompt_path.display()
+        );
+        let prompt = std::fs::read_to_string(&prompt_path).unwrap();
+        assert!(prompt.contains("Merge Conflict Resolution"));
+        assert!(prompt.contains("shared.txt"));
+    }
+
+    #[test]
+    fn llm_assisted_conflict_markers_check() {
+        let temp_dir = TempDir::new().unwrap();
+        let (source_repo, patch) = setup_diverged_repo_for_conflict(&temp_dir);
+
+        // Command that resolves git conflicts (via checkout --theirs) but leaves
+        // marker-like content in the file.
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::LlmAssisted,
+            repair_command: Some(
+                r#"git checkout --theirs -- shared.txt && git add -A && printf '<<<<<<< leftover\nresolved\n>>>>>>> leftover\n' > shared.txt"#.to_string(),
+            ),
+            repair_timeout_seconds: 10,
+        };
+        let err = apply_workspace_patch_to_source(
+            &source_repo,
+            "task-markers",
+            patch.as_bytes(),
+            &resolution_config,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ParallelWorkspaceMergeFailureKind::MergeConflict);
+        assert!(
+            err.message.contains("left conflict markers"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn llm_assisted_env_vars_set() {
+        let temp_dir = TempDir::new().unwrap();
+        let (source_repo, patch) = setup_diverged_repo_for_conflict(&temp_dir);
+
+        let env_dump_path = temp_dir.path().join("env_dump.txt");
+        let cmd = format!(
+            r#"env | grep ^YARLI_ > '{}' && printf 'resolved\n' > shared.txt"#,
+            env_dump_path.display()
+        );
+        let resolution_config = MergeResolutionConfig {
+            strategy: config::MergeConflictResolution::LlmAssisted,
+            repair_command: Some(cmd),
+            repair_timeout_seconds: 10,
+        };
+        apply_workspace_patch_to_source(
+            &source_repo,
+            "task-env",
+            patch.as_bytes(),
+            &resolution_config,
+        )
+        .unwrap();
+
+        let env_dump = std::fs::read_to_string(&env_dump_path).unwrap();
+        assert!(
+            env_dump.contains("YARLI_CONFLICT_CONTEXT="),
+            "should set YARLI_CONFLICT_CONTEXT: {env_dump}"
+        );
+        assert!(
+            env_dump.contains("YARLI_CONFLICT_PROMPT="),
+            "should set YARLI_CONFLICT_PROMPT: {env_dump}"
+        );
+        assert!(
+            env_dump.contains("YARLI_CONFLICTED_FILES="),
+            "should set YARLI_CONFLICTED_FILES: {env_dump}"
+        );
+        assert!(
+            env_dump.contains("YARLI_TASK_KEY=task-env"),
+            "should set YARLI_TASK_KEY: {env_dump}"
         );
     }
 }

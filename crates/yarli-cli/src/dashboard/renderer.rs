@@ -1,9 +1,10 @@
 //! Dashboard mode renderer — fullscreen TUI (Section 16.3).
 //!
-//! Manages a fullscreen terminal with panel layout: task list (left),
-//! output viewer (right), gates panel, Why Not Done bar, and key hints.
+//! Manages a fullscreen terminal with panel layout: task list (left), output viewer,
+//! gates panel, audit panel, Why Not Done bar, and key hints.
 
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEvent};
@@ -29,6 +30,7 @@ use super::widgets::CollapsiblePanel;
 use crate::stream::events::StreamEvent;
 use crate::stream::spinner::{Spinner, GLYPH_BLOCKED, GLYPH_COMPLETE, GLYPH_FAILED, GLYPH_PENDING};
 use crate::stream::style::Tier;
+use yarli_observability::{AuditSink, JsonlAuditSink};
 
 /// Configuration for the dashboard renderer.
 #[derive(Debug, Clone)]
@@ -51,11 +53,12 @@ pub struct DashboardRenderer {
     config: DashboardConfig,
     copy_mode: CopyMode,
     overlays: OverlayStack,
+    audit_file: Option<PathBuf>,
 }
 
 impl DashboardRenderer {
     /// Create a new dashboard renderer, entering alternate screen + raw mode.
-    pub fn new(config: DashboardConfig) -> io::Result<Self> {
+    pub fn new(config: DashboardConfig, audit_file: Option<PathBuf>) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         stdout.execute(EnterAlternateScreen)?;
@@ -70,6 +73,7 @@ impl DashboardRenderer {
             config,
             copy_mode: CopyMode::new(),
             overlays: OverlayStack::new(),
+            audit_file,
         })
     }
 
@@ -217,6 +221,7 @@ impl DashboardRenderer {
         let task_lines = build_task_list_lines(state, spinners);
         let output_lines = build_output_lines(state);
         let gate_lines = build_gate_lines(state);
+        let audit_lines = self.build_audit_lines();
         let explain_line = build_explain_line(state);
         let key_hints_line = build_key_hints_line(state);
         let title_line = if borderless {
@@ -230,6 +235,7 @@ impl DashboardRenderer {
         let task_panel_state = state.panel_state(PanelId::TaskList);
         let output_panel_state = state.panel_state(PanelId::Output);
         let gates_panel_state = state.panel_state(PanelId::Gates);
+        let audit_panel_state = state.panel_state(PanelId::Audit);
         let focused = state.focused;
         let task_scroll = state
             .scroll_offsets
@@ -244,6 +250,11 @@ impl DashboardRenderer {
         let gate_scroll = state
             .scroll_offsets
             .get(&PanelId::Gates)
+            .copied()
+            .unwrap_or(0);
+        let audit_scroll = state
+            .scroll_offsets
+            .get(&PanelId::Audit)
             .copied()
             .unwrap_or(0);
         let auto_scroll = state.output_auto_scroll;
@@ -299,47 +310,75 @@ impl DashboardRenderer {
                 .borderless(borderless);
             frame.render_widget(task_panel, body_cols[0]);
 
-            // Right column: vertical split [Output | Gates].
-            let right_constraints = match gates_panel_state {
-                PanelState::Hidden => vec![Constraint::Min(3)],
-                PanelState::Collapsed => vec![Constraint::Min(3), Constraint::Length(1)],
-                PanelState::Expanded => {
-                    if body_area.height >= 40 {
-                        vec![Constraint::Percentage(70), Constraint::Percentage(30)]
-                    } else {
-                        vec![Constraint::Min(5), Constraint::Length(5)]
-                    }
+            // Right column: [Output | Gates | Audit].
+            let mut right_constraints = Vec::new();
+            let mut right_panel_states = Vec::new();
+            for panel_state in &[output_panel_state, gates_panel_state, audit_panel_state] {
+                if *panel_state != PanelState::Hidden {
+                    right_panel_states.push(*panel_state);
                 }
-            };
+            }
+
+            let visible_panels = right_panel_states.len();
+            for state in right_panel_states.iter() {
+                match state {
+                    PanelState::Expanded => {
+                        let constraint = match visible_panels {
+                            1 => Constraint::Min(3),
+                            2 => Constraint::Percentage(50),
+                            _ => Constraint::Percentage(34),
+                        };
+                        right_constraints.push(constraint);
+                    }
+                    PanelState::Collapsed => right_constraints.push(Constraint::Length(1)),
+                    PanelState::Hidden => {}
+                }
+            }
+            if right_constraints.is_empty() {
+                right_constraints.push(Constraint::Min(3));
+            }
 
             let right_rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(right_constraints.clone())
                 .split(body_cols[1]);
 
-            // Output panel.
-            let output_title = if !auto_scroll {
-                "Output [PAUSED]"
-            } else {
-                "Output"
-            };
-            let output_panel = CollapsiblePanel::new(output_title, output_panel_state)
-                .content(output_lines)
-                .focused(focused == PanelId::Output)
-                .scroll_offset(output_scroll)
-                .shortcut(Some('2'))
-                .borderless(borderless);
-            frame.render_widget(output_panel, right_rows[0]);
+            let mut right_index = 0usize;
+            if output_panel_state != PanelState::Hidden {
+                let output_title = if !auto_scroll {
+                    "Output [PAUSED]"
+                } else {
+                    "Output"
+                };
+                let output_panel = CollapsiblePanel::new(output_title, output_panel_state)
+                    .content(output_lines)
+                    .focused(focused == PanelId::Output)
+                    .scroll_offset(output_scroll)
+                    .shortcut(Some('2'))
+                    .borderless(borderless);
+                frame.render_widget(output_panel, right_rows[right_index]);
+                right_index += 1;
+            }
 
-            // Gates panel (if visible).
-            if right_constraints.len() > 1 {
+            if gates_panel_state != PanelState::Hidden {
                 let gate_panel = CollapsiblePanel::new("Gates", gates_panel_state)
                     .content(gate_lines)
                     .focused(focused == PanelId::Gates)
                     .scroll_offset(gate_scroll)
                     .shortcut(Some('3'))
                     .borderless(borderless);
-                frame.render_widget(gate_panel, right_rows[1]);
+                frame.render_widget(gate_panel, right_rows[right_index]);
+                right_index += 1;
+            }
+
+            if audit_panel_state != PanelState::Hidden {
+                let audit_panel = CollapsiblePanel::new("Audit", audit_panel_state)
+                    .content(audit_lines)
+                    .focused(focused == PanelId::Audit)
+                    .scroll_offset(audit_scroll)
+                    .shortcut(Some('4'))
+                    .borderless(borderless);
+                frame.render_widget(audit_panel, right_rows[right_index]);
             }
 
             // WHY NOT DONE bar.
@@ -368,6 +407,22 @@ impl DashboardRenderer {
     pub fn state_mut(&mut self) -> &mut PanelManager {
         &mut self.state
     }
+
+    fn build_audit_lines(&self) -> Vec<Line<'static>> {
+        let Some(path) = self.audit_file.as_deref() else {
+            return vec![Line::from(Span::styled(
+                " No audit file configured",
+                Tier::Contextual.style(),
+            ))];
+        };
+
+        build_audit_lines_from_file(path).unwrap_or_else(|err| {
+            vec![Line::from(Span::styled(
+                format!(" Failed to read audit log: {err}"),
+                Tier::Urgent.style(),
+            ))]
+        })
+    }
 }
 
 impl Drop for DashboardRenderer {
@@ -379,6 +434,38 @@ impl Drop for DashboardRenderer {
 // ---------------------------------------------------------------------------
 // Line builders — pure functions for testability
 // ---------------------------------------------------------------------------
+
+fn build_audit_lines_from_file(path: &Path) -> io::Result<Vec<Line<'static>>> {
+    let sink = JsonlAuditSink::new(path);
+    let entries = sink
+        .read_all()
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+
+    if entries.is_empty() {
+        return Ok(vec![Line::from(Span::styled(
+            " No audit events yet",
+            Tier::Contextual.style(),
+        ))]);
+    }
+
+    let rows = entries
+        .into_iter()
+        .rev()
+        .take(40)
+        .map(|entry| {
+            let row = format!(
+                "{:<20} {:<20} {:<16} {}",
+                entry.timestamp.format("%m-%d %H:%M:%S"),
+                format!("{:?}", entry.category),
+                entry.actor,
+                entry.reason
+            );
+            Line::from(Span::styled(row, Tier::Contextual.style()))
+        })
+        .collect();
+
+    Ok(rows)
+}
 
 /// Build task list lines with state glyphs and timing.
 pub fn build_task_list_lines<'a>(
@@ -572,7 +659,7 @@ pub fn build_help_text() -> Vec<String> {
         "    q / Ctrl-C    Quit".into(),
         "    Tab           Cycle focus to next panel".into(),
         "    Shift+Tab     Cycle focus to previous panel".into(),
-        "    1-3           Jump to panel".into(),
+        "    1-4           Jump to panel".into(),
         "    c             Toggle copy mode".into(),
         "    ?             Toggle this help".into(),
         "    Esc           Dismiss overlay".into(),

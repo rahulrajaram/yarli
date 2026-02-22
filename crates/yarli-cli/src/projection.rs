@@ -152,6 +152,67 @@ pub(crate) fn collect_run_token_totals(
     Ok(totals)
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunResourceTotals {
+    pub(crate) total_cpu_user_ticks: u64,
+    pub(crate) total_cpu_system_ticks: u64,
+    pub(crate) total_io_read_bytes: u64,
+    pub(crate) total_io_write_bytes: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) peak_rss_bytes: u64,
+}
+
+pub(crate) fn collect_run_resource_totals(
+    store: &dyn EventStore,
+    correlation_id: Uuid,
+) -> Result<RunResourceTotals> {
+    let events = query_events(store, &EventQuery::by_correlation(correlation_id))?;
+    let mut totals = RunResourceTotals::default();
+    let mut seen_command_ids: HashSet<String> = HashSet::new();
+
+    for event in &events {
+        if event.entity_type != EntityType::Command {
+            continue;
+        }
+        if !matches!(
+            event.event_type.as_str(),
+            "command.exited" | "command.timed_out" | "command.killed" | "command.completed"
+        ) {
+            continue;
+        }
+        if !seen_command_ids.insert(event.entity_id.clone()) {
+            continue;
+        }
+
+        if let Some(raw_usage) = event
+            .payload
+            .get("resource_usage")
+            .or_else(|| event.payload.get("command_resource_usage"))
+        {
+            if let Ok(usage) = serde_json::from_value::<CommandResourceUsage>(raw_usage.clone()) {
+                if let Some(value) = usage.cpu_user_ticks {
+                    totals.total_cpu_user_ticks = totals.total_cpu_user_ticks.saturating_add(value);
+                }
+                if let Some(value) = usage.cpu_system_ticks {
+                    totals.total_cpu_system_ticks = totals.total_cpu_system_ticks.saturating_add(value);
+                }
+                if let Some(value) = usage.io_read_bytes {
+                    totals.total_io_read_bytes = totals.total_io_read_bytes.saturating_add(value);
+                }
+                if let Some(value) = usage.io_write_bytes {
+                    totals.total_io_write_bytes = totals.total_io_write_bytes.saturating_add(value);
+                }
+                if let Some(value) = usage.max_rss_bytes {
+                    totals.peak_rss_bytes = totals.peak_rss_bytes.max(value);
+                }
+            }
+        }
+    }
+
+    totals.total_tokens = collect_run_token_totals(store, correlation_id)?.total_tokens;
+    Ok(totals)
+}
+
 pub(crate) fn run_state_from_event(event: &Event) -> Option<RunState> {
         event
             .payload

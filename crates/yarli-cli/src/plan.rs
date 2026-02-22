@@ -24,6 +24,7 @@ use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
 use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue};
 use yarli_store::{InMemoryEventStore, PostgresEventStore};
+use yarli_observability::{Registry, YarliMetrics};
 
 /// `yarli run start` — create a run, submit tasks, drive scheduler with stream output.
 #[derive(Debug, Clone)]
@@ -1016,6 +1017,12 @@ pub(crate) async fn execute_run_plan(
     ensure_write_backend_guard(loaded_config, "run start")?;
     config::ensure_parallel_workspace_contract(loaded_config)?;
 
+    let mut metrics_registry = Registry::default();
+    let metrics = Arc::new(YarliMetrics::new(&mut metrics_registry));
+
+    #[cfg(feature = "chaos")]
+    let chaos = Some(Arc::new(yarli_chaos::ChaosController::new()));
+
     match loaded_config.backend_selection()? {
         BackendSelection::InMemory => {
             println!("Using backend: in-memory");
@@ -1028,15 +1035,18 @@ pub(crate) async fn execute_run_plan(
                 store,
                 queue,
                 allow_recursive_run_override,
+                metrics,
+                #[cfg(feature = "chaos")]
+                chaos,
             )
             .await
         }
         BackendSelection::Postgres { database_url } => {
             println!("Using backend: postgres");
-            let store =
-                Arc::new(PostgresEventStore::new(&database_url).map_err(|e| {
-                    anyhow::anyhow!("failed to initialize postgres event store: {e}")
-                })?);
+            let store = PostgresEventStore::new(&database_url).map_err(|e| {
+                anyhow::anyhow!("failed to initialize postgres event store: {e}")
+            })?;
+            let store = Arc::new(store.with_metrics(metrics.clone()));
             let queue =
                 Arc::new(PostgresTaskQueue::new(&database_url).map_err(|e| {
                     anyhow::anyhow!("failed to initialize postgres task queue: {e}")
@@ -1048,6 +1058,9 @@ pub(crate) async fn execute_run_plan(
                 store,
                 queue,
                 allow_recursive_run_override,
+                metrics,
+                #[cfg(feature = "chaos")]
+                chaos,
             )
             .await
         }

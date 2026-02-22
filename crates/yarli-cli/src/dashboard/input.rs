@@ -15,7 +15,7 @@ pub enum DashboardAction {
     FocusNext,
     /// Cycle focus to previous panel (Shift+Tab).
     FocusPrev,
-    /// Jump to specific panel (1-3).
+    /// Jump to specific panel (1-4).
     FocusPanel(PanelId),
     /// Collapse the focused panel (-/[).
     Collapse,
@@ -72,6 +72,7 @@ pub fn map_key_event(event: KeyEvent, focused: PanelId) -> DashboardAction {
         KeyCode::Char('1') => return DashboardAction::FocusPanel(PanelId::TaskList),
         KeyCode::Char('2') => return DashboardAction::FocusPanel(PanelId::Output),
         KeyCode::Char('3') => return DashboardAction::FocusPanel(PanelId::Gates),
+        KeyCode::Char('4') => return DashboardAction::FocusPanel(PanelId::Audit),
         _ => {}
     }
 
@@ -173,6 +174,10 @@ mod tests {
         assert_eq!(
             map_key_event(key(KeyCode::Char('3')), PanelId::TaskList),
             DashboardAction::FocusPanel(PanelId::Gates)
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('4')), PanelId::TaskList),
+            DashboardAction::FocusPanel(PanelId::Audit)
         );
     }
 

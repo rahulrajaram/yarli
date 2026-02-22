@@ -3,16 +3,16 @@
 //! Provides a composable tracing-subscriber setup with:
 //! - JSON or human-readable formatting
 //! - `RUST_LOG` environment filter (defaults to `info`)
-//! - Correlation ID propagation via tracing spans
-//!
-//! OTLP exporter integration is deferred until `tracing-opentelemetry` is
-//! added as a workspace dependency; the current setup outputs structured logs
-//! that are compatible with log collectors (Loki, Fluentd, etc.).
+//! - Optional OTLP export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
 
+use std::env;
+
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
 use tracing::Level;
-use tracing_subscriber::fmt;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+const OTEL_ENDPOINT_ENV_VAR: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
 /// Configuration for the tracing subsystem.
 #[derive(Debug, Clone)]
@@ -65,34 +65,74 @@ pub fn init_tracing(config: &TracingConfig) -> Result<(), TracingInitError> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(config.default_level.as_str()));
 
-    if config.json {
-        let fmt_layer = fmt::layer()
-            .json()
-            .with_target(config.target)
-            .with_thread_ids(config.thread_ids)
-            .with_file(config.file_info)
-            .with_line_number(config.file_info);
+    let maybe_tracer = match env::var(OTEL_ENDPOINT_ENV_VAR) {
+        Ok(endpoint) if !endpoint.trim().is_empty() => {
+            let exporter = opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(&endpoint);
 
-        tracing_subscriber::registry()
+            let provider = opentelemetry_otlp::new_pipeline()
+                .tracing()
+                .with_exporter(exporter)
+                .install_simple()
+                .map_err(|err| TracingInitError::OTelSetup(err.to_string()))?;
+            let tracer = provider.tracer("yarli");
+
+            Some(tracer)
+        }
+        _ => None,
+    };
+
+    // Each combination of (otel, json) produces a unique subscriber type,
+    // so we branch explicitly to let the compiler infer each chain.
+    let init_result = match (maybe_tracer, config.json) {
+        (Some(tracer), true) => tracing_subscriber::registry()
             .with(filter)
-            .with(fmt_layer)
-            .try_init()
-            .map_err(|_| TracingInitError::AlreadyInitialized)?;
-    } else {
-        let fmt_layer = fmt::layer()
-            .with_target(config.target)
-            .with_thread_ids(config.thread_ids)
-            .with_file(config.file_info)
-            .with_line_number(config.file_info);
-
-        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_target(config.target)
+                    .with_thread_ids(config.thread_ids)
+                    .with_file(config.file_info)
+                    .with_line_number(config.file_info),
+            )
+            .try_init(),
+        (Some(tracer), false) => tracing_subscriber::registry()
             .with(filter)
-            .with(fmt_layer)
-            .try_init()
-            .map_err(|_| TracingInitError::AlreadyInitialized)?;
-    }
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(
+                fmt::layer()
+                    .with_target(config.target)
+                    .with_thread_ids(config.thread_ids)
+                    .with_file(config.file_info)
+                    .with_line_number(config.file_info),
+            )
+            .try_init(),
+        (None, true) => tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_target(config.target)
+                    .with_thread_ids(config.thread_ids)
+                    .with_file(config.file_info)
+                    .with_line_number(config.file_info),
+            )
+            .try_init(),
+        (None, false) => tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                fmt::layer()
+                    .with_target(config.target)
+                    .with_thread_ids(config.thread_ids)
+                    .with_file(config.file_info)
+                    .with_line_number(config.file_info),
+            )
+            .try_init(),
+    };
 
-    Ok(())
+    init_result.map_err(|_| TracingInitError::AlreadyInitialized)
 }
 
 /// Errors from tracing initialization.
@@ -100,6 +140,9 @@ pub fn init_tracing(config: &TracingConfig) -> Result<(), TracingInitError> {
 pub enum TracingInitError {
     #[error("tracing subscriber already initialized")]
     AlreadyInitialized,
+
+    #[error("failed to configure OTLP tracing: {0}")]
+    OTelSetup(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -140,5 +183,11 @@ mod tests {
     fn tracing_init_error_display() {
         let err = TracingInitError::AlreadyInitialized;
         assert_eq!(err.to_string(), "tracing subscriber already initialized");
+
+        let err = TracingInitError::OTelSetup("collector unreachable".to_string());
+        assert_eq!(
+            err.to_string(),
+            "failed to configure OTLP tracing: collector unreachable"
+        );
     }
 }
