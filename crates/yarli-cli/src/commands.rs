@@ -952,9 +952,7 @@ where
     let mut indegree = HashMap::with_capacity(plan.tasks.len());
     let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
     for planned in &plan.tasks {
-        indegree
-            .entry(planned.task_key.clone())
-            .or_insert(0usize);
+        indegree.entry(planned.task_key.clone()).or_insert(0usize);
         for depends_on_key in &planned.depends_on {
             if !task_key_to_id.contains_key(depends_on_key) {
                 bail!(

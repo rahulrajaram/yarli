@@ -334,7 +334,13 @@ fn validate_run_spec_task_dependencies(tasks: &[RunSpecTask]) -> Result<()> {
 
     for task_key in available_keys {
         if !visited.contains(task_key) {
-            detect_task_dependency_cycle(task_key, &dependency_graph, &mut visited, &mut visiting_stack, &mut visiting_lookup)?;
+            detect_task_dependency_cycle(
+                task_key,
+                &dependency_graph,
+                &mut visited,
+                &mut visiting_stack,
+                &mut visiting_lookup,
+            )?;
         }
     }
 
@@ -362,14 +368,23 @@ fn detect_task_dependency_cycle<'a>(
             .chain(std::iter::once(&task_key))
             .copied()
             .collect();
-        bail!("run spec has cyclic task dependency: {}", cycle.join(" -> "));
+        bail!(
+            "run spec has cyclic task dependency: {}",
+            cycle.join(" -> ")
+        );
     }
 
     visiting_lookup.insert(task_key);
     visiting_stack.push(task_key);
 
     for dep in dependency_graph.get(task_key).into_iter().flatten() {
-        detect_task_dependency_cycle(dep, dependency_graph, visited, visiting_stack, visiting_lookup)?;
+        detect_task_dependency_cycle(
+            dep,
+            dependency_graph,
+            visited,
+            visiting_stack,
+            visiting_lookup,
+        )?;
     }
 
     visiting_lookup.remove(task_key);

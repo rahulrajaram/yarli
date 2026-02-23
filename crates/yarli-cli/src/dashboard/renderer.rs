@@ -93,8 +93,13 @@ impl DashboardRenderer {
                 task_name,
                 depends_on,
             } => {
-                self.state
-                    .update_task(task_id, &task_name, TaskState::TaskOpen, None, Some(depends_on));
+                self.state.update_task(
+                    task_id,
+                    &task_name,
+                    TaskState::TaskOpen,
+                    None,
+                    Some(depends_on),
+                );
             }
             StreamEvent::TaskTransition {
                 task_id,
@@ -521,7 +526,10 @@ pub fn build_task_list_lines<'a>(
             Span::styled(format!(" {:<6}", elapsed_str), Tier::Contextual.style()),
         ];
         if let Some(by) = task.blocked_by.as_deref() {
-            spans.push(Span::styled(format!(" blocked_by={by}"), Tier::Contextual.style()));
+            spans.push(Span::styled(
+                format!(" blocked_by={by}"),
+                Tier::Contextual.style(),
+            ));
         }
         lines.push(Line::from(spans));
     }
