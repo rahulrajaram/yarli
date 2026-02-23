@@ -14,12 +14,12 @@ use uuid::Uuid;
 use yarli_core::domain::Event;
 use yarli_core::explain::{DeteriorationFactor, DeteriorationReport, DeteriorationTrend};
 use yarli_memory::{
-    MemoryCliAdapter, InsertMemory, MemoryAdapter, MemoryClass, MemoryQuery, ScopeId,
+    InsertMemory, MemoryAdapter, MemoryClass, MemoryCliAdapter, MemoryQuery, ScopeId,
 };
 use yarli_store::event_store::EventQuery;
 use yarli_store::EventStore;
 
-use crate::config::LoadedConfig;
+use crate::config::{LoadedConfig, MemoryProviderKind};
 use crate::plan::RunPlan;
 use crate::prompt;
 use crate::{append_event, IncrementalEventCursor};
@@ -1559,11 +1559,9 @@ pub(crate) fn build_memory_observer(
     task_names: &[(Uuid, String)],
 ) -> Result<Option<MemoryObserver>> {
     let memory_cfg = &loaded_config.config().memory;
-    let mem = &memory_cfg.backend;
-    let enabled = memory_cfg.enabled.unwrap_or(mem.enabled);
-    if !enabled || !mem.enabled {
+    let Some(provider) = memory_cfg.resolve_provider()? else {
         return Ok(None);
-    }
+    };
 
     let cwd = std::env::current_dir().context("failed to read current working directory")?;
     let prompt_root = prompt::find_prompt_upwards(cwd.clone())
@@ -1583,7 +1581,7 @@ pub(crate) fn build_memory_observer(
         })
         .unwrap_or_else(|| "default".to_string());
 
-    let project_dir = mem
+    let project_dir = provider
         .project_dir
         .as_deref()
         .filter(|s| !s.trim().is_empty())
@@ -1597,7 +1595,9 @@ pub(crate) fn build_memory_observer(
         })
         .unwrap_or_else(|| prompt_root.clone());
 
-    let adapter = MemoryCliAdapter::new(mem.command.clone(), project_dir);
+    let adapter = match provider.kind {
+        MemoryProviderKind::Cli => MemoryCliAdapter::new(provider.command, project_dir),
+    };
 
     let task_keys = plan.tasks.iter().map(|t| t.task_key.clone()).collect();
 
@@ -1607,9 +1607,9 @@ pub(crate) fn build_memory_observer(
         correlation_id,
         plan.objective.clone(),
         adapter,
-        mem.query_limit,
-        mem.inject_on_run_start,
-        mem.inject_on_failure,
+        provider.query_limit,
+        provider.inject_on_run_start,
+        provider.inject_on_failure,
         task_keys,
         task_names,
     )))

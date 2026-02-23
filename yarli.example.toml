@@ -130,6 +130,38 @@ max_run_peak_rss_bytes = 2147483648  # 2 GiB
 enforce_policies = true
 audit_decisions = true
 
+[memory]
+# Enable memory integrations and choose a named provider from [memory.providers.<name>].
+# enabled = true
+# project_id = "my-project"
+# provider = "default"
+
+# Generic provider registry (adapter pattern).
+# Configure one or more providers and select with [memory].provider.
+[memory.providers.default]
+type = "cli"
+enabled = false
+command = "memory-backend"
+# project_dir = "."
+query_limit = 8
+inject_on_run_start = true
+inject_on_failure = true
+
+# Example alternative plugin provider:
+# [memory.providers.kafka]
+# type = "cli"
+# enabled = false
+# command = "memory-kafka-adapter"
+# query_limit = 8
+# inject_on_run_start = true
+# inject_on_failure = true
+
+# Legacy fallback (still supported):
+# [memory.backend]
+# enabled = true
+# command = "memory-backend"
+# query_limit = 8
+
 [observability]
 audit_file = ".yarl/audit.jsonl"
 

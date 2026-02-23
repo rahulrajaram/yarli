@@ -30,6 +30,21 @@ use yarli_core::fsm::command::CommandState;
 
 use crate::error::ExecError;
 
+/// Derive a deterministic command ID from an idempotency key.
+///
+/// This keeps command entity IDs stable across retries/replays and lets callers
+/// pre-emit lifecycle events before runner completion.
+pub(crate) fn command_id_from_idempotency_key(idempotency_key: &str) -> Uuid {
+    let namespaced = format!("yarli:command:{idempotency_key}");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, namespaced.as_bytes())
+}
+
+pub(crate) fn command_id_for_request(idempotency_key: Option<&str>) -> Uuid {
+    idempotency_key
+        .map(command_id_from_idempotency_key)
+        .unwrap_or_else(Uuid::now_v7)
+}
+
 /// Request to execute a command.
 #[derive(Debug, Clone)]
 pub struct CommandRequest {
@@ -169,6 +184,7 @@ impl CommandRunner for LocalCommandRunner {
             request.command_class,
             request.correlation_id,
         );
+        execution.id = command_id_for_request(request.idempotency_key.as_deref());
         if let Some(key) = &request.idempotency_key {
             execution = execution.with_idempotency_key(key);
         }
@@ -184,7 +200,8 @@ impl CommandRunner for LocalCommandRunner {
         // TODO(phase1): Before spawn, create cgroup sandbox and set resource limits.
         //   After spawn, obtain pidfd for race-free lifecycle management.
         //   See IMPLEMENTATION_PLAN.md Section 18 sections 5.1, 5.2, 6.
-        let mut child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(&request.command)
             .current_dir(&request.working_dir)
@@ -192,10 +209,22 @@ impl CommandRunner for LocalCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(request.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(ExecError::SpawnFailed)?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        // Isolate each command in its own process group so cancellation tears
+        // down descendants (shell + child toolchain processes) reliably.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.spawn().map_err(ExecError::SpawnFailed)?;
         self.record_overhead(request.command_class, "spawn", spawn_start.elapsed());
+        let process_group_id = child.id().and_then(pid_to_process_group_id);
 
         let capture_start = Instant::now();
         let monitor = child.id().map(spawn_resource_monitor);
@@ -270,18 +299,18 @@ impl CommandRunner for LocalCommandRunner {
                 biased;
                 _ = cancel.cancelled() => {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
-                    kill_child(&mut child).await;
+                    kill_child(&mut child, process_group_id).await;
                     // Drain remaining output.
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
                 _ = tokio::time::sleep(dur) => {
                     warn!(cmd_id = %cmd_id, timeout = ?dur, "command timed out");
-                    kill_child(&mut child).await;
+                    kill_child(&mut child, process_group_id).await;
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Timeout(dur))
                 }
-                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
+                result = collect_and_wait(&mut child, process_group_id, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
                     result
                 }
             }
@@ -290,11 +319,11 @@ impl CommandRunner for LocalCommandRunner {
                 biased;
                 _ = cancel.cancelled() => {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
-                    kill_child(&mut child).await;
+                    kill_child(&mut child, process_group_id).await;
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
-                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
+                result = collect_and_wait(&mut child, process_group_id, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
                     result
                 }
             }
@@ -545,6 +574,7 @@ fn read_process_sample(_pid: u32) -> Option<ProcessSample> {
 /// is received within the given duration (detects hung processes).
 async fn collect_and_wait(
     child: &mut tokio::process::Child,
+    process_group_id: Option<i32>,
     rx: &mut tokio::sync::mpsc::Receiver<(StreamType, String)>,
     cmd_id: Uuid,
     seq: &mut u64,
@@ -596,7 +626,7 @@ async fn collect_and_wait(
                     idle_timeout = ?dur,
                     "command produced no output for idle_kill_timeout — killing"
                 );
-                kill_child(child).await;
+                kill_child(child, process_group_id).await;
                 drain_channel(rx, cmd_id, seq, chunks, live_tx).await;
                 return Err(ExecError::Timeout(dur));
             }
@@ -634,16 +664,51 @@ async fn drain_channel(
     }
 }
 
+fn pid_to_process_group_id(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok()
+}
+
 /// Kill a child process (best-effort).
-async fn kill_child(child: &mut tokio::process::Child) {
+async fn kill_child(child: &mut tokio::process::Child, process_group_id: Option<i32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = process_group_id {
+        let _ = signal_process_group(pgid, libc::SIGTERM);
+        for _ in 0..10 {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => tokio::time::sleep(Duration::from_millis(25)).await,
+                Err(err) => {
+                    warn!(error = %err, "failed to poll child process status during cancellation");
+                    break;
+                }
+            }
+        }
+        let _ = signal_process_group(pgid, libc::SIGKILL);
+    }
     if let Err(e) = child.kill().await {
         warn!(error = %e, "failed to kill child process");
     }
 }
 
+#[cfg(unix)]
+fn signal_process_group(process_group_id: i32, signal: i32) -> std::io::Result<()> {
+    // Negative PID targets the entire process group.
+    let rc = unsafe { libc::kill(-process_group_id, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if matches!(err.raw_os_error(), Some(code) if code == libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io;
 
     fn make_request(cmd: &str) -> CommandRequest {
         CommandRequest {
@@ -764,6 +829,40 @@ mod tests {
         let result = runner.run(req, cancel).await.unwrap();
         assert_eq!(result.execution.state, CommandState::CmdKilled);
         assert!(result.execution.ended_at.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cancellation_terminates_descendant_processes() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
+        let mut req = make_request("sleep 60 & echo child:$!; wait");
+        req.live_output_tx = Some(live_tx);
+
+        tokio::spawn(async move {
+            while let Some(chunk) = live_rx.recv().await {
+                if chunk.data.starts_with("child:") {
+                    cancel_clone.cancel();
+                    break;
+                }
+            }
+        });
+
+        let result = runner.run(req, cancel).await.unwrap();
+        assert_eq!(result.execution.state, CommandState::CmdKilled);
+
+        let child_pid = result
+            .chunks
+            .iter()
+            .find_map(|chunk| chunk.data.strip_prefix("child:"))
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+            .expect("expected child pid line in output");
+
+        wait_for_process_exit(child_pid, Duration::from_secs(2))
+            .await
+            .expect("descendant process should be terminated by cancellation");
     }
 
     #[tokio::test]
@@ -937,5 +1036,29 @@ mod tests {
         assert_eq!(live_chunks[2].data, "line3");
         // Sequences must match.
         assert_eq!(live_chunks[0].sequence, result.chunks[0].sequence);
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        let err = io::Error::last_os_error();
+        matches!(err.raw_os_error(), Some(code) if code == libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32, timeout: Duration) -> Result<(), ()> {
+        let started = Instant::now();
+        loop {
+            if !process_exists(pid) {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }

@@ -18,7 +18,9 @@ use yarli_observability::audit::{AuditEntry, AuditSink};
 use yarli_store::EventStore;
 
 use crate::error::ExecError;
-use crate::runner::{CommandRequest, CommandResult, CommandRunner};
+use crate::runner::{
+    command_id_from_idempotency_key, CommandRequest, CommandResult, CommandRunner,
+};
 
 /// Wraps a `CommandRunner` and persists execution events to an `EventStore`.
 pub struct CommandJournal<'a, R: CommandRunner, S: EventStore> {
@@ -54,36 +56,35 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandResult, ExecError> {
         let correlation_id = request.correlation_id;
+        let prestarted_command_id = request
+            .idempotency_key
+            .as_deref()
+            .map(command_id_from_idempotency_key);
+
+        // For idempotent requests, persist command.started before command execution.
+        // This keeps command lifecycle visible while the process is still running.
+        if let Some(command_id) = prestarted_command_id {
+            self.store
+                .append(command_started_from_request(&request, command_id))
+                .map_err(|e| ExecError::Journal(e.to_string()))?;
+        }
 
         // Run the command to completion.
         let result = self.runner.run(request, cancel).await?;
 
-        // Persist the started event.
-        let started_event = Event {
-            event_id: Uuid::now_v7(),
-            occurred_at: result.execution.started_at.unwrap_or_else(Utc::now),
-            entity_type: EntityType::Command,
-            entity_id: result.execution.id.to_string(),
-            event_type: "command.started".to_string(),
-            payload: serde_json::json!({
-                "command": result.execution.command,
-                "working_dir": result.execution.working_dir,
-                "command_class": result.execution.command_class,
-                "backend_metadata": result.backend_metadata,
-            }),
-            correlation_id,
-            causation_id: None,
-            actor: result.runner_actor.clone(),
-            idempotency_key: result
-                .execution
-                .idempotency_key
-                .as_ref()
-                .map(|k| format!("{k}:started")),
-        };
-
-        self.store
-            .append(started_event)
-            .map_err(|e| ExecError::Journal(e.to_string()))?;
+        if let Some(expected_command_id) = prestarted_command_id {
+            if result.execution.id != expected_command_id {
+                return Err(ExecError::Journal(format!(
+                    "runner command id mismatch: expected {expected_command_id}, got {}",
+                    result.execution.id
+                )));
+            }
+        } else {
+            // Non-idempotent requests retain legacy behavior.
+            self.store
+                .append(command_started_from_result(&result))
+                .map_err(|e| ExecError::Journal(e.to_string()))?;
+        }
 
         if let Err(err) = persist_task_output_artifact(
             result.execution.run_id,
@@ -177,6 +178,57 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
         }
 
         Ok(result)
+    }
+}
+
+fn command_started_from_request(request: &CommandRequest, command_id: Uuid) -> Event {
+    Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: Utc::now(),
+        entity_type: EntityType::Command,
+        entity_id: command_id.to_string(),
+        event_type: "command.started".to_string(),
+        payload: serde_json::json!({
+            "run_id": request.run_id,
+            "task_id": request.task_id,
+            "command": request.command,
+            "working_dir": request.working_dir,
+            "command_class": request.command_class,
+            "backend_metadata": serde_json::Value::Null,
+        }),
+        correlation_id: request.correlation_id,
+        causation_id: None,
+        actor: "command_journal".to_string(),
+        idempotency_key: request
+            .idempotency_key
+            .as_ref()
+            .map(|k| format!("{k}:started")),
+    }
+}
+
+fn command_started_from_result(result: &CommandResult) -> Event {
+    Event {
+        event_id: Uuid::now_v7(),
+        occurred_at: result.execution.started_at.unwrap_or_else(Utc::now),
+        entity_type: EntityType::Command,
+        entity_id: result.execution.id.to_string(),
+        event_type: "command.started".to_string(),
+        payload: serde_json::json!({
+            "run_id": result.execution.run_id,
+            "task_id": result.execution.task_id,
+            "command": result.execution.command,
+            "working_dir": result.execution.working_dir,
+            "command_class": result.execution.command_class,
+            "backend_metadata": result.backend_metadata,
+        }),
+        correlation_id: result.execution.correlation_id,
+        causation_id: None,
+        actor: result.runner_actor.clone(),
+        idempotency_key: result
+            .execution
+            .idempotency_key
+            .as_ref()
+            .map(|k| format!("{k}:started")),
     }
 }
 

@@ -2,6 +2,7 @@
 //!
 //! Loop-2 requires explicit backend selection and typed config sections.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1376,17 +1377,79 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MemoryConfig {
-    /// Master switch. When unset, defaults to `memory.backend.enabled`.
+    /// Master switch. When unset, defaults to selected provider enabled state.
     ///
-    /// This is intentionally optional to preserve the simple legacy toggle:
-    /// setting `[memory.backend].enabled = true` should be enough to turn memory on.
+    /// Backward-compatible behavior:
+    /// - when using `[memory.backend]`, defaults to `memory.backend.enabled`
+    /// - when using `[memory.providers.<name>]`, defaults to selected provider's `enabled`
     #[serde(default)]
     pub enabled: Option<bool>,
     /// Optional explicit project identifier for memory scoping.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Named provider to select from `[memory.providers.<name>]`.
+    ///
+    /// Examples:
+    /// - `provider = "default"`
+    /// - `provider = "kafka"`
+    ///
+    /// When omitted, YARLI falls back to legacy `[memory.backend]`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Provider registry keyed by name.
+    #[serde(default)]
+    pub providers: BTreeMap<String, MemoryProviderConfig>,
+    /// Legacy single-backend configuration (kept for backward compatibility).
     #[serde(default)]
     pub backend: MemoryBackendConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryProviderKind {
+    #[default]
+    Cli,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryProviderConfig {
+    /// Provider type. `cli` shells out to a plugin binary implementing memory operations.
+    #[serde(rename = "type", default)]
+    pub kind: MemoryProviderKind,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Executable to invoke for CLI provider integration.
+    #[serde(default = "default_memory_command")]
+    pub command: String,
+    /// Directory to run provider CLI from (defaults to the directory containing `PROMPT.md`).
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Max results to query and inject.
+    #[serde(default = "default_memory_query_limit")]
+    pub query_limit: u32,
+    /// Query and emit memory hints once at run start.
+    #[serde(default = "default_true")]
+    pub inject_on_run_start: bool,
+    /// Query and emit memory hints when a task blocks/fails.
+    #[serde(default = "default_true")]
+    pub inject_on_failure: bool,
+}
+
+impl Default for MemoryProviderConfig {
+    fn default() -> Self {
+        Self {
+            kind: MemoryProviderKind::Cli,
+            enabled: true,
+            endpoint: None,
+            command: default_memory_command(),
+            project_dir: None,
+            query_limit: default_memory_query_limit(),
+            inject_on_run_start: true,
+            inject_on_failure: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1423,6 +1486,74 @@ impl Default for MemoryBackendConfig {
             inject_on_run_start: true,
             inject_on_failure: true,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedMemoryProviderConfig {
+    pub(crate) name: String,
+    pub(crate) kind: MemoryProviderKind,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) command: String,
+    pub(crate) project_dir: Option<String>,
+    pub(crate) query_limit: u32,
+    pub(crate) inject_on_run_start: bool,
+    pub(crate) inject_on_failure: bool,
+}
+
+impl MemoryConfig {
+    pub(crate) fn resolve_provider(&self) -> Result<Option<ResolvedMemoryProviderConfig>> {
+        let selected_provider = self
+            .provider
+            .as_deref()
+            .and_then(|name| trim_to_non_empty(name).map(|name| name.to_string()));
+
+        if let Some(provider_name) = selected_provider {
+            let provider = self.providers.get(&provider_name).with_context(|| {
+                format!(
+                    "memory.provider={provider_name:?} does not exist in [memory.providers.<name>]"
+                )
+            })?;
+            let enabled = self.enabled.unwrap_or(provider.enabled);
+            if !enabled || !provider.enabled {
+                return Ok(None);
+            }
+            return Ok(Some(ResolvedMemoryProviderConfig {
+                name: provider_name,
+                kind: provider.kind,
+                endpoint: provider.endpoint.clone(),
+                command: provider.command.clone(),
+                project_dir: provider.project_dir.clone(),
+                query_limit: provider.query_limit,
+                inject_on_run_start: provider.inject_on_run_start,
+                inject_on_failure: provider.inject_on_failure,
+            }));
+        }
+
+        let enabled = self.enabled.unwrap_or(self.backend.enabled);
+        if !enabled || !self.backend.enabled {
+            return Ok(None);
+        }
+
+        Ok(Some(ResolvedMemoryProviderConfig {
+            name: "legacy-backend".to_string(),
+            kind: MemoryProviderKind::Cli,
+            endpoint: self.backend.endpoint.clone(),
+            command: self.backend.command.clone(),
+            project_dir: self.backend.project_dir.clone(),
+            query_limit: self.backend.query_limit,
+            inject_on_run_start: self.backend.inject_on_run_start,
+            inject_on_failure: self.backend.inject_on_failure,
+        }))
+    }
+}
+
+fn trim_to_non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -1644,6 +1775,15 @@ mod tests {
             "git.destructive_default_deny",
             "policy.enforce_policies",
             "policy.audit_decisions",
+            "memory.provider",
+            "memory.providers.<name>.type",
+            "memory.providers.<name>.enabled",
+            "memory.providers.<name>.endpoint",
+            "memory.providers.<name>.command",
+            "memory.providers.<name>.project_dir",
+            "memory.providers.<name>.query_limit",
+            "memory.providers.<name>.inject_on_run_start",
+            "memory.providers.<name>.inject_on_failure",
             "memory.backend.enabled",
             "memory.backend.endpoint",
             "memory.backend.command",
@@ -2031,6 +2171,85 @@ mode = "stream"
                 .command_timeout_seconds,
             Some(123)
         );
+    }
+
+    #[test]
+    fn memory_provider_registry_resolves_named_provider() {
+        let loaded = write_test_config(
+            r#"
+[memory]
+enabled = true
+project_id = "proj-1"
+provider = "default"
+
+[memory.providers.default]
+type = "cli"
+enabled = true
+command = "memory-backend"
+project_dir = "."
+query_limit = 11
+inject_on_run_start = true
+inject_on_failure = false
+"#,
+        );
+
+        let resolved = loaded
+            .config()
+            .memory
+            .resolve_provider()
+            .expect("provider resolution should succeed")
+            .expect("provider should be enabled");
+
+        assert_eq!(resolved.name, "default");
+        assert_eq!(resolved.kind, MemoryProviderKind::Cli);
+        assert_eq!(resolved.command, "memory-backend");
+        assert_eq!(resolved.project_dir.as_deref(), Some("."));
+        assert_eq!(resolved.query_limit, 11);
+        assert!(resolved.inject_on_run_start);
+        assert!(!resolved.inject_on_failure);
+    }
+
+    #[test]
+    fn memory_provider_registry_falls_back_to_legacy_backend() {
+        let loaded = write_test_config(
+            r#"
+[memory]
+enabled = true
+
+[memory.backend]
+enabled = true
+command = "memory-backend"
+query_limit = 5
+inject_on_run_start = true
+inject_on_failure = true
+"#,
+        );
+
+        let resolved = loaded
+            .config()
+            .memory
+            .resolve_provider()
+            .expect("provider resolution should succeed")
+            .expect("legacy backend should be enabled");
+
+        assert_eq!(resolved.name, "legacy-backend");
+        assert_eq!(resolved.kind, MemoryProviderKind::Cli);
+        assert_eq!(resolved.command, "memory-backend");
+        assert_eq!(resolved.query_limit, 5);
+    }
+
+    #[test]
+    fn memory_provider_registry_errors_on_unknown_provider() {
+        let loaded = write_test_config(
+            r#"
+[memory]
+enabled = true
+provider = "missing"
+"#,
+        );
+
+        let err = loaded.config().memory.resolve_provider().unwrap_err();
+        assert!(err.to_string().contains("memory.provider"));
     }
 
     #[test]

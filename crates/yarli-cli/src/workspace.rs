@@ -539,6 +539,22 @@ fn prepare_parallel_workspace_layout_worktree(
 
         match result {
             Ok(output) if output.status.success() => {
+                if let Err(err) = mirror_runtime_config_into_workspace(
+                    &source_workdir,
+                    &workspace_dir,
+                    loaded_config,
+                ) {
+                    warn!(
+                        branch = %branch,
+                        workspace = %workspace_dir.display(),
+                        "failed to mirror runtime config into worktree: {err}; rolling back"
+                    );
+                    rollback_worktrees(&source_workdir, &created_worktrees);
+                    let _ = fs::remove_dir_all(&run_workspace_root);
+                    return Err(err.context(format!(
+                        "failed to mirror runtime config into worktree branch {branch}"
+                    )));
+                }
                 created_worktrees.push((workspace_dir.clone(), branch.clone()));
                 task_workspace_dirs.push(workspace_dir);
                 worktree_branches.push(branch);
@@ -575,6 +591,54 @@ fn prepare_parallel_workspace_layout_worktree(
         worktree_branches,
         source_workdir: Some(source_workdir),
     }))
+}
+
+/// Mirror local runtime config into a newly created worktree workspace.
+///
+/// `git worktree add` only materializes tracked files from HEAD. Since local
+/// runtime config (notably `yarli.toml`) is intentionally untracked in this
+/// repository, copy it explicitly so worker workspaces preserve parity.
+fn mirror_runtime_config_into_workspace(
+    source_workdir: &Path,
+    workspace_dir: &Path,
+    loaded_config: &LoadedConfig,
+) -> Result<()> {
+    let default_config = source_workdir.join(config::DEFAULT_CONFIG_PATH);
+    let loaded_path = loaded_config.path();
+    let loaded_candidate = if loaded_path.is_absolute() {
+        loaded_path.to_path_buf()
+    } else {
+        source_workdir.join(loaded_path)
+    };
+
+    let candidates = if loaded_candidate == default_config {
+        vec![default_config]
+    } else {
+        vec![default_config, loaded_candidate]
+    };
+
+    for source_config in candidates {
+        if !source_config.is_file() {
+            continue;
+        }
+        let Some(file_name) = source_config.file_name() else {
+            continue;
+        };
+        let destination = workspace_dir.join(file_name);
+        if destination.exists() {
+            return Ok(());
+        }
+        fs::copy(&source_config, &destination).with_context(|| {
+            format!(
+                "failed to copy runtime config {} to {}",
+                source_config.display(),
+                destination.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    Ok(())
 }
 
 /// Remove worktrees and their branches on failure.
@@ -5386,6 +5450,10 @@ worktree_root = "{}"
             assert!(
                 git_file.is_file(),
                 ".git should be a file in worktree, not a dir"
+            );
+            assert!(
+                dir.join("yarli.toml").is_file(),
+                "runtime config should be mirrored into worktree"
             );
         }
 

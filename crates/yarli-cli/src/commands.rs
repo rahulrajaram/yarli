@@ -1142,6 +1142,7 @@ where
             &plan,
             &task_names,
         )?,
+        Some(loaded_config),
     )
     .await?;
 
@@ -1768,6 +1769,129 @@ pub(crate) fn task_blocker_db(blocker: &yarli_core::entities::task::BlockerCode)
     }
 }
 
+#[derive(Debug, Default)]
+struct PostgresSyncState {
+    pool: Option<sqlx::PgPool>,
+    last_signature: Option<String>,
+}
+
+#[derive(Debug)]
+struct PostgresSyncSnapshot {
+    run_state: &'static str,
+    exit_reason: Option<&'static str>,
+    task_states: Vec<(Uuid, &'static str)>,
+}
+
+async fn initialize_postgres_sync_state(
+    loaded_config: Option<&LoadedConfig>,
+) -> Result<PostgresSyncState> {
+    let Some(loaded_config) = loaded_config else {
+        return Ok(PostgresSyncState::default());
+    };
+    let BackendSelection::Postgres { database_url } = loaded_config.backend_selection()? else {
+        return Ok(PostgresSyncState::default());
+    };
+
+    match PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+    {
+        Ok(pool) => Ok(PostgresSyncState {
+            pool: Some(pool),
+            last_signature: None,
+        }),
+        Err(error) => {
+            warn!(
+                config_path = %loaded_config.path().display(),
+                error = %error,
+                "failed to initialize postgres sync pool; disabling in-loop projection sync"
+            );
+            Ok(PostgresSyncState::default())
+        }
+    }
+}
+
+async fn build_postgres_sync_signature<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    run_id: Uuid,
+) -> Option<String>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let reg = scheduler.registry().read().await;
+    let run = reg.get_run(&run_id)?;
+    let run_state = run.state;
+    let run_exit_reason = run.exit_reason;
+    let mut task_states: Vec<(Uuid, TaskState)> = reg
+        .tasks_for_run(&run_id)
+        .iter()
+        .map(|task| (task.id, task.state))
+        .collect();
+    drop(reg);
+
+    task_states.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut signature = format!("run={run_state:?};exit={run_exit_reason:?};");
+    for (task_id, state) in task_states {
+        let _ = write!(signature, "{task_id}:{state:?};");
+    }
+    Some(signature)
+}
+
+async fn collect_postgres_sync_snapshot<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    run_id: Uuid,
+) -> Option<PostgresSyncSnapshot>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let reg = scheduler.registry().read().await;
+    let run = reg.get_run(&run_id)?;
+    let run_state = run_state_db(run.state);
+    let exit_reason = run.exit_reason.map(exit_reason_db);
+    let task_states: Vec<(Uuid, &'static str)> = reg
+        .tasks_for_run(&run_id)
+        .iter()
+        .map(|task| (task.id, task_state_db(task.state)))
+        .collect();
+    drop(reg);
+
+    Some(PostgresSyncSnapshot {
+        run_state,
+        exit_reason,
+        task_states,
+    })
+}
+
+async fn sync_postgres_state_if_changed<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    run_id: Uuid,
+    sync_state: &mut PostgresSyncState,
+) -> Result<bool>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let Some(pool) = sync_state.pool.as_ref() else {
+        return Ok(false);
+    };
+    let Some(signature) = build_postgres_sync_signature(scheduler, run_id).await else {
+        return Ok(false);
+    };
+    if sync_state.last_signature.as_ref() == Some(&signature) {
+        return Ok(false);
+    }
+
+    sync_postgres_state_with_pool(scheduler, pool, run_id).await?;
+    sync_state.last_signature = Some(signature);
+    Ok(true)
+}
+
 /// Sync the materialized run and task states in Postgres to match in-memory registry.
 ///
 /// The `runs.state` and `tasks.state` columns are seeded once at INSERT and never updated,
@@ -1787,26 +1911,28 @@ where
         return Ok(());
     };
 
-    let reg = scheduler.registry().read().await;
-    let run = match reg.get_run(&run_id) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-
-    let run_state = run_state_db(run.state);
-    let exit_reason = run.exit_reason.map(exit_reason_db);
-    let task_states: Vec<(Uuid, &'static str)> = reg
-        .tasks_for_run(&run_id)
-        .iter()
-        .map(|t| (t.id, task_state_db(t.state)))
-        .collect();
-    drop(reg);
-
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
         .await
         .context("sync_postgres_state: failed to connect")?;
+
+    sync_postgres_state_with_pool(scheduler, &pool, run_id).await
+}
+
+async fn sync_postgres_state_with_pool<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+) -> Result<()>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let Some(snapshot) = collect_postgres_sync_snapshot(scheduler, run_id).await else {
+        return Ok(());
+    };
 
     let mut tx = pool
         .begin()
@@ -1822,14 +1948,14 @@ where
         WHERE run_id = $3
         "#,
     )
-    .bind(run_state)
-    .bind(exit_reason)
+    .bind(snapshot.run_state)
+    .bind(snapshot.exit_reason)
     .bind(run_id)
     .execute(tx.as_mut())
     .await
     .context("sync_postgres_state: update runs")?;
 
-    for (task_id, state) in &task_states {
+    for (task_id, state) in &snapshot.task_states {
         sqlx::query(
             r#"
             UPDATE tasks
@@ -1849,8 +1975,8 @@ where
 
     debug!(
         run_id = %run_id,
-        run_state = run_state,
-        tasks = task_states.len(),
+        run_state = snapshot.run_state,
+        tasks = snapshot.task_states.len(),
         "synced postgres state"
     );
     Ok(())
@@ -2832,6 +2958,7 @@ pub(crate) async fn drive_scheduler<Q, S, R>(
     cancellation_diagnostics: bool,
     mut task_health_observer: Option<observers::TaskHealthArtifactObserver>,
     mut memory_observer: Option<observers::MemoryObserver>,
+    postgres_sync_config: Option<&LoadedConfig>,
 ) -> Result<yarli_core::entities::ContinuationPayload>
 where
     Q: yarli_queue::TaskQueue,
@@ -2852,6 +2979,7 @@ where
         correlation_id,
         observers::OBSERVER_WINDOW_SIZE,
     );
+    let mut postgres_sync_state = initialize_postgres_sync_state(postgres_sync_config).await?;
 
     if let Some(observer) = memory_observer.as_mut() {
         match tokio::time::timeout(
@@ -2939,6 +3067,12 @@ where
                     provenance,
                 )
                 .await?;
+                if let Err(err) =
+                    sync_postgres_state_if_changed(scheduler, run_id, &mut postgres_sync_state)
+                        .await
+                {
+                    warn!(run_id = %run_id, error = %err, "failed to sync postgres state after cancellation");
+                }
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
                 if let Some(observer) = task_health_observer.as_mut() {
@@ -3096,6 +3230,15 @@ where
                             operator_provenance,
                         )
                         .await?;
+                        if let Err(err) = sync_postgres_state_if_changed(
+                            scheduler,
+                            run_id,
+                            &mut postgres_sync_state,
+                        )
+                        .await
+                        {
+                            warn!(run_id = %run_id, error = %err, "failed to sync postgres state after operator cancellation");
+                        }
                         let cancel_events =
                             emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
                         if let Some(observer) = task_health_observer.as_mut() {
@@ -3166,6 +3309,12 @@ where
                         .tick_with_cancel(cancel.child_token())
                         .await
                         .context("scheduler tick failed")?;
+                    if let Err(err) =
+                        sync_postgres_state_if_changed(scheduler, run_id, &mut postgres_sync_state)
+                            .await
+                    {
+                        warn!(run_id = %run_id, error = %err, "failed to sync postgres state after scheduler tick");
+                    }
 
                     debug!(
                         tick = tick_count,
@@ -3232,6 +3381,15 @@ where
                                 operator_provenance,
                             )
                             .await?;
+                            if let Err(err) = sync_postgres_state_if_changed(
+                                scheduler,
+                                run_id,
+                                &mut postgres_sync_state,
+                            )
+                            .await
+                            {
+                                warn!(run_id = %run_id, error = %err, "failed to sync postgres state after post-tick operator cancellation");
+                            }
                             let _cancel_events =
                                 emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
                             if let Some(observer) = task_health_observer.as_mut() {
@@ -6834,6 +6992,33 @@ mod tests {
         (scheduler, store, run_id, correlation_id, task_names)
     }
 
+    #[tokio::test]
+    async fn postgres_sync_signature_changes_only_on_state_transitions() {
+        let (scheduler, _store, run_id, _correlation_id, _task_names) =
+            setup_drive_scheduler_fixture("true").await;
+
+        let initial = build_postgres_sync_signature(&scheduler, run_id)
+            .await
+            .expect("initial signature should exist");
+        let repeated = build_postgres_sync_signature(&scheduler, run_id)
+            .await
+            .expect("signature should remain available");
+        assert_eq!(
+            initial, repeated,
+            "signature should be stable when state is unchanged"
+        );
+
+        scheduler.tick().await.unwrap();
+
+        let after_tick = build_postgres_sync_signature(&scheduler, run_id)
+            .await
+            .expect("signature should exist after tick");
+        assert_ne!(
+            initial, after_tick,
+            "signature should change after run/task state transitions"
+        );
+    }
+
     #[test]
     fn run_help_mentions_prompt_resolution_precedence() {
         let mut cmd = Cli::command();
@@ -8054,6 +8239,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             ),
         )
         .await
@@ -8175,6 +8361,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             ),
         )
         .await
@@ -8247,6 +8434,7 @@ mod tests {
                 None,
                 0.9,
                 false,
+                None,
                 None,
                 None,
             ),
@@ -8421,6 +8609,7 @@ mod tests {
                     None,
                     0.9,
                     false,
+                    None,
                     None,
                     None,
                 ),

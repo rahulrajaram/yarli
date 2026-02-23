@@ -15,7 +15,9 @@ use yarli_core::entities::command_execution::{
 use yarli_core::fsm::command::CommandState;
 
 use crate::error::ExecError;
-use crate::runner::{estimate_token_usage, CommandRequest, CommandResult, CommandRunner};
+use crate::runner::{
+    command_id_for_request, estimate_token_usage, CommandRequest, CommandResult, CommandRunner,
+};
 
 const OVERWATCH_RUNNER_ACTOR: &str = "overwatch_runner";
 
@@ -163,6 +165,7 @@ impl CommandRunner for OverwatchCommandRunner {
             request.command_class,
             request.correlation_id,
         );
+        execution.id = command_id_for_request(request.idempotency_key.as_deref());
         if let Some(key) = &request.idempotency_key {
             execution = execution.with_idempotency_key(key);
         }

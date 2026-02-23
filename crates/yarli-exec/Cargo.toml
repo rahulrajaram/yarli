@@ -21,6 +21,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
+libc = "0.2"
 
 [features]
 chaos = ["dep:yarli-chaos"]

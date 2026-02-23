@@ -19,8 +19,9 @@ use crate::YARLI_VERSION;
 /// Recommended durability: use Postgres (`core.backend = "postgres"`); in-memory mode blocks writes
 /// unless explicitly opted in via `core.allow_in_memory_writes = true`.
 ///
-/// Optional memories: Backend-backed memory hints/storage can be enabled via `yarli.toml`
-/// (`[memory.backend] enabled = true`). See `yarli init --help` for config keys.
+/// Optional memories: adapter-backed memory hints/storage can be enabled via `yarli.toml`
+/// (`[memory] provider = "default"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`).
+/// See `yarli init --help` for config keys.
 #[derive(Parser)]
 #[command(name = "yarli", version = YARLI_VERSION, about)]
 pub(crate) struct Cli {
@@ -156,7 +157,22 @@ commands unless `core.allow_in_memory_writes = true`.
 - policy.enforce_policies (default: true)
 - policy.audit_decisions (default: true)
 
-[memory.backend]
+[memory]
+- memory.enabled (optional; master switch, defaults to selected provider enabled state)
+- memory.project_id (optional; defaults to prompt-root directory name)
+- memory.provider (optional; select `[memory.providers.<name>]`; e.g. "default" or "kafka")
+
+[memory.providers.<name>]
+- memory.providers.<name>.type (default: "cli")
+- memory.providers.<name>.enabled (default: true)
+- memory.providers.<name>.endpoint (optional)
+- memory.providers.<name>.command (default: "memory-backend")
+- memory.providers.<name>.project_dir (optional; defaults to prompt root)
+- memory.providers.<name>.query_limit (default: 8)
+- memory.providers.<name>.inject_on_run_start (default: true)
+- memory.providers.<name>.inject_on_failure (default: true)
+
+[memory.backend] (legacy fallback)
 - memory.backend.enabled (default: false)
 - memory.backend.endpoint (optional)
 - memory.backend.command (default: "memory-backend")
@@ -164,10 +180,6 @@ commands unless `core.allow_in_memory_writes = true`.
 - memory.backend.query_limit (default: 8)
 - memory.backend.inject_on_run_start (default: true)
 - memory.backend.inject_on_failure (default: true)
-
-[memory]
-- memory.enabled (optional; master switch, defaults to memory.backend.enabled when unset)
-- memory.project_id (optional; defaults to prompt-root directory name)
 
 [observability]
 - observability.audit_file (default: ".yarl/audit.jsonl")
@@ -381,6 +393,28 @@ destructive_default_deny = true
 enforce_policies = true
 audit_decisions = true
 
+[memory]
+# Preferred provider-based setup:
+# enabled = true
+# project_id = "my-project"
+# provider = "default"
+#
+# [memory.providers.default]
+# type = "cli"
+# enabled = true
+# command = "memory-backend"
+# project_dir = "."            # defaults to the directory containing PROMPT.md
+# query_limit = 8
+# inject_on_run_start = true
+# inject_on_failure = true
+#
+# Example alternative plugin name:
+# provider = "kafka"
+# [memory.providers.kafka]
+# type = "cli"
+# command = "memory-kafka-adapter"
+
+# Legacy single-backend fallback (still supported):
 [memory.backend]
 enabled = false
 # [memory]
@@ -392,7 +426,7 @@ enabled = false
 # inject_on_run_start = true
 # inject_on_failure = true
 #
-# Bootstrap Memory-backend for a repository:
+# Bootstrap memory plugin for a repository:
 # - `memory-backend init -y`
 #
 # Then YARLI can store/query memories during `yarli run` when enabled=true.
@@ -514,7 +548,7 @@ pub(crate) fn replace_between(haystack: &str, begin: &str, end: &str, replacemen
 pub(crate) enum Commands {
     #[command(
         about = "Manage orchestration runs (default: config-first plan-driven execution)",
-        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable Backend-backed hints/storage via `yarli.toml` (`[memory.backend] enabled = true`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
+        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable adapter-backed hints/storage via `yarli.toml` (`[memory] provider = \"default\"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
     )]
     Run {
         /// Override the prompt file used by default `yarli run` (no subcommand).
