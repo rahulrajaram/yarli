@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use futures_util::SinkExt;
+use futures_util::SinkExt as _;
 use prometheus_client::registry::Registry;
 use reqwest::Client;
 use reqwest::Url;
@@ -348,7 +348,7 @@ fn build_api_router(state: ApiState) -> Router {
 
 async fn api_security_guard(
     State(state): State<ApiState>,
-    mut request: Request,
+    mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
@@ -384,13 +384,13 @@ async fn api_security_guard(
         let rate_key = api_key.unwrap_or_else(|| ANONYMOUS_API_ACTOR.to_string());
         if let Err(error) = enforce_rate_limit(&state.security, &state.rate_limits, rate_key).await
         {
-            let mut response = error.into_response();
-            let retry_after = match error {
+            let retry_after = match &error {
                 ApiError::RateLimitExceeded {
                     retry_after_seconds,
-                } => retry_after_seconds,
+                } => *retry_after_seconds,
                 _ => 1,
             };
+            let mut response = error.into_response();
             response.headers_mut().insert(
                 header::RETRY_AFTER,
                 HeaderValue::from_str(&retry_after.to_string())
@@ -461,7 +461,7 @@ async fn metrics(State(state): State<ApiState>) -> String {
     encode_metrics(&state.metrics_registry)
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct EventFilter {
     run_id: Option<Uuid>,
     task_id: Option<Uuid>,
@@ -897,8 +897,7 @@ async fn list_runs(
         .skip(offset)
         .take(limit)
         .map(|projection| {
-            let task_summary = summarize_tasks(state.store.as_ref(), projection.correlation_id)
-                .map_err(ApiError::Store)?;
+            let task_summary = summarize_tasks(state.store.as_ref(), projection.correlation_id)?;
             Ok(RunListItem {
                 run_id: projection.run_id,
                 state: format!("{:?}", projection.state),
@@ -988,16 +987,17 @@ async fn audit_log(
     let correlation_id = query_correlation_for_run(state.store.as_ref(), run_id)?
         .ok_or(ApiError::RunNotFound(run_id))?;
     let limit = normalize_list_limit(query.limit);
+    let after = query.after;
 
-    let mut query = EventQuery::by_correlation(correlation_id);
-    query.limit = Some(limit);
-    query.after_event_id = query.after;
+    let mut eq = EventQuery::by_correlation(correlation_id);
+    eq.limit = Some(limit);
+    eq.after_event_id = after;
 
-    let events = state.store.query(&query).map_err(ApiError::Store)?;
+    let events = state.store.query(&eq).map_err(ApiError::Store)?;
     Ok(Json(AuditLogResponse {
         run_id,
         correlation_id,
-        after: query.after_event_id,
+        after: eq.after_event_id,
         limit,
         events,
     }))
@@ -1627,6 +1627,21 @@ async fn task_retry(
     Extension(context): Extension<ApiRequestContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<TaskStatusResponse>, ApiError> {
+    let parsed_task_id = task_id
+        .parse::<Uuid>()
+        .map_err(|_| ApiError::InvalidTaskId)?;
+    let projection = load_task_projection_for_control(state.store.as_ref(), parsed_task_id)?
+        .ok_or(ApiError::TaskNotFound(parsed_task_id))?;
+
+    if projection.state != TaskState::TaskFailed {
+        return Err(ApiError::InvalidTaskTransition {
+            task_id: parsed_task_id,
+            current: projection.state,
+            target: TaskState::TaskReady,
+            action: "task retry".to_string(),
+        });
+    }
+
     apply_task_transition_to_state(
         &context.actor,
         task_id,

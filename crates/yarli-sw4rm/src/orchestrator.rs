@@ -270,6 +270,9 @@ where
                 .run_gates
                 .clone()
                 .unwrap_or_else(yarli_gates::default_run_gates),
+            allow_recursive_run: false,
+            max_runtime: None,
+            idle_timeout: None,
             ..Default::default()
         };
 

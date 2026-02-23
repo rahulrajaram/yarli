@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -83,6 +83,12 @@ pub struct SchedulerConfig {
     pub budgets: ResourceBudgetConfig,
     /// Allow task commands to recursively invoke `yarli run`.
     pub allow_recursive_run: bool,
+    /// Maximum wall-clock runtime for the entire scheduler loop.
+    /// When elapsed, the run transitions to TimedOut.
+    pub max_runtime: Option<Duration>,
+    /// Idle timeout — if no task produces output or completes within this
+    /// duration, the run transitions to StalledNoProgress.
+    pub idle_timeout: Option<Duration>,
 }
 
 /// Per-task/per-run budgets used for explicit fail-fast policy behavior.
@@ -142,6 +148,8 @@ impl Default for SchedulerConfig {
             audit_decisions: true,
             budgets: ResourceBudgetConfig::default(),
             allow_recursive_run: false,
+            max_runtime: None,
+            idle_timeout: None,
         }
     }
 }
@@ -172,6 +180,12 @@ pub enum SchedulerError {
 
     #[error("audit error: {0}")]
     Audit(#[from] yarli_observability::AuditError),
+
+    #[error("run timed out after {0:?}")]
+    RunTimedOut(Duration),
+
+    #[error("run stalled — no progress for {0:?}")]
+    RunIdleTimeout(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -717,16 +731,45 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         Ok(result)
     }
 
-    /// Run the scheduler loop until cancellation.
+    /// Run the scheduler loop until cancellation, max-runtime, or idle timeout.
     pub async fn run(&self, cancel: CancellationToken) -> Result<(), SchedulerError> {
         info!(worker_id = %self.config.worker_id, "scheduler starting");
         self.record_queue_depth();
+
+        let run_started_at = Instant::now();
+        let mut last_progress_at = Instant::now();
 
         let mut tick_interval = tokio::time::interval(self.config.tick_interval);
         let mut heartbeat_interval = tokio::time::interval(self.config.heartbeat_interval);
         let mut reclaim_interval = tokio::time::interval(self.config.reclaim_interval);
 
         loop {
+            // Enforce max runtime.
+            if let Some(max_runtime) = self.config.max_runtime {
+                if run_started_at.elapsed() > max_runtime {
+                    warn!(
+                        elapsed = ?run_started_at.elapsed(),
+                        max_runtime = ?max_runtime,
+                        "run timed out — max_runtime exceeded"
+                    );
+                    self.transition_all_runs_to_terminal(ExitReason::TimedOut).await;
+                    return Err(SchedulerError::RunTimedOut(max_runtime));
+                }
+            }
+
+            // Enforce idle timeout.
+            if let Some(idle_timeout) = self.config.idle_timeout {
+                if last_progress_at.elapsed() > idle_timeout {
+                    warn!(
+                        idle_duration = ?last_progress_at.elapsed(),
+                        idle_timeout = ?idle_timeout,
+                        "run stalled — no progress within idle_timeout"
+                    );
+                    self.transition_all_runs_to_terminal(ExitReason::StalledNoProgress).await;
+                    return Err(SchedulerError::RunIdleTimeout(idle_timeout));
+                }
+            }
+
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -734,8 +777,18 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     return Ok(());
                 }
                 _ = tick_interval.tick() => {
-                    if let Err(e) = self.tick_with_cancel(cancel.child_token()).await {
-                        warn!(error = %e, "scheduler tick error");
+                    match self.tick_with_cancel(cancel.child_token()).await {
+                        Ok(result) => {
+                            // Any executed, succeeded, or failed task counts as progress.
+                            if result.executed > 0 || result.succeeded > 0 || result.failed > 0
+                                || result.runs_completed > 0 || result.promoted > 0
+                            {
+                                last_progress_at = Instant::now();
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "scheduler tick error");
+                        }
                     }
                 }
                 _ = heartbeat_interval.tick() => {
@@ -743,6 +796,33 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 }
                 _ = reclaim_interval.tick() => {
                     self.reclaim_stale_leases().await;
+                }
+            }
+        }
+    }
+
+    /// Transition all non-terminal runs to a failed terminal state.
+    async fn transition_all_runs_to_terminal(&self, exit_reason: ExitReason) {
+        let mut reg = self.registry.write().await;
+        let active_run_ids: Vec<RunId> = reg
+            .runs
+            .values()
+            .filter(|r| !r.state.is_terminal())
+            .map(|r| r.id)
+            .collect();
+        for run_id in active_run_ids {
+            if let Some(run) = reg.get_run_mut(&run_id) {
+                let target = match exit_reason {
+                    ExitReason::TimedOut | ExitReason::StalledNoProgress => RunState::RunFailed,
+                    _ => RunState::RunFailed,
+                };
+                if run.state.can_transition_to(target) {
+                    if let Err(e) = run.transition(target, &format!("{exit_reason}"), "scheduler", None) {
+                        warn!(run_id = %run_id, error = %e, "failed to transition run to terminal");
+                    } else {
+                        run.exit_reason = Some(exit_reason);
+                        info!(run_id = %run_id, exit_reason = %exit_reason, "run terminated by scheduler");
+                    }
                 }
             }
         }
@@ -790,6 +870,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
             if deps_satisfied {
                 let task = reg.get_task_mut(&task_id).unwrap();
+                let prev_state = task.state;
+                let prev_updated_at = task.updated_at;
                 let transition = task.transition(
                     TaskState::TaskReady,
                     "dependencies satisfied",
@@ -797,7 +879,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     None,
                 )?;
 
-                self.store.append(Event {
+                let append_result = self.store.append(Event {
                     event_id: transition.event_id,
                     occurred_at: transition.occurred_at,
                     entity_type: EntityType::Task,
@@ -811,7 +893,16 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     causation_id: None,
                     actor: self.config.worker_id.clone(),
                     idempotency_key: Some(format!("{task_id}:ready:{}", task.attempt_no)),
-                })?;
+                });
+
+                if let Err(e) = append_result {
+                    // Rollback in-memory state so the task can be re-promoted on the next tick.
+                    let task = reg.get_task_mut(&task_id).unwrap();
+                    task.state = prev_state;
+                    task.updated_at = prev_updated_at;
+                    warn!(task_id = %task_id, run_id = %run_id, error = %e, "store append failed during promote, rolled back to {prev_state:?}");
+                    return Err(SchedulerError::Store(e));
+                }
 
                 // Enqueue into the task queue now that the task is Ready
                 match self.enqueue_task(task_id, run_id, inherited_priority, command_class) {
@@ -2590,6 +2681,8 @@ mod tests {
             audit_decisions: true,
             budgets: ResourceBudgetConfig::default(),
             allow_recursive_run: false,
+            max_runtime: None,
+            idle_timeout: None,
         }
     }
 
@@ -4255,5 +4348,76 @@ mod tests {
             "should claim both tasks despite stale rows"
         );
         assert_eq!(result.succeeded, 2, "should execute both tasks");
+    }
+
+    #[tokio::test]
+    async fn scheduler_run_terminates_on_max_runtime() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = SchedulerConfig {
+            // Very short max_runtime to trigger quickly.
+            max_runtime: Some(Duration::from_millis(50)),
+            command_timeout: Some(Duration::from_secs(10)),
+            ..test_config()
+        };
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = make_run("timeout test");
+        let run_id = run.id;
+        let corr_id = run.correlation_id;
+        // Submit a task that would run forever.
+        let task = make_task(run_id, "forever", "sleep 3600", corr_id);
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        let cancel = CancellationToken::new();
+        let result = sched.run(cancel).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::RunTimedOut(_)),
+            "expected RunTimedOut, got: {err}"
+        );
+
+        // The run should be in a terminal state.
+        let reg = sched.registry().read().await;
+        let run = reg.get_run(&run_id).unwrap();
+        assert!(run.state.is_terminal(), "run should be terminal after timeout");
+        assert_eq!(run.exit_reason, Some(ExitReason::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn scheduler_run_terminates_on_idle_timeout() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = SchedulerConfig {
+            // Very short idle_timeout to trigger quickly — no tasks will produce
+            // activity since we submit no tasks.
+            idle_timeout: Some(Duration::from_millis(50)),
+            ..test_config()
+        };
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = make_run("idle test");
+        let run_id = run.id;
+        // Submit run with no tasks — scheduler will see no progress.
+        sched.submit_run(run, vec![]).await.unwrap();
+
+        let cancel = CancellationToken::new();
+        let result = sched.run(cancel).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::RunIdleTimeout(_)),
+            "expected RunIdleTimeout, got: {err}"
+        );
+
+        let reg = sched.registry().read().await;
+        let run = reg.get_run(&run_id).unwrap();
+        assert!(run.state.is_terminal(), "run should be terminal after idle timeout");
+        assert_eq!(run.exit_reason, Some(ExitReason::StalledNoProgress));
     }
 }

@@ -46,6 +46,8 @@ async fn graceful_shutdown_cancels_running_tasks() {
         audit_decisions: true,
         budgets: ResourceBudgetConfig::default(),
         allow_recursive_run: false,
+        max_runtime: None,
+        idle_timeout: None,
     };
     let sched = Scheduler::new(queue, store.clone(), runner, config);
 
@@ -131,6 +133,8 @@ async fn scheduler_loop_with_cancellation_completes_fast_task() {
         audit_decisions: true,
         budgets: ResourceBudgetConfig::default(),
         allow_recursive_run: false,
+        max_runtime: None,
+        idle_timeout: None,
     };
     let sched = Scheduler::new(queue, store.clone(), runner, config);
 

@@ -8,6 +8,7 @@
 //! - Timeout and cancellation support via `tokio_util::CancellationToken`.
 
 pub mod error;
+pub mod introspect;
 pub mod journal;
 pub mod overwatch;
 pub mod runner;

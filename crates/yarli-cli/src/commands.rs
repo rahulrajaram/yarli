@@ -1,5 +1,6 @@
 //! Command handlers extracted from `main.rs`.
 
+use anyhow::anyhow;
 use yarli_exec::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
     OverwatchRunnerConfig,
@@ -790,9 +791,18 @@ where
         );
     }
 
+    let idle_kill_timeout = if loaded_config.config().event_loop.idle_timeout_secs > 0 {
+        Some(Duration::from_secs(
+            loaded_config.config().event_loop.idle_timeout_secs,
+        ))
+    } else {
+        None
+    };
     let runner = match loaded_config.config().execution.runner {
         ExecutionRunner::Native => {
-            Arc::new(SelectedCommandRunner::Native(LocalCommandRunner::new()))
+            let mut lcr = LocalCommandRunner::new();
+            lcr.idle_kill_timeout = idle_kill_timeout;
+            Arc::new(SelectedCommandRunner::Native(lcr))
         }
         ExecutionRunner::Overwatch => {
             let overwatch = &loaded_config.config().execution.overwatch;
@@ -854,6 +864,17 @@ where
     config.audit_decisions = loaded_config.config().policy.audit_decisions;
     config.allow_recursive_run =
         recursive_run_execution_enabled(loaded_config, allow_recursive_run_override);
+    let el = &loaded_config.config().event_loop;
+    config.max_runtime = if el.max_runtime_seconds > 0 {
+        Some(Duration::from_secs(el.max_runtime_seconds))
+    } else {
+        None
+    };
+    config.idle_timeout = if el.idle_timeout_secs > 0 {
+        Some(Duration::from_secs(el.idle_timeout_secs))
+    } else {
+        None
+    };
     config.budgets = ResourceBudgetConfig {
         max_task_rss_bytes: loaded_config.config().budgets.max_task_rss_bytes,
         max_task_cpu_user_ticks: loaded_config.config().budgets.max_task_cpu_user_ticks,
@@ -2820,6 +2841,7 @@ where
     R: yarli_exec::CommandRunner + Clone,
 {
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+    tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
     let mut reclaim_interval = tokio::time::interval(Duration::from_secs(10));
     let mut tick_count: u64 = 0;
@@ -3011,51 +3033,9 @@ where
             }
             _ = tick_interval.tick() => {
                 tick_count += 1;
-                if let Ok(Some(run_projection)) = load_run_projection(store.as_ref(), run_id) {
-                    if run_projection.state == RunState::RunBlocked && !paused {
-                        paused = true;
-                    } else if run_projection.state == RunState::RunActive {
-                        paused = false;
-                    }
-                }
 
-                if paused {
-                    zero_progress_ticks += 1;
-                } else {
-                    // Run a scheduler tick.
-                    let _result = scheduler
-                        .tick_with_cancel(cancel.child_token())
-                        .await
-                        .context("scheduler tick failed")?;
-
-                    debug!(
-                        tick = tick_count,
-                        promoted = _result.promoted,
-                        claimed = _result.claimed,
-                        executed = _result.executed,
-                        failed = _result.failed,
-                        errors = _result.errors,
-                        "drive_scheduler tick"
-                    );
-
-                    if _result.claimed == 0 && _result.executed == 0 {
-                        zero_progress_ticks += 1;
-                        if zero_progress_ticks >= 10 && zero_progress_ticks % 10 == 0 {
-                            let stats = scheduler.queue_stats();
-                            warn!(
-                                consecutive_zero_ticks = zero_progress_ticks,
-                                tick = tick_count,
-                                queue_pending = stats.pending,
-                                queue_leased = stats.leased,
-                                "no tasks claimed or executed for {zero_progress_ticks} consecutive ticks"
-                            );
-                        }
-                    } else {
-                        zero_progress_ticks = 0;
-                    }
-                }
-
-                // Emit events using incremental cursor reads.
+                // Poll events FIRST so control signals (pause/resume/cancel)
+                // are processed before any task claiming in the tick below.
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
                 let control_signal = _new_events
@@ -3168,6 +3148,156 @@ where
                         return Ok(payload);
                     }
                     None => {}
+                }
+
+
+                // Check run projection for pause/resume state.
+                if let Ok(Some(run_projection)) = load_run_projection(store.as_ref(), run_id) {
+                    if run_projection.state == RunState::RunBlocked && !paused {
+                        paused = true;
+                    } else if run_projection.state == RunState::RunActive {
+                        paused = false;
+                    }
+                }
+
+                if paused {
+                    zero_progress_ticks += 1;
+                } else {
+                    // Run a scheduler tick.
+                    let _result = scheduler
+                        .tick_with_cancel(cancel.child_token())
+                        .await
+                        .context("scheduler tick failed")?;
+
+                    debug!(
+                        tick = tick_count,
+                        promoted = _result.promoted,
+                        claimed = _result.claimed,
+                        executed = _result.executed,
+                        failed = _result.failed,
+                        errors = _result.errors,
+                        "drive_scheduler tick"
+                    );
+
+                    // Post-tick event poll: catch control signals (pause/resume/cancel)
+                    // that arrived during command execution within the tick above.
+                    // Without this, a missed-tick fires immediately and claims new
+                    // tasks before the next pre-tick poll can see the signal.
+                    let post_tick_events =
+                        emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                    let post_tick_signal = post_tick_events
+                        .iter()
+                        .filter_map(|event| operator_control_signal_from_event(event, run_id))
+                        .next_back();
+                    if let Some(observer) = task_health_observer.as_mut() {
+                        observer.observe_store(store.as_ref());
+                    }
+                    deterioration_observer.observe_store(store.as_ref())?;
+                    match post_tick_signal {
+                        Some(OperatorControlSignal::Pause { reason }) => {
+                            paused = true;
+                            let _ = tx.send(StreamEvent::TransientStatus {
+                                message: format!("operator pause: {reason}"),
+                            });
+                        }
+                        Some(OperatorControlSignal::Resume { reason }) => {
+                            paused = false;
+                            let _ = tx.send(StreamEvent::TransientStatus {
+                                message: format!("operator resume: {reason}"),
+                            });
+                        }
+                        Some(OperatorControlSignal::Cancel { reason }) => {
+                            info!(%reason, "received operator cancel signal (post-tick)");
+                            let operator_provenance = if cancellation_diagnostics {
+                                Some(with_cancellation_diagnostics(
+                                    default_cancellation_provenance(
+                                        CancellationSource::Operator,
+                                        Some("operator control-plane cancel event (post-tick)".to_string()),
+                                    ),
+                                    run_id,
+                                    correlation_id,
+                                    tick_count,
+                                    &reason,
+                                ))
+                            } else {
+                                Some(default_cancellation_provenance(
+                                    CancellationSource::Operator,
+                                    Some("operator control-plane cancel event (post-tick)".to_string()),
+                                ))
+                            };
+                            let _ = cancel_active_run(
+                                scheduler,
+                                store,
+                                run_id,
+                                &reason,
+                                CancellationSource::Operator,
+                                operator_provenance,
+                            )
+                            .await?;
+                            let _cancel_events =
+                                emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                            if let Some(observer) = task_health_observer.as_mut() {
+                                observer.observe_store(store.as_ref());
+                            }
+                            deterioration_observer.observe_store(store.as_ref())?;
+                            let payload = {
+                                let reg = scheduler.registry().read().await;
+                                let run = reg.get_run(&run_id).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "run {run_id} missing from registry after operator cancel (post-tick)"
+                                    )
+                                })?;
+                                let tasks: Vec<&yarli_core::entities::Task> = run
+                                    .task_ids
+                                    .iter()
+                                    .filter_map(|tid| reg.get_task(tid))
+                                    .collect();
+                                let run_total_tokens = collect_run_total_tokens();
+                                build_continuation_payload(
+                                    run,
+                                    &tasks,
+                                    deterioration_observer.latest_report(),
+                                    auto_advance_policy,
+                                    task_health,
+                                    run_total_tokens,
+                                    max_run_total_tokens,
+                                    soft_token_cap_ratio,
+                                    deterioration_observer.has_deterioration_cycle(),
+                                )
+                            };
+                            scheduler.clear_live_output();
+                            if let Some(h) = forwarder_handle.take() {
+                                let _ = h.await;
+                            }
+                            drop(tx);
+                            return Ok(payload);
+                        }
+                        None => {}
+                    }
+                    // Also refresh projection after the post-tick poll.
+                    if let Ok(Some(run_projection)) = load_run_projection(store.as_ref(), run_id) {
+                        if run_projection.state == RunState::RunBlocked && !paused {
+                            paused = true;
+                        } else if run_projection.state == RunState::RunActive {
+                            paused = false;
+                        }
+                    }
+
+                    if _result.claimed == 0 && _result.executed == 0 {
+                        zero_progress_ticks += 1;
+                        if zero_progress_ticks >= 10 && zero_progress_ticks % 10 == 0 {
+                            let stats = scheduler.queue_stats();
+                            warn!(
+                                consecutive_zero_ticks = zero_progress_ticks,
+                                tick = tick_count,
+                                queue_pending = stats.pending,
+                                queue_leased = stats.leased,
+                                "no tasks claimed or executed for {zero_progress_ticks} consecutive ticks"
+                            );
+                        }
+                    } else {
+                        zero_progress_ticks = 0;
+                    }
                 }
 
                 // Send tick for spinner animation.
@@ -8225,7 +8355,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drive_scheduler_drains_without_claiming_new_tasks_during_pause() {
         let store = Arc::new(InMemoryEventStore::new());
         let queue = Arc::new(InMemoryTaskQueue::new());
@@ -8245,18 +8375,21 @@ mod tests {
         let primary_task = Task::new(
             run_id,
             "primary",
-            "sleep 1",
-            CommandClass::Io,
-            correlation_id,
-        );
-        let queued_task = Task::new(
-            run_id,
-            "queued",
             "sleep 2",
             CommandClass::Io,
             correlation_id,
         );
         let primary_task_id = primary_task.id;
+        let mut queued_task = Task::new(
+            run_id,
+            "queued",
+            "sleep 1",
+            CommandClass::Io,
+            correlation_id,
+        );
+        // Ensure queued_task cannot be promoted until primary completes,
+        // guaranteeing claim order regardless of HashMap iteration order.
+        queued_task.depends_on(primary_task_id);
         let queued_task_id = queued_task.id;
         let task_names = vec![
             (primary_task_id, "primary".to_string()),
@@ -8298,6 +8431,7 @@ mod tests {
             .expect("drive_scheduler timed out")
         });
 
+        // Wait for primary task to start executing.
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Some(primary_projection) =
@@ -8307,12 +8441,13 @@ mod tests {
                         break;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("primary task did not start executing");
 
+        // Pause the run while the primary task is still executing.
         execute_run_pause_control(store.as_ref(), run_id, "maintenance window").unwrap();
         assert_eq!(
             load_run_projection(store.as_ref(), run_id)
@@ -8322,50 +8457,42 @@ mod tests {
             RunState::RunBlocked,
         );
 
-        let mut queued_task_held = false;
-        let mut primary_task_completed = false;
-        let mut observed = 0;
-        while observed < 80 {
-            let primary_projection = load_task_projection(store.as_ref(), primary_task_id)
-                .unwrap()
-                .expect("primary task projection");
-            let queued_projection = load_task_projection(store.as_ref(), queued_task_id)
-                .unwrap()
-                .expect("queued task projection");
-
-            if primary_projection.state == TaskState::TaskComplete {
-                primary_task_completed = true;
+        // Wait for primary to complete (it was already running before pause).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pp) = load_task_projection(store.as_ref(), primary_task_id).unwrap() {
+                    if pp.state == TaskState::TaskComplete {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        })
+        .await
+        .expect("primary task should complete while paused");
 
-            if matches!(
-                queued_projection.state,
-                TaskState::TaskReady | TaskState::TaskOpen | TaskState::TaskVerifying
-            ) {
-                queued_task_held = true;
-            }
-            assert_ne!(
-                queued_projection.state,
-                TaskState::TaskExecuting,
-                "paused run must not claim additional tasks"
+        // Wait for the scheduler to process the pause signal (at least
+        // 2 tick intervals of 100ms each, plus margin).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Now verify that the queued task is NOT executing — the scheduler
+        // should have detected the pause and stopped claiming new tasks.
+        // The queued task depends on primary, so it may still be in TaskOpen
+        // (no projection events yet) or TaskReady if promoted but not claimed.
+        let queued_projection = load_task_projection(store.as_ref(), queued_task_id).unwrap();
+        if let Some(qp) = &queued_projection {
+            assert!(
+                matches!(
+                    qp.state,
+                    TaskState::TaskReady | TaskState::TaskOpen | TaskState::TaskVerifying
+                ),
+                "queued task should be held while paused, got {:?}",
+                qp.state
             );
-
-            if primary_task_completed {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            observed += 1;
         }
+        // None means the task was never promoted (still TaskOpen in registry) — also correct.
 
-        assert!(
-            primary_task_completed,
-            "primary task should complete while paused"
-        );
-        assert!(
-            queued_task_held,
-            "queued task should remain ready while paused"
-        );
-
+        // Resume the run and verify both tasks complete.
         execute_run_resume_control(store.as_ref(), run_id, "maintenance complete").unwrap();
         let payload = run_handle
             .await

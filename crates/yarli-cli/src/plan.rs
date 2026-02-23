@@ -649,6 +649,7 @@ pub(crate) fn run_spec_from_run_config(run_config: &config::RunConfig) -> prompt
                 key: task.key.clone(),
                 cmd: task.cmd.clone(),
                 class: task.class.clone(),
+                depends_on: task.depends_on.clone(),
             })
             .collect(),
     };
@@ -2483,11 +2484,13 @@ mode = "verify-only"
                         key: "lint".to_string(),
                         cmd: "cargo clippy --workspace -- -D warnings".to_string(),
                         class: Some("cpu".to_string()),
+                        depends_on: Vec::new(),
                     },
                     prompt::RunSpecTask {
                         key: "test".to_string(),
                         cmd: "cargo test --workspace".to_string(),
                         class: Some("io".to_string()),
+                        depends_on: Vec::new(),
                     },
                 ],
             },
@@ -2512,11 +2515,13 @@ mode = "verify-only"
                         key: "lint".to_string(),
                         cmd: "cargo clippy --workspace --all-targets -- -D warnings".to_string(),
                         class: Some("cpu".to_string()),
+                        depends_on: Vec::new(),
                     },
                     prompt::RunSpecTask {
                         key: "docs".to_string(),
                         cmd: "make docs-build".to_string(),
                         class: Some("io".to_string()),
+                        depends_on: Vec::new(),
                     },
                 ],
             },

@@ -3948,6 +3948,7 @@ dependencies = [
 name = "yarli-exec"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.8",
  "chrono",
  "reqwest",

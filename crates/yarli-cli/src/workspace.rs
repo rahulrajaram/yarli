@@ -2804,6 +2804,7 @@ worktree_root = "{}"
             command_class: CommandClass::Io,
             tranche_key: None,
             tranche_group: None,
+            depends_on: Vec::new(),
             allowed_paths: Vec::new(),
         };
         let plan = RunPlan {
@@ -2882,6 +2883,7 @@ worktree_root = "{}"
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
             }],
             task_catalog: Vec::new(),
@@ -2955,6 +2957,7 @@ worktree_root = "{}"
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
             }],
             task_catalog: Vec::new(),
@@ -4633,6 +4636,7 @@ worktree_root = "{}"
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
             },
             PlannedTask {
@@ -4641,6 +4645,7 @@ worktree_root = "{}"
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
             },
             PlannedTask {
@@ -4649,6 +4654,7 @@ worktree_root = "{}"
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
             },
         ];
@@ -4856,6 +4862,7 @@ worktree_root = "{}"
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
             },
             PlannedTask {
@@ -4865,6 +4872,7 @@ worktree_root = "{}"
                 command_class: CommandClass::Io,
                 tranche_key: None,
                 tranche_group: None,
+                depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
             },
         ];
@@ -5304,6 +5312,7 @@ worktree_root = "{}"
             command_class: CommandClass::Io,
             tranche_key: None,
             tranche_group: None,
+            depends_on: Vec::new(),
             allowed_paths: Vec::new(),
         }
     }

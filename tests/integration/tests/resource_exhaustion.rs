@@ -56,6 +56,8 @@ fn make_scheduler_config(
         audit_decisions: true,
         budgets,
         allow_recursive_run: false,
+        max_runtime: None,
+        idle_timeout: None,
     }
 }
 
@@ -200,14 +202,14 @@ async fn resource_exhaustion_disk_full_append_failure_is_recoverable() {
         let reg = sched.registry().read().await;
         let task = reg.get_task(&task_id).unwrap();
         let run = reg.get_run(&run_id).unwrap();
-        assert_eq!(task.state, TaskState::TaskReady);
+        assert_eq!(task.state, TaskState::TaskOpen);
         assert_eq!(run.state, RunState::RunActive);
     }
 
     assert_eq!(
         queue.pending_count(),
         0,
-        "failed append should occur after state transition but before queueing"
+        "failed append should rollback state; task not enqueued"
     );
 
     let mut complete = false;

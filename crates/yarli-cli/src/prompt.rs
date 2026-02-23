@@ -250,7 +250,7 @@ pub fn validate_run_spec(run_spec: &RunSpec) -> Result<()> {
         }
     }
 
-    validate_run_spec_task_dependencies(&run_spec.tasks)?;
+    validate_run_spec_task_dependencies(&run_spec.tasks.items)?;
 
     if let Some(tranches) = run_spec.tranches.as_ref() {
         if tranches.items.is_empty() {
@@ -329,12 +329,12 @@ fn validate_run_spec_task_dependencies(tasks: &[RunSpecTask]) -> Result<()> {
     }
 
     let mut visited = BTreeSet::new();
-    let mut visiting = Vec::new();
-    let mut in_stack = BTreeSet::new();
+    let mut visiting_stack = Vec::new();
+    let mut visiting_lookup = BTreeSet::new();
 
     for task_key in available_keys {
         if !visited.contains(task_key) {
-            detect_task_dependency_cycle(task_key, &dependency_graph, &mut visited, &mut in_stack, &mut in_stack.clone())?;
+            detect_task_dependency_cycle(task_key, &dependency_graph, &mut visited, &mut visiting_stack, &mut visiting_lookup)?;
         }
     }
 
@@ -342,12 +342,12 @@ fn validate_run_spec_task_dependencies(tasks: &[RunSpecTask]) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn detect_task_dependency_cycle(
-    task_key: &str,
-    dependency_graph: &HashMap<&str, Vec<&str>>,
-    visited: &mut BTreeSet<&str>,
-    visiting_stack: &mut Vec<&str>,
-    visiting_lookup: &mut BTreeSet<&str>,
+fn detect_task_dependency_cycle<'a>(
+    task_key: &'a str,
+    dependency_graph: &HashMap<&str, Vec<&'a str>>,
+    visited: &mut BTreeSet<&'a str>,
+    visiting_stack: &mut Vec<&'a str>,
+    visiting_lookup: &mut BTreeSet<&'a str>,
 ) -> Result<()> {
     if visited.contains(task_key) {
         return Ok(());

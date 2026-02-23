@@ -91,6 +91,9 @@ pub trait CommandRunner: Send + Sync {
 pub struct LocalCommandRunner {
     /// Default timeout if not specified per-command.
     pub default_timeout: Option<Duration>,
+    /// Kill the child process if no stdout/stderr output for this duration.
+    /// Detects processes stuck in infinite read-think-compact loops.
+    pub idle_kill_timeout: Option<Duration>,
     /// Optional metrics registry for telemetry.
     pub metrics: Option<std::sync::Arc<YarliMetrics>>,
 }
@@ -99,12 +102,18 @@ impl LocalCommandRunner {
     pub fn new() -> Self {
         Self {
             default_timeout: None,
+            idle_kill_timeout: None,
             metrics: None,
         }
     }
 
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_idle_kill_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_kill_timeout = Some(timeout);
         self
     }
 
@@ -148,6 +157,7 @@ impl CommandRunner for LocalCommandRunner {
         cancel: CancellationToken,
     ) -> Result<CommandResult, ExecError> {
         let timeout = request.timeout.or(self.default_timeout);
+        let idle_kill_timeout = self.idle_kill_timeout;
         let live_tx = request.live_output_tx;
 
         // Create entity in CmdQueued state.
@@ -271,7 +281,7 @@ impl CommandRunner for LocalCommandRunner {
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Timeout(dur))
                 }
-                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx) => {
+                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
                     result
                 }
             }
@@ -284,7 +294,7 @@ impl CommandRunner for LocalCommandRunner {
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
-                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx) => {
+                result = collect_and_wait(&mut child, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
                     result
                 }
             }
@@ -530,6 +540,9 @@ fn read_process_sample(_pid: u32) -> Option<ProcessSample> {
 }
 
 /// Collect output from the channel and wait for the process to exit.
+///
+/// If `idle_kill_timeout` is Some, the child will be killed if no output
+/// is received within the given duration (detects hung processes).
 async fn collect_and_wait(
     child: &mut tokio::process::Child,
     rx: &mut tokio::sync::mpsc::Receiver<(StreamType, String)>,
@@ -537,15 +550,29 @@ async fn collect_and_wait(
     seq: &mut u64,
     chunks: &mut Vec<StreamChunk>,
     live_tx: &Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
+    idle_kill_timeout: Option<Duration>,
 ) -> Result<i32, ExecError> {
+    let mut last_output_at = Instant::now();
+
     // Read output lines until the channel closes (readers done).
     // Meanwhile the child is running.
     loop {
+        let idle_sleep = async {
+            match idle_kill_timeout {
+                Some(dur) => {
+                    let remaining = dur.saturating_sub(last_output_at.elapsed());
+                    tokio::time::sleep(remaining).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
             biased;
             line = rx.recv() => {
                 match line {
                     Some((stream, data)) => {
+                        last_output_at = Instant::now();
                         *seq += 1;
                         let chunk = StreamChunk {
                             command_id: cmd_id,
@@ -561,6 +588,17 @@ async fn collect_and_wait(
                     }
                     None => break, // channel closed, readers done
                 }
+            }
+            _ = idle_sleep => {
+                let dur = idle_kill_timeout.unwrap();
+                warn!(
+                    cmd_id = %cmd_id,
+                    idle_timeout = ?dur,
+                    "command produced no output for idle_kill_timeout — killing"
+                );
+                kill_child(child).await;
+                drain_channel(rx, cmd_id, seq, chunks, live_tx).await;
+                return Err(ExecError::Timeout(dur));
             }
         }
     }

@@ -61,6 +61,8 @@ async fn budget_breach_fails_tasks_and_run() {
             ..ResourceBudgetConfig::default()
         },
         allow_recursive_run: false,
+        max_runtime: None,
+        idle_timeout: None,
     };
     let sched = Scheduler::new(queue, store.clone(), runner, config);
 

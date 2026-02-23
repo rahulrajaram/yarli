@@ -48,6 +48,8 @@ async fn concurrent_runs_respect_concurrency_caps() {
         audit_decisions: true,
         budgets: ResourceBudgetConfig::default(),
         allow_recursive_run: false,
+        max_runtime: None,
+        idle_timeout: None,
     };
     let sched = Scheduler::new(queue, store.clone(), runner, config);
 

@@ -1272,6 +1272,8 @@ pub struct RunTaskConfig {
     pub cmd: String,
     #[serde(default)]
     pub class: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
