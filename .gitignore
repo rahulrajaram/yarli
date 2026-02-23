@@ -1,6 +1,8 @@
 target/
 .agent/
 .orchestrator/
+.ralph/
+.cultivar/
 .yarl/
 .code-index/
 yarli.toml

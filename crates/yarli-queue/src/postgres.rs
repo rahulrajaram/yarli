@@ -30,7 +30,7 @@ const CLAIM_CANDIDATES_SQL: &str = r#"
     FROM task_queue
     WHERE status = 'pending'
       AND available_at <= $1
-    ORDER BY (priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60)) DESC, priority DESC, available_at ASC, queue_id ASC
+    ORDER BY (priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60))) DESC, priority DESC, available_at ASC, queue_id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $2
 "#;
@@ -47,7 +47,7 @@ const CLAIM_CANDIDATES_SCOPED_SQL: &str = r#"
     WHERE status = 'pending'
       AND available_at <= $1
       AND run_id = ANY($3::uuid[])
-    ORDER BY (priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60)) DESC, priority DESC, available_at ASC, queue_id ASC
+    ORDER BY (priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60))) DESC, priority DESC, available_at ASC, queue_id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $2
 "#;
@@ -995,13 +995,21 @@ mod tests {
 
     use super::{
         classify_unique_violation, command_class_from_db, command_class_to_db,
-        queue_status_from_db, queue_status_to_db, UniqueViolation, CLAIM_CANDIDATES_SQL,
+        queue_status_from_db, queue_status_to_db, UniqueViolation, CLAIM_CANDIDATES_SCOPED_SQL,
+        CLAIM_CANDIDATES_SQL,
     };
     use crate::queue::QueueStatus;
 
     #[test]
     fn claim_sql_uses_skip_locked() {
         assert!(CLAIM_CANDIDATES_SQL.contains("FOR UPDATE SKIP LOCKED"));
+    }
+
+    #[test]
+    fn claim_sql_uses_valid_aging_order_expression() {
+        let expected = "(priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60))) DESC";
+        assert!(CLAIM_CANDIDATES_SQL.contains(expected));
+        assert!(CLAIM_CANDIDATES_SCOPED_SQL.contains(expected));
     }
 
     #[test]

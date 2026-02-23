@@ -216,6 +216,128 @@ async fn concurrent_claim_no_duplicate_lease_postgres() -> Result<(), Box<dyn st
     Ok(())
 }
 
+#[tokio::test]
+async fn claim_paths_execute_without_sql_syntax_errors_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) = test_database_url() else {
+        if require_postgres_tests() {
+            panic!(
+                "postgres integration tests require {TEST_DATABASE_URL_ENV} when {REQUIRE_POSTGRES_TESTS_ENV}=1"
+            );
+        }
+        eprintln!(
+            "skipping postgres integration test: set {TEST_DATABASE_URL_ENV} (example: postgres://postgres:postgres@localhost:5432/postgres)"
+        );
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database.database_url)
+        .await?;
+    let queue = PostgresTaskQueue::new(&database.database_url)?;
+
+    let run_a = Uuid::now_v7();
+    let run_b = Uuid::now_v7();
+    let correlation_a = Uuid::now_v7();
+    let correlation_b = Uuid::now_v7();
+
+    sqlx::query(
+        r#"
+        INSERT INTO runs (run_id, objective, state, safe_mode, correlation_id, config_snapshot)
+        VALUES ($1, $2, 'RUN_ACTIVE', 'execute', $3, '{}'::jsonb)
+        "#,
+    )
+    .bind(run_a)
+    .bind("claim path test run a")
+    .bind(correlation_a)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO runs (run_id, objective, state, safe_mode, correlation_id, config_snapshot)
+        VALUES ($1, $2, 'RUN_ACTIVE', 'execute', $3, '{}'::jsonb)
+        "#,
+    )
+    .bind(run_b)
+    .bind("claim path test run b")
+    .bind(correlation_b)
+    .execute(&pool)
+    .await?;
+
+    let task_a = Uuid::now_v7();
+    let task_b1 = Uuid::now_v7();
+    let task_b2 = Uuid::now_v7();
+
+    sqlx::query(
+        r#"
+        INSERT INTO tasks (
+            task_id, run_id, task_key, description, state, command_class,
+            attempt_no, max_attempts, blocker_code, correlation_id, priority
+        )
+        VALUES ($1, $2, $3, $4, 'TASK_READY', 'git', 1, 3, NULL, $5, $6)
+        "#,
+    )
+    .bind(task_a)
+    .bind(run_a)
+    .bind("claim-path-task-a")
+    .bind("claim path task a")
+    .bind(correlation_a)
+    .bind(50_i32)
+    .execute(&pool)
+    .await?;
+
+    for (idx, task_id) in [task_b1, task_b2].iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO tasks (
+                task_id, run_id, task_key, description, state, command_class,
+                attempt_no, max_attempts, blocker_code, correlation_id, priority
+            )
+            VALUES ($1, $2, $3, $4, 'TASK_READY', 'git', 1, 3, NULL, $5, $6)
+            "#,
+        )
+        .bind(task_id)
+        .bind(run_b)
+        .bind(format!("claim-path-task-b-{idx}"))
+        .bind(format!("claim path task b {idx}"))
+        .bind(correlation_b)
+        .bind(1_i32)
+        .execute(&pool)
+        .await?;
+    }
+
+    queue.enqueue(task_a, run_a, 50, CommandClass::Git, None)?;
+    queue.enqueue(task_b1, run_b, 1, CommandClass::Git, None)?;
+    queue.enqueue(task_b2, run_b, 1, CommandClass::Git, None)?;
+    let mut unconstrained_git_caps = ConcurrencyConfig::default();
+    unconstrained_git_caps.git_cap = 8;
+
+    // Unscoped claim path (allowed_run_ids = None).
+    let unscoped = queue.claim(
+        &ClaimRequest::new("worker-unscoped", 1, Duration::seconds(30)),
+        &unconstrained_git_caps,
+    )?;
+    assert_eq!(unscoped.len(), 1);
+    assert_eq!(unscoped[0].run_id, run_a);
+
+    // Scoped claim path (allowed_run_ids = Some(...)).
+    let scoped = queue.claim(
+        &ClaimRequest::new("worker-scoped", 5, Duration::seconds(30))
+            .with_allowed_run_ids(vec![run_b]),
+        &unconstrained_git_caps,
+    )?;
+    assert_eq!(scoped.len(), 2);
+    assert!(scoped.iter().all(|entry| entry.run_id == run_b));
+
+    database.drop().await?;
+    Ok(())
+}
+
 /// Prove that replaying events via idempotency keys produces no duplicate records.
 ///
 /// This validates the replay/restart safety invariant: after a crash, re-appending
