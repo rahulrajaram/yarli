@@ -337,7 +337,7 @@ pub(crate) fn build_tranche_task_prompt(
     let mut instruction_lines = vec![
         "1. Read PROMPT and plan context from the workspace paths above.".to_string(),
         "2. Implement only the target tranche if it is still incomplete.".to_string(),
-        "3. Update IMPLEMENTATION_PLAN.md and evidence in-repo.".to_string(),
+        "3. Update IMPLEMENTATION_PLAN.md status. Write verification evidence to .yarli/evidence/I<id>.md.".to_string(),
         "4. Run the tranche's required verification commands before finishing.".to_string(),
     ];
     let mut instruction_counter = 5;
@@ -413,7 +413,7 @@ pub(crate) fn build_verification_task_prompt(
     open_tranche_count: usize,
 ) -> String {
     format!(
-        "YARLI verification task.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nOpen tranche count seen at dispatch: {}.\nMode: verification-only.\n\nInstructions:\n1. Verify current workspace state against PROMPT.md and IMPLEMENTATION_PLAN.md.\n2. Run verification commands and capture concrete results.\n3. Update evidence/status text in-repo only if needed.\n4. Do not invent completion claims.",
+        "YARLI verification task.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nOpen tranche count seen at dispatch: {}.\nMode: verification-only.\n\nInstructions:\n1. Verify current workspace state against PROMPT.md and IMPLEMENTATION_PLAN.md.\n2. Run verification commands and capture concrete results.\n3. Write verification evidence to .yarli/evidence/I<id>.md for each verified tranche. Update status in IMPLEMENTATION_PLAN.md only if needed.\n4. Do not invent completion claims.",
         objective,
         loaded_prompt.entry_path.display(),
         plan_path.display(),
