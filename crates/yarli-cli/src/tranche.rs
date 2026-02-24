@@ -1117,6 +1117,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_plan_tranche_header_line_handles_colon_in_title() {
+        let line = r#"62. I153 `Visual indicator in status bar: "PLAN MODE -- read-only"`: incomplete. tranche_group=tool-io"#;
+        let entry = crate::plan::parse_plan_tranche_header_line(line).expect("should parse");
+        assert_eq!(entry.key, "I153");
+        assert!(!entry.is_complete);
+        assert_eq!(entry.tranche_group.as_deref(), Some("tool-io"));
+
+        // Multiple colons in title
+        let line2 = r#"30. I121 `Search backend adapter: LSP: ripgrep`: blocked. tranche_group=tool-lsp-search"#;
+        let entry2 = crate::plan::parse_plan_tranche_header_line(line2).expect("should parse");
+        assert_eq!(entry2.key, "I121");
+        assert!(!entry2.is_complete);
+    }
+
+    #[test]
     fn discover_plan_entries_extracts_allowed_paths_metadata() {
         let entries = crate::plan::discover_plan_entries(
             "- [ ] I8A first allowed_paths=src/main.rs,docs/CLI.md,../reject\n- [x] I8B second [allowed_paths=src/lib.rs,SRC/lib.rs,/reject]\n",
