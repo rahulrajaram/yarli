@@ -1017,6 +1017,67 @@ fn collect_conflicted_workspace_files(source_workdir: &Path) -> Vec<String> {
     files
 }
 
+fn parse_unmerged_paths_from_status_snapshot(status: &str) -> Vec<String> {
+    let mut paths = HashSet::new();
+    for raw_line in status.lines() {
+        let line = raw_line.trim_end();
+        if line.len() < 3 {
+            continue;
+        }
+        let status_code = &line[..2];
+        let is_unmerged = matches!(status_code, "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU");
+        if !is_unmerged {
+            continue;
+        }
+        let remainder = line[2..].trim();
+        if remainder.is_empty() {
+            continue;
+        }
+        let candidate = remainder
+            .split(" -> ")
+            .last()
+            .unwrap_or(remainder)
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        if !candidate.is_empty() {
+            let _ = paths.insert(candidate.to_string());
+        }
+    }
+    let mut values = paths.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
+fn collect_patch_target_paths(patch: &str) -> Vec<String> {
+    let mut paths = HashSet::new();
+    for raw_line in patch.lines() {
+        if let Some(path) = raw_line.strip_prefix("+++ b/") {
+            let path = path.trim();
+            if !path.is_empty() && path != "/dev/null" {
+                let _ = paths.insert(path.to_string());
+            }
+            continue;
+        }
+        if let Some(path) = raw_line.strip_prefix("--- a/") {
+            let path = path.trim();
+            if !path.is_empty() && path != "/dev/null" {
+                let _ = paths.insert(path.to_string());
+            }
+            continue;
+        }
+        if let Some(path) = raw_line.strip_prefix("rename to ") {
+            let path = path.trim();
+            if !path.is_empty() {
+                let _ = paths.insert(path.to_string());
+            }
+        }
+    }
+    let mut values = paths.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
 fn collect_workspace_status_snapshot(source_workdir: &Path) -> String {
     let status_args = ["status", "--short"];
     match run_git_capture(source_workdir, &status_args) {
@@ -2133,7 +2194,11 @@ pub(crate) fn merge_worktree_workspace_results(
                                         "stderr": stderr.to_string(),
                                     }),
                                 );
-                                bail!("merge conflict for task {task_key} (branch {branch}): {stderr}");
+                                return Err(ParallelWorkspaceMergeApplyError::new(
+                                    ParallelWorkspaceMergeFailureKind::MergeConflict,
+                                    false,
+                                    format!("merge conflict for task {task_key} (branch {branch}): {stderr}"),
+                                ).into());
                             }
                         }
                     }
@@ -2606,8 +2671,14 @@ Operator recovery steps:\n\
                 }
                 if err.kind == ParallelWorkspaceMergeFailureKind::MergeConflict {
                     conflict_count += 1;
-                    let conflicted_files = collect_conflicted_workspace_files(source_workdir);
                     let repo_status = collect_workspace_status_snapshot(source_workdir);
+                    let mut conflicted_files = collect_conflicted_workspace_files(source_workdir);
+                    if conflicted_files.is_empty() {
+                        conflicted_files = parse_unmerged_paths_from_status_snapshot(&repo_status);
+                    }
+                    if conflicted_files.is_empty() {
+                        conflicted_files = collect_patch_target_paths(&patch);
+                    }
                     let recovery_hints = merge_conflict_recovery_hints(source_workdir, &patch_path);
                     merge_apply_telemetry_event(
                         apply_telemetry,
@@ -2823,6 +2894,32 @@ mod tests {
     fn run_git_expect_ok(repo: &Path, args: &[&str]) {
         let (ok, _stdout, stderr) = run_git(repo, args);
         assert!(ok, "git {:?} failed: {stderr}", args);
+    }
+
+    #[test]
+    fn parse_unmerged_paths_from_status_snapshot_extracts_conflict_entries() {
+        let status = "UU src/lib.rs\nAA shared.txt\n M README.md\nR  old.rs -> new.rs\n";
+        let files = parse_unmerged_paths_from_status_snapshot(status);
+        assert_eq!(files, vec!["shared.txt".to_string(), "src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn collect_patch_target_paths_extracts_paths_from_patch_headers() {
+        let patch = "\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n\
+diff --git a/shared.txt b/shared.txt\n\
+deleted file mode 100644\n\
+index 3333333..0000000\n\
+--- a/shared.txt\n\
++++ /dev/null\n";
+        let files = collect_patch_target_paths(patch);
+        assert_eq!(files, vec!["shared.txt".to_string(), "src/lib.rs".to_string()]);
     }
 
     #[test]

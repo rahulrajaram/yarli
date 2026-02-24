@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 pub const PROMPT_FILENAME: &str = "PROMPT.md";
 const MAX_INCLUDE_DEPTH: usize = 8;
-const MAX_EXPANDED_BYTES: usize = 512 * 1024;
+const MAX_EXPANDED_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunSpec {
