@@ -212,7 +212,7 @@ async fn run_projection_state_consistency_roundtrip_against_postgres(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
 {
     let Some(admin_database_url) =
@@ -230,7 +230,8 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
 
     let pool = connect_postgres(&database.database_url, "run_cancel_hardening_roundtrip").await?;
 
-    let start_output = Command::new(&binary)
+    // Spawn the run in the background so we can cancel while it's active.
+    let mut child = tokio::process::Command::new(&binary)
         .current_dir(temp_dir.path())
         .args([
             "run",
@@ -238,25 +239,18 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
             "postgres cancellation hardening",
             "--stream",
             "--cmd",
-            "sleep 30",
+            "sleep 300",
         ])
-        .output()?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
 
-    assert!(
-        start_output.status.success(),
-        "run start command failed before cancellation\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&start_output.stdout),
-        String::from_utf8_lossy(&start_output.stderr)
-    );
-    let start_stdout = String::from_utf8(start_output.stdout)?;
-    let run_id =
-        parse_run_id(&start_stdout).ok_or("missing run id in cancellation hardening output")?;
-
-    wait_for_run_state_in(
+    // Wait for the run to reach an active state in Postgres by polling the DB
+    // for any run in the RUN_ACTIVE state (we don't have the run_id yet).
+    let run_id = wait_for_any_run_state_in(
         &pool,
-        run_id,
         &["RUN_ACTIVE", "RUN_VERIFYING"],
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     )
     .await?;
 
@@ -276,6 +270,9 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
         String::from_utf8_lossy(&cancel_output.stdout),
         String::from_utf8_lossy(&cancel_output.stderr)
     );
+
+    // Wait for the background process to exit.
+    let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
 
     wait_for_run_state(&pool, run_id, "RUN_CANCELLED", Duration::from_secs(15)).await?;
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
@@ -333,7 +330,7 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_cancel_load_hardening_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -355,41 +352,33 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
     )
     .await?;
 
-    let start_output = Command::new(&binary)
+    // Spawn the run in the background with long-running tasks so we can
+    // cancel while they are active.
+    let mut child = tokio::process::Command::new(&binary)
         .current_dir(temp_dir.path())
         .args([
             "run",
             "start",
             "postgres cancellation load hardening",
             "--stream",
-            "--timeout",
-            "20",
             "--cmd",
-            "sleep 20",
+            "sleep 300",
             "--cmd",
-            "sleep 20",
+            "sleep 300",
             "--cmd",
-            "sleep 20",
+            "sleep 300",
             "--cmd",
-            "sleep 20",
+            "sleep 300",
         ])
-        .output()?;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
 
-    assert!(
-        start_output.status.success(),
-        "run start command failed before cancellation load\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&start_output.stdout),
-        String::from_utf8_lossy(&start_output.stderr)
-    );
-    let start_stdout = String::from_utf8(start_output.stdout)?;
-    let run_id = parse_run_id(&start_stdout)
-        .ok_or("missing run id in cancellation load hardening output")?;
-
-    wait_for_run_state_in(
+    // Wait for the run to reach an active state and all tasks to be created.
+    let run_id = wait_for_any_run_state_in(
         &pool,
-        run_id,
         &["RUN_ACTIVE", "RUN_VERIFYING"],
-        Duration::from_secs(20),
+        Duration::from_secs(30),
     )
     .await?;
     wait_for_task_count(&pool, run_id, 4, Duration::from_secs(25)).await?;
@@ -415,6 +404,9 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
         String::from_utf8_lossy(&cancel_output.stdout),
         String::from_utf8_lossy(&cancel_output.stderr)
     );
+
+    // Wait for the background process to exit.
+    let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
 
     wait_for_run_state(&pool, run_id, "RUN_CANCELLED", Duration::from_secs(15)).await?;
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
@@ -497,14 +489,17 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
         ])
         .output()?;
 
-    assert!(
-        start_output.status.success(),
-        "run start command failed before timeout validation\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&start_output.stdout),
-        String::from_utf8_lossy(&start_output.stderr)
-    );
-    let start_stdout = String::from_utf8(start_output.stdout)?;
-    let run_id = parse_run_id(&start_stdout).ok_or("missing run id in timeout hardening output")?;
+    // The run is expected to fail (command times out). The CLI exits non-zero
+    // for RunFailed, so we do NOT assert exit success here.
+    let start_stdout = String::from_utf8_lossy(&start_output.stdout);
+    let start_stderr = String::from_utf8_lossy(&start_output.stderr);
+    let run_id = parse_run_id(&start_stdout)
+        .or_else(|| parse_run_id(&start_stderr))
+        .ok_or_else(|| {
+            format!(
+                "missing run id in timeout hardening output\nstdout:\n{start_stdout}\nstderr:\n{start_stderr}"
+            )
+        })?;
 
     wait_for_run_state(&pool, run_id, "RUN_FAILED", Duration::from_secs(20)).await?;
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
@@ -551,7 +546,7 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overwatch_runner_hardening_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -637,7 +632,7 @@ async fn overwatch_runner_hardening_roundtrip_against_postgres(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overwatch_runner_failure_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -750,9 +745,17 @@ fn parse_merge_id(output: &str) -> Option<Uuid> {
 
 fn parse_run_id(output: &str) -> Option<Uuid> {
     output.lines().find_map(|line| {
+        // Match "Run <uuid> completed/failed/..." format
         line.strip_prefix("Run ")
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|value| value.trim().parse::<Uuid>().ok())
+            // Also match "  Run ID:      <uuid>" format from the summary block
+            .or_else(|| {
+                let trimmed = line.trim();
+                trimmed
+                    .strip_prefix("Run ID:")
+                    .and_then(|rest| rest.trim().parse::<Uuid>().ok())
+            })
     })
 }
 
@@ -1006,6 +1009,39 @@ async fn wait_for_run_state(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_run_state_in(pool, run_id, &[expected], timeout).await
+}
+
+/// Wait for any run (not a specific run_id) to reach one of the expected states.
+/// Returns the run_id of the first matching run. Used by cancel tests where the
+/// run_id is not known ahead of time because the process is spawned in the background.
+async fn wait_for_any_run_state_in(
+    pool: &PgPool,
+    expected_states: &[&str],
+    timeout: Duration,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "run state wait timeout overflow".to_string())?;
+
+    loop {
+        for expected in expected_states {
+            let row: Option<Uuid> =
+                sqlx::query_scalar("SELECT run_id FROM runs WHERE state = $1 LIMIT 1")
+                    .bind(*expected)
+                    .fetch_optional(pool)
+                    .await?;
+            if let Some(run_id) = row {
+                return Ok(run_id);
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(
+                format!("timed out waiting for any run in states {expected_states:?}").into(),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_for_run_state_in(
@@ -1325,6 +1361,9 @@ backend = "postgres"
 [postgres]
 database_url = "{escaped_database_url}"
 
+[features]
+parallel = false
+
 [execution]
 worktree_root = ".yarl/workspaces"
 "#
@@ -1346,6 +1385,9 @@ backend = "postgres"
 
 [postgres]
 database_url = "{escaped_database_url}"
+
+[features]
+parallel = false
 
 [execution]
 runner = "overwatch"
