@@ -231,6 +231,11 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
     let pool = connect_postgres(&database.database_url, "run_cancel_hardening_roundtrip").await?;
 
     // Spawn the run in the background so we can cancel while it's active.
+    // Redirect output to files for diagnostics if the test fails.
+    let stdout_path = temp_dir.path().join("yarli-stdout.log");
+    let stderr_path = temp_dir.path().join("yarli-stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut child = tokio::process::Command::new(&binary)
         .current_dir(temp_dir.path())
         .args([
@@ -241,21 +246,33 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
             "--cmd",
             "sleep 300",
         ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(stdout_file)
+        .stderr(stderr_file)
         .spawn()?;
 
     // Wait for the run to appear in Postgres (any state including RUN_OPEN).
     let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
 
-    // Then wait for it to reach an active state.
-    wait_for_run_state_in(
+    // Then wait for it to reach an active state. Check that the child process
+    // is still running — if it exited early, the run will never reach RUN_ACTIVE.
+    let run_state_result = wait_for_run_state_with_child_check(
         &pool,
+        &mut child,
         run_id,
         &["RUN_ACTIVE", "RUN_VERIFYING"],
         Duration::from_secs(30),
+        &stdout_path,
+        &stderr_path,
     )
-    .await?;
+    .await;
+    if let Err(ref e) = run_state_result {
+        eprintln!("cancel hardening wait failed: {e}");
+        let stdout_log = fs::read_to_string(&stdout_path).unwrap_or_default();
+        let stderr_log = fs::read_to_string(&stderr_path).unwrap_or_default();
+        eprintln!("yarli stdout:\n{stdout_log}");
+        eprintln!("yarli stderr:\n{stderr_log}");
+    }
+    run_state_result?;
 
     let cancel_output = Command::new(&binary)
         .current_dir(temp_dir.path())
@@ -356,8 +373,11 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
     .await?;
 
     // Spawn the run in the background with long-running tasks so we can
-    // cancel while they are active. Use Stdio::null() to prevent pipe buffer
-    // deadlock (the yarli stream renderer can fill the 64KB pipe buffer).
+    // cancel while they are active.
+    let stdout_path = temp_dir.path().join("yarli-stdout.log");
+    let stderr_path = temp_dir.path().join("yarli-stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut child = tokio::process::Command::new(&binary)
         .current_dir(temp_dir.path())
         .args([
@@ -374,19 +394,30 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
             "--cmd",
             "sleep 300",
         ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(stdout_file)
+        .stderr(stderr_file)
         .spawn()?;
 
     // Wait for the run to appear in Postgres then become active.
     let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
-    wait_for_run_state_in(
+    let run_state_result = wait_for_run_state_with_child_check(
         &pool,
+        &mut child,
         run_id,
         &["RUN_ACTIVE", "RUN_VERIFYING"],
         Duration::from_secs(30),
+        &stdout_path,
+        &stderr_path,
     )
-    .await?;
+    .await;
+    if let Err(ref e) = run_state_result {
+        eprintln!("cancel load hardening wait failed: {e}");
+        let stdout_log = fs::read_to_string(&stdout_path).unwrap_or_default();
+        let stderr_log = fs::read_to_string(&stderr_path).unwrap_or_default();
+        eprintln!("yarli stdout:\n{stdout_log}");
+        eprintln!("yarli stderr:\n{stderr_log}");
+    }
+    run_state_result?;
     wait_for_task_count(&pool, run_id, 4, Duration::from_secs(25)).await?;
     let task_states_before_cancel = fetch_task_states(&pool, run_id).await?;
     assert!(
@@ -1058,6 +1089,63 @@ async fn wait_for_any_run_in_db(
     }
 }
 
+/// Like `wait_for_run_state_in` but also checks whether the child process is
+/// still alive.  If the child exits before the expected state is reached, the
+/// run will never transition and the test should fail immediately with the
+/// child's exit status and captured output for diagnosis.
+async fn wait_for_run_state_with_child_check(
+    pool: &PgPool,
+    child: &mut tokio::process::Child,
+    run_id: Uuid,
+    expected_states: &[&str],
+    timeout: Duration,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "run state wait timeout overflow".to_string())?;
+
+    loop {
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+
+        if let Some(ref state) = state {
+            if expected_states.contains(&state.as_str()) {
+                return Ok(());
+            }
+        }
+
+        // Check if the child process exited prematurely.
+        if let Some(exit_status) = child.try_wait()? {
+            let stdout_content = fs::read_to_string(stdout_path).unwrap_or_default();
+            let stderr_content = fs::read_to_string(stderr_path).unwrap_or_default();
+            return Err(format!(
+                "yarli process exited prematurely with {exit_status} while waiting for \
+                 run {run_id} state in {expected_states:?} (current DB state: {state:?})\n\
+                 stdout:\n{stdout_content}\nstderr:\n{stderr_content}"
+            )
+            .into());
+        }
+
+        if Instant::now() >= deadline {
+            let current_state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM runs WHERE run_id = $1")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await?;
+            return Err(format!(
+                "timed out waiting for run {run_id} state in {expected_states:?} \
+                 (current state: {current_state:?})"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn wait_for_run_state_in(
     pool: &PgPool,
     run_id: Uuid,
@@ -1081,9 +1169,16 @@ async fn wait_for_run_state_in(
         }
 
         if Instant::now() >= deadline {
-            return Err(
-                format!("timed out waiting for run {run_id} state in {expected_states:?}").into(),
-            );
+            let current_state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM runs WHERE run_id = $1")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await?;
+            return Err(format!(
+                "timed out waiting for run {run_id} state in {expected_states:?} \
+                 (current state: {current_state:?})"
+            )
+            .into());
         }
         sleep(Duration::from_millis(100)).await;
     }
