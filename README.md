@@ -1,5 +1,10 @@
-# YARLI
-Deterministic run/task orchestration with event sourcing, queue scheduling, and safe Git controls.
+<p align="center">
+  <img src="assets/logo.png" alt="YARLI" width="360">
+</p>
+
+<p align="center">
+  Deterministic run/task orchestration with event sourcing, queue scheduling, and safe Git controls.
+</p>
 
 ## What is this?
 YARLI is a Rust workspace for executing plan-driven engineering workflows with durable state and explicit operator control. It treats runs, tasks, worktrees, merges, command execution, and policy decisions as state-machine entities persisted through an event log.
@@ -83,9 +88,6 @@ Verified command tree (from live `--help`):
 - `yarli init`, `yarli info`
 
 Exact clap output snapshots for every command/subcommand are in `docs/CLI_HELP.md`.
-
-Known issue from audit:
-- `yarli audit query --help` currently panics due duplicate short flag `-f` in clap.
 
 ## AI Agent Integration
 YARLI integrates with agent CLIs through `[cli]` configuration (for example `codex`, `claude`, `gemini`, or custom command wiring).
