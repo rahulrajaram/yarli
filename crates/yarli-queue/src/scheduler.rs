@@ -587,10 +587,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         #[cfg(feature = "chaos")]
         if let Some(chaos) = &self.chaos {
             chaos.inject("scheduler_tick_start").await.map_err(|e| {
-                SchedulerError::Exec(ExecError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                )))
+                SchedulerError::Exec(ExecError::Io(std::io::Error::other(e)))
             })?;
         }
 
@@ -633,10 +630,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         #[cfg(feature = "chaos")]
         if let Some(chaos) = &self.chaos {
             chaos.inject("scheduler_tick_claimed").await.map_err(|e| {
-                SchedulerError::Exec(ExecError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                )))
+                SchedulerError::Exec(ExecError::Io(std::io::Error::other(e)))
             })?;
         }
 
