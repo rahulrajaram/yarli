@@ -80,6 +80,11 @@ pub struct MergeIntent {
     pub conflicts: Vec<ConflictRecord>,
     /// Policy approval token ID (if required).
     pub approval_token_id: Option<String>,
+    /// Optional custom commit message template. If `None`, uses the default
+    /// conventional-commits template from `MERGE_COMMIT_TEMPLATE`.
+    /// Supports placeholders: `{source}`, `{target}`, `{run_id}`, `{task_id}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_message_template: Option<String>,
     /// Correlation ID (inherited from parent run).
     pub correlation_id: CorrelationId,
     /// When the merge intent was created.
@@ -111,6 +116,7 @@ impl MergeIntent {
             result_sha: None,
             conflicts: Vec::new(),
             approval_token_id: None,
+            commit_message_template: None,
             correlation_id,
             created_at: now,
             updated_at: now,
@@ -120,6 +126,12 @@ impl MergeIntent {
     /// Set the merge strategy.
     pub fn with_strategy(mut self, strategy: MergeStrategy) -> Self {
         self.strategy = strategy;
+        self
+    }
+
+    /// Set a custom merge commit message template (overrides the default).
+    pub fn with_commit_template(mut self, template: impl Into<String>) -> Self {
+        self.commit_message_template = Some(template.into());
         self
     }
 

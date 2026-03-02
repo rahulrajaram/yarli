@@ -124,6 +124,18 @@ fn merge_conflict_display() {
 }
 
 #[test]
+fn hook_rejected_display() {
+    let err = GitError::HookRejected {
+        hook: "commit-msg".into(),
+        stderr: "Subject does not follow Conventional Commits".into(),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("hook rejected"));
+    assert!(msg.contains("commit-msg"));
+    assert!(msg.contains("Conventional Commits"));
+}
+
+#[test]
 fn merge_lock_unavailable_display() {
     let err = GitError::MergeLockUnavailable {
         branch: "main".into(),
@@ -1632,7 +1644,10 @@ async fn merge_commit_message_has_attribution() {
         msg.contains("yarli-task:"),
         "commit should contain yarli-task attribution"
     );
-    assert!(msg.contains("Merge"), "commit should start with Merge");
+    assert!(
+        msg.contains("chore(yarli): merge"),
+        "commit should use conventional commits format: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -1696,7 +1711,10 @@ fn merge_build_commit_message() {
     let intent = MergeIntent::new(run_id, wt_id, "feature/branch", "main", corr_id);
 
     let msg = LocalMergeOrchestrator::build_commit_message(&intent);
-    assert!(msg.contains("Merge feature/branch into main"));
+    assert!(
+        msg.contains("chore(yarli): merge feature/branch into main"),
+        "default template should use conventional commits: {msg}"
+    );
     assert!(msg.contains(&run_id.to_string()));
     assert!(msg.contains(&wt_id.to_string()));
 }
@@ -2650,4 +2668,173 @@ async fn recover_manual_block_preserves_interrupted_state() {
     binding
         .transition(WorktreeState::WtClosed, "closed", "test", None)
         .unwrap();
+}
+
+// ── Hook rejection detection tests ─────────────────────────────────────
+
+#[test]
+fn is_hook_rejection_detects_commit_msg_hook() {
+    let stderr = "[commit-msg] Subject does not follow Conventional Commits format.\nNot committing merge; use 'git commit' to complete the merge.";
+    assert!(LocalMergeOrchestrator::is_hook_rejection(stderr));
+}
+
+#[test]
+fn is_hook_rejection_detects_pre_commit_hook() {
+    let stderr = "pre-commit hook failed (add --no-verify to bypass)";
+    assert!(LocalMergeOrchestrator::is_hook_rejection(stderr));
+}
+
+#[test]
+fn is_hook_rejection_detects_generic_hook_mention() {
+    let stderr = "error: hook declined to update refs/heads/main";
+    assert!(LocalMergeOrchestrator::is_hook_rejection(stderr));
+}
+
+#[test]
+fn is_hook_rejection_false_for_real_conflict() {
+    let stderr = "CONFLICT (content): Merge conflict in src/main.rs\nAutomatic merge failed; fix conflicts and then commit the result.";
+    assert!(!LocalMergeOrchestrator::is_hook_rejection(stderr));
+}
+
+#[test]
+fn detect_hook_name_finds_commit_msg() {
+    let stderr = "[commit-msg] Subject line too long";
+    assert_eq!(
+        LocalMergeOrchestrator::detect_hook_name(stderr),
+        "commit-msg"
+    );
+}
+
+#[test]
+fn detect_hook_name_finds_pre_commit() {
+    let stderr = "pre-commit hook failed";
+    assert_eq!(
+        LocalMergeOrchestrator::detect_hook_name(stderr),
+        "pre-commit"
+    );
+}
+
+#[test]
+fn detect_hook_name_falls_back_to_unknown() {
+    let stderr = "some hook error occurred";
+    assert_eq!(
+        LocalMergeOrchestrator::detect_hook_name(stderr),
+        "unknown"
+    );
+}
+
+// ── Custom commit message template tests ───────────────────────────────
+
+#[test]
+fn build_commit_message_with_custom_template() {
+    let run_id = Uuid::now_v7();
+    let wt_id = Uuid::now_v7();
+    let corr_id = Uuid::now_v7();
+
+    let intent = MergeIntent::new(run_id, wt_id, "feature/auth", "main", corr_id)
+        .with_commit_template("fix: merge {source} into {target}");
+
+    let msg = LocalMergeOrchestrator::build_commit_message(&intent);
+    assert!(
+        msg.starts_with("fix: merge feature/auth into main"),
+        "custom template should be used: {msg}"
+    );
+    assert!(!msg.contains("yarli-run:"));
+}
+
+#[test]
+fn build_commit_message_custom_template_with_all_placeholders() {
+    let run_id = Uuid::now_v7();
+    let wt_id = Uuid::now_v7();
+    let corr_id = Uuid::now_v7();
+
+    let intent = MergeIntent::new(run_id, wt_id, "dev", "main", corr_id).with_commit_template(
+        "feat(merge): {source} → {target}\n\nrun={run_id} task={task_id}",
+    );
+
+    let msg = LocalMergeOrchestrator::build_commit_message(&intent);
+    assert!(msg.contains(&run_id.to_string()));
+    assert!(msg.contains(&wt_id.to_string()));
+    assert!(msg.starts_with("feat(merge): dev → main"));
+}
+
+// ── Integration test: hook rejection during merge apply ────────────────
+
+#[tokio::test]
+async fn merge_apply_hook_rejection_returns_hook_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (main_branch, feature_branch) = create_merge_test_repo(&repo).await;
+
+    let wt_mgr = LocalWorktreeManager::new();
+    let cancel = CancellationToken::new();
+    let run_id = Uuid::now_v7();
+    let corr_id = Uuid::now_v7();
+    let task_id = Uuid::now_v7();
+    let wt_id = Uuid::now_v7();
+
+    let mut binding = WorktreeBinding::new(
+        run_id,
+        &repo,
+        format!("yarl/{}/hook-test", &run_id.to_string()[..8]),
+        "main",
+        corr_id,
+    )
+    .with_task(task_id);
+
+    wt_mgr.create(&mut binding, cancel.clone()).await.unwrap();
+
+    let mut intent = MergeIntent::new(run_id, wt_id, &feature_branch, &main_branch, corr_id);
+
+    let orchestrator = LocalMergeOrchestrator::new(wt_mgr);
+
+    orchestrator
+        .precheck(&mut intent, &binding, cancel.clone())
+        .await
+        .unwrap();
+    orchestrator
+        .dry_run(&mut intent, &binding, cancel.clone())
+        .await
+        .unwrap();
+
+    // Install a commit-msg hook in the MAIN repo's .git/hooks/.
+    // Git worktrees inherit hooks from the main repo, not from the
+    // worktree-specific gitdir.
+    let hooks_dir = repo.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let hook_path = hooks_dir.join("commit-msg");
+    std::fs::write(
+        &hook_path,
+        "#!/bin/sh\necho '[commit-msg] Subject does not follow Conventional Commits' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Apply should fail with HookRejected, not MergeConflict.
+    let err = orchestrator
+        .apply(&mut intent, &mut binding, cancel.clone())
+        .await
+        .expect_err("apply should fail due to hook");
+
+    match &err {
+        GitError::HookRejected { hook, stderr } => {
+            assert_eq!(hook, "commit-msg");
+            assert!(
+                stderr.contains("Conventional Commits"),
+                "stderr should contain hook message: {stderr}"
+            );
+        }
+        other => panic!("expected HookRejected, got {other:?}"),
+    }
+
+    // Worktree should be back to WtBoundHome, not WtConflict.
+    assert_eq!(
+        binding.state,
+        WorktreeState::WtBoundHome,
+        "hook rejection should recover worktree to WtBoundHome, not WtConflict"
+    );
 }

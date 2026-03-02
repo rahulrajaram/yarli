@@ -35,13 +35,14 @@ pub const DOT_GIT_FILE: &str = ".git";
 
 // ── Merge commit template (Section 12.5) ─────────────────────────────────
 
-/// Default merge commit message template. Placeholders:
+/// Default merge commit message template (Conventional Commits format).
+/// Placeholders:
 /// - `{source}`: source branch/ref
 /// - `{target}`: target branch/ref
 /// - `{run_id}`: YARLI run ID
 /// - `{task_id}`: YARLI task ID (if applicable)
 pub const MERGE_COMMIT_TEMPLATE: &str =
-    "Merge {source} into {target}\n\nyarli-run: {run_id}\nyarli-task: {task_id}";
+    "chore(yarli): merge {source} into {target}\n\nyarli-run: {run_id}\nyarli-task: {task_id}";
 
 // ── Timeouts and limits ──────────────────────────────────────────────────
 

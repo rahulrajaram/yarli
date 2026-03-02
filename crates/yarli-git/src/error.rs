@@ -64,6 +64,12 @@ pub enum GitError {
     #[error("merge conflicts detected: {count} file(s)")]
     MergeConflict { count: usize },
 
+    /// A git hook rejected the merge commit (e.g. commit-msg, pre-commit).
+    /// Distinct from MergeConflict — the merge content was clean but a hook
+    /// blocked the commit.
+    #[error("git hook rejected merge: {hook} — {stderr}")]
+    HookRejected { hook: String, stderr: String },
+
     /// Could not acquire merge lock for the target branch (Section 12.8).
     #[error("merge lock unavailable for branch {branch}")]
     MergeLockUnavailable { branch: String },

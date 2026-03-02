@@ -186,6 +186,42 @@ impl LocalMergeOrchestrator {
             .collect()
     }
 
+    /// Hook rejection detection patterns. Git hooks that reject a commit
+    /// produce stderr containing these fragments.
+    const HOOK_REJECTION_PATTERNS: &'static [&'static str] = &[
+        "hook",
+        "not committing",
+        "commit-msg",
+        "pre-commit",
+        "prepare-commit-msg",
+        "pre-merge-commit",
+    ];
+
+    /// Detect whether a git command's stderr indicates a hook rejection
+    /// rather than a real merge conflict.
+    pub(crate) fn is_hook_rejection(stderr: &str) -> bool {
+        let lower = stderr.to_lowercase();
+        Self::HOOK_REJECTION_PATTERNS
+            .iter()
+            .any(|pat| lower.contains(pat))
+    }
+
+    /// Try to extract the hook name from stderr. Falls back to "unknown".
+    pub(crate) fn detect_hook_name(stderr: &str) -> String {
+        let lower = stderr.to_lowercase();
+        for hook in &[
+            "commit-msg",
+            "pre-commit",
+            "prepare-commit-msg",
+            "pre-merge-commit",
+        ] {
+            if lower.contains(hook) {
+                return (*hook).to_string();
+            }
+        }
+        "unknown".to_string()
+    }
+
     /// Parse conflict markers from `git diff --check` or `git status` output.
     pub(crate) fn parse_conflicts(stdout: &str) -> Vec<ConflictRecord> {
         // Parse `git diff --name-only --diff-filter=U` for conflicting files.
@@ -303,7 +339,7 @@ impl LocalMergeOrchestrator {
             }
         };
 
-        // Check for conflicts during apply.
+        // Check for conflicts or hook rejection during apply.
         if merge_result.exit_code != 0 {
             // Collect conflicting files.
             let conflict_output = self
@@ -317,6 +353,33 @@ impl LocalMergeOrchestrator {
 
             // Abort the merge.
             let _ = self.run_git(&wt_path, &["merge", "--abort"], cancel).await;
+
+            // Distinguish hook rejection from real merge conflicts.
+            // A hook failure produces exit_code != 0 but zero unmerged files.
+            if conflicts.is_empty() && Self::is_hook_rejection(&merge_result.stderr) {
+                let hook = Self::detect_hook_name(&merge_result.stderr);
+                warn!(
+                    hook = %hook,
+                    stderr = %merge_result.stderr.trim(),
+                    "merge apply rejected by git hook"
+                );
+
+                // Transition worktree back to WtBoundHome — this is recoverable,
+                // not a conflict state.
+                binding
+                    .transition(
+                        WorktreeState::WtBoundHome,
+                        format!("merge rejected by {hook} hook"),
+                        "merge_orchestrator",
+                        None,
+                    )
+                    .map_err(GitError::Transition)?;
+
+                return Err(GitError::HookRejected {
+                    hook,
+                    stderr: merge_result.stderr.clone(),
+                });
+            }
 
             let count = conflicts.len();
             intent.set_conflicts(conflicts);
@@ -382,9 +445,13 @@ impl LocalMergeOrchestrator {
         })
     }
 
-    /// Build the merge commit message from the template.
+    /// Build the merge commit message from the intent's custom template or the default.
     pub(crate) fn build_commit_message(intent: &MergeIntent) -> String {
-        MERGE_COMMIT_TEMPLATE
+        let template = intent
+            .commit_message_template
+            .as_deref()
+            .unwrap_or(MERGE_COMMIT_TEMPLATE);
+        template
             .replace("{source}", &intent.source_ref)
             .replace("{target}", &intent.target_ref)
             .replace("{run_id}", &intent.run_id.to_string())
@@ -550,7 +617,7 @@ impl MergeOrchestrator for LocalMergeOrchestrator {
             .await?;
         let changed_files = Self::parse_changed_files(&diff_output.stdout);
 
-        // Check for conflicts.
+        // Check for conflicts or hook rejection.
         if merge_result.exit_code != 0 {
             // Merge had conflicts. Collect conflicting files.
             let conflict_output = self
@@ -564,6 +631,21 @@ impl MergeOrchestrator for LocalMergeOrchestrator {
 
             // Abort the failed merge to return to clean state.
             let _ = self.run_git(wt_path, &["merge", "--abort"], &cancel).await;
+
+            // Distinguish hook rejection from real conflicts.
+            if conflicts.is_empty() && Self::is_hook_rejection(&merge_result.stderr) {
+                let hook = Self::detect_hook_name(&merge_result.stderr);
+                warn!(
+                    hook = %hook,
+                    stderr = %merge_result.stderr.trim(),
+                    "merge dry-run rejected by git hook"
+                );
+
+                return Err(GitError::HookRejected {
+                    hook,
+                    stderr: merge_result.stderr.clone(),
+                });
+            }
 
             let count = conflicts.len();
             intent.set_conflicts(conflicts.clone());
