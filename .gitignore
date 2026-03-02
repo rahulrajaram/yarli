@@ -4,5 +4,11 @@ target/
 .ralph/
 .cultivar/
 .yarl/
+.yarli/
 .code-index/
 yarli.toml
+VISION.md
+PROMPT.md
+IMPLEMENTATION_PLAN.md
+WORKSPACE_COMMITTED_CHANGES_FIX.md
+deploy/
