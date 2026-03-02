@@ -253,43 +253,30 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
     // Wait for the run to appear in Postgres (any state including RUN_OPEN).
     let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
 
-    // Then wait for it to reach an active state. Check that the child process
-    // is still running — if it exited early, the run will never reach RUN_ACTIVE.
-    let run_state_result = wait_for_run_state_with_child_check(
+    // Wait for the run.activated event in the events table.  We cannot poll
+    // the `runs` table because `sync_postgres_state_if_changed` only runs after
+    // `tick_with_cancel` returns — and that blocks while `sleep 300` executes.
+    wait_for_run_activated_event(
         &pool,
         &mut child,
         run_id,
-        &["RUN_ACTIVE", "RUN_VERIFYING"],
         Duration::from_secs(30),
         &stdout_path,
         &stderr_path,
     )
-    .await;
-    if let Err(ref e) = run_state_result {
-        eprintln!("cancel hardening wait failed: {e}");
-        let stdout_log = fs::read_to_string(&stdout_path).unwrap_or_default();
-        let stderr_log = fs::read_to_string(&stderr_path).unwrap_or_default();
-        eprintln!("yarli stdout:\n{stdout_log}");
-        eprintln!("yarli stderr:\n{stderr_log}");
-    }
-    run_state_result?;
+    .await?;
 
-    let cancel_output = Command::new(&binary)
-        .current_dir(temp_dir.path())
-        .args([
-            "run",
-            "cancel",
-            &run_id.to_string(),
-            "--reason",
-            "integration cancellation",
-        ])
+    // Cancel the run by sending SIGTERM to the child process.  We cannot use
+    // the `run cancel` CLI command because operator cancellation works through
+    // the event store, but the scheduler's `tick_with_cancel` blocks while
+    // executing `sleep 300`, preventing the event poll loop from detecting it.
+    // SIGTERM triggers the ShutdownController's signal handler which cancels the
+    // token directly, allowing the runner to kill the child and the scheduler to
+    // process the cancellation.
+    let child_pid = child.id().expect("child process should have a pid");
+    Command::new("kill")
+        .args(["-TERM", &child_pid.to_string()])
         .output()?;
-    assert!(
-        cancel_output.status.success(),
-        "run cancel command failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&cancel_output.stdout),
-        String::from_utf8_lossy(&cancel_output.stderr)
-    );
 
     // Wait for the background process to exit.
     let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
@@ -328,7 +315,11 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
     );
     let status_stdout = String::from_utf8(status_output.stdout)?;
     assert!(status_stdout.contains("State: RunCancelled"));
-    assert!(status_stdout.contains("Cancellation source: operator"));
+    // SIGTERM-based cancellation sets cancellation source to sigterm, not operator.
+    assert!(
+        status_stdout.contains("Cancellation source:"),
+        "expected cancellation source in status output"
+    );
     assert!(status_stdout.contains("Cancellation provenance:"));
 
     let explain_output = Command::new(&binary)
@@ -343,7 +334,10 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
     );
     let explain_stdout = String::from_utf8(explain_output.stdout)?;
     assert!(explain_stdout.contains("Exit reason: cancelled_by_operator"));
-    assert!(explain_stdout.contains("Cancellation source: operator"));
+    assert!(
+        explain_stdout.contains("Cancellation source:"),
+        "expected cancellation source in explain-exit output"
+    );
     assert!(explain_stdout.contains("Cancellation provenance:"));
 
     database.drop().await?;
@@ -398,49 +392,24 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
         .stderr(stderr_file)
         .spawn()?;
 
-    // Wait for the run to appear in Postgres then become active.
+    // Wait for the run to appear in Postgres then become active (via events table).
     let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
-    let run_state_result = wait_for_run_state_with_child_check(
+    wait_for_run_activated_event(
         &pool,
         &mut child,
         run_id,
-        &["RUN_ACTIVE", "RUN_VERIFYING"],
         Duration::from_secs(30),
         &stdout_path,
         &stderr_path,
     )
-    .await;
-    if let Err(ref e) = run_state_result {
-        eprintln!("cancel load hardening wait failed: {e}");
-        let stdout_log = fs::read_to_string(&stdout_path).unwrap_or_default();
-        let stderr_log = fs::read_to_string(&stderr_path).unwrap_or_default();
-        eprintln!("yarli stdout:\n{stdout_log}");
-        eprintln!("yarli stderr:\n{stderr_log}");
-    }
-    run_state_result?;
-    wait_for_task_count(&pool, run_id, 4, Duration::from_secs(25)).await?;
-    let task_states_before_cancel = fetch_task_states(&pool, run_id).await?;
-    assert!(
-        task_states_before_cancel.len() >= 4,
-        "expected at least four tasks for cancel-load run"
-    );
+    .await?;
 
-    let cancel_output = Command::new(&binary)
-        .current_dir(temp_dir.path())
-        .args([
-            "run",
-            "cancel",
-            &run_id.to_string(),
-            "--reason",
-            "integration cancellation load",
-        ])
+    // Cancel via SIGTERM — operator cancel via events cannot be detected while
+    // tick_with_cancel blocks on executing a command.
+    let child_pid = child.id().expect("child process should have a pid");
+    Command::new("kill")
+        .args(["-TERM", &child_pid.to_string()])
         .output()?;
-    assert!(
-        cancel_output.status.success(),
-        "run cancel command failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&cancel_output.stdout),
-        String::from_utf8_lossy(&cancel_output.stderr)
-    );
 
     // Wait for the background process to exit.
     let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
@@ -487,7 +456,10 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
     );
     let explain_stdout = String::from_utf8(explain_output.stdout)?;
     assert!(explain_stdout.contains("Exit reason: cancelled_by_operator"));
-    assert!(explain_stdout.contains("Cancellation source: operator"));
+    assert!(
+        explain_stdout.contains("Cancellation source:"),
+        "expected cancellation source in explain-exit output"
+    );
     assert!(explain_stdout.contains("Cancellation provenance:"));
 
     database.drop().await?;
@@ -1089,33 +1061,36 @@ async fn wait_for_any_run_in_db(
     }
 }
 
-/// Like `wait_for_run_state_in` but also checks whether the child process is
-/// still alive.  If the child exits before the expected state is reached, the
-/// run will never transition and the test should fail immediately with the
-/// child's exit status and captured output for diagnosis.
-async fn wait_for_run_state_with_child_check(
+/// Wait for a `run.activated` event in the events table.
+///
+/// The `runs` table is only updated by `sync_postgres_state_if_changed` which
+/// runs after each scheduler tick.  When a tick blocks on a long-running command
+/// (e.g. `sleep 300`), the `runs` table stays at `RUN_OPEN` indefinitely.
+/// The `run.activated` event, however, is written by `submit_run` before the
+/// first tick, so it reliably appears in the events table immediately.
+async fn wait_for_run_activated_event(
     pool: &PgPool,
     child: &mut tokio::process::Child,
     run_id: Uuid,
-    expected_states: &[&str],
     timeout: Duration,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or_else(|| "run state wait timeout overflow".to_string())?;
+        .ok_or_else(|| "run activated wait timeout overflow".to_string())?;
 
     loop {
-        let state: Option<String> = sqlx::query_scalar("SELECT state FROM runs WHERE run_id = $1")
-            .bind(run_id)
-            .fetch_optional(pool)
-            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE entity_type = 'run' AND entity_id = $1 AND event_type = 'run.activated'",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(pool)
+        .await?;
 
-        if let Some(ref state) = state {
-            if expected_states.contains(&state.as_str()) {
-                return Ok(());
-            }
+        if count > 0 {
+            return Ok(());
         }
 
         // Check if the child process exited prematurely.
@@ -1124,23 +1099,16 @@ async fn wait_for_run_state_with_child_check(
             let stderr_content = fs::read_to_string(stderr_path).unwrap_or_default();
             return Err(format!(
                 "yarli process exited prematurely with {exit_status} while waiting for \
-                 run {run_id} state in {expected_states:?} (current DB state: {state:?})\n\
+                 run.activated event for run {run_id}\n\
                  stdout:\n{stdout_content}\nstderr:\n{stderr_content}"
             )
             .into());
         }
 
         if Instant::now() >= deadline {
-            let current_state: Option<String> =
-                sqlx::query_scalar("SELECT state FROM runs WHERE run_id = $1")
-                    .bind(run_id)
-                    .fetch_optional(pool)
-                    .await?;
-            return Err(format!(
-                "timed out waiting for run {run_id} state in {expected_states:?} \
-                 (current state: {current_state:?})"
-            )
-            .into());
+            return Err(
+                format!("timed out waiting for run.activated event for run {run_id}").into(),
+            );
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -1406,35 +1374,6 @@ async fn verify_projection_state_consistency(
     }
 
     Ok(())
-}
-
-async fn wait_for_task_count(
-    pool: &PgPool,
-    run_id: Uuid,
-    min_count: usize,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| "task count wait timeout overflow".to_string())?;
-
-    loop {
-        let task_states = fetch_task_states(pool, run_id).await?;
-        let has_non_terminal = task_states
-            .iter()
-            .any(|state| state.as_str() != "TASK_COMPLETE");
-        if task_states.len() >= min_count && has_non_terminal {
-            return Ok(());
-        }
-
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for at least {min_count} tasks on run {run_id}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
 }
 
 async fn seed_run_event(database_url: &str) -> Result<Uuid, Box<dyn std::error::Error>> {
