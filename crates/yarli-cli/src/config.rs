@@ -2294,6 +2294,9 @@ provider = "missing"
 
     #[test]
     fn postgres_backend_prefers_configured_database_url_file() {
+        let _guard = with_database_url_env_lock();
+        let previous_env = std::env::var(DATABASE_URL_ENV).ok();
+        std::env::remove_var(DATABASE_URL_ENV);
         let temp_dir = TempDir::new().unwrap();
         let secret_path = temp_dir.path().join("database-url");
         std::fs::write(
@@ -2319,6 +2322,11 @@ database_url_file = "{}"
                 database_url: "postgres://postgres:postgres@localhost:5432/file-backed".to_string()
             }
         );
+
+        match previous_env {
+            Some(value) => std::env::set_var(DATABASE_URL_ENV, value),
+            None => std::env::remove_var(DATABASE_URL_ENV),
+        }
     }
 
     #[test]
