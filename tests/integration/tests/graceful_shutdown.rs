@@ -16,6 +16,7 @@ use yarli_core::domain::{CommandClass, SafeMode};
 use yarli_core::entities::{Run, Task};
 use yarli_core::fsm::run::RunState;
 use yarli_core::fsm::task::TaskState;
+use yarli_core::shutdown::ShutdownController;
 use yarli_exec::LocalCommandRunner;
 use yarli_queue::{
     ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
@@ -165,4 +166,98 @@ async fn scheduler_loop_with_cancellation_completes_fast_task() {
         RunState::RunCompleted,
         "fast run should complete before cancellation"
     );
+}
+
+/// Verify that `terminate_children()` kills tracked child processes.
+///
+/// This tests the zombie prevention fix: when a run reaches RunFailed
+/// programmatically, `terminate_children()` must kill any surviving children.
+#[cfg(unix)]
+#[tokio::test]
+async fn terminate_children_kills_tracked_processes() {
+    use yarli_core::entities::command_execution::StreamChunk;
+    use yarli_exec::{CommandRequest, CommandRunner};
+
+    let shutdown = ShutdownController::new();
+    let runner = LocalCommandRunner::new().with_shutdown(shutdown.clone());
+
+    // Spawn a long-running sleep via the runner, capturing its PID via live output.
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    // The command prints both its shell PID and the PID of a background sleep,
+    // so we can verify that process-group signalling kills descendants too.
+    let req = CommandRequest {
+        task_id: uuid::Uuid::now_v7(),
+        run_id: uuid::Uuid::now_v7(),
+        command: "sleep 300 & echo sleeper:$!; echo shell:$$; wait".to_string(),
+        working_dir: "/tmp".to_string(),
+        command_class: CommandClass::Io,
+        correlation_id: uuid::Uuid::now_v7(),
+        idempotency_key: None,
+        timeout: None,
+        env: vec![],
+        live_output_tx: Some(live_tx),
+    };
+
+    // Run the command in a background task, cancel it once we capture PIDs.
+    let runner_handle = tokio::spawn(async move { runner.run(req, cancel).await });
+
+    // Wait for PIDs to be printed.
+    let mut shell_pid: Option<i32> = None;
+    let mut sleeper_pid: Option<i32> = None;
+    while let Some(chunk) = live_rx.recv().await {
+        if let Some(pid_str) = chunk.data.strip_prefix("shell:") {
+            shell_pid = pid_str.trim().parse::<i32>().ok();
+        }
+        if let Some(pid_str) = chunk.data.strip_prefix("sleeper:") {
+            sleeper_pid = pid_str.trim().parse::<i32>().ok();
+        }
+        if shell_pid.is_some() && sleeper_pid.is_some() {
+            break;
+        }
+    }
+    let shell_pid = shell_pid.expect("should have captured shell PID");
+    let sleeper_pid = sleeper_pid.expect("should have captured sleeper PID");
+
+    // Verify both processes are alive.
+    assert!(
+        process_alive(shell_pid),
+        "shell process {shell_pid} should be alive"
+    );
+    assert!(
+        process_alive(sleeper_pid),
+        "sleeper process {sleeper_pid} should be alive"
+    );
+
+    // Now call terminate_children — this simulates what happens on RunFailed.
+    shutdown.terminate_children().await;
+
+    // Wait briefly for signals to be delivered.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Both processes should be dead (process-group kill).
+    assert!(
+        !process_alive(shell_pid),
+        "shell process {shell_pid} should have been killed by terminate_children()"
+    );
+    assert!(
+        !process_alive(sleeper_pid),
+        "sleeper process {sleeper_pid} should have been killed by terminate_children()"
+    );
+
+    // Clean up the runner task.
+    cancel_clone.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), runner_handle).await;
+}
+
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    matches!(err.raw_os_error(), Some(code) if code == libc::EPERM)
 }

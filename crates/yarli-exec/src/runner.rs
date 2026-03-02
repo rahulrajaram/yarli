@@ -27,6 +27,7 @@ use yarli_core::entities::command_execution::{
     CommandExecution, CommandResourceUsage, StreamChunk, StreamType, TokenUsage,
 };
 use yarli_core::fsm::command::CommandState;
+use yarli_core::shutdown::ShutdownController;
 
 use crate::error::ExecError;
 
@@ -111,6 +112,10 @@ pub struct LocalCommandRunner {
     pub idle_kill_timeout: Option<Duration>,
     /// Optional metrics registry for telemetry.
     pub metrics: Option<std::sync::Arc<YarliMetrics>>,
+    /// Optional shutdown controller for tracking child PIDs.
+    /// When set, spawned children are registered so `terminate_children()`
+    /// can clean them up on programmatic failure (not just Ctrl+C).
+    shutdown: Option<ShutdownController>,
 }
 
 impl LocalCommandRunner {
@@ -119,6 +124,7 @@ impl LocalCommandRunner {
             default_timeout: None,
             idle_kill_timeout: None,
             metrics: None,
+            shutdown: None,
         }
     }
 
@@ -134,6 +140,11 @@ impl LocalCommandRunner {
 
     pub fn with_metrics(mut self, metrics: std::sync::Arc<YarliMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_shutdown(mut self, shutdown: ShutdownController) -> Self {
+        self.shutdown = Some(shutdown);
         self
     }
 
@@ -224,7 +235,15 @@ impl CommandRunner for LocalCommandRunner {
         }
         let mut child = command.spawn().map_err(ExecError::SpawnFailed)?;
         self.record_overhead(request.command_class, "spawn", spawn_start.elapsed());
-        let process_group_id = child.id().and_then(pid_to_process_group_id);
+        let child_pid = child.id();
+        let process_group_id = child_pid.and_then(pid_to_process_group_id);
+
+        // Track child PID in shutdown controller so it can be killed on
+        // programmatic failure (RunFailed) — not just on Ctrl+C signal.
+        #[cfg(unix)]
+        if let (Some(pid), Some(shutdown)) = (child_pid, &self.shutdown) {
+            shutdown.track_child(pid);
+        }
 
         let capture_start = Instant::now();
         let monitor = child.id().map(spawn_resource_monitor);
@@ -339,6 +358,12 @@ impl CommandRunner for LocalCommandRunner {
         };
         execution.resource_usage = resource_usage;
         execution.token_usage = Some(estimate_token_usage(&execution.command, &chunks));
+
+        // Untrack child PID — process has exited (normally, timed out, or killed).
+        #[cfg(unix)]
+        if let (Some(pid), Some(shutdown)) = (child_pid, &self.shutdown) {
+            shutdown.untrack_child(pid);
+        }
 
         // Apply terminal transition based on outcome.
         match wait_result {

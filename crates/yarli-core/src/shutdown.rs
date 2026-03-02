@@ -57,6 +57,14 @@ pub struct ShutdownController {
     inner: Arc<ShutdownInner>,
 }
 
+impl std::fmt::Debug for ShutdownController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShutdownController")
+            .field("phase", &self.phase())
+            .finish()
+    }
+}
+
 struct ShutdownInner {
     /// CancellationToken propagated to all async tasks.
     token: CancellationToken,
@@ -270,9 +278,13 @@ impl ShutdownController {
         }
     }
 
-    /// Send SIGTERM to all tracked children, then SIGKILL after `SIGKILL_ESCALATION`.
+    /// Send SIGTERM to all tracked children (and their process groups), then
+    /// SIGKILL after `SIGKILL_ESCALATION`.
     ///
-    /// This is called during graceful shutdown. The caller should await the returned future.
+    /// Each tracked PID is also used as a process group ID (PGID) because the
+    /// runner calls `setpgid(0,0)` before spawning, making each child its own
+    /// process group leader. Signalling `-pgid` ensures descendant processes
+    /// (e.g. codex backends) are also terminated.
     #[cfg(unix)]
     pub async fn terminate_children(&self) {
         use tokio::time::sleep;
@@ -292,9 +304,12 @@ impl ShutdownController {
 
         info!(count = pids.len(), "sending SIGTERM to tracked children");
         for &pid in &pids {
-            // Safety: sending signal to a known PID.
+            let pgid = pid as i32;
+            // Signal the process group first (negative PID), then the process
+            // itself as a fallback in case it changed its own group.
             unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
+                libc::kill(-pgid, libc::SIGTERM);
+                libc::kill(pgid, libc::SIGTERM);
             }
         }
 
@@ -311,9 +326,11 @@ impl ShutdownController {
         };
 
         for &pid in &remaining {
+            let pgid = pid as i32;
             warn!(pid, "escalating to SIGKILL");
             unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+                libc::kill(-pgid, libc::SIGKILL);
+                libc::kill(pgid, libc::SIGKILL);
             }
         }
     }
