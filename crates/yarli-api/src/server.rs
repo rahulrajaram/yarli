@@ -16,7 +16,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use futures_util::SinkExt as _;
 use prometheus_client::registry::Registry;
 use reqwest::Client;
 use reqwest::Url;
@@ -87,7 +86,7 @@ impl ApiState {
         }
     }
 
-    pub fn new_with_security(store: Arc<dyn EventStore>, security: ApiSecurityConfig) -> Self {
+    pub(crate) fn new_with_security(store: Arc<dyn EventStore>, security: ApiSecurityConfig) -> Self {
         let mut metrics_registry = Registry::default();
         let _ = YarliMetrics::new(&mut metrics_registry);
         Self {
@@ -141,7 +140,7 @@ impl ApiState {
 }
 
 #[derive(Clone)]
-struct ApiSecurityConfig {
+pub(crate) struct ApiSecurityConfig {
     api_keys: Arc<Vec<String>>,
     require_api_key: bool,
     rate_limit_per_minute: usize,
@@ -1908,7 +1907,6 @@ struct TaskMutationProjection {
     correlation_id: Uuid,
     last_event_id: Option<Uuid>,
     attempt_no: u32,
-    last_event_type: String,
 }
 
 fn load_task_projection_for_control(
@@ -1929,8 +1927,6 @@ fn load_task_projection_for_control(
     let mut correlation_id = task_events[0].correlation_id;
     let mut last_event_id = None;
     let mut attempt_no = 0u32;
-    let mut last_event_type = String::new();
-
     for event in &task_events {
         correlation_id = event.correlation_id;
         last_event_id = Some(event.event_id);
@@ -1944,7 +1940,6 @@ fn load_task_projection_for_control(
         {
             attempt_no = raw_attempt as u32;
         }
-        last_event_type = event.event_type.clone();
     }
 
     Ok(Some(TaskMutationProjection {
@@ -1952,7 +1947,6 @@ fn load_task_projection_for_control(
         correlation_id,
         last_event_id,
         attempt_no,
-        last_event_type,
     }))
 }
 
@@ -2001,6 +1995,7 @@ struct TaskUnblockRequest {
     reason: Option<String>,
 }
 
+#[cfg(feature = "debug-api")]
 #[derive(Debug, Deserialize)]
 struct TaskPriorityOverrideRequest {
     priority: u32,
