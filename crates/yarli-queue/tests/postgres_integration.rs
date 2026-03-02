@@ -314,8 +314,10 @@ async fn claim_paths_execute_without_sql_syntax_errors_postgres(
     queue.enqueue(task_a, run_a, 50, CommandClass::Git, None)?;
     queue.enqueue(task_b1, run_b, 1, CommandClass::Git, None)?;
     queue.enqueue(task_b2, run_b, 1, CommandClass::Git, None)?;
-    let mut unconstrained_git_caps = ConcurrencyConfig::default();
-    unconstrained_git_caps.git_cap = 8;
+    let unconstrained_git_caps = ConcurrencyConfig {
+        git_cap: 8,
+        ..Default::default()
+    };
 
     // Unscoped claim path (allowed_run_ids = None).
     let unscoped = queue.claim(

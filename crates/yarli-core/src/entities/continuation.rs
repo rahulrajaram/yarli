@@ -92,19 +92,14 @@ mod run_state_pascal_case {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskHealthAction {
+    #[default]
     Continue,
     CheckpointNow,
     ForcePivot,
     StopAndSummarize,
-}
-
-impl Default for TaskHealthAction {
-    fn default() -> Self {
-        Self::Continue
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,20 +154,15 @@ pub struct TrancheSpec {
     pub interventions: Vec<ContinuationIntervention>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrancheKind {
+    #[default]
     RetryUnfinished,
     PlannedNext,
     /// All tasks completed but run-level gates failed. Re-run the same tranche
     /// so gates can be re-evaluated after the operator addresses the gate issue.
     GateRetry,
-}
-
-impl Default for TrancheKind {
-    fn default() -> Self {
-        Self::RetryUnfinished
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
