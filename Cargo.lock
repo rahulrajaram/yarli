@@ -4012,6 +4012,7 @@ name = "yarli-integration-tests"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "libc",
  "serde_json",
  "sqlx",
  "tempfile",

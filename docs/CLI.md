@@ -1,6 +1,16 @@
 # YARLI CLI Usage Guide
 
-This is the exhaustive, command-by-command usage guide for `yarli`.
+This is the command-by-command usage guide for `yarli`.
+
+For exact clap output snapshots (captured from live `--help`), see `docs/CLI_HELP.md`.
+
+## CLI Help-Text Audit Report
+
+Commands scanned: 51  
+Issues found: 1
+
+INCORRECT:
+- [ERR] `yarli audit query --help` currently panics at runtime because `-f` is assigned to both `--file` and `--format` in clap definitions.
 
 ## Core Concepts
 
@@ -69,9 +79,9 @@ If `yarli.toml` is missing, defaults are used. Defaults are intentionally conser
 
 Bootstrap a config with `yarli init`.
 
-### Memories (Memory-backend)
+### Memories (Provider Adapters)
 
-YARLI can store and query "memories" (short, reusable incident summaries) using Memory-backend.
+YARLI can store and query memories (short, reusable incident summaries) via provider adapters.
 
 What gets stored (high level):
 
@@ -80,21 +90,28 @@ What gets stored (high level):
   - at run start (`run.observer.memory_hints`)
   - on task failure/block (`task.observer.memory_hints`)
 
-Enable Backend-backed memories in `yarli.toml`:
+Enable memory providers in `yarli.toml`:
 
 ```toml
 [memory]
-# Optional master switch. If unset, `[memory.backend].enabled` is the effective toggle.
+# Optional master switch. If unset, selected provider `enabled` is the effective toggle.
 # enabled = true
 # project_id = "project"
+# provider = "default"
 
-[memory.backend]
+[memory.providers.default]
+type = "cli"
 enabled = true
 command = "memory-backend"
 # project_dir = "."            # defaults to the directory containing PROMPT.md
 query_limit = 8
 inject_on_run_start = true
 inject_on_failure = true
+
+# Legacy fallback is still supported:
+# [memory.backend]
+# enabled = true
+# command = "memory-backend"
 ```
 
 Memory backend bootstrap (per repo):
@@ -161,6 +178,8 @@ yarli run --stream
 # Or provide DATABASE_URL at runtime (recommended for container deployments):
 # export DATABASE_URL="postgres://postgres:postgres@localhost:5432/yarli"
 #
+```
+
 ### Postgres migration control
 
 Use the new migration tooling for durable mode:
@@ -174,9 +193,6 @@ yarli migrate restore --label <label>
 ```
 
 Apply schema migrations (or restore from a snapshot) before running durable CLI write commands.
- 
-yarli run --stream
-```
 
 Execution backend examples:
 
@@ -491,6 +507,69 @@ yarli audit tail --category policy_decision
 yarli audit query --run-id <run-id> --task-id <task-id>
 yarli audit query --category gate_evaluation --since 2026-02-20T00:00:00Z --before 2026-02-22T23:59:59Z
 yarli audit query --category policy_decision --format csv --limit 50
+```
+
+### `yarli plan`
+
+Purpose:
+
+- Manage the structured tranches file (`.yarli/tranches.toml`) used by plan-driven dispatch.
+
+Examples:
+
+```bash
+# Validate tranche metadata and key validity.
+yarli plan validate
+
+# List, add, complete, and remove tranches.
+yarli plan tranche list
+yarli plan tranche add --key TP-05 --summary "Config loader hardening"
+yarli plan tranche complete --key TP-05
+yarli plan tranche remove --key TP-05
+```
+
+### `yarli debug`
+
+Purpose:
+
+- Inspect live scheduler internals and queue/runtime telemetry.
+
+Examples:
+
+```bash
+# Queue depth by run and command class.
+yarli debug queue-depth
+
+# Active lease owners and TTLs.
+yarli debug active-leases
+
+# Run-level resource budget usage.
+yarli debug resource-usage <run-id>
+```
+
+### `yarli migrate`
+
+Purpose:
+
+- Manage Postgres migration lifecycle for durable mode.
+
+Examples:
+
+```bash
+# Inspect applied vs pending migrations.
+yarli migrate status
+
+# Apply migrations (optionally to a target).
+yarli migrate up
+yarli migrate up --target 0001
+
+# Roll back (automatically creates backup label if omitted).
+yarli migrate down
+yarli migrate down --target 0001 --backup-label rollback_20260224
+
+# Manual snapshot and restore.
+yarli migrate backup --label pre_release
+yarli migrate restore pre_release
 ```
 
 ### `yarli info`

@@ -1,77 +1,227 @@
 # YARLI
+Deterministic run/task orchestration with event sourcing, queue scheduling, and safe Git controls.
 
-YARLI is a Rust workspace for durable run/task orchestration with event sourcing, queue scheduling, and git workflow controls.
+## What is this?
+YARLI is a Rust workspace for executing plan-driven engineering workflows with durable state and explicit operator control. It treats runs, tasks, worktrees, merges, command execution, and policy decisions as state-machine entities persisted through an event log.
 
-Execution backends:
+The primary workflow is `yarli run`: resolve prompt context, discover open tranches, dispatch execution tasks, and emit explainable run/task status. YARLI supports both local ephemeral development and durable Postgres-backed operation.
 
-- `execution.runner = "native"` (default)
-- `execution.runner = "overwatch"` (opt-in; Overwatch service API integration)
+This project is for teams that want reproducible orchestration behavior, auditable transitions, and safe defaults around Git operations, policy checks, and runtime controls.
 
-## Quick Verification
+## Features
+- Config-first orchestration (`yarli.toml`) with plan-driven tranche dispatch.
+- Durable event store and queue backends (Postgres) with in-memory mode for local testing.
+- Explicit operator controls (`pause`, `resume`, `cancel`) and explainability commands.
+- Policy and gate evaluation over task/run state.
+- Parallel workspace execution with scoped merge and recovery artifacts.
+- Optional memory provider adapters via `[memory.providers.<name>]`.
+- REST API crate (`yarli-api`) with health, status, control, webhook, and websocket event routes.
 
+## Installation
+### Build from source
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo build --release -p yarli-cli --bin yarli
+./target/release/yarli --help
 ```
 
-## Default `yarli run`
-
-`yarli run` is opinionated: prompt resolution precedence is:
-1. `yarli run --prompt-file <path>`
-2. `yarli.toml` `[run].prompt_file`
-3. fallback lookup for `PROMPT.md` (walking up from the current directory)
-
-YARLI then expands any `@include <path>` directives, discovers incomplete tranches from
-`IMPLEMENTATION_PLAN.md`, and dispatches tranche + verification tasks via `[cli]` config.
-Run-spec defaults can be defined in `yarli.toml` under `[run]`, `[[run.tasks]]`,
-`[[run.tranches]]`, and `[run.plan_guard]`; a `PROMPT.md` `yarli-run` block is optional
-and acts as an override layer.
-When `PROMPT.md` has no embedded `yarli-run` block and the plan has no open tranches,
-YARLI dispatches the full prompt text as a single task.
-When `[features].parallel = true` (default), `yarli run` requires `[execution].worktree_root`
-and provisions per-task workspace copies under that root before execution.
-Execution paths (`execution.working_dir` and `execution.worktree_root`) expand `~` and `$ENV_VAR`
-tokens before resolution.
-Use `[execution].worktree_exclude_paths` to skip heavy/generated paths during workspace copy
-(for example `target`, `node_modules`, `.venv`, `venv`, `__pycache__`).
-After a completed run, YARLI auto-merges each task workspace back into the source repo by scoping
-to paths that differ from the source workspace and applying with `git apply --3way`.
-If a merge cannot be completed automatically, YARLI preserves the run workspace root and writes
-`PARALLEL_MERGE_RECOVERY.txt` with deterministic operator recovery commands.
-Optional grouping is available with `[run].enable_plan_tranche_grouping = true` plus
-`tranche_group=<name>` metadata on plan lines.
-Optional tranche file scope hints are available with `allowed_paths=...` metadata and
-`[run].enforce_plan_tranche_allowed_paths = true`.
-Legacy prompt-embedded task execution remains as fallback compatibility when config-first
-dispatch cannot be materialized.
-CLI environment isolation is configurable with `[cli].env_unset` (for example
-`env_unset = ["CLAUDECODE"]` for nested Claude subprocesses).
-
-Control model:
-- `yarli run` is the authoritative execution entry point.
-- Built-in Yarli policy gates are code-defined checks; verification command chains are plan/config/script-defined.
-- Observer integrations are read-only telemetry and do not gate active run progression.
-- Operator controls are explicit: `yarli run pause`, `yarli run resume`, `yarli run cancel`.
-
+### Cargo install (local path)
 ```bash
+cargo install --path crates/yarli-cli --bin yarli
+yarli --help
+```
+
+### Install script
+```bash
+./install.sh
+~/.local/bin/yarli --version
+```
+
+### Docker
+```bash
+docker build -t yarli:local .
+docker run --rm yarli:local --help
+```
+
+## Quick Start
+```bash
+# 1) Generate config template
+yarli init
+
+# 2) For local ephemeral writes, set in yarli.toml:
+# [core]
+# backend = "in-memory"
+# allow_in_memory_writes = true
+
+# 3) Ensure PROMPT.md exists, then run
 yarli run --stream
 ```
 
-## CLI Usage
+For durable mode, configure:
+```toml
+[core]
+backend = "postgres"
 
-See `docs/CLI.md` for an exhaustive, command-by-command guide (with `init` backend examples).
-
-## Postgres Integration Tests
-
+[postgres]
+database_url = "postgres://postgres:postgres@localhost:5432/yarli"
+```
+Then apply migrations:
 ```bash
-export YARLI_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
-cargo test -p yarli-store --test postgres_integration
-cargo test -p yarli-queue --test postgres_integration
-cargo test -p yarli-cli --test postgres_integration
+yarli migrate up
 ```
 
-## Operations
+## CLI Reference
+Verified command tree (from live `--help`):
+- `yarli run`: `start`, `batch`, `status`, `explain-exit`, `list`, `continue`, `pause`, `resume`, `cancel`
+- `yarli task`: `list`, `explain`, `unblock`, `annotate`, `output`
+- `yarli gate`: `list`, `rerun`
+- `yarli worktree`: `status`, `recover`
+- `yarli merge`: `request`, `approve`, `reject`, `status`
+- `yarli audit`: `tail`, `query`
+- `yarli plan`: `tranche` (`add`, `complete`, `list`, `remove`), `validate`
+- `yarli debug`: `queue-depth`, `active-leases`, `resource-usage`
+- `yarli migrate`: `status`, `up`, `down`, `backup`, `restore`
+- `yarli init`, `yarli info`
 
-Operational setup, migration steps, and local runbook details are documented in `docs/OPERATIONS.md`.
-CI/CD API workflow examples are in `docs/CI_CD_INTEGRATION_EXAMPLES.md`.
+Exact clap output snapshots for every command/subcommand are in `docs/CLI_HELP.md`.
+
+Known issue from audit:
+- `yarli audit query --help` currently panics due duplicate short flag `-f` in clap.
+
+## AI Agent Integration
+YARLI integrates with agent CLIs through `[cli]` configuration (for example `codex`, `claude`, `gemini`, or custom command wiring).
+
+Example:
+```toml
+[cli]
+backend = "codex"
+prompt_mode = "arg"
+command = "codex"
+args = ["exec"]
+```
+
+YARLI is not currently an MCP server. Agent integration is command-dispatch based.
+
+## gRPC API
+Current status: no gRPC service is exposed by default in this repository.  
+`yarli-api` currently exposes HTTP/WebSocket routes (Axum). If gRPC is added later, document proto service definitions and RPCs here.
+
+## REST API
+Core routes (from `crates/yarli-api/src/server.rs`):
+- `GET /health`
+- `GET /metrics`
+- `GET /v1/events/ws`
+- `POST /v1/webhooks`
+- `POST /v1/runs`, `GET /v1/runs`
+- `GET /v1/runs/:run_id/status`
+- `POST /v1/runs/:run_id/pause|resume|cancel`
+- `GET /v1/tasks`
+- `GET /v1/tasks/:task_id`
+- `POST /v1/tasks/:task_id/annotate|unblock|retry`
+- `GET /v1/audit`
+- `GET /v1/metrics/reporting`
+- `POST /v1/tasks/:task_id/priority` and `/debug/*` routes when built with `debug-api`
+
+Example curl:
+```bash
+curl -sS http://127.0.0.1:3000/health
+curl -sS http://127.0.0.1:3000/v1/runs
+curl -sS http://127.0.0.1:3000/v1/runs/<run-id>/status
+```
+
+Minimal server embedding example:
+```rust
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use yarli_api::server::serve;
+use yarli_store::InMemoryEventStore;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:3000").await?;
+    let store = Arc::new(InMemoryEventStore::new());
+    serve(listener, store).await?;
+    Ok(())
+}
+```
+
+## Configuration
+Main config file: `yarli.toml` (template via `yarli init`; example in `yarli.example.toml`).
+
+Important environment variables read by code:
+- `DATABASE_URL` (Postgres DSN fallback)
+- `YARLI_LOG` (used to populate `RUST_LOG` when unset)
+- `YARLI_ALLOW_RECURSIVE_RUN` (recursive-run override path)
+- `YARLI_API_KEYS` (API auth keys)
+- `YARLI_API_RATE_LIMIT_PER_MINUTE` (API rate limit)
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP tracing exporter endpoint)
+- `YARLI_TEST_DATABASE_URL`, `YARLI_REQUIRE_POSTGRES_TESTS` (Postgres integration test controls)
+
+## Architecture
+```text
+                +---------------------+
+                |  yarli CLI (run/*)  |
+                +----------+----------+
+                           |
+                           v
+                +---------------------+
+                | Scheduler + Queue   |
+                | (yarli-queue)       |
+                +----------+----------+
+                           |
+        +------------------+------------------+
+        v                                     v
++---------------+                    +------------------+
+| Command Runner|                    | Policy + Gates   |
+| (yarli-exec)  |                    | (yarli-policy,   |
++-------+-------+                    |  yarli-gates)    |
+        |                            +--------+---------+
+        v                                     |
++---------------+                             |
+| Git/Worktree  |<----------------------------+
+| (yarli-git)   |
++-------+-------+
+        |
+        v
++---------------+
+| Event Store   |
+| (in-memory or |
+| Postgres)     |
++-------+-------+
+        |
+        v
++---------------+
+| API / Observe |
+| (yarli-api)   |
++---------------+
+```
+
+## Security
+- Safe mode and policy enforcement are configurable (`observe`, `restricted`, `execute`, `breakglass`).
+- Destructive Git operations are denied by default (`git.destructive_default_deny = true`).
+- API authentication is enabled when `YARLI_API_KEYS` is set.
+- API key rate limiting uses `YARLI_API_RATE_LIMIT_PER_MINUTE` (default 120/min).
+- Durable mode is recommended for write commands; in-memory mode blocks writes unless explicitly allowed.
+
+## Examples
+```bash
+# List runs and inspect a run
+yarli run list
+yarli run status <run-id>
+
+# Explain unresolved run/task state
+yarli run explain-exit <run-id>
+yarli task explain <task-id>
+
+# Operator controls
+yarli run pause <run-id> --reason "maintenance window"
+yarli run resume <run-id> --reason "maintenance complete"
+yarli run cancel <run-id> --reason "operator stop"
+
+# Migration lifecycle
+yarli migrate status
+yarli migrate up
+yarli migrate backup --label pre_change
+```
+
+## License
+Dual licensed under `MIT OR Apache-2.0`.
