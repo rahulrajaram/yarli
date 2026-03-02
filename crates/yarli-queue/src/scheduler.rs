@@ -820,7 +820,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 };
                 if run.state.can_transition_to(target) {
                     if let Err(e) =
-                        run.transition(target, &format!("{exit_reason}"), "scheduler", None)
+                        run.transition(target, format!("{exit_reason}"), "scheduler", None)
                     {
                         warn!(run_id = %run_id, error = %e, "failed to transition run to terminal");
                     } else {

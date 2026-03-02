@@ -597,6 +597,7 @@ fn read_process_sample(_pid: u32) -> Option<ProcessSample> {
 ///
 /// If `idle_kill_timeout` is Some, the child will be killed if no output
 /// is received within the given duration (detects hung processes).
+#[allow(clippy::too_many_arguments)]
 async fn collect_and_wait(
     child: &mut tokio::process::Child,
     process_group_id: Option<i32>,

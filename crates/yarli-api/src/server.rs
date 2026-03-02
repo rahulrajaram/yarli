@@ -1268,10 +1268,11 @@ fn detect_budget_breach_reason(event: &Event) -> Option<String> {
 }
 
 fn event_query_with_after_limit(after_event_id: Option<Uuid>, limit: Option<usize>) -> EventQuery {
-    let mut query = EventQuery::default();
-    query.after_event_id = after_event_id;
-    query.limit = limit;
-    query
+    EventQuery {
+        after_event_id,
+        limit,
+        ..Default::default()
+    }
 }
 
 fn event_task_id(event: &Event) -> Option<Uuid> {
@@ -1752,6 +1753,7 @@ fn load_existing_run_status(
         .map(Json)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_run_transition(
     actor: &str,
     run_id: String,
