@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Project-specific commit-msg checks for yarli
+# Called by the dispatcher in .git/hooks/commit-msg
+
+COMMITHOOKS_DIR="${COMMITHOOKS_DIR:-$(git rev-parse --git-dir)}"
+source "$COMMITHOOKS_DIR/lib/common.sh"
+source "$COMMITHOOKS_DIR/lib/commit-msg.sh"
