@@ -245,10 +245,13 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    // Wait for the run to reach an active state in Postgres by polling the DB
-    // for any run in the RUN_ACTIVE state (we don't have the run_id yet).
-    let run_id = wait_for_any_run_state_in(
+    // Wait for the run to appear in Postgres (any state including RUN_OPEN).
+    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+
+    // Then wait for it to reach an active state.
+    wait_for_run_state_in(
         &pool,
+        run_id,
         &["RUN_ACTIVE", "RUN_VERIFYING"],
         Duration::from_secs(30),
     )
@@ -374,9 +377,11 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    // Wait for the run to reach an active state and all tasks to be created.
-    let run_id = wait_for_any_run_state_in(
+    // Wait for the run to appear in Postgres then become active.
+    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+    wait_for_run_state_in(
         &pool,
+        run_id,
         &["RUN_ACTIVE", "RUN_VERIFYING"],
         Duration::from_secs(30),
     )
@@ -504,7 +509,10 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
     wait_for_run_state(&pool, run_id, "RUN_FAILED", Duration::from_secs(20)).await?;
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
     assert_eq!(state, "RUN_FAILED");
-    assert_eq!(exit_reason, Some("timed_out".to_string()));
+    // Command-level timeout causes task failure which leads to run failure with
+    // failed_runtime_error. The "timed_out" exit reason is only for run-level
+    // max_runtime timeouts.
+    assert_eq!(exit_reason, Some("failed_runtime_error".to_string()));
 
     let status_output = Command::new(&binary)
         .current_dir(temp_dir.path())
@@ -540,7 +548,7 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
     );
     let explain_stdout = String::from_utf8(explain_output.stdout)?;
     assert!(explain_stdout.contains("Status: RunFailed"));
-    assert!(explain_stdout.contains("Exit reason: timed_out"));
+    assert!(explain_stdout.contains("Exit reason: failed_runtime_error"));
 
     database.drop().await?;
     Ok(())
@@ -665,15 +673,17 @@ async fn overwatch_runner_failure_roundtrip_against_postgres(
         ])
         .output()?;
 
-    assert!(
-        run_output.status.success(),
-        "run start command failed with failing overwatch backend\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run_output.stdout),
-        String::from_utf8_lossy(&run_output.stderr)
-    );
-    let run_stdout = String::from_utf8(run_output.stdout)?;
-    let run_id =
-        parse_run_id(&run_stdout).ok_or("missing run id in overwatch failure hardening output")?;
+    // The run is expected to fail (overwatch reports task failure). The CLI
+    // exits non-zero for RunFailed, so we do NOT assert exit success here.
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    let run_stderr = String::from_utf8_lossy(&run_output.stderr);
+    let run_id = parse_run_id(&run_stdout)
+        .or_else(|| parse_run_id(&run_stderr))
+        .ok_or_else(|| {
+            format!(
+                "missing run id in overwatch failure hardening output\nstdout:\n{run_stdout}\nstderr:\n{run_stderr}"
+            )
+        })?;
 
     wait_for_run_state(&pool, run_id, "RUN_FAILED", Duration::from_secs(20)).await?;
 
@@ -1011,36 +1021,29 @@ async fn wait_for_run_state(
     wait_for_run_state_in(pool, run_id, &[expected], timeout).await
 }
 
-/// Wait for any run (not a specific run_id) to reach one of the expected states.
-/// Returns the run_id of the first matching run. Used by cancel tests where the
-/// run_id is not known ahead of time because the process is spawned in the background.
-async fn wait_for_any_run_state_in(
+/// Wait for any run to appear in the database (any state).
+/// Returns the run_id of the first run found. Used by cancel tests where the
+/// process is spawned in the background and we need to discover the run_id.
+async fn wait_for_any_run_in_db(
     pool: &PgPool,
-    expected_states: &[&str],
     timeout: Duration,
 ) -> Result<Uuid, Box<dyn std::error::Error>> {
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or_else(|| "run state wait timeout overflow".to_string())?;
+        .ok_or_else(|| "run wait timeout overflow".to_string())?;
 
     loop {
-        for expected in expected_states {
-            let row: Option<Uuid> =
-                sqlx::query_scalar("SELECT run_id FROM runs WHERE state = $1 LIMIT 1")
-                    .bind(*expected)
-                    .fetch_optional(pool)
-                    .await?;
-            if let Some(run_id) = row {
-                return Ok(run_id);
-            }
+        let row: Option<Uuid> = sqlx::query_scalar("SELECT run_id FROM runs LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+        if let Some(run_id) = row {
+            return Ok(run_id);
         }
 
         if Instant::now() >= deadline {
-            return Err(
-                format!("timed out waiting for any run in states {expected_states:?}").into(),
-            );
+            return Err("timed out waiting for any run to appear in the database".into());
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -1216,8 +1219,14 @@ async fn expected_run_state_from_events(
     pool: &PgPool,
     run_id: Uuid,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // Exclude non-transition events (config snapshots, catalogs, merge events,
+    // continuation payloads) that don't correspond to state transitions.
     let row = sqlx::query(
-        "SELECT event_type, (payload->>'to') AS to_state FROM events WHERE entity_type='run' AND entity_id = $1 ORDER BY occurred_at DESC, event_id DESC LIMIT 1",
+        "SELECT event_type, (payload->>'to') AS to_state FROM events \
+         WHERE entity_type='run' AND entity_id = $1 \
+         AND event_type NOT IN ('run.config_snapshot', 'run.task_catalog', 'run.continuation', \
+             'run.parallel_merge_succeeded', 'run.parallel_merge_failed', 'run.cancel_provenance') \
+         ORDER BY occurred_at DESC, event_id DESC LIMIT 1",
     )
     .bind(run_id.to_string())
     .fetch_one(pool)
