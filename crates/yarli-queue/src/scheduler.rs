@@ -752,7 +752,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         max_runtime = ?max_runtime,
                         "run timed out — max_runtime exceeded"
                     );
-                    self.transition_all_runs_to_terminal(ExitReason::TimedOut).await;
+                    self.transition_all_runs_to_terminal(ExitReason::TimedOut)
+                        .await;
                     return Err(SchedulerError::RunTimedOut(max_runtime));
                 }
             }
@@ -765,7 +766,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         idle_timeout = ?idle_timeout,
                         "run stalled — no progress within idle_timeout"
                     );
-                    self.transition_all_runs_to_terminal(ExitReason::StalledNoProgress).await;
+                    self.transition_all_runs_to_terminal(ExitReason::StalledNoProgress)
+                        .await;
                     return Err(SchedulerError::RunIdleTimeout(idle_timeout));
                 }
             }
@@ -817,7 +819,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     _ => RunState::RunFailed,
                 };
                 if run.state.can_transition_to(target) {
-                    if let Err(e) = run.transition(target, &format!("{exit_reason}"), "scheduler", None) {
+                    if let Err(e) =
+                        run.transition(target, &format!("{exit_reason}"), "scheduler", None)
+                    {
                         warn!(run_id = %run_id, error = %e, "failed to transition run to terminal");
                     } else {
                         run.exit_reason = Some(exit_reason);
@@ -4383,7 +4387,10 @@ mod tests {
         // The run should be in a terminal state.
         let reg = sched.registry().read().await;
         let run = reg.get_run(&run_id).unwrap();
-        assert!(run.state.is_terminal(), "run should be terminal after timeout");
+        assert!(
+            run.state.is_terminal(),
+            "run should be terminal after timeout"
+        );
         assert_eq!(run.exit_reason, Some(ExitReason::TimedOut));
     }
 
@@ -4417,7 +4424,10 @@ mod tests {
 
         let reg = sched.registry().read().await;
         let run = reg.get_run(&run_id).unwrap();
-        assert!(run.state.is_terminal(), "run should be terminal after idle timeout");
+        assert!(
+            run.state.is_terminal(),
+            "run should be terminal after idle timeout"
+        );
         assert_eq!(run.exit_reason, Some(ExitReason::StalledNoProgress));
     }
 }

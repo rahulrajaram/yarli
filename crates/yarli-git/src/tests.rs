@@ -2717,10 +2717,7 @@ fn detect_hook_name_finds_pre_commit() {
 #[test]
 fn detect_hook_name_falls_back_to_unknown() {
     let stderr = "some hook error occurred";
-    assert_eq!(
-        LocalMergeOrchestrator::detect_hook_name(stderr),
-        "unknown"
-    );
+    assert_eq!(LocalMergeOrchestrator::detect_hook_name(stderr), "unknown");
 }
 
 // ── Custom commit message template tests ───────────────────────────────
@@ -2748,9 +2745,8 @@ fn build_commit_message_custom_template_with_all_placeholders() {
     let wt_id = Uuid::now_v7();
     let corr_id = Uuid::now_v7();
 
-    let intent = MergeIntent::new(run_id, wt_id, "dev", "main", corr_id).with_commit_template(
-        "feat(merge): {source} → {target}\n\nrun={run_id} task={task_id}",
-    );
+    let intent = MergeIntent::new(run_id, wt_id, "dev", "main", corr_id)
+        .with_commit_template("feat(merge): {source} → {target}\n\nrun={run_id} task={task_id}");
 
     let msg = LocalMergeOrchestrator::build_commit_message(&intent);
     assert!(msg.contains(&run_id.to_string()));

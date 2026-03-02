@@ -18,14 +18,14 @@
 
 pub mod adapter;
 pub mod error;
-pub mod memory_cli;
 pub mod in_memory;
+pub mod memory_cli;
 pub mod types;
 
 pub use adapter::MemoryAdapter;
 pub use error::MemoryError;
-pub use memory_cli::MemoryCliAdapter;
 pub use in_memory::InMemoryAdapter;
+pub use memory_cli::MemoryCliAdapter;
 pub use types::{
     content_may_contain_secrets, InsertMemory, LinkMemories, MemoryClass, MemoryQuery,
     MemoryRecord, RelationshipKind, ScopeId,

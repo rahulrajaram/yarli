@@ -922,8 +922,7 @@ where
     };
     let runner = match loaded_config.config().execution.runner {
         ExecutionRunner::Native => {
-            let lcr = LocalCommandRunner::new()
-                .with_shutdown(shutdown.clone());
+            let lcr = LocalCommandRunner::new().with_shutdown(shutdown.clone());
             let mut lcr = lcr;
             lcr.idle_kill_timeout = idle_kill_timeout;
             Arc::new(SelectedCommandRunner::Native(lcr))
@@ -1530,32 +1529,38 @@ where
                 _ => ExitReason::FailedRuntimeError,
             });
             if parallel_merge_retry_task_keys.is_empty() {
-                parallel_merge_retry_task_keys =
-                    plan.tasks.iter().map(|task| task.task_key.clone()).collect();
+                parallel_merge_retry_task_keys = plan
+                    .tasks
+                    .iter()
+                    .map(|task| task.task_key.clone())
+                    .collect();
             }
             parallel_merge_retry_task_keys.sort_unstable();
             parallel_merge_retry_task_keys.dedup();
-            continuation_payload.next_tranche = (!parallel_merge_retry_task_keys.is_empty()).then(
-                || yarli_core::entities::continuation::TrancheSpec {
-                    suggested_objective: format!(
-                        "Recover merge finalization by re-running tasks: {}",
-                        parallel_merge_retry_task_keys.join(", ")
-                    ),
-                    kind: yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
-                    retry_task_keys: parallel_merge_retry_task_keys.clone(),
-                    unfinished_task_keys: Vec::new(),
-                    planned_task_keys: Vec::new(),
-                    planned_tranche_key: None,
-                    cursor: None,
-                    config_snapshot: run_snapshot.clone(),
-                    interventions: Vec::new(),
-                },
-            );
+            continuation_payload.next_tranche =
+                (!parallel_merge_retry_task_keys.is_empty()).then(|| {
+                    yarli_core::entities::continuation::TrancheSpec {
+                        suggested_objective: format!(
+                            "Recover merge finalization by re-running tasks: {}",
+                            parallel_merge_retry_task_keys.join(", ")
+                        ),
+                        kind: yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
+                        retry_task_keys: parallel_merge_retry_task_keys.clone(),
+                        unfinished_task_keys: Vec::new(),
+                        planned_task_keys: Vec::new(),
+                        planned_tranche_key: None,
+                        cursor: None,
+                        config_snapshot: run_snapshot.clone(),
+                        interventions: Vec::new(),
+                    }
+                });
             eprintln!("Run {run_id} completed core tasks, but parallel merge did not finalize;");
             if continuation_payload.next_tranche.is_some() {
                 eprintln!("Continuation prepared a recovery tranche for explicit operator retry.");
             } else {
-                eprintln!("Continuation state set to RunFailed with no recovery tranche available.");
+                eprintln!(
+                    "Continuation state set to RunFailed with no recovery tranche available."
+                );
             }
         }
     }

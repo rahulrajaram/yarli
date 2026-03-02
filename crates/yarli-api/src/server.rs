@@ -86,7 +86,11 @@ impl ApiState {
         }
     }
 
-    pub(crate) fn new_with_security(store: Arc<dyn EventStore>, security: ApiSecurityConfig) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_with_security(
+        store: Arc<dyn EventStore>,
+        security: ApiSecurityConfig,
+    ) -> Self {
         let mut metrics_registry = Registry::default();
         let _ = YarliMetrics::new(&mut metrics_registry);
         Self {

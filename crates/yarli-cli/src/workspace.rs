@@ -2900,7 +2900,10 @@ mod tests {
     fn parse_unmerged_paths_from_status_snapshot_extracts_conflict_entries() {
         let status = "UU src/lib.rs\nAA shared.txt\n M README.md\nR  old.rs -> new.rs\n";
         let files = parse_unmerged_paths_from_status_snapshot(status);
-        assert_eq!(files, vec!["shared.txt".to_string(), "src/lib.rs".to_string()]);
+        assert_eq!(
+            files,
+            vec!["shared.txt".to_string(), "src/lib.rs".to_string()]
+        );
     }
 
     #[test]
@@ -2919,7 +2922,10 @@ index 3333333..0000000\n\
 --- a/shared.txt\n\
 +++ /dev/null\n";
         let files = collect_patch_target_paths(patch);
-        assert_eq!(files, vec!["shared.txt".to_string(), "src/lib.rs".to_string()]);
+        assert_eq!(
+            files,
+            vec!["shared.txt".to_string(), "src/lib.rs".to_string()]
+        );
     }
 
     #[test]

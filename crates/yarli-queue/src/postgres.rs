@@ -1007,7 +1007,8 @@ mod tests {
 
     #[test]
     fn claim_sql_uses_valid_aging_order_expression() {
-        let expected = "(priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60))) DESC";
+        let expected =
+            "(priority + (GREATEST(0, EXTRACT(EPOCH FROM ($1 - available_at))::BIGINT / 60))) DESC";
         assert!(CLAIM_CANDIDATES_SQL.contains(expected));
         assert!(CLAIM_CANDIDATES_SCOPED_SQL.contains(expected));
     }

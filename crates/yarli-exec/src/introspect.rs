@@ -717,11 +717,7 @@ impl IntrospectionController {
             task_objective: self.task_objective.clone(),
             runtime_seconds: self.started_at.elapsed().as_secs_f64(),
             total_samples: self.scorer.total_samples,
-            detected_signatures: self
-                .analyzer
-                .compaction
-                .detected_signatures()
-                .to_vec(),
+            detected_signatures: self.analyzer.compaction.detected_signatures().to_vec(),
         }
     }
 
@@ -824,7 +820,11 @@ mod tests {
         for i in 0..5 {
             det.feed(&format!("unique {i}"));
         }
-        assert!(det.score() > 0.3 && det.score() < 0.8, "score={}", det.score());
+        assert!(
+            det.score() > 0.3 && det.score() < 0.8,
+            "score={}",
+            det.score()
+        );
     }
 
     #[test]
