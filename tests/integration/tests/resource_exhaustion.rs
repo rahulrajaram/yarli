@@ -138,6 +138,10 @@ impl CommandRunner for SyntheticCommandRunner {
             request.command_class,
             request.correlation_id,
         );
+        if let Some(key) = request.idempotency_key.as_deref() {
+            let namespaced = format!("yarli:command:{key}");
+            execution.id = Uuid::new_v5(&Uuid::NAMESPACE_OID, namespaced.as_bytes());
+        }
 
         if let Some(key) = &request.idempotency_key {
             execution = execution.with_idempotency_key(key);

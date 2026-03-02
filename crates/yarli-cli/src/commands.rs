@@ -43,6 +43,76 @@ fn collect_telemetry_string_values(metadata: Option<&serde_json::Value>) -> Vec<
     output
 }
 
+fn parse_conflicted_paths_from_repo_status(repo_status: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for raw_line in repo_status.lines() {
+        let line = raw_line.trim_end();
+        if line.len() < 3 {
+            continue;
+        }
+        let status = &line[..2];
+        let is_unmerged = matches!(status, "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU");
+        if !is_unmerged {
+            continue;
+        }
+        let remainder = line[2..].trim();
+        if remainder.is_empty() {
+            continue;
+        }
+        // Porcelain rename/copy format uses `old -> new`; keep the destination path.
+        let candidate = remainder
+            .split(" -> ")
+            .last()
+            .unwrap_or(remainder)
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        if !candidate.is_empty() {
+            paths.push(candidate.to_string());
+        }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+fn parse_conflicted_paths_from_reason(reason: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for raw_line in reason.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((_, tail)) = line.split_once("patch failed:") {
+            let candidate = tail
+                .trim()
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if !candidate.is_empty() {
+                paths.push(candidate.to_string());
+                continue;
+            }
+        }
+        if let Some(prefix) = line.strip_suffix(": patch does not apply") {
+            let candidate = prefix
+                .trim_start_matches("error:")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if !candidate.is_empty() {
+                paths.push(candidate.to_string());
+            }
+        }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
 #[derive(Debug, Clone, Default)]
 struct RunResourceBudgetLimits {
     max_run_cpu_user_ticks: Option<u64>,
@@ -315,7 +385,15 @@ fn merge_apply_conflict_metadata(
     telemetry
         .iter()
         .rev()
-        .find(|event| event.event_type == "merge.apply.conflict")
+        .find(|event| {
+            event.event_type == "merge.apply.conflict"
+                || (event.event_type == "merge.apply.finalized"
+                    && event
+                        .metadata
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        == Some("failed"))
+        })
         .map_or_else(
             || (None, None, None, Vec::new(), Vec::new(), None),
             |event| {
@@ -334,8 +412,10 @@ fn merge_apply_conflict_metadata(
                     .get("workspace_path")
                     .and_then(|value| value.as_str())
                     .map(ToString::to_string);
-                let conflicted_files =
-                    collect_telemetry_string_values(event.metadata.get("conflicted_files"));
+                let reason = event
+                    .metadata
+                    .get("reason")
+                    .and_then(|value| value.as_str());
                 let recovery_hints =
                     collect_telemetry_string_values(event.metadata.get("recovery_hints"));
                 let repo_status = event
@@ -343,6 +423,18 @@ fn merge_apply_conflict_metadata(
                     .get("repo_status")
                     .and_then(|value| value.as_str())
                     .map(ToString::to_string);
+                let mut conflicted_files =
+                    collect_telemetry_string_values(event.metadata.get("conflicted_files"));
+                if conflicted_files.is_empty() {
+                    if let Some(status) = repo_status.as_deref() {
+                        conflicted_files = parse_conflicted_paths_from_repo_status(status);
+                    }
+                }
+                if conflicted_files.is_empty() {
+                    if let Some(reason) = reason {
+                        conflicted_files = parse_conflicted_paths_from_reason(reason);
+                    }
+                }
                 (
                     task_key,
                     patch_path,
@@ -483,9 +575,33 @@ pub(crate) async fn cmd_run_continue(
 ) -> Result<()> {
     let payload = load_continuation_payload_for_continue(&file, loaded_config).await?;
 
-    let tranche = payload
-        .next_tranche
-        .ok_or_else(|| anyhow::anyhow!("nothing to continue — all tasks completed successfully"))?;
+    let Some(tranche) = payload.next_tranche.clone() else {
+        let exit_reason = payload
+            .exit_reason
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "none".to_string());
+        match payload.exit_state {
+            RunState::RunFailed => {
+                bail!(
+                    "run {} is RunFailed (reason: {}) with no recovery tranche; inspect `yarli run explain-exit {}` and PARALLEL_MERGE_RECOVERY.txt",
+                    payload.run_id,
+                    exit_reason,
+                    payload.run_id
+                );
+            }
+            RunState::RunCancelled | RunState::RunBlocked => {
+                bail!(
+                    "run {} is {:?} (reason: {}) with no continuation tranche",
+                    payload.run_id,
+                    payload.exit_state,
+                    exit_reason
+                );
+            }
+            _ => {
+                bail!("nothing to continue — all tasks completed successfully");
+            }
+        }
+    };
 
     let auto_advance = config::AutoAdvanceConfig::from_loaded(loaded_config);
     let mut plan = build_plan_from_continuation_tranche(&tranche, loaded_config)?;
@@ -791,6 +907,12 @@ where
         );
     }
 
+    // Create shutdown controller early so the runner can track child PIDs.
+    // This ensures `terminate_children()` can clean up zombie processes when
+    // the run reaches a terminal state programmatically (not just on Ctrl+C).
+    let shutdown = ShutdownController::new();
+    shutdown.install_signal_handler();
+
     let idle_kill_timeout = if loaded_config.config().event_loop.idle_timeout_secs > 0 {
         Some(Duration::from_secs(
             loaded_config.config().event_loop.idle_timeout_secs,
@@ -800,7 +922,9 @@ where
     };
     let runner = match loaded_config.config().execution.runner {
         ExecutionRunner::Native => {
-            let mut lcr = LocalCommandRunner::new();
+            let lcr = LocalCommandRunner::new()
+                .with_shutdown(shutdown.clone());
+            let mut lcr = lcr;
             lcr.idle_kill_timeout = idle_kill_timeout;
             Arc::new(SelectedCommandRunner::Native(lcr))
         }
@@ -1046,7 +1170,7 @@ where
         payload: serde_json::json!({
             "objective": plan.objective.clone(),
             "safe_mode": loaded_config.config().core.safe_mode,
-            "config_snapshot": run_snapshot,
+            "config_snapshot": run_snapshot.clone(),
         }),
         correlation_id,
         causation_id: None,
@@ -1090,9 +1214,6 @@ where
 
     info!(run_id = %run_id, objective = %plan.objective, "run started");
 
-    // Set up shutdown controller.
-    let shutdown = ShutdownController::new();
-    shutdown.install_signal_handler();
     let cancel = shutdown.token();
 
     // Set up event channel for renderer.
@@ -1146,9 +1267,16 @@ where
     )
     .await?;
 
+    // Terminate any tracked child processes that survived the scheduler loop.
+    // This prevents zombie processes when a run reaches RunFailed programmatically
+    // (not via Ctrl+C signal, which has its own signal-handler path).
+    #[cfg(unix)]
+    shutdown.terminate_children().await;
+
     let mut parallel_merge_error: Option<anyhow::Error> = None;
     let mut parallel_merge_error_reason: Option<ParallelWorkspaceMergeFailureKind> = None;
     let mut parallel_merge_report: Option<ParallelWorkspaceMergeReport> = None;
+    let mut parallel_merge_retry_task_keys: Vec<String> = Vec::new();
     if continuation_payload.exit_state == RunState::RunCompleted {
         if let Some(layout) = parallel_workspace_layout.as_ref() {
             let source_workdir =
@@ -1278,6 +1406,16 @@ where
                         recovery_hints,
                         conflict_repo_status,
                     ) = merge_apply_conflict_metadata(&merge_apply_telemetry);
+                    if let Some(task_key) = conflict_task_key.as_ref() {
+                        parallel_merge_retry_task_keys.push(task_key.clone());
+                    } else if let Some(task_key) = merge_apply_telemetry
+                        .iter()
+                        .rev()
+                        .filter_map(|event| event.task_key.as_ref())
+                        .next()
+                    {
+                        parallel_merge_retry_task_keys.push(task_key.clone());
+                    }
                     if let Err(append_err) = store.append(Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: chrono::Utc::now(),
@@ -1391,9 +1529,34 @@ where
                 Some(ParallelWorkspaceMergeFailureKind::MergeConflict) => ExitReason::MergeConflict,
                 _ => ExitReason::FailedRuntimeError,
             });
-            continuation_payload.next_tranche = None;
+            if parallel_merge_retry_task_keys.is_empty() {
+                parallel_merge_retry_task_keys =
+                    plan.tasks.iter().map(|task| task.task_key.clone()).collect();
+            }
+            parallel_merge_retry_task_keys.sort_unstable();
+            parallel_merge_retry_task_keys.dedup();
+            continuation_payload.next_tranche = (!parallel_merge_retry_task_keys.is_empty()).then(
+                || yarli_core::entities::continuation::TrancheSpec {
+                    suggested_objective: format!(
+                        "Recover merge finalization by re-running tasks: {}",
+                        parallel_merge_retry_task_keys.join(", ")
+                    ),
+                    kind: yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
+                    retry_task_keys: parallel_merge_retry_task_keys.clone(),
+                    unfinished_task_keys: Vec::new(),
+                    planned_task_keys: Vec::new(),
+                    planned_tranche_key: None,
+                    cursor: None,
+                    config_snapshot: run_snapshot.clone(),
+                    interventions: Vec::new(),
+                },
+            );
             eprintln!("Run {run_id} completed core tasks, but parallel merge did not finalize;");
-            eprintln!("Continuation state set to RunFailed to block auto-completion.");
+            if continuation_payload.next_tranche.is_some() {
+                eprintln!("Continuation prepared a recovery tranche for explicit operator retry.");
+            } else {
+                eprintln!("Continuation state set to RunFailed with no recovery tranche available.");
+            }
         }
     }
 
@@ -8797,5 +8960,68 @@ mod tests {
             vec!["hint-a".to_string(), "hint-b".to_string()]
         );
         assert_eq!(repo_status.as_deref(), Some("UU src/lib.rs\nUU shared.txt"));
+    }
+
+    #[test]
+    fn merge_apply_conflict_metadata_falls_back_to_repo_status_paths() {
+        let telemetry = vec![MergeApplyTelemetryEvent {
+            event_type: "merge.apply.conflict".to_string(),
+            task_key: Some("task-status".to_string()),
+            task_index: Some(1),
+            metadata: serde_json::json!({
+                "task_key": "task-status",
+                "reason": "merge conflict without explicit conflicted_files array",
+                "repo_status": "UU src/lib.rs\nAA shared.txt\n M README.md"
+            }),
+        }];
+
+        let (_, _, _, conflicted_files, _, _) = merge_apply_conflict_metadata(&telemetry);
+        assert_eq!(
+            conflicted_files,
+            vec!["shared.txt".to_string(), "src/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_apply_conflict_metadata_falls_back_to_reason_paths() {
+        let telemetry = vec![MergeApplyTelemetryEvent {
+            event_type: "merge.apply.conflict".to_string(),
+            task_key: Some("task-reason".to_string()),
+            task_index: Some(1),
+            metadata: serde_json::json!({
+                "task_key": "task-reason",
+                "reason": "error: patch failed: src/core.rs:41\nerror: src/lib.rs: patch does not apply"
+            }),
+        }];
+
+        let (_, _, _, conflicted_files, _, _) = merge_apply_conflict_metadata(&telemetry);
+        assert_eq!(
+            conflicted_files,
+            vec!["src/core.rs".to_string(), "src/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_apply_conflict_metadata_uses_failed_finalize_event_when_needed() {
+        let telemetry = vec![MergeApplyTelemetryEvent {
+            event_type: "merge.apply.finalized".to_string(),
+            task_key: Some("task-finalize".to_string()),
+            task_index: Some(3),
+            metadata: serde_json::json!({
+                "task_key": "task-finalize",
+                "status": "failed",
+                "reason": "error: patch failed: shared.txt:1"
+            }),
+        }];
+
+        let (task_key, patch_path, workspace_path, conflicted_files, recovery_hints, repo_status) =
+            merge_apply_conflict_metadata(&telemetry);
+
+        assert_eq!(task_key.as_deref(), Some("task-finalize"));
+        assert!(patch_path.is_none());
+        assert!(workspace_path.is_none());
+        assert_eq!(conflicted_files, vec!["shared.txt".to_string()]);
+        assert!(recovery_hints.is_empty());
+        assert!(repo_status.is_none());
     }
 }

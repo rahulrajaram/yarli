@@ -593,6 +593,23 @@ worktree_root = "{}"
         Some("merge_conflict"),
         "expected continuation exit_reason to be merge_conflict after merge conflict escalation"
     );
+    let next_tranche = continuation
+        .get("next_tranche")
+        .and_then(Value::as_object)
+        .expect("expected merge-conflict continuation to include recovery tranche");
+    assert_eq!(
+        next_tranche.get("kind").and_then(Value::as_str),
+        Some("retry_unfinished"),
+        "expected recovery tranche kind to be retry_unfinished"
+    );
+    let retry_task_keys = next_tranche
+        .get("retry_task_keys")
+        .and_then(Value::as_array)
+        .expect("expected retry_task_keys array");
+    assert!(
+        !retry_task_keys.is_empty(),
+        "expected at least one retry task key in recovery tranche"
+    );
     assert_output_state_matches_continuation(&run_stdout, &continuation);
 }
 
@@ -796,6 +813,18 @@ worktree_root = "{}"
             .and_then(Value::as_str),
         Some("failed_runtime_error"),
         "expected continuation exit_reason to be failed_runtime_error after auto-repair failure on delete conflict"
+    );
+    let next_tranche = continuation
+        .get("next_tranche")
+        .and_then(Value::as_object)
+        .expect("expected merge-finalization runtime failure to include recovery tranche");
+    let retry_task_keys = next_tranche
+        .get("retry_task_keys")
+        .and_then(Value::as_array)
+        .expect("expected retry_task_keys array");
+    assert!(
+        !retry_task_keys.is_empty(),
+        "expected at least one retry task key for merge-finalization recovery"
     );
     assert_output_state_matches_continuation(&run_stdout, &continuation);
 }
