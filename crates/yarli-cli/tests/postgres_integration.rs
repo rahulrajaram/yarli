@@ -241,8 +241,8 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
             "--cmd",
             "sleep 300",
         ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
 
     // Wait for the run to appear in Postgres (any state including RUN_OPEN).
@@ -356,7 +356,8 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
     .await?;
 
     // Spawn the run in the background with long-running tasks so we can
-    // cancel while they are active.
+    // cancel while they are active. Use Stdio::null() to prevent pipe buffer
+    // deadlock (the yarli stream renderer can fill the 64KB pipe buffer).
     let mut child = tokio::process::Command::new(&binary)
         .current_dir(temp_dir.path())
         .args([
@@ -373,8 +374,8 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
             "--cmd",
             "sleep 300",
         ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
 
     // Wait for the run to appear in Postgres then become active.
@@ -526,9 +527,11 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
     );
     assert!(String::from_utf8(status_output.stdout)?.contains("State: RunFailed"));
 
+    // The `commands` table is not populated by the Postgres event store — only
+    // the `events` table is written to.  Use a correlation_id-based lookup
+    // instead: all events emitted during a run share the same correlation_id.
     assert!(
-        count_events_by_entity_type_for_run(&pool, run_id, "command", "command.timed_out").await?
-            >= 1,
+        count_command_events_by_correlation(&pool, run_id, "command.timed_out").await? >= 1,
         "expected at least one command.timed_out event"
     );
     assert!(
@@ -547,7 +550,10 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
         String::from_utf8_lossy(&explain_output.stderr)
     );
     let explain_stdout = String::from_utf8(explain_output.stdout)?;
-    assert!(explain_stdout.contains("Status: RunFailed"));
+    assert!(
+        explain_stdout.contains("Status: Failed"),
+        "explain-exit should show Status: Failed\nactual explain output:\n{explain_stdout}"
+    );
     assert!(explain_stdout.contains("Exit reason: failed_runtime_error"));
 
     database.drop().await?;
@@ -727,7 +733,12 @@ async fn overwatch_runner_failure_roundtrip_against_postgres(
         String::from_utf8_lossy(&explain_output.stderr)
     );
     let explain_stdout = String::from_utf8(explain_output.stdout)?;
-    assert!(explain_stdout.contains("Status: RunFailed"));
+    // explain-exit uses RunStatus enum (Done/Active/Blocked/Failed/Cancelled),
+    // not RunState (RunFailed). The Debug format is "Failed".
+    assert!(
+        explain_stdout.contains("Status: Failed"),
+        "explain-exit should show Status: Failed\nactual explain output:\n{explain_stdout}"
+    );
     assert!(explain_stdout.contains("Exit reason:"));
 
     let state = mock_state.lock().await;
@@ -1135,18 +1146,25 @@ AND e.entity_type = 'task' AND e.event_type = $2",
     Ok(count)
 }
 
-async fn count_events_by_entity_type_for_run(
+/// Count command events for a run using the correlation_id chain.
+/// The `commands` table is not populated by the Postgres event store, so we
+/// cannot JOIN on it.  Instead, find the run's correlation_id from any run
+/// event and then count matching command events with the same correlation_id.
+async fn count_command_events_by_correlation(
     pool: &PgPool,
     run_id: Uuid,
-    entity_type: &str,
     event_type: &str,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM events e JOIN commands c ON e.entity_id = c.command_id::text \
-WHERE c.run_id = $1 AND e.entity_type = $2 AND e.event_type = $3",
+        "SELECT COUNT(*) FROM events \
+         WHERE entity_type = 'command' AND event_type = $2 \
+         AND correlation_id = ( \
+             SELECT correlation_id FROM events \
+             WHERE entity_type = 'run' AND entity_id = $1 \
+             LIMIT 1 \
+         )",
     )
-    .bind(run_id)
-    .bind(entity_type)
+    .bind(run_id.to_string())
     .bind(event_type)
     .fetch_one(pool)
     .await?;
@@ -1226,6 +1244,7 @@ async fn expected_run_state_from_events(
          WHERE entity_type='run' AND entity_id = $1 \
          AND event_type NOT IN ('run.config_snapshot', 'run.task_catalog', 'run.continuation', \
              'run.parallel_merge_succeeded', 'run.parallel_merge_failed', 'run.cancel_provenance') \
+         AND event_type NOT LIKE 'run.observer.%' \
          ORDER BY occurred_at DESC, event_id DESC LIMIT 1",
     )
     .bind(run_id.to_string())
