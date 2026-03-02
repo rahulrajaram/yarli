@@ -1417,10 +1417,80 @@ Options:
 ## `target/debug/yarli audit query`
 
 ```text
+Query the JSONL audit log.
 
-thread 'main' panicked at /home/rahul/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/clap_builder-4.5.57/src/builder/debug_asserts.rs:112:17:
-Command query: Short option names must be unique for each argument, but '-f' is in use by both 'file' and 'format'
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Filter by run ID, task ID, category, actor, and time range.
+Supports multiple output formats and pagination.
+
+Categories:
+  policy_decision      — policy engine allow/deny decisions
+  destructive_attempt   — blocked destructive git operations
+  token_consumed        — LLM token usage records
+  gate_evaluation      — gate pass/fail results
+  command_execution    — command execution terminal events
+
+Output formats:
+  table (default), json, csv
+
+Examples:
+  yarli audit query --category policy_decision
+  yarli audit query --run-id 019577a5-... --format table
+  yarli audit query --since 2026-02-20T00:00:00Z --before 2026-02-22T23:59:59Z
+  yarli audit query --after 019577a5-... --limit 25 --format csv
+
+Usage: yarli audit query [OPTIONS]
+
+Options:
+  -f, --file <FILE>
+          Path to the audit JSONL file
+
+          [default: .yarl/audit.jsonl]
+
+      --stream
+          Force stream mode output (inline viewport, no fullscreen TUI)
+
+      --run-id <RUN_ID>
+          Filter by run ID
+
+      --tui
+          Force dashboard mode (fullscreen TUI with panel layout)
+
+      --task-id <TASK_ID>
+          Filter by task ID
+
+  -c, --category <CATEGORY>
+          Filter by category
+
+      --actor <ACTOR>
+          Filter by actor
+
+      --since <SINCE>
+          Include entries on or after this UTC timestamp (RFC 3339 or YYYY-MM-DD)
+
+      --before <BEFORE>
+          Include entries on or before this UTC timestamp (RFC 3339 or YYYY-MM-DD)
+
+      --after <AFTER>
+          Cursor-based pagination. Start after this audit ID
+
+      --offset <OFFSET>
+          Offset entries before returning the page
+
+          [default: 0]
+
+  -l, --limit <LIMIT>
+          Max entries to return (0 = all)
+
+          [default: 50]
+
+  -F, --format <FORMAT>
+          Output format
+
+          [default: table]
+          [possible values: table, json, csv]
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## `target/debug/yarli plan tranche`

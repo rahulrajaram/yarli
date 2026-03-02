@@ -989,7 +989,7 @@ pub(crate) enum AuditAction {
         #[arg(short, long, default_value = "50")]
         limit: usize,
         /// Output format.
-        #[arg(short, long, default_value_t = AuditOutputFormat::Table, value_enum)]
+        #[arg(short = 'F', long, default_value_t = AuditOutputFormat::Table, value_enum)]
         format: AuditOutputFormat,
     },
 }

@@ -6,11 +6,8 @@ For exact clap output snapshots (captured from live `--help`), see `docs/CLI_HEL
 
 ## CLI Help-Text Audit Report
 
-Commands scanned: 51  
-Issues found: 1
-
-INCORRECT:
-- [ERR] `yarli audit query --help` currently panics at runtime because `-f` is assigned to both `--file` and `--format` in clap definitions.
+Commands scanned: 51
+Issues found: 0
 
 ## Core Concepts
 
