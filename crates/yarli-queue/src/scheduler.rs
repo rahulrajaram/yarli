@@ -586,9 +586,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     ) -> Result<TickResult, SchedulerError> {
         #[cfg(feature = "chaos")]
         if let Some(chaos) = &self.chaos {
-            chaos.inject("scheduler_tick_start").await.map_err(|e| {
-                SchedulerError::Exec(ExecError::Io(std::io::Error::other(e)))
-            })?;
+            chaos
+                .inject("scheduler_tick_start")
+                .await
+                .map_err(|e| SchedulerError::Exec(ExecError::Io(std::io::Error::other(e))))?;
         }
 
         let _tick_span = info_span!(
@@ -629,9 +630,10 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
         #[cfg(feature = "chaos")]
         if let Some(chaos) = &self.chaos {
-            chaos.inject("scheduler_tick_claimed").await.map_err(|e| {
-                SchedulerError::Exec(ExecError::Io(std::io::Error::other(e)))
-            })?;
+            chaos
+                .inject("scheduler_tick_claimed")
+                .await
+                .map_err(|e| SchedulerError::Exec(ExecError::Io(std::io::Error::other(e))))?;
         }
 
         if result.claimed == 0 && result.promoted == 0 {
