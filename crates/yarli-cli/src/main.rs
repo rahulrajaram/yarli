@@ -357,6 +357,7 @@ async fn run() -> Result<()> {
             }
             MigrateAction::Restore { label } => cmd_migrate_restore(&loaded_config, &label).await,
         },
+        Commands::Serve { bind, port } => cmd_serve(&bind, port).await,
         Commands::Init { .. } => unreachable!("init command handled before runtime config load"),
         Commands::Info => {
             // `info` should report capabilities even if the current terminal

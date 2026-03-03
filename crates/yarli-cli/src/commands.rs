@@ -25,7 +25,8 @@ use yarli_core::entities::continuation::{
     ContinuationIntervention, ContinuationInterventionKind, RetryScope, TaskHealthAction,
 };
 use yarli_store::{
-    MIGRATION_0001_DOWN, MIGRATION_0001_INIT, MIGRATION_0002_DOWN, MIGRATION_0002_INDEXES,
+    InMemoryEventStore, MIGRATION_0001_DOWN, MIGRATION_0001_INIT, MIGRATION_0002_DOWN,
+    MIGRATION_0002_INDEXES, PostgresEventStore,
 };
 
 fn collect_telemetry_string_values(metadata: Option<&serde_json::Value>) -> Vec<String> {
@@ -2987,6 +2988,7 @@ pub(crate) fn build_continuation_payload(
     )
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_continuation_payload_with_gate_failures(
     run: &Run,
@@ -6606,6 +6608,52 @@ pub(crate) fn cmd_info(
         loaded_config.path().display(),
         loaded_config.source().label()
     );
+    Ok(())
+}
+
+/// `yarli serve` — start the YARLI HTTP API server.
+pub(crate) async fn cmd_serve(bind: &str, port: u16) -> Result<()> {
+    let loaded_config = load_runtime_config_for_reads()
+        .context("failed to load runtime config for API serve");
+    let loaded_config = match loaded_config {
+        Ok(config) => config,
+        Err(err) => return Err(err),
+    };
+
+    let bind = bind.trim();
+    let bind = if bind.is_empty() {
+        "127.0.0.1"
+    } else {
+        bind
+    };
+
+    let store: Arc<dyn EventStore> = match loaded_config.backend_selection()? {
+        BackendSelection::InMemory => Arc::new(InMemoryEventStore::new()),
+        BackendSelection::Postgres { database_url } => Arc::new(
+            PostgresEventStore::new(&database_url)
+                .with_context(|| format!("failed to initialize postgres event store at {database_url}"))?,
+        ),
+    };
+
+    let listener = tokio::net::TcpListener::bind((bind, port))
+        .await
+        .with_context(|| format!("failed to bind API listener on {bind}:{port}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to determine API listener address")?;
+
+    println!("Starting YARLI API server on http://{local_addr}");
+
+    let graceful_shutdown = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!("failed to register ctrl-c shutdown handler: {error}");
+        }
+    };
+
+    axum::serve(listener, yarli_api::router(store))
+        .with_graceful_shutdown(graceful_shutdown)
+        .await
+        .map_err(|error| anyhow!("API server encountered an error: {error}"))?;
     Ok(())
 }
 

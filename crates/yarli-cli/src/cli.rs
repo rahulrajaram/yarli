@@ -640,6 +640,18 @@ Examples:
         action: MigrateAction,
     },
     #[command(
+        about = "Serve API for run/task introspection and control",
+        long_about = "Start the YARLI HTTP API server.\n\nStarts a local server that serves event-store-backed run, task,\nand audit endpoints.\n\nExamples:\n  yarli serve\n  yarli serve --bind 0.0.0.0 --port 8080"
+    )]
+    Serve {
+        /// Host or address to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// TCP port to listen on.
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+    },
+    #[command(
         about = "Initialize yarli.toml with a documented template",
         long_about = INIT_LONG_ABOUT
     )]

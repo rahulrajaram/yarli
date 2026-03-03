@@ -12,6 +12,7 @@ name = "yarli"
 path = "src/main.rs"
 
 [dependencies]
+axum = { version = "0.7" }
 yarli-core = { workspace = true }
 yarli-store = { workspace = true }
 yarli-queue = { workspace = true }
@@ -39,6 +40,7 @@ owo-colors = { workspace = true }
 sqlx = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+yarli-api = { path = "../yarli-api" }
 
 yarli-sw4rm = { workspace = true, optional = true, features = ["test-support"] }
 sw4rm-sdk = { workspace = true, optional = true }

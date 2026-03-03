@@ -3902,6 +3902,7 @@ name = "yarli-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.7.9",
  "chrono",
  "clap",
  "crossterm",
@@ -3921,6 +3922,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yarli-api",
  "yarli-chaos",
  "yarli-core",
  "yarli-exec",
