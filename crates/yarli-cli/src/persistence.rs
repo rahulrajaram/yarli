@@ -257,6 +257,7 @@ mod tests {
                 interventions: Vec::new(),
             }),
             quality_gate: None,
+            retry_recommendation: None,
         };
 
         let temp_dir = TempDir::new().unwrap();

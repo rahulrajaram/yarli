@@ -5,7 +5,7 @@ use yarli_exec::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
     OverwatchRunnerConfig,
 };
-use yarli_observability::{AuditCategory, YarliMetrics};
+use yarli_observability::{run_analyzer, AuditCategory, YarliMetrics};
 use yarli_queue::scheduler::LiveOutputEvent;
 use yarli_queue::{QueueEntry, QueueStatus};
 
@@ -22,7 +22,7 @@ use crate::workspace::{
 };
 use yarli_core::domain::ExitReason;
 use yarli_core::entities::continuation::{
-    ContinuationIntervention, ContinuationInterventionKind, TaskHealthAction,
+    ContinuationIntervention, ContinuationInterventionKind, RetryScope, TaskHealthAction,
 };
 use yarli_store::{
     MIGRATION_0001_DOWN, MIGRATION_0001_INIT, MIGRATION_0002_DOWN, MIGRATION_0002_INDEXES,
@@ -2961,6 +2961,7 @@ pub(crate) fn persist_continuation_payload_event(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn build_continuation_payload(
     run: &Run,
     tasks: &[&yarli_core::entities::Task],
@@ -2971,6 +2972,33 @@ pub(crate) fn build_continuation_payload(
     max_run_total_tokens: Option<u64>,
     soft_token_cap_ratio: f64,
     deterioration_cycle_detected: bool,
+) -> yarli_core::entities::ContinuationPayload {
+    build_continuation_payload_with_gate_failures(
+        run,
+        tasks,
+        report,
+        auto_advance_policy,
+        task_health,
+        run_total_tokens,
+        max_run_total_tokens,
+        soft_token_cap_ratio,
+        deterioration_cycle_detected,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_continuation_payload_with_gate_failures(
+    run: &Run,
+    tasks: &[&yarli_core::entities::Task],
+    report: Option<&DeteriorationReport>,
+    auto_advance_policy: AutoAdvancePolicy,
+    task_health: config::RunTaskHealthConfig,
+    run_total_tokens: u64,
+    max_run_total_tokens: Option<u64>,
+    soft_token_cap_ratio: f64,
+    deterioration_cycle_detected: bool,
+    gate_failures: &[String],
 ) -> yarli_core::entities::ContinuationPayload {
     let mut payload = yarli_core::entities::ContinuationPayload::build(run, tasks);
     let mut quality_gate = compute_quality_gate(
@@ -3013,7 +3041,55 @@ pub(crate) fn build_continuation_payload(
         }
     }
     payload.quality_gate = Some(quality_gate);
+    payload.retry_recommendation = Some(analyze_retry_recommendation(run, tasks, gate_failures));
     payload
+}
+
+fn analyze_retry_recommendation(
+    run: &Run,
+    tasks: &[&yarli_core::entities::Task],
+    gate_failures: &[String],
+) -> RetryScope {
+    let analyzer_tasks: Vec<run_analyzer::TaskOutcome> = tasks
+        .iter()
+        .map(|task| run_analyzer::TaskOutcome {
+            task_key: task.task_key.clone(),
+            state: task.state,
+            last_error: task.last_error.clone(),
+            blocker: task.blocker.clone(),
+        })
+        .collect();
+    let analysis = run_analyzer::analyze_run(
+        run.state,
+        run.exit_reason,
+        &analyzer_tasks,
+        gate_failures,
+    );
+    match analysis.retry_recommendation {
+        run_analyzer::RetryScope::Full => RetryScope::Full,
+        run_analyzer::RetryScope::Subset { keys } => RetryScope::Subset { keys },
+        run_analyzer::RetryScope::None => RetryScope::None,
+    }
+}
+
+fn extract_gate_failure_names_for_run(store: &dyn EventStore, run_id: Uuid) -> Vec<String> {
+    let Ok(Some(run_projection)) = load_run_projection(store, run_id) else {
+        return Vec::new();
+    };
+
+    let mut names = run_projection
+        .failed_gates
+        .iter()
+        .map(|(gate_type, _)| {
+            gate_type
+                .label()
+                .trim_start_matches("gate.")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 pub(crate) fn cancellation_reason_for_source(source: CancellationSource) -> &'static str {
@@ -3108,6 +3184,169 @@ pub(crate) fn with_cancellation_diagnostics(
     provenance
 }
 
+fn emit_task_health_transition_audits(
+    task_health_controllers: &mut std::collections::HashMap<
+        Uuid,
+        yarli_exec::introspect::IntrospectionController,
+    >,
+    events: &[Event],
+    run_id: Uuid,
+    audit_sink: Option<&dyn yarli_observability::AuditSink>,
+) {
+    for event in events {
+        if event.event_type != "run.observer.task_health" {
+            continue;
+        }
+
+        let Some(task_id) = event
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            continue;
+        };
+
+        let Some(report) = task_health_report_from_payload(&event.payload) else {
+            continue;
+        };
+        let Some(controller) = task_health_controllers.get_mut(&task_id) else {
+            continue;
+        };
+        if !controller.set_health_report(report) {
+            warn!(
+                task_id = %task_id,
+                run_id = %run_id,
+                "failed to update task health report"
+            );
+            continue;
+        }
+
+        if let Some(transition) = controller.check_health_transition() {
+            let Some(sink) = audit_sink else {
+                continue;
+            };
+            let factors = serde_json::to_value(transition.factors)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let entry = AuditEntry::process_health_transition(
+                transition.previous_level.to_string(),
+                transition.new_level.to_string(),
+                transition.score,
+                factors,
+                Some(run_id),
+                Some(task_id),
+            );
+            if let Err(err) = sink.append(&entry) {
+                warn!(
+                    task_id = %task_id,
+                    run_id = %run_id,
+                    error = %err,
+                    "failed to append process health transition audit entry"
+                );
+            }
+        }
+    }
+}
+
+fn task_health_report_from_payload(
+    payload: &serde_json::Value,
+) -> Option<yarli_exec::introspect::HealthReport> {
+    let score = payload
+        .get("score")
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| {
+            payload
+                .get("outcome")
+                .and_then(|value| value.get("score"))
+                .and_then(serde_json::Value::as_f64)
+        })
+        .filter(|value| value.is_finite());
+
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("outcome")
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .get("outcome")
+                .and_then(|value| value.get("result"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
+
+    let level = task_health_level_from_status(status, score)?;
+
+    Some(yarli_exec::introspect::HealthReport {
+        score: score.unwrap_or(match level {
+            yarli_exec::introspect::HealthLevel::Healthy => 1.0,
+            yarli_exec::introspect::HealthLevel::Degraded => 0.5,
+            yarli_exec::introspect::HealthLevel::Stuck => 0.1,
+        }),
+        level,
+        factors: task_health_factors_from_payload(payload),
+    })
+}
+
+fn task_health_level_from_status(
+    status: &str,
+    score: Option<f64>,
+) -> Option<yarli_exec::introspect::HealthLevel> {
+    if let Some(score) = score {
+        return Some(yarli_exec::introspect::HealthLevel::from_score(score));
+    }
+
+    let normalized = status.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("healthy")
+        || normalized.contains("pass")
+        || normalized.contains("ok")
+        || normalized.contains("improving")
+        || normalized.contains("continue")
+    {
+        Some(yarli_exec::introspect::HealthLevel::Healthy)
+    } else if normalized.contains("degraded") || normalized.contains("deteriorating") {
+        Some(yarli_exec::introspect::HealthLevel::Degraded)
+    } else if normalized.contains("stuck")
+        || normalized.contains("error")
+        || normalized.contains("fail")
+    {
+        Some(yarli_exec::introspect::HealthLevel::Stuck)
+    } else {
+        None
+    }
+}
+
+fn task_health_factors_from_payload(
+    payload: &serde_json::Value,
+) -> yarli_exec::introspect::HealthFactors {
+    let factors = payload
+        .get("factors")
+        .or_else(|| payload.get("outcome").and_then(|value| value.get("factors")));
+
+    let factor = |key: &str| -> f64 {
+        factors
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite())
+            .unwrap_or(1.0)
+    };
+
+    yarli_exec::introspect::HealthFactors {
+        output_recency: factor("output_recency"),
+        io_delta: factor("io_delta"),
+        cpu_utilization: factor("cpu_utilization"),
+        repetition: factor("repetition"),
+        sleep_ratio: factor("sleep_ratio"),
+    }
+}
+
 /// Drive the scheduler, emitting StreamEvents to the renderer channel.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_scheduler<Q, S, R>(
@@ -3147,6 +3386,15 @@ where
         correlation_id,
         observers::OBSERVER_WINDOW_SIZE,
     );
+    let mut task_health_controllers: std::collections::HashMap<
+        Uuid,
+        yarli_exec::introspect::IntrospectionController,
+    > = task_names
+        .iter()
+        .map(|(task_id, task_key)| {
+            (*task_id, yarli_exec::introspect::IntrospectionController::new(0, task_key.clone()))
+        })
+        .collect();
     let mut postgres_sync_state = initialize_postgres_sync_state(postgres_sync_config).await?;
 
     if let Some(observer) = memory_observer.as_mut() {
@@ -3243,6 +3491,12 @@ where
                 }
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                emit_task_health_transition_audits(
+                    &mut task_health_controllers,
+                    &_new_events,
+                    run_id,
+                    scheduler.audit_sink().as_deref(),
+                );
                 if let Some(observer) = task_health_observer.as_mut() {
                     observer.observe_store(store.as_ref());
                 }
@@ -3269,7 +3523,8 @@ where
                         .filter_map(|tid| reg.get_task(tid))
                         .collect();
                     let run_total_tokens = collect_run_total_tokens();
-                    build_continuation_payload(
+                    let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
+                    build_continuation_payload_with_gate_failures(
                         run,
                         &tasks,
                         deterioration_observer.latest_report(),
@@ -3279,12 +3534,14 @@ where
                         max_run_total_tokens,
                         soft_token_cap_ratio,
                         deterioration_observer.has_deterioration_cycle(),
+                        &gate_failures,
                     )
                 };
                 if let Some(observer) = memory_observer.as_ref() {
+                    let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
                     let _ = tokio::time::timeout(
                         Duration::from_secs(15),
-                        observer.observe_run_end(store.as_ref(), &payload, &[]),
+                        observer.observe_run_end(store.as_ref(), &payload, &gate_failures),
                     ).await;
                 }
                 scheduler.clear_live_output();
@@ -3344,6 +3601,12 @@ where
                 // are processed before any task claiming in the tick below.
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                emit_task_health_transition_audits(
+                    &mut task_health_controllers,
+                    &_new_events,
+                    run_id,
+                    scheduler.audit_sink().as_deref(),
+                );
                 let control_signal = _new_events
                     .iter()
                     .filter_map(|event| operator_control_signal_from_event(event, run_id))
@@ -3415,6 +3678,12 @@ where
                         }
                         let cancel_events =
                             emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                        emit_task_health_transition_audits(
+                            &mut task_health_controllers,
+                            &cancel_events,
+                            run_id,
+                            scheduler.audit_sink().as_deref(),
+                        );
                         if let Some(observer) = task_health_observer.as_mut() {
                             observer.observe_store(store.as_ref());
                         }
@@ -3443,7 +3712,8 @@ where
                                 .filter_map(|tid| reg.get_task(tid))
                                 .collect();
                             let run_total_tokens = collect_run_total_tokens();
-                            build_continuation_payload(
+                            let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
+                            build_continuation_payload_with_gate_failures(
                                 run,
                                 &tasks,
                                 deterioration_observer.latest_report(),
@@ -3453,6 +3723,7 @@ where
                                 max_run_total_tokens,
                                 soft_token_cap_ratio,
                                 deterioration_observer.has_deterioration_cycle(),
+                                &gate_failures,
                             )
                         };
                         scheduler.clear_live_output();
@@ -3506,6 +3777,12 @@ where
                     // tasks before the next pre-tick poll can see the signal.
                     let post_tick_events =
                         emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                    emit_task_health_transition_audits(
+                        &mut task_health_controllers,
+                        &post_tick_events,
+                        run_id,
+                        scheduler.audit_sink().as_deref(),
+                    );
                     let post_tick_signal = post_tick_events
                         .iter()
                         .filter_map(|event| operator_control_signal_from_event(event, run_id))
@@ -3566,6 +3843,12 @@ where
                             }
                             let _cancel_events =
                                 emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                            emit_task_health_transition_audits(
+                                &mut task_health_controllers,
+                                &_cancel_events,
+                                run_id,
+                                scheduler.audit_sink().as_deref(),
+                            );
                             if let Some(observer) = task_health_observer.as_mut() {
                                 observer.observe_store(store.as_ref());
                             }
@@ -3583,7 +3866,9 @@ where
                                     .filter_map(|tid| reg.get_task(tid))
                                     .collect();
                                 let run_total_tokens = collect_run_total_tokens();
-                                build_continuation_payload(
+                                let gate_failures =
+                                    extract_gate_failure_names_for_run(store.as_ref(), run_id);
+                                build_continuation_payload_with_gate_failures(
                                     run,
                                     &tasks,
                                     deterioration_observer.latest_report(),
@@ -3593,12 +3878,14 @@ where
                                     max_run_total_tokens,
                                     soft_token_cap_ratio,
                                     deterioration_observer.has_deterioration_cycle(),
+                                    &gate_failures,
                                 )
                             };
                             if let Some(observer) = memory_observer.as_ref() {
+                                let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
                                 let _ = tokio::time::timeout(
                                     Duration::from_secs(15),
-                                    observer.observe_run_end(store.as_ref(), &payload, &[]),
+                                    observer.observe_run_end(store.as_ref(), &payload, &gate_failures),
                                 ).await;
                             }
                             scheduler.clear_live_output();
@@ -3651,7 +3938,8 @@ where
                                 .filter_map(|tid| reg.get_task(tid))
                                 .collect();
                             let run_total_tokens = collect_run_total_tokens();
-                            Some(build_continuation_payload(
+                            let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
+                            Some(build_continuation_payload_with_gate_failures(
                                 run,
                                 &tasks,
                                 deterioration_observer.latest_report(),
@@ -3661,6 +3949,7 @@ where
                                 max_run_total_tokens,
                                 soft_token_cap_ratio,
                                 deterioration_observer.has_deterioration_cycle(),
+                                &gate_failures,
                             ))
                         } else {
                             None
@@ -3672,9 +3961,10 @@ where
 
                 if let Some(payload) = terminal_payload {
                     if let Some(observer) = memory_observer.as_ref() {
+                        let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
                         let _ = tokio::time::timeout(
                             Duration::from_secs(15),
-                            observer.observe_run_end(store.as_ref(), &payload, &[]),
+                            observer.observe_run_end(store.as_ref(), &payload, &gate_failures),
                         ).await;
                     }
                     scheduler.clear_live_output();

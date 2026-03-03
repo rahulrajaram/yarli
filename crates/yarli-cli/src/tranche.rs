@@ -681,6 +681,7 @@ mod tests {
                 score: Some(30.0),
                 task_health_action: TaskHealthAction::Continue,
             }),
+            retry_recommendation: None,
         };
         let (allow, reason) = should_auto_advance_planned_tranche(
             &payload,
@@ -731,6 +732,7 @@ mod tests {
                 score: Some(30.0),
                 task_health_action: TaskHealthAction::Continue,
             }),
+            retry_recommendation: None,
         };
         let (allow, reason) = should_auto_advance_planned_tranche(
             &payload,
@@ -781,6 +783,7 @@ mod tests {
                 score: Some(5.0),
                 task_health_action: TaskHealthAction::Continue,
             }),
+            retry_recommendation: None,
         };
 
         let (allow, reason) = should_auto_advance_planned_tranche(
@@ -832,6 +835,7 @@ mod tests {
                 score: Some(5.0),
                 task_health_action: TaskHealthAction::Continue,
             }),
+            retry_recommendation: None,
         };
 
         let (allow, reason) = should_auto_advance_planned_tranche(

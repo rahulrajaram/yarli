@@ -32,6 +32,8 @@ pub struct ContinuationPayload {
     pub next_tranche: Option<TrancheSpec>,
     #[serde(default)]
     pub quality_gate: Option<ContinuationQualityGate>,
+    #[serde(default)]
+    pub retry_recommendation: Option<RetryScope>,
 }
 
 mod run_state_pascal_case {
@@ -181,6 +183,18 @@ pub struct ContinuationQualityGate {
     pub task_health_action: TaskHealthAction,
 }
 
+/// Retry recommendation derived from run analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum RetryScope {
+    /// Retry the full run.
+    Full,
+    /// Retry a subset of tasks.
+    Subset { keys: Vec<String> },
+    /// Do not retry; run may need manual intervention.
+    None,
+}
+
 impl ContinuationPayload {
     /// Build a continuation payload from a terminal run and its tasks.
     pub fn build(run: &Run, tasks: &[&Task]) -> Self {
@@ -316,6 +330,7 @@ impl ContinuationPayload {
             summary,
             next_tranche,
             quality_gate: None,
+            retry_recommendation: None,
         }
     }
 }

@@ -3854,6 +3854,7 @@ cmds = ["echo ok"]
                 score: Some(10.0),
                 task_health_action: yarli_core::entities::continuation::TaskHealthAction::Continue,
             }),
+            retry_recommendation: None,
         };
 
         let (allow, _) = should_auto_advance_planned_tranche(

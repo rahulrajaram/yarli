@@ -41,7 +41,6 @@ pub(crate) struct MemoryHintsReport {
     pub(crate) results: Vec<MemoryHint>,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct MemoryObserver {
     enabled: bool,
     project_id: String,
@@ -55,6 +54,7 @@ pub(crate) struct MemoryObserver {
     run_objective: String,
     task_keys: Vec<String>,
     task_names: BTreeMap<Uuid, String>,
+    audit_sink: Option<yarli_observability::JsonlAuditSink>,
     run_start_done: bool,
 }
 
@@ -71,6 +71,7 @@ impl MemoryObserver {
         inject_on_failure: bool,
         task_keys: Vec<String>,
         task_names: &[(Uuid, String)],
+        audit_sink: Option<yarli_observability::JsonlAuditSink>,
     ) -> Self {
         let project_scope = ScopeId(format!("project/{project_id}"));
         Self {
@@ -87,6 +88,7 @@ impl MemoryObserver {
             task_keys,
             task_names: task_names.iter().cloned().collect(),
             run_start_done: false,
+            audit_sink,
         }
     }
 
@@ -231,6 +233,22 @@ impl MemoryObserver {
         let pattern_names = yarli_observability::run_analyzer::pattern_names(&analysis.patterns);
         let recommendation_str = serde_json::to_string(&analysis.retry_recommendation)
             .unwrap_or_else(|_| "unknown".to_string());
+
+        if let Some(lesson) = &analysis.run_lesson {
+            if let Some(sink) = &self.audit_sink {
+                let audit_entry = yarli_observability::AuditEntry::run_analysis(
+                    &pattern_names,
+                    recommendation_str.as_str(),
+                    analysis.confidence,
+                    Some(lesson),
+                    self.run_id,
+                );
+                if let Err(err) = yarli_observability::AuditSink::append(sink, &audit_entry) {
+                    warn!(error = %err, "failed to append run analysis audit entry");
+                }
+            }
+        }
+
         let _ = append_event(
             store,
             Event {
@@ -1730,6 +1748,7 @@ pub(crate) fn build_memory_observer(
     };
 
     let task_keys = plan.tasks.iter().map(|t| t.task_key.clone()).collect();
+    let audit_sink = crate::config::prepare_audit_sink(loaded_config)?;
 
     Ok(Some(MemoryObserver::new(
         project_id,
@@ -1742,6 +1761,7 @@ pub(crate) fn build_memory_observer(
         provider.inject_on_failure,
         task_keys,
         task_names,
+        audit_sink,
     )))
 }
 
@@ -2361,6 +2381,7 @@ mod tests {
             },
             next_tranche: None,
             quality_gate: None,
+            retry_recommendation: None,
         }
     }
 

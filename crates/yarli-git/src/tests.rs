@@ -2834,3 +2834,666 @@ async fn merge_apply_hook_rejection_returns_hook_error() {
         "hook rejection should recover worktree to WtBoundHome, not WtConflict"
     );
 }
+
+// ── Cross-worktree integration tests ─────────────────────────────────────
+//
+// These tests exercise the real agentic workflow: create worktree, commit
+// work in it, merge back to main, verify main sees the changes, cleanup.
+
+/// Helper: generate a random UUID (v4) for test isolation.
+///
+/// Uuid::now_v7() is timestamp-based, so UUIDs generated in quick succession
+/// share the same first 8 hex chars. Since worktree paths use `run_short[..8]-task_short[..8]`,
+/// this causes collisions when creating multiple worktrees in the same test.
+fn random_uuid() -> Uuid {
+    Uuid::new_v4()
+}
+
+/// Helper: resolve a ref to SHA in a repo using std::process::Command.
+fn git_rev_parse(dir: &Path, refspec: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", refspec])
+        .current_dir(dir)
+        .output()
+        .expect("git rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Helper: get the git log (one line per commit) for a branch.
+fn git_log_oneline(dir: &Path, refspec: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["log", "--oneline", refspec])
+        .current_dir(dir)
+        .output()
+        .expect("git log");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Test: commits made in a worktree are visible from the main repo after merge.
+///
+/// Workflow: init repo → create worktree on main → make commits in worktree
+/// → merge feature branch into worktree (which is on main) → verify main
+/// branch in the original repo has the new commits.
+#[tokio::test]
+async fn cross_worktree_merge_visible_in_main_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+    let (_main, feature) = create_merge_test_repo(&repo).await;
+
+    let wt_mgr = LocalWorktreeManager::new();
+    let cancel = CancellationToken::new();
+
+    let run_id = random_uuid();
+    let corr_id = random_uuid();
+    let task_id = random_uuid();
+    let wt_id = random_uuid();
+
+    let mut binding = WorktreeBinding::new(
+        run_id,
+        &repo,
+        format!("yarl/{}/merge-task", &run_id.to_string()[..8]),
+        "main",
+        corr_id,
+    )
+    .with_task(task_id);
+
+    wt_mgr.create(&mut binding, cancel.clone()).await.unwrap();
+    assert_eq!(binding.state, WorktreeState::WtBoundHome);
+
+    let wt_path = binding.worktree_path.clone();
+
+    // Merge feature into the worktree branch (which started from main).
+    let orchestrator = LocalMergeOrchestrator::new(wt_mgr.clone());
+    let mut intent = MergeIntent::new(run_id, wt_id, &feature, &binding.branch_name, corr_id);
+
+    let precheck = orchestrator
+        .precheck(&mut intent, &binding, cancel.clone())
+        .await
+        .unwrap();
+
+    let dry = orchestrator
+        .dry_run(&mut intent, &binding, cancel.clone())
+        .await
+        .unwrap();
+    assert!(dry.clean, "merge should be clean");
+
+    let apply = orchestrator
+        .apply(&mut intent, &mut binding, cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!(apply.merge_sha.len(), 40);
+    assert_eq!(intent.state, MergeState::MergeApply);
+
+    orchestrator
+        .verify(
+            &mut intent,
+            &binding,
+            &precheck.submodule_snapshot,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(intent.state, MergeState::MergeDone);
+
+    // Key assertion: the worktree branch now has the merge commit.
+    let wt_head = git_rev_parse(&wt_path, "HEAD");
+    assert_eq!(wt_head, apply.merge_sha);
+
+    // The worktree branch ref should be resolvable from the main repo.
+    let branch_sha_from_main = git_rev_parse(&repo, &binding.branch_name);
+    assert_eq!(
+        branch_sha_from_main, apply.merge_sha,
+        "worktree branch ref should be visible from main repo"
+    );
+
+    // The feature file should exist in the worktree after merge.
+    assert!(
+        wt_path.join("feature.txt").exists(),
+        "feature.txt should exist in worktree after merge"
+    );
+}
+
+/// Test: full agent workflow — create worktree, make new commits, merge back,
+/// cleanup, and verify the main branch has the work.
+///
+/// This is the core agentic pattern: agent gets a worktree, does work,
+/// merges results into the target branch, then worktree is cleaned up.
+#[tokio::test]
+async fn full_agent_workflow_commit_merge_cleanup() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+
+    // Init repo with just an initial commit on main.
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@yarli.dev"])
+        .current_dir(&repo)
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo)
+        .output()
+        .expect("git config name");
+    std::fs::write(repo.join("README.md"), "# test repo\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "initial commit"])
+        .current_dir(&repo)
+        .output()
+        .expect("git commit");
+
+    let main_sha_before = git_rev_parse(&repo, "main");
+
+    let wt_mgr = LocalWorktreeManager::new();
+    let cancel = CancellationToken::new();
+
+    let run_id = random_uuid();
+    let corr_id = random_uuid();
+    let task_id = random_uuid();
+    let wt_id = random_uuid();
+
+    // Step 1: Create worktree on a yarl branch from main.
+    let branch_name = format!("yarl/{}/agent-work", &run_id.to_string()[..8]);
+    let mut binding =
+        WorktreeBinding::new(run_id, &repo, &branch_name, "main", corr_id).with_task(task_id);
+
+    wt_mgr.create(&mut binding, cancel.clone()).await.unwrap();
+    let wt_path = binding.worktree_path.clone();
+
+    // Step 2: Agent does work in the worktree — creates files, commits.
+    std::fs::write(wt_path.join("agent_output.txt"), "agent did this work\n").unwrap();
+    std::fs::write(wt_path.join("results.json"), "{\"score\": 0.95}\n").unwrap();
+
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&wt_path)
+        .output()
+        .expect("git add in worktree");
+    Command::new("git")
+        .args(["commit", "-m", "agent: add output and results"])
+        .current_dir(&wt_path)
+        .output()
+        .expect("git commit in worktree");
+
+    // Agent makes a second commit.
+    std::fs::write(
+        wt_path.join("agent_output.txt"),
+        "agent refined this work\n",
+    )
+    .unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&wt_path)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "agent: refine output"])
+        .current_dir(&wt_path)
+        .output()
+        .expect("git commit");
+
+    // Step 3: Merge agent's work into a branch based on main.
+    // The merge orchestrator merges source_ref into the worktree's branch.
+    // Create a second worktree on a merge branch (based on main) and merge
+    // the agent's work branch into it.
+    let merge_run_id = random_uuid();
+    let merge_corr_id = random_uuid();
+    let merge_task_id = random_uuid();
+
+    let merge_branch = format!("yarl/{}/merge-into-main", &merge_run_id.to_string()[..8]);
+    let mut merge_binding =
+        WorktreeBinding::new(merge_run_id, &repo, &merge_branch, "main", merge_corr_id)
+            .with_task(merge_task_id);
+
+    wt_mgr
+        .create(&mut merge_binding, cancel.clone())
+        .await
+        .unwrap();
+    let merge_wt_path = merge_binding.worktree_path.clone();
+
+    let orchestrator = LocalMergeOrchestrator::new(wt_mgr.clone());
+    let mut intent = MergeIntent::new(
+        merge_run_id,
+        wt_id,
+        &branch_name,  // source: the agent's work branch
+        &merge_branch, // target: the merge worktree's branch (based on main)
+        merge_corr_id,
+    );
+
+    let precheck = orchestrator
+        .precheck(&mut intent, &merge_binding, cancel.clone())
+        .await
+        .unwrap();
+
+    let dry = orchestrator
+        .dry_run(&mut intent, &merge_binding, cancel.clone())
+        .await
+        .unwrap();
+    assert!(dry.clean, "merge of agent work should be clean");
+    assert!(
+        dry.changed_files.len() >= 2,
+        "should have at least agent_output.txt and results.json changed"
+    );
+
+    let apply = orchestrator
+        .apply(&mut intent, &mut merge_binding, cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!(apply.merge_sha.len(), 40);
+
+    orchestrator
+        .verify(
+            &mut intent,
+            &merge_binding,
+            &precheck.submodule_snapshot,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(intent.state, MergeState::MergeDone);
+
+    // Step 4: Verify the merge worktree branch has agent's files.
+    assert!(merge_wt_path.join("agent_output.txt").exists());
+    assert!(merge_wt_path.join("results.json").exists());
+    let content = std::fs::read_to_string(merge_wt_path.join("agent_output.txt")).unwrap();
+    assert_eq!(content, "agent refined this work\n");
+
+    // The merge branch ref is visible from the main repo.
+    let merge_branch_sha = git_rev_parse(&repo, &merge_branch);
+    assert_eq!(merge_branch_sha, apply.merge_sha);
+
+    // The merge log should contain the agent's commits.
+    let log = git_log_oneline(&repo, &merge_branch);
+    assert!(
+        log.contains("agent: add output"),
+        "merge branch log should contain agent's first commit"
+    );
+    assert!(
+        log.contains("agent: refine output"),
+        "merge branch log should contain agent's second commit"
+    );
+
+    // Step 5: Cleanup both worktrees.
+    wt_mgr
+        .cleanup(&mut merge_binding, true, cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!(merge_binding.state, WorktreeState::WtClosed);
+    assert!(!merge_wt_path.exists(), "merge worktree dir should be gone");
+
+    wt_mgr
+        .cleanup(&mut binding, true, cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!(binding.state, WorktreeState::WtClosed);
+    assert!(!wt_path.exists(), "agent worktree dir should be gone");
+
+    // After cleanup, main should still be at the original SHA (the merge
+    // happened on the merge branch, not directly on main).
+    let main_sha_after = git_rev_parse(&repo, "main");
+    assert_eq!(
+        main_sha_before, main_sha_after,
+        "main should not have moved — merge was on a yarl branch"
+    );
+}
+
+/// Test: concurrent merges to the same target branch are blocked by the lock.
+///
+/// Two worktrees attempt to merge different source branches into the same
+/// target. The second merge should fail with MergeLockUnavailable.
+#[tokio::test]
+async fn concurrent_merge_same_target_blocked() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+
+    // Create repo with two feature branches.
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@yarli.dev"])
+        .current_dir(&repo)
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo)
+        .output()
+        .expect("git config name");
+    std::fs::write(repo.join("README.md"), "# test\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&repo)
+        .output()
+        .expect("git commit");
+
+    // Feature A
+    Command::new("git")
+        .args(["checkout", "-b", "feature/a"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout a");
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .expect("add a");
+    Command::new("git")
+        .args(["commit", "-m", "add a"])
+        .current_dir(&repo)
+        .output()
+        .expect("commit a");
+
+    // Feature B
+    Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout main");
+    Command::new("git")
+        .args(["checkout", "-b", "feature/b"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout b");
+    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .expect("add b");
+    Command::new("git")
+        .args(["commit", "-m", "add b"])
+        .current_dir(&repo)
+        .output()
+        .expect("commit b");
+    Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout main");
+
+    let wt_mgr = LocalWorktreeManager::new();
+    let cancel = CancellationToken::new();
+    let shared_lock = Arc::new(MergeLockMap::new());
+
+    // Create two worktrees, both targeting the same branch.
+    let run_id_a = random_uuid();
+    let run_id_b = random_uuid();
+    let corr = random_uuid();
+    let target_branch = format!("yarl/merge-target-{}", &corr.to_string()[..8]);
+
+    // Worktree A
+    let mut binding_a = WorktreeBinding::new(run_id_a, &repo, &target_branch, "main", corr)
+        .with_task(random_uuid());
+
+    wt_mgr.create(&mut binding_a, cancel.clone()).await.unwrap();
+
+    // Worktree B — must be on a different branch but merge into same target.
+    let target_branch_b = format!("yarl/merge-target-b-{}", &corr.to_string()[..8]);
+    let mut binding_b = WorktreeBinding::new(run_id_b, &repo, &target_branch_b, "main", corr)
+        .with_task(random_uuid());
+
+    wt_mgr.create(&mut binding_b, cancel.clone()).await.unwrap();
+
+    // Both orchestrators share the same lock map.
+    let orch_a = LocalMergeOrchestrator::new(wt_mgr.clone()).with_lock_map(shared_lock.clone());
+    let orch_b = LocalMergeOrchestrator::new(wt_mgr.clone()).with_lock_map(shared_lock.clone());
+
+    // Merge A: feature/a → target_branch
+    let mut intent_a = MergeIntent::new(run_id_a, random_uuid(), "feature/a", &target_branch, corr);
+    orch_a
+        .precheck(&mut intent_a, &binding_a, cancel.clone())
+        .await
+        .unwrap();
+    orch_a
+        .dry_run(&mut intent_a, &binding_a, cancel.clone())
+        .await
+        .unwrap();
+
+    // Hold the lock by manually acquiring it (simulating concurrent apply).
+    assert!(shared_lock.try_acquire(&target_branch).await);
+
+    // Merge B tries to merge feature/b → same target_branch. Should fail on lock.
+    let mut intent_b = MergeIntent::new(run_id_b, random_uuid(), "feature/b", &target_branch, corr);
+    orch_b
+        .precheck(&mut intent_b, &binding_b, cancel.clone())
+        .await
+        .unwrap();
+    orch_b
+        .dry_run(&mut intent_b, &binding_b, cancel.clone())
+        .await
+        .unwrap();
+
+    let err = orch_b
+        .apply(&mut intent_b, &mut binding_b, cancel.clone())
+        .await
+        .expect_err("should fail due to lock");
+
+    match &err {
+        GitError::MergeLockUnavailable { branch } => {
+            assert_eq!(branch, &target_branch);
+        }
+        other => panic!("expected MergeLockUnavailable, got {other:?}"),
+    }
+
+    // Release the lock and verify merge A can proceed.
+    shared_lock.release(&target_branch).await;
+
+    let apply_a = orch_a
+        .apply(&mut intent_a, &mut binding_a, cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!(apply_a.merge_sha.len(), 40);
+}
+
+/// Test: concurrent merges to different target branches succeed independently.
+///
+/// Two worktrees merge into different branches. Both should succeed because
+/// the lock is per-branch.
+#[tokio::test]
+async fn concurrent_merge_different_targets_succeed() {
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().to_path_buf();
+
+    // Create repo with two feature branches.
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@yarli.dev"])
+        .current_dir(&repo)
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo)
+        .output()
+        .expect("git config name");
+    std::fs::write(repo.join("README.md"), "# test\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&repo)
+        .output()
+        .expect("git commit");
+
+    // Feature A (non-conflicting)
+    Command::new("git")
+        .args(["checkout", "-b", "feature/alpha"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout alpha");
+    std::fs::write(repo.join("alpha.txt"), "alpha\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .expect("add alpha");
+    Command::new("git")
+        .args(["commit", "-m", "add alpha"])
+        .current_dir(&repo)
+        .output()
+        .expect("commit alpha");
+
+    // Feature B (non-conflicting, different file)
+    Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout main");
+    Command::new("git")
+        .args(["checkout", "-b", "feature/beta"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout beta");
+    std::fs::write(repo.join("beta.txt"), "beta\n").unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .expect("add beta");
+    Command::new("git")
+        .args(["commit", "-m", "add beta"])
+        .current_dir(&repo)
+        .output()
+        .expect("commit beta");
+    Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(&repo)
+        .output()
+        .expect("checkout main");
+
+    let wt_mgr = LocalWorktreeManager::new();
+    let cancel = CancellationToken::new();
+    let shared_lock = Arc::new(MergeLockMap::new());
+    let corr = random_uuid();
+
+    // Worktree A targets branch "target-a", worktree B targets branch "target-b".
+    let run_id_a = random_uuid();
+    let run_id_b = random_uuid();
+
+    let target_a = format!("yarl/target-a-{}", &corr.to_string()[..8]);
+    let target_b = format!("yarl/target-b-{}", &corr.to_string()[..8]);
+
+    let mut binding_a =
+        WorktreeBinding::new(run_id_a, &repo, &target_a, "main", corr).with_task(random_uuid());
+    let mut binding_b =
+        WorktreeBinding::new(run_id_b, &repo, &target_b, "main", corr).with_task(random_uuid());
+
+    wt_mgr.create(&mut binding_a, cancel.clone()).await.unwrap();
+    wt_mgr.create(&mut binding_b, cancel.clone()).await.unwrap();
+
+    let orch_a = LocalMergeOrchestrator::new(wt_mgr.clone()).with_lock_map(shared_lock.clone());
+    let orch_b = LocalMergeOrchestrator::new(wt_mgr.clone()).with_lock_map(shared_lock.clone());
+
+    // Merge A: feature/alpha → target_a
+    let mut intent_a = MergeIntent::new(run_id_a, random_uuid(), "feature/alpha", &target_a, corr);
+    let pre_a = orch_a
+        .precheck(&mut intent_a, &binding_a, cancel.clone())
+        .await
+        .unwrap();
+    orch_a
+        .dry_run(&mut intent_a, &binding_a, cancel.clone())
+        .await
+        .unwrap();
+    let apply_a = orch_a
+        .apply(&mut intent_a, &mut binding_a, cancel.clone())
+        .await
+        .unwrap();
+
+    // Merge B: feature/beta → target_b (apply releases A's lock, so no contention)
+    let mut intent_b = MergeIntent::new(run_id_b, random_uuid(), "feature/beta", &target_b, corr);
+    let pre_b = orch_b
+        .precheck(&mut intent_b, &binding_b, cancel.clone())
+        .await
+        .unwrap();
+    orch_b
+        .dry_run(&mut intent_b, &binding_b, cancel.clone())
+        .await
+        .unwrap();
+    let apply_b = orch_b
+        .apply(&mut intent_b, &mut binding_b, cancel.clone())
+        .await
+        .unwrap();
+
+    // Both merges succeeded.
+    assert_eq!(apply_a.merge_sha.len(), 40);
+    assert_eq!(apply_b.merge_sha.len(), 40);
+    assert_ne!(apply_a.merge_sha, apply_b.merge_sha);
+
+    // Verify each target has the right file.
+    assert!(
+        binding_a.worktree_path.join("alpha.txt").exists(),
+        "target-a worktree should have alpha.txt"
+    );
+    assert!(
+        !binding_a.worktree_path.join("beta.txt").exists(),
+        "target-a worktree should NOT have beta.txt"
+    );
+    assert!(
+        binding_b.worktree_path.join("beta.txt").exists(),
+        "target-b worktree should have beta.txt"
+    );
+    assert!(
+        !binding_b.worktree_path.join("alpha.txt").exists(),
+        "target-b worktree should NOT have alpha.txt"
+    );
+
+    // Both branches visible from main repo.
+    let sha_a = git_rev_parse(&repo, &target_a);
+    let sha_b = git_rev_parse(&repo, &target_b);
+    assert_eq!(sha_a, apply_a.merge_sha);
+    assert_eq!(sha_b, apply_b.merge_sha);
+
+    // Verify through completeness.
+    orch_a
+        .verify(
+            &mut intent_a,
+            &binding_a,
+            &pre_a.submodule_snapshot,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    orch_b
+        .verify(
+            &mut intent_b,
+            &binding_b,
+            &pre_b.submodule_snapshot,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(intent_a.state, MergeState::MergeDone);
+    assert_eq!(intent_b.state, MergeState::MergeDone);
+}

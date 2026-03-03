@@ -112,5 +112,6 @@ pub(crate) fn sample_continuation_payload(run_id: Uuid, objective: &str) -> Cont
         },
         next_tranche: None,
         quality_gate: None,
+        retry_recommendation: None,
     }
 }

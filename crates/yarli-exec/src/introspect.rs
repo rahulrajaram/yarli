@@ -755,6 +755,14 @@ impl IntrospectionController {
         })
     }
 
+    /// Update the in-memory health report without a new process sample.
+    ///
+    /// This is intended for adapters that replay externally-derived health
+    /// observations back into transition tracking.
+    pub fn set_health_report(&self, report: HealthReport) -> bool {
+        self.health_tx.send(report).is_ok()
+    }
+
     /// Run the introspection loop at the given sampling interval.
     /// Calls `on_degraded` when health drops to Degraded, and
     /// `on_stuck` when it drops to Stuck (with diagnostic context).
