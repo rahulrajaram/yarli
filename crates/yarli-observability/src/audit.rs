@@ -47,6 +47,10 @@ pub enum AuditCategory {
     GateEvaluation,
     /// A command execution terminal event (exited, killed, timed out).
     CommandExecution,
+    /// A process health level transition (healthy→degraded, etc.).
+    ProcessHealth,
+    /// A post-run analysis result.
+    RunAnalysis,
 }
 
 /// A single audit record, serialized as one JSON line.
@@ -179,6 +183,68 @@ impl AuditEntry {
                 "exit_code": exit_code,
                 "duration_ms": duration_ms,
                 "stderr_excerpt": stderr_excerpt.into(),
+            }),
+        }
+    }
+
+    /// Create a process health transition audit entry.
+    pub fn process_health_transition(
+        previous_level: impl Into<String>,
+        new_level: impl Into<String>,
+        score: f64,
+        factors: serde_json::Value,
+        run_id: Option<RunId>,
+        task_id: Option<TaskId>,
+    ) -> Self {
+        let prev = previous_level.into();
+        let new = new_level.into();
+        Self {
+            audit_id: Uuid::now_v7(),
+            timestamp: Utc::now(),
+            category: AuditCategory::ProcessHealth,
+            actor: "introspection_controller".to_string(),
+            action: format!("health_transition:{prev}->{new}"),
+            outcome: None,
+            rule_id: None,
+            reason: format!("health level changed from {prev} to {new} (score={score:.2})"),
+            run_id,
+            task_id,
+            details: serde_json::json!({
+                "previous_level": prev,
+                "new_level": new,
+                "score": score,
+                "factors": factors,
+            }),
+        }
+    }
+
+    /// Create a run analysis audit entry.
+    pub fn run_analysis(
+        patterns: &[String],
+        recommendation: impl Into<String>,
+        confidence: f64,
+        lesson: Option<&str>,
+        run_id: RunId,
+    ) -> Self {
+        Self {
+            audit_id: Uuid::now_v7(),
+            timestamp: Utc::now(),
+            category: AuditCategory::RunAnalysis,
+            actor: "run_analyzer".to_string(),
+            action: "post_run_analysis".to_string(),
+            outcome: None,
+            rule_id: None,
+            reason: format!(
+                "detected {} pattern(s), confidence={confidence:.2}",
+                patterns.len()
+            ),
+            run_id: Some(run_id),
+            task_id: None,
+            details: serde_json::json!({
+                "patterns": patterns,
+                "recommendation": recommendation.into(),
+                "confidence": confidence,
+                "lesson": lesson,
             }),
         }
     }
@@ -664,6 +730,66 @@ mod tests {
     }
 
     #[test]
+    fn process_health_category_serializes() {
+        let cat = AuditCategory::ProcessHealth;
+        let json = serde_json::to_string(&cat).unwrap();
+        assert_eq!(json, "\"process_health\"");
+        let decoded: AuditCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, AuditCategory::ProcessHealth);
+    }
+
+    #[test]
+    fn process_health_transition_creates_entry() {
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let entry = AuditEntry::process_health_transition(
+            "healthy",
+            "degraded",
+            0.45,
+            serde_json::json!({"output_recency": 0.3}),
+            Some(run_id),
+            Some(task_id),
+        );
+        assert_eq!(entry.category, AuditCategory::ProcessHealth);
+        assert_eq!(entry.actor, "introspection_controller");
+        assert!(entry.action.contains("healthy->degraded"));
+        assert_eq!(entry.run_id, Some(run_id));
+        assert_eq!(entry.task_id, Some(task_id));
+        assert_eq!(entry.details["previous_level"], "healthy");
+        assert_eq!(entry.details["new_level"], "degraded");
+    }
+
+    #[test]
+    fn run_analysis_creates_entry() {
+        let run_id = Uuid::new_v4();
+        let entry = AuditEntry::run_analysis(
+            &[
+                "cascading_failure".to_string(),
+                "timeout_or_stall".to_string(),
+            ],
+            "none",
+            0.7,
+            Some("root task failed causing cascade"),
+            run_id,
+        );
+        assert_eq!(entry.category, AuditCategory::RunAnalysis);
+        assert_eq!(entry.actor, "run_analyzer");
+        assert_eq!(entry.run_id, Some(run_id));
+        assert!(entry.reason.contains("2 pattern(s)"));
+        assert_eq!(entry.details["confidence"], 0.7);
+        assert_eq!(entry.details["lesson"], "root task failed causing cascade");
+    }
+
+    #[test]
+    fn run_analysis_category_serializes() {
+        let cat = AuditCategory::RunAnalysis;
+        let json = serde_json::to_string(&cat).unwrap();
+        assert_eq!(json, "\"run_analysis\"");
+        let decoded: AuditCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, AuditCategory::RunAnalysis);
+    }
+
+    #[test]
     fn all_audit_categories_serialize() {
         let categories = [
             AuditCategory::PolicyDecision,
@@ -671,6 +797,8 @@ mod tests {
             AuditCategory::TokenConsumed,
             AuditCategory::GateEvaluation,
             AuditCategory::CommandExecution,
+            AuditCategory::ProcessHealth,
+            AuditCategory::RunAnalysis,
         ];
         for cat in &categories {
             let json = serde_json::to_string(cat).unwrap();

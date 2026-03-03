@@ -621,6 +621,19 @@ pub trait IntrospectionRouter: Send + Sync {
     async fn analyze(&self, context: &DiagnosticContext) -> Result<IntrospectionVerdict, String>;
 }
 
+/// Event emitted when the health level changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthTransitionEvent {
+    /// Previous health level before the transition.
+    pub previous_level: HealthLevel,
+    /// New health level after the transition.
+    pub new_level: HealthLevel,
+    /// Health score at the time of transition.
+    pub score: f64,
+    /// Factor breakdown at the time of transition.
+    pub factors: HealthFactors,
+}
+
 /// Controller that orchestrates introspection alongside command execution.
 pub struct IntrospectionController {
     pid: u32,
@@ -632,6 +645,7 @@ pub struct IntrospectionController {
     task_objective: String,
     health_tx: tokio::sync::watch::Sender<HealthReport>,
     health_rx: tokio::sync::watch::Receiver<HealthReport>,
+    last_emitted_level: HealthLevel,
 }
 
 impl IntrospectionController {
@@ -660,6 +674,7 @@ impl IntrospectionController {
             task_objective,
             health_tx,
             health_rx,
+            last_emitted_level: HealthLevel::Healthy,
         }
     }
 
@@ -719,6 +734,25 @@ impl IntrospectionController {
             total_samples: self.scorer.total_samples,
             detected_signatures: self.analyzer.compaction.detected_signatures().to_vec(),
         }
+    }
+
+    /// Check if the health level has changed since the last emission.
+    ///
+    /// Returns `Some(HealthTransitionEvent)` if the level changed, `None` otherwise.
+    /// Calling this updates the internal `last_emitted_level` tracker.
+    pub fn check_health_transition(&mut self) -> Option<HealthTransitionEvent> {
+        let current = self.health_rx.borrow().clone();
+        if current.level == self.last_emitted_level {
+            return None;
+        }
+        let previous_level = self.last_emitted_level;
+        self.last_emitted_level = current.level;
+        Some(HealthTransitionEvent {
+            previous_level,
+            new_level: current.level,
+            score: current.score,
+            factors: current.factors,
+        })
     }
 
     /// Run the introspection loop at the given sampling interval.
@@ -1137,5 +1171,127 @@ mod tests {
         assert_eq!(ctx.task_objective, "run tests");
         assert_eq!(ctx.recent_output.len(), 1);
         assert!(ctx.runtime_seconds >= 0.0);
+    }
+
+    // --- HealthTransitionEvent ---
+
+    #[test]
+    fn health_transition_detected_on_level_change() {
+        let mut ctrl = IntrospectionController::new(99999, "test".to_string());
+        // Initially Healthy; simulate a degraded report via watch channel
+        let degraded_report = HealthReport {
+            score: 0.5,
+            level: HealthLevel::Degraded,
+            factors: HealthFactors {
+                output_recency: 0.5,
+                io_delta: 0.5,
+                cpu_utilization: 0.5,
+                repetition: 0.5,
+                sleep_ratio: 0.5,
+            },
+        };
+        ctrl.health_tx.send(degraded_report).unwrap();
+        let transition = ctrl.check_health_transition();
+        assert!(transition.is_some());
+        let t = transition.unwrap();
+        assert_eq!(t.previous_level, HealthLevel::Healthy);
+        assert_eq!(t.new_level, HealthLevel::Degraded);
+    }
+
+    #[test]
+    fn no_transition_when_level_unchanged() {
+        let mut ctrl = IntrospectionController::new(99999, "test".to_string());
+        // Health is Healthy initially; send another Healthy report
+        let healthy_report = HealthReport {
+            score: 0.9,
+            level: HealthLevel::Healthy,
+            factors: HealthFactors {
+                output_recency: 1.0,
+                io_delta: 1.0,
+                cpu_utilization: 0.5,
+                repetition: 1.0,
+                sleep_ratio: 1.0,
+            },
+        };
+        ctrl.health_tx.send(healthy_report).unwrap();
+        assert!(ctrl.check_health_transition().is_none());
+    }
+
+    #[test]
+    fn transition_back_to_healthy() {
+        let mut ctrl = IntrospectionController::new(99999, "test".to_string());
+        // Go to Degraded first
+        let degraded = HealthReport {
+            score: 0.5,
+            level: HealthLevel::Degraded,
+            factors: HealthFactors {
+                output_recency: 0.5,
+                io_delta: 0.5,
+                cpu_utilization: 0.5,
+                repetition: 0.5,
+                sleep_ratio: 0.5,
+            },
+        };
+        ctrl.health_tx.send(degraded).unwrap();
+        let _ = ctrl.check_health_transition(); // consume Healthy→Degraded
+
+        // Now go back to Healthy
+        let healthy = HealthReport {
+            score: 0.9,
+            level: HealthLevel::Healthy,
+            factors: HealthFactors {
+                output_recency: 1.0,
+                io_delta: 1.0,
+                cpu_utilization: 0.5,
+                repetition: 1.0,
+                sleep_ratio: 1.0,
+            },
+        };
+        ctrl.health_tx.send(healthy).unwrap();
+        let transition = ctrl.check_health_transition();
+        assert!(transition.is_some());
+        let t = transition.unwrap();
+        assert_eq!(t.previous_level, HealthLevel::Degraded);
+        assert_eq!(t.new_level, HealthLevel::Healthy);
+    }
+
+    #[test]
+    fn transition_tracks_previous_level() {
+        let mut ctrl = IntrospectionController::new(99999, "test".to_string());
+        // Healthy → Degraded
+        ctrl.health_tx
+            .send(HealthReport {
+                score: 0.5,
+                level: HealthLevel::Degraded,
+                factors: HealthFactors {
+                    output_recency: 0.5,
+                    io_delta: 0.5,
+                    cpu_utilization: 0.5,
+                    repetition: 0.5,
+                    sleep_ratio: 0.5,
+                },
+            })
+            .unwrap();
+        let t1 = ctrl.check_health_transition().unwrap();
+        assert_eq!(t1.previous_level, HealthLevel::Healthy);
+        assert_eq!(t1.new_level, HealthLevel::Degraded);
+
+        // Degraded → Stuck
+        ctrl.health_tx
+            .send(HealthReport {
+                score: 0.1,
+                level: HealthLevel::Stuck,
+                factors: HealthFactors {
+                    output_recency: 0.0,
+                    io_delta: 0.0,
+                    cpu_utilization: 0.0,
+                    repetition: 0.0,
+                    sleep_ratio: 0.0,
+                },
+            })
+            .unwrap();
+        let t2 = ctrl.check_health_transition().unwrap();
+        assert_eq!(t2.previous_level, HealthLevel::Degraded);
+        assert_eq!(t2.new_level, HealthLevel::Stuck);
     }
 }

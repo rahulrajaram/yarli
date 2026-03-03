@@ -195,6 +195,136 @@ impl MemoryObserver {
         }
     }
 
+    /// Analyze the completed run and store a semantic memory with the run-level lesson.
+    ///
+    /// Skips storage for clean completions (no patterns detected).
+    /// Emits a `run.observer.analysis` event with the analysis JSON.
+    pub(crate) async fn observe_run_end(
+        &self,
+        store: &dyn EventStore,
+        payload: &yarli_core::entities::ContinuationPayload,
+        gate_failures: &[String],
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        let analyzer_tasks: Vec<yarli_observability::run_analyzer::TaskOutcome> = payload
+            .tasks
+            .iter()
+            .map(|t| yarli_observability::run_analyzer::TaskOutcome {
+                task_key: t.task_key.clone(),
+                state: t.state,
+                last_error: t.last_error.clone(),
+                blocker: t.blocker.clone(),
+            })
+            .collect();
+
+        let analysis = yarli_observability::run_analyzer::analyze_run(
+            payload.exit_state,
+            payload.exit_reason,
+            &analyzer_tasks,
+            gate_failures,
+        );
+
+        // Emit analysis event
+        let pattern_names = yarli_observability::run_analyzer::pattern_names(&analysis.patterns);
+        let recommendation_str = serde_json::to_string(&analysis.retry_recommendation)
+            .unwrap_or_else(|_| "unknown".to_string());
+        let _ = append_event(
+            store,
+            Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: Utc::now(),
+                entity_type: yarli_core::domain::EntityType::Run,
+                entity_id: self.run_id.to_string(),
+                event_type: "run.observer.analysis".to_string(),
+                payload: serde_json::to_value(&analysis).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "patterns": pattern_names,
+                        "confidence": analysis.confidence,
+                    })
+                }),
+                correlation_id: self.correlation_id,
+                causation_id: None,
+                actor: "observer.run_analyzer".to_string(),
+                idempotency_key: None,
+            },
+        );
+
+        // Store semantic memory only for non-trivial runs (has patterns)
+        if let Some(lesson) = &analysis.run_lesson {
+            let content = truncate_for_memory(&format!(
+                "run_analysis: objective={} patterns=[{}] recommendation={} lesson={}",
+                self.run_objective,
+                pattern_names.join(","),
+                recommendation_str,
+                lesson
+            ));
+
+            let mut semantic = yarli_memory::InsertMemory::new(
+                self.project_scope.clone(),
+                yarli_memory::MemoryClass::Semantic,
+                content,
+            );
+            semantic
+                .metadata
+                .insert("run_id".to_string(), self.run_id.to_string());
+            semantic
+                .metadata
+                .insert("patterns".to_string(), pattern_names.join(","));
+            semantic.metadata.insert(
+                "confidence".to_string(),
+                format!("{:.2}", analysis.confidence),
+            );
+
+            match self.adapter.store(&self.project_id, semantic).await {
+                Ok(record) => {
+                    let _ = append_event(
+                        store,
+                        Event {
+                            event_id: Uuid::now_v7(),
+                            occurred_at: Utc::now(),
+                            entity_type: yarli_core::domain::EntityType::Run,
+                            entity_id: self.run_id.to_string(),
+                            event_type: "run.observer.analysis_memory_stored".to_string(),
+                            payload: serde_json::json!({
+                                "memory_id": record.memory_id,
+                                "scope_id": record.scope_id.as_str(),
+                                "memory_class": record.memory_class,
+                                "patterns": pattern_names,
+                            }),
+                            correlation_id: self.correlation_id,
+                            causation_id: None,
+                            actor: "observer.run_analyzer".to_string(),
+                            idempotency_key: None,
+                        },
+                    );
+                }
+                Err(err) => {
+                    let _ = append_event(
+                        store,
+                        Event {
+                            event_id: Uuid::now_v7(),
+                            occurred_at: Utc::now(),
+                            entity_type: yarli_core::domain::EntityType::Run,
+                            entity_id: self.run_id.to_string(),
+                            event_type: "run.observer.analysis_memory_store_failed".to_string(),
+                            payload: serde_json::json!({
+                                "error": err.to_string(),
+                                "scope_id": self.project_scope.as_str(),
+                            }),
+                            correlation_id: self.correlation_id,
+                            causation_id: None,
+                            actor: "observer.run_analyzer".to_string(),
+                            idempotency_key: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     async fn on_task_failed(&self, store: &dyn EventStore, event: &Event) {
         let Ok(task_id) = event.entity_id.parse::<Uuid>() else {
             return;
@@ -2190,5 +2320,208 @@ mod tests {
         }
 
         assert_eq!(state.failure_signatures.len(), OBSERVER_FAILURE_RING_SIZE);
+    }
+
+    // --- observe_run_end integration (run_analyzer path) ---
+
+    use yarli_core::entities::continuation::{ContinuationPayload, RunSummary};
+    use yarli_core::fsm::run::RunState;
+    use yarli_core::fsm::task::TaskState;
+    use yarli_observability::run_analyzer;
+
+    fn make_continuation_payload(
+        exit_state: RunState,
+        exit_reason: Option<yarli_core::domain::ExitReason>,
+        tasks: Vec<yarli_core::entities::continuation::TaskOutcome>,
+    ) -> ContinuationPayload {
+        let total = tasks.len() as u32;
+        let completed = tasks
+            .iter()
+            .filter(|t| t.state == TaskState::TaskComplete)
+            .count() as u32;
+        let failed = tasks
+            .iter()
+            .filter(|t| t.state == TaskState::TaskFailed)
+            .count() as u32;
+        ContinuationPayload {
+            run_id: Uuid::new_v4(),
+            objective: "test objective".to_string(),
+            exit_state,
+            exit_reason,
+            cancellation_source: None,
+            cancellation_provenance: None,
+            completed_at: Utc::now(),
+            tasks,
+            summary: RunSummary {
+                total,
+                completed,
+                failed,
+                cancelled: 0,
+                pending: 0,
+            },
+            next_tranche: None,
+            quality_gate: None,
+        }
+    }
+
+    fn make_task_outcome(
+        key: &str,
+        state: TaskState,
+    ) -> yarli_core::entities::continuation::TaskOutcome {
+        yarli_core::entities::continuation::TaskOutcome {
+            task_id: Uuid::new_v4(),
+            task_key: key.to_string(),
+            state,
+            attempt_no: 1,
+            last_error: None,
+            blocker: None,
+        }
+    }
+
+    #[test]
+    fn observe_run_end_analyzer_stores_lesson_on_failure() {
+        let payload = make_continuation_payload(
+            RunState::RunFailed,
+            Some(yarli_core::domain::ExitReason::BlockedOpenTasks),
+            vec![make_task_outcome("build", TaskState::TaskComplete), {
+                let mut t = make_task_outcome("test", TaskState::TaskFailed);
+                t.last_error = Some("exit code 1".to_string());
+                t
+            }],
+        );
+
+        let analyzer_tasks: Vec<run_analyzer::TaskOutcome> = payload
+            .tasks
+            .iter()
+            .map(|t| run_analyzer::TaskOutcome {
+                task_key: t.task_key.clone(),
+                state: t.state,
+                last_error: t.last_error.clone(),
+                blocker: t.blocker.clone(),
+            })
+            .collect();
+
+        let analysis = run_analyzer::analyze_run(
+            payload.exit_state,
+            payload.exit_reason,
+            &analyzer_tasks,
+            &[],
+        );
+        assert!(
+            analysis.run_lesson.is_some(),
+            "should have a lesson for failures"
+        );
+        assert!(!analysis.patterns.is_empty());
+    }
+
+    #[test]
+    fn observe_run_end_analyzer_skips_clean_completion() {
+        let payload = make_continuation_payload(
+            RunState::RunCompleted,
+            Some(yarli_core::domain::ExitReason::CompletedAllGates),
+            vec![
+                make_task_outcome("build", TaskState::TaskComplete),
+                make_task_outcome("test", TaskState::TaskComplete),
+            ],
+        );
+
+        let analyzer_tasks: Vec<run_analyzer::TaskOutcome> = payload
+            .tasks
+            .iter()
+            .map(|t| run_analyzer::TaskOutcome {
+                task_key: t.task_key.clone(),
+                state: t.state,
+                last_error: t.last_error.clone(),
+                blocker: t.blocker.clone(),
+            })
+            .collect();
+
+        let analysis = run_analyzer::analyze_run(
+            payload.exit_state,
+            payload.exit_reason,
+            &analyzer_tasks,
+            &[],
+        );
+        assert!(
+            analysis.run_lesson.is_none(),
+            "clean completion should not produce a lesson"
+        );
+        assert!(analysis.patterns.is_empty());
+    }
+
+    #[test]
+    fn observe_run_end_analyzer_emits_analysis_event() {
+        let payload = make_continuation_payload(
+            RunState::RunFailed,
+            Some(yarli_core::domain::ExitReason::BlockedGateFailure),
+            vec![
+                make_task_outcome("build", TaskState::TaskComplete),
+                make_task_outcome("test", TaskState::TaskComplete),
+            ],
+        );
+
+        let analyzer_tasks: Vec<run_analyzer::TaskOutcome> = payload
+            .tasks
+            .iter()
+            .map(|t| run_analyzer::TaskOutcome {
+                task_key: t.task_key.clone(),
+                state: t.state,
+                last_error: t.last_error.clone(),
+                blocker: t.blocker.clone(),
+            })
+            .collect();
+
+        let gate_failures = vec!["tests_passed".to_string()];
+        let analysis = run_analyzer::analyze_run(
+            payload.exit_state,
+            payload.exit_reason,
+            &analyzer_tasks,
+            &gate_failures,
+        );
+        let pattern_names = run_analyzer::pattern_names(&analysis.patterns);
+
+        // Verify analysis event payload can be serialized
+        let event_payload = serde_json::to_value(&analysis).unwrap();
+        assert!(event_payload.get("patterns").is_some());
+        assert!(event_payload.get("confidence").is_some());
+        assert!(!pattern_names.is_empty());
+        assert!(pattern_names.iter().any(|n| n == "gate_only_failure"));
+    }
+
+    #[test]
+    fn observe_run_end_analyzer_includes_gate_failures() {
+        let payload = make_continuation_payload(
+            RunState::RunFailed,
+            Some(yarli_core::domain::ExitReason::BlockedGateFailure),
+            vec![make_task_outcome("build", TaskState::TaskComplete)],
+        );
+
+        let analyzer_tasks: Vec<run_analyzer::TaskOutcome> = payload
+            .tasks
+            .iter()
+            .map(|t| run_analyzer::TaskOutcome {
+                task_key: t.task_key.clone(),
+                state: t.state,
+                last_error: t.last_error.clone(),
+                blocker: t.blocker.clone(),
+            })
+            .collect();
+
+        let gate_failures = vec!["tests_passed".to_string(), "lint_clean".to_string()];
+        let analysis = run_analyzer::analyze_run(
+            payload.exit_state,
+            payload.exit_reason,
+            &analyzer_tasks,
+            &gate_failures,
+        );
+        let lesson = analysis.run_lesson.expect("should have a lesson");
+        assert!(
+            lesson.contains("tests_passed"),
+            "lesson should mention gate failures"
+        );
+        assert!(
+            lesson.contains("lint_clean"),
+            "lesson should mention all gate failures"
+        );
     }
 }

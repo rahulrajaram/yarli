@@ -3281,6 +3281,12 @@ where
                         deterioration_observer.has_deterioration_cycle(),
                     )
                 };
+                if let Some(observer) = memory_observer.as_ref() {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        observer.observe_run_end(store.as_ref(), &payload, &[]),
+                    ).await;
+                }
                 scheduler.clear_live_output();
                 if let Some(h) = forwarder_handle.take() {
                     let _ = h.await;
@@ -3589,6 +3595,12 @@ where
                                     deterioration_observer.has_deterioration_cycle(),
                                 )
                             };
+                            if let Some(observer) = memory_observer.as_ref() {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(15),
+                                    observer.observe_run_end(store.as_ref(), &payload, &[]),
+                                ).await;
+                            }
                             scheduler.clear_live_output();
                             if let Some(h) = forwarder_handle.take() {
                                 let _ = h.await;
@@ -3659,6 +3671,12 @@ where
                 }; // reg dropped here
 
                 if let Some(payload) = terminal_payload {
+                    if let Some(observer) = memory_observer.as_ref() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            observer.observe_run_end(store.as_ref(), &payload, &[]),
+                        ).await;
+                    }
                     scheduler.clear_live_output();
                     if let Some(h) = forwarder_handle.take() {
                         let _ = h.await;
