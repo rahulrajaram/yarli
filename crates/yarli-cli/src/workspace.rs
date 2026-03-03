@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Stdio};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -412,6 +413,8 @@ fn prepare_parallel_workspace_layout_copy(
 
 /// Maximum number of git worktrees allowed per project.
 const MAX_WORKTREES: usize = 10;
+const WORKTREE_SLOT_WAIT_INITIAL_SECONDS: u64 = 1;
+const WORKTREE_SLOT_WAIT_MAX_SECONDS: u64 = 30;
 
 /// Check if `git worktree` is available in the given directory.
 pub(crate) fn git_worktree_available(cwd: &Path) -> bool {
@@ -440,6 +443,36 @@ pub(crate) fn prune_stale_worktrees(cwd: &Path) -> Result<()> {
     let output = run_git_capture(cwd, &["worktree", "prune"])?;
     ensure_git_success(output, cwd, &["worktree", "prune"], "prune stale worktrees")?;
     Ok(())
+}
+
+/// Wait until enough worktree slots are available for `needed` worktrees.
+fn wait_for_available_worktree_slots(source_workdir: &Path, needed: usize) -> Result<usize> {
+    if needed > MAX_WORKTREES {
+        bail!(
+            "creating {} worktrees would exceed the maximum of {}; reduce parallel task count",
+            needed,
+            MAX_WORKTREES
+        );
+    }
+
+    let mut wait_seconds = WORKTREE_SLOT_WAIT_INITIAL_SECONDS;
+    loop {
+        prune_stale_worktrees(source_workdir)?;
+        let existing = count_existing_worktrees(source_workdir)?;
+        if existing + needed <= MAX_WORKTREES {
+            return Ok(existing);
+        }
+
+        warn!(
+            existing_worktrees = existing,
+            requested_worktrees = needed,
+            max_worktrees = MAX_WORKTREES,
+            wait_seconds,
+            "worktree limit reached, waiting for slots to free"
+        );
+        std::thread::sleep(Duration::from_secs(wait_seconds));
+        wait_seconds = (wait_seconds.saturating_mul(2)).min(WORKTREE_SLOT_WAIT_MAX_SECONDS);
+    }
 }
 
 /// Create parallel workspaces using git worktrees.
@@ -489,19 +522,8 @@ fn prepare_parallel_workspace_layout_worktree(
         );
     }
 
-    prune_stale_worktrees(&source_workdir)?;
-
-    let existing = count_existing_worktrees(&source_workdir)?;
     let needed = plan.tasks.len();
-    if existing + needed > MAX_WORKTREES {
-        bail!(
-            "creating {} worktrees would exceed the maximum of {} (currently {} active); \
-             clean up stale worktrees or reduce parallel task count",
-            needed,
-            MAX_WORKTREES,
-            existing
-        );
-    }
+    let _existing = wait_for_available_worktree_slots(&source_workdir, needed)?;
 
     let source_head_at_creation = run_git_capture(&source_workdir, &["rev-parse", "HEAD"])
         .ok()
@@ -652,6 +674,118 @@ fn rollback_worktrees(source_workdir: &Path, created: &[(PathBuf, String)]) {
         let _ = run_git_capture(source_workdir, &["branch", "-D", branch]);
     }
     let _ = run_git_capture(source_workdir, &["worktree", "prune"]);
+}
+
+fn copy_state_file_if_present(
+    source_workdir: &Path,
+    workspace_dir: &Path,
+    relative_path: &str,
+) -> Result<()> {
+    let workspace_path = workspace_dir.join(relative_path);
+    if !workspace_path.exists() {
+        return Ok(());
+    }
+    let destination_path = source_workdir.join(relative_path);
+    if let Some(parent) = destination_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create state file parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::copy(&workspace_path, &destination_path).with_context(|| {
+        format!(
+            "failed to sync state file {} -> {}",
+            workspace_path.display(),
+            destination_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_directory_files_recursive(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    if !src_dir.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(dst_dir).with_context(|| {
+        format!(
+            "failed to create destination directory {}",
+            dst_dir.display()
+        )
+    })?;
+    for entry in fs::read_dir(src_dir)
+        .with_context(|| format!("failed to read source directory {}", src_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", src_dir.display()))?;
+        let src_path = entry.path();
+        let dst_path = dst_dir.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", src_path.display()))?;
+        if file_type.is_dir() {
+            copy_directory_files_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory {}", parent.display()))?;
+            }
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "failed to copy file {} -> {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        } else if file_type.is_symlink() {
+            copy_symlink_entry(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sync runtime state artifacts from a task workspace back to source.
+///
+/// This ensures `.yarli/tranches.toml` and evidence survive even when the
+/// worktree had no tracked code changes (skip path).
+fn sync_workspace_state_artifacts(source_workdir: &Path, workspace_dir: &Path) -> Result<()> {
+    copy_state_file_if_present(source_workdir, workspace_dir, ".yarli/tranches.toml")?;
+    copy_state_file_if_present(source_workdir, workspace_dir, ".yarli/continuation.json")?;
+
+    let evidence_src = workspace_dir.join(".yarli/evidence");
+    let evidence_dst = source_workdir.join(".yarli/evidence");
+    copy_directory_files_recursive(&evidence_src, &evidence_dst)?;
+    Ok(())
+}
+
+/// Remove a merged/skipped task worktree and its branch to free worktree slots.
+fn release_worktree_slot(source_workdir: &Path, workspace_dir: &Path, branch: &str) -> Result<()> {
+    let workspace_dir_str = workspace_dir.display().to_string();
+    let remove_args = ["worktree", "remove", &workspace_dir_str, "--force"];
+    let remove_output = run_git_capture(source_workdir, &remove_args)?;
+    ensure_git_success(
+        remove_output,
+        source_workdir,
+        &remove_args,
+        "remove merged task worktree",
+    )?;
+
+    match run_git_capture(source_workdir, &["branch", "-D", branch]) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(branch = %branch, "failed to delete worktree branch after merge: {stderr}");
+        }
+        Err(err) => {
+            warn!(branch = %branch, "failed to delete worktree branch after merge: {err}");
+        }
+    }
+
+    if let Err(err) = prune_stale_worktrees(source_workdir) {
+        warn!("failed to prune worktree metadata after slot release: {err}");
+    }
+    Ok(())
 }
 
 /// Clean up a parallel workspace layout.
@@ -2041,6 +2175,20 @@ pub(crate) fn merge_worktree_workspace_results(
                         .to_string();
 
                     if source_head == ws_head {
+                        sync_workspace_state_artifacts(source_workdir, workspace_dir)
+                            .with_context(|| {
+                                format!(
+                                    "failed to sync yarli state artifacts from skipped worktree {}",
+                                    workspace_dir.display()
+                                )
+                            })?;
+                        release_worktree_slot(source_workdir, workspace_dir, branch).with_context(
+                            || {
+                                format!(
+                                    "failed to release skipped worktree slot for task {task_key}"
+                                )
+                            },
+                        )?;
                         skipped_task_keys.push(task_key.clone());
                         task_outcomes.push(ParallelTaskMergeOutcome {
                             task_key: task_key.clone(),
@@ -2083,7 +2231,6 @@ pub(crate) fn merge_worktree_workspace_results(
 
                 match merge_result {
                     Ok(output) if output.status.success() => {
-                        merged_task_keys.push(task_key.clone());
                         let ws_head_output =
                             run_git_capture(workspace_dir, &["rev-parse", "HEAD"])?;
                         let ws_head = String::from_utf8_lossy(&ws_head_output.stdout)
@@ -2094,6 +2241,21 @@ pub(crate) fn merge_worktree_workspace_results(
                         let source_head = String::from_utf8_lossy(&source_head_output.stdout)
                             .trim()
                             .to_string();
+                        sync_workspace_state_artifacts(source_workdir, workspace_dir)
+                            .with_context(|| {
+                                format!(
+                                    "failed to sync yarli state artifacts from merged worktree {}",
+                                    workspace_dir.display()
+                                )
+                            })?;
+                        release_worktree_slot(source_workdir, workspace_dir, branch).with_context(
+                            || {
+                                format!(
+                                    "failed to release merged worktree slot for task {task_key}"
+                                )
+                            },
+                        )?;
+                        merged_task_keys.push(task_key.clone());
                         task_outcomes.push(ParallelTaskMergeOutcome {
                             task_key: task_key.clone(),
                             disposition: ParallelTaskMergeDisposition::Merged,
@@ -5782,6 +5944,81 @@ worktree_root = "{}"
         let (ok, log_output, _) = run_git(&repo, &["log", "--oneline", "-5"]);
         assert!(ok);
         assert!(log_output.contains("merge alpha"), "git log: {log_output}");
+
+        // Merged task worktree should be removed immediately to free slots.
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
+        assert!(!wt1.exists(), "worktree path should be removed after merge");
+    }
+
+    #[test]
+    fn worktree_merge_skip_syncs_tranche_state_and_releases_slot() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".yarli")).unwrap();
+        init_git_repo(&repo);
+
+        // Ignore runtime state directory to emulate real `.yarli` behavior.
+        std::fs::write(repo.join(".gitignore"), ".yarli/\n").unwrap();
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        std::fs::write(
+            repo.join(".yarli/tranches.toml"),
+            "status = \"incomplete\"\n",
+        )
+        .unwrap();
+        run_git_expect_ok(&repo, &["add", ".gitignore", "README.md"]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let run_root = wt_root.join("run-skip-sync-test");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let wt1 = run_root.join("001-task");
+        let wt1_str = wt1.display().to_string();
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/skip/001-task",
+                &wt1_str,
+                "HEAD",
+            ],
+        );
+
+        // Only update ignored runtime state (no tracked code changes).
+        std::fs::create_dir_all(wt1.join(".yarli")).unwrap();
+        std::fs::write(wt1.join(".yarli/tranches.toml"), "status = \"complete\"\n").unwrap();
+
+        let resolution_config = MergeResolutionConfig {
+            strategy: crate::config::MergeConflictResolution::Fail,
+            repair_command: None,
+            repair_timeout_seconds: 300,
+        };
+        let task_workspaces = vec![("task".to_string(), wt1.clone())];
+        let branches = vec!["yarli/skip/001-task".to_string()];
+        let mut telemetry = Vec::new();
+
+        let report = merge_worktree_workspace_results(
+            &repo,
+            Uuid::now_v7(),
+            &task_workspaces,
+            &branches,
+            &resolution_config,
+            &mut telemetry,
+        )
+        .unwrap();
+
+        assert!(report.merged_task_keys.is_empty());
+        assert_eq!(report.skipped_task_keys, vec!["task"]);
+
+        // Ignored runtime state should still sync back to source workspace.
+        let synced = std::fs::read_to_string(repo.join(".yarli/tranches.toml")).unwrap();
+        assert_eq!(synced, "status = \"complete\"\n");
+
+        // Skipped task worktree should also be removed immediately.
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
+        assert!(!wt1.exists(), "worktree path should be removed after skip");
     }
 
     #[test]
