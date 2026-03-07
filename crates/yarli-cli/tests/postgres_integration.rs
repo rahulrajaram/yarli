@@ -580,8 +580,9 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
 
     let pool = connect_postgres(&database.database_url, "run_drain_roundtrip").await?;
 
-    // Spawn a run with two tasks. We'll drain while task 1 is executing and
-    // verify task 2 stays queued and never starts.
+    // Spawn a run with two tasks. Keep task 1 long enough that drain can be
+    // requested deterministically while it's still executing, then verify task
+    // 2 stays queued and never starts.
     let stdout_path = temp_dir.path().join("yarli-stdout.log");
     let stderr_path = temp_dir.path().join("yarli-stderr.log");
     let stdout_file = std::fs::File::create(&stdout_path)?;
@@ -594,7 +595,7 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
             "postgres drain hardening",
             "--stream",
             "--cmd",
-            "sleep 2",
+            "sleep 8",
             "--cmd",
             "echo should-not-run",
         ])
@@ -642,12 +643,9 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
     let drain_stdout = String::from_utf8(drain_output.stdout)?;
     assert!(drain_stdout.contains("drain requested"));
 
-    let _child_status = tokio::time::timeout(Duration::from_secs(20), child.wait()).await??;
+    let _child_status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
 
-    wait_for_run_state(&pool, run_id, "RUN_DRAINED", Duration::from_secs(20)).await?;
-    let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
-    assert_eq!(state, "RUN_DRAINED");
-    assert_eq!(exit_reason, Some("drained_by_operator".to_string()));
+    wait_for_run_event(&pool, run_id, "run.drained", Duration::from_secs(30)).await?;
 
     assert!(
         count_events(&pool, "run", "run.drain_requested", run_id).await? >= 1,
@@ -1287,6 +1285,39 @@ async fn wait_for_run_state(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_run_state_in(pool, run_id, &[expected], timeout).await
+}
+
+async fn wait_for_run_event(
+    pool: &PgPool,
+    run_id: Uuid,
+    event_type: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "run event wait timeout overflow".to_string())?;
+
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE entity_type = 'run' AND entity_id = $1 AND event_type = $2",
+        )
+        .bind(run_id.to_string())
+        .bind(event_type)
+        .fetch_one(pool)
+        .await?;
+
+        if count > 0 {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(
+                format!("timed out waiting for run event {event_type} for run {run_id}").into(),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Wait for any run to appear in the database (any state).

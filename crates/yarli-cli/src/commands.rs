@@ -1969,8 +1969,7 @@ async fn initialize_postgres_sync_state(
 
     match PgPoolOptions::new()
         .max_connections(1)
-        .connect(&database_url)
-        .await
+        .connect_lazy(&database_url)
     {
         Ok(pool) => Ok(PostgresSyncState {
             pool: Some(pool),
@@ -4057,6 +4056,12 @@ where
                 }; // reg dropped here
 
                 if let Some(payload) = terminal_payload {
+                    if let Err(err) =
+                        sync_postgres_state_if_changed(scheduler, run_id, &mut postgres_sync_state)
+                            .await
+                    {
+                        warn!(run_id = %run_id, error = %err, "failed to sync postgres state before terminal return");
+                    }
                     if let Some(observer) = memory_observer.as_ref() {
                         let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
                         let _ = tokio::time::timeout(
