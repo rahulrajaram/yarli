@@ -6231,10 +6231,14 @@ worktree_root = "{}"
         // Verify git log shows merge + reapply commits.
         let (ok, log, _) = run_git(&repo, &["log", "--oneline", "-5"]);
         assert!(ok);
-        assert!(log.contains("merge task"), "git log: {log}");
+        assert!(log.contains("feat(state): update state"), "git log: {log}");
         assert!(
-            log.contains("reapply pre-existing"),
+            log.contains("chore(workspace): restore local workspace changes"),
             "should reapply stashed state: {log}"
+        );
+        assert!(
+            !log.contains("merge task") && !log.contains("reapply pre-existing"),
+            "git log should avoid workflow-centric subjects: {log}"
         );
 
         // Verify no stash entries remain.
