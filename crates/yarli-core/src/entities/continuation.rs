@@ -53,6 +53,7 @@ mod run_state_pascal_case {
             RunState::RunFailed => "RunFailed",
             RunState::RunCompleted => "RunCompleted",
             RunState::RunCancelled => "RunCancelled",
+            RunState::RunDrained => "RunDrained",
         })
     }
 
@@ -69,6 +70,7 @@ mod run_state_pascal_case {
             "RunFailed" | "RUN_FAILED" => RunState::RunFailed,
             "RunCompleted" | "RUN_COMPLETED" => RunState::RunCompleted,
             "RunCancelled" | "RUN_CANCELLED" => RunState::RunCancelled,
+            "RunDrained" | "RUN_DRAINED" => RunState::RunDrained,
             other => {
                 return Err(D::Error::unknown_variant(
                     other,
@@ -80,6 +82,7 @@ mod run_state_pascal_case {
                         "RunFailed",
                         "RunCompleted",
                         "RunCancelled",
+                        "RunDrained",
                         "RUN_OPEN",
                         "RUN_ACTIVE",
                         "RUN_VERIFYING",
@@ -87,6 +90,7 @@ mod run_state_pascal_case {
                         "RUN_FAILED",
                         "RUN_COMPLETED",
                         "RUN_CANCELLED",
+                        "RUN_DRAINED",
                     ],
                 ))
             }

@@ -623,6 +623,13 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             worker_id = %self.config.worker_id,
             claim_batch_size = self.config.claim_batch_size,
         );
+        #[cfg(feature = "chaos")]
+        if let Some(chaos) = &self.chaos {
+            chaos
+                .inject("scheduler_queue_claim")
+                .await
+                .map_err(|e| SchedulerError::Exec(ExecError::Io(std::io::Error::other(e))))?;
+        }
         let claimed = self.queue.claim(&claim_req, &self.config.concurrency)?;
         self.record_queue_depth();
         result.claimed = claimed.len();
@@ -2546,6 +2553,7 @@ fn run_state_label(state: RunState) -> &'static str {
         RunState::RunCompleted => "RUN_COMPLETED",
         RunState::RunFailed => "RUN_FAILED",
         RunState::RunCancelled => "RUN_CANCELLED",
+        RunState::RunDrained => "RUN_DRAINED",
     }
 }
 

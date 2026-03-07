@@ -150,6 +150,7 @@ impl Run {
                 }
             }
             RunState::RunCancelled => ExitReason::CancelledByOperator,
+            RunState::RunDrained => ExitReason::DrainedByOperator,
             _ => ExitReason::FailedRuntimeError,
         }
     }

@@ -42,7 +42,7 @@ use yarli_git::error::{GitError, RecoveryAction};
 use yarli_git::{LocalMergeOrchestrator, LocalWorktreeManager, MergeOrchestrator, WorktreeManager};
 use yarli_observability::{init_tracing, AuditEntry, AuditSink, JsonlAuditSink, TracingConfig};
 use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
-use yarli_queue::{ResourceBudgetConfig, Scheduler, SchedulerConfig, TaskQueue};
+use yarli_queue::{ResourceBudgetConfig, Scheduler, SchedulerConfig};
 use yarli_store::event_store::EventQuery;
 use yarli_store::EventStore;
 
@@ -235,6 +235,16 @@ async fn run() -> Result<()> {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
                 cmd_run_resume(run_id.as_deref(), all_paused, &reason)
+            }
+            Some(RunAction::Drain {
+                run_id,
+                all_active,
+                reason,
+            }) => {
+                if prompt_file.is_some() {
+                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                cmd_run_drain(run_id.as_deref(), all_active, &reason)
             }
             Some(RunAction::Cancel {
                 run_id,

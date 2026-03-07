@@ -789,6 +789,7 @@ fn tier_for_run_state(state: yarli_core::fsm::run::RunState) -> Tier {
         RunState::RunFailed | RunState::RunBlocked => Tier::Urgent,
         RunState::RunActive | RunState::RunVerifying => Tier::Active,
         RunState::RunCompleted => Tier::Contextual,
+        RunState::RunDrained => Tier::Contextual,
         _ => Tier::Contextual,
     }
 }

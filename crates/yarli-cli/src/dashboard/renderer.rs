@@ -651,6 +651,7 @@ pub fn build_title_line<'a>(state: &PanelManager) -> Line<'a> {
             RunState::RunFailed | RunState::RunBlocked => Tier::Urgent,
             RunState::RunActive | RunState::RunVerifying => Tier::Active,
             RunState::RunCompleted => Tier::Contextual,
+            RunState::RunDrained => Tier::Contextual,
             _ => Tier::Contextual,
         })
         .unwrap_or(Tier::Contextual);

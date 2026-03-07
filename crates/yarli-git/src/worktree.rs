@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use yarli_core::entities::worktree_binding::WorktreeBinding;
 use yarli_core::fsm::worktree::WorktreeState;
@@ -211,15 +212,21 @@ impl LocalWorktreeManager {
 
     /// Compute worktree path from binding metadata.
     fn compute_worktree_path(binding: &WorktreeBinding) -> PathBuf {
+        if !binding.worktree_path.as_os_str().is_empty() {
+            return binding.worktree_path.clone();
+        }
+
         let run_short = &binding.run_id.to_string()[..SHORT_ID_LEN.min(36)];
         let task_short = binding
             .task_id
             .map(|t| t.to_string()[..SHORT_ID_LEN.min(36)].to_string())
             .unwrap_or_else(|| "notask".to_string());
+        let random_short = Uuid::new_v4().simple().to_string();
+        let random_short = &random_short[..SHORT_ID_LEN.min(32)];
         binding
             .repo_root
             .join(WORKTREE_DIR)
-            .join(format!("{run_short}-{task_short}"))
+            .join(format!("{run_short}-{task_short}-{random_short}"))
     }
 
     /// Find the git directory for a worktree (reads .git file).

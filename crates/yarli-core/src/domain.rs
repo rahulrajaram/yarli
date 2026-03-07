@@ -94,6 +94,7 @@ pub enum ExitReason {
     FailedPolicyDenial,
     FailedRuntimeError,
     CancelledByOperator,
+    DrainedByOperator,
     TimedOut,
     StalledNoProgress,
 }
@@ -108,6 +109,7 @@ impl std::fmt::Display for ExitReason {
             Self::FailedPolicyDenial => write!(f, "failed_policy_denial"),
             Self::FailedRuntimeError => write!(f, "failed_runtime_error"),
             Self::CancelledByOperator => write!(f, "cancelled_by_operator"),
+            Self::DrainedByOperator => write!(f, "drained_by_operator"),
             Self::TimedOut => write!(f, "timed_out"),
             Self::StalledNoProgress => write!(f, "stalled_no_progress"),
         }

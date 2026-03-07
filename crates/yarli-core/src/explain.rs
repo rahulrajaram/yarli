@@ -322,6 +322,7 @@ fn compute_run_status(snapshot: &RunSnapshot) -> RunStatus {
     match snapshot.state {
         RunState::RunCompleted => RunStatus::Done,
         RunState::RunCancelled => RunStatus::Cancelled,
+        RunState::RunDrained => RunStatus::Cancelled,
         RunState::RunFailed => RunStatus::Failed,
         RunState::RunOpen => RunStatus::Pending,
         RunState::RunBlocked => {

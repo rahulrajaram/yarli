@@ -139,6 +139,103 @@ async fn run_start_and_status_roundtrip_against_postgres() -> Result<(), Box<dyn
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_queue_commands_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(admin_database_url) =
+        test_database_url_for_test("debug_queue_commands_roundtrip_against_postgres")
+    else {
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let temp_dir = TempDir::new()?;
+    write_test_config(temp_dir.path(), &database.database_url)?;
+    let binary = yarli_binary_path()?;
+    let pool = connect_postgres(&database.database_url, "debug_queue_commands_roundtrip").await?;
+
+    let stdout_path = temp_dir.path().join("yarli-stdout.log");
+    let stderr_path = temp_dir.path().join("yarli-stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
+    let mut child = tokio::process::Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args([
+            "run",
+            "start",
+            "postgres debug queue hardening",
+            "--stream",
+            "--cmd",
+            "sleep 300",
+        ])
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()?;
+
+    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+    wait_for_run_activated_event(
+        &pool,
+        &mut child,
+        run_id,
+        Duration::from_secs(30),
+        &stdout_path,
+        &stderr_path,
+    )
+    .await?;
+    wait_for_task_event_for_run(
+        &pool,
+        &mut child,
+        run_id,
+        "task.executing",
+        Duration::from_secs(30),
+        &stdout_path,
+        &stderr_path,
+    )
+    .await?;
+
+    let queue_depth_output = Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["debug", "queue-depth"])
+        .output()?;
+    assert!(
+        queue_depth_output.status.success(),
+        "debug queue-depth command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&queue_depth_output.stdout),
+        String::from_utf8_lossy(&queue_depth_output.stderr)
+    );
+    let queue_depth_stdout = String::from_utf8(queue_depth_output.stdout)?;
+    assert!(queue_depth_stdout.contains("Queue depth report"));
+    assert!(queue_depth_stdout.contains(&run_id.to_string()));
+    assert!(queue_depth_stdout.contains("leased=1"));
+
+    let active_leases_output = Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["debug", "active-leases"])
+        .output()?;
+    assert!(
+        active_leases_output.status.success(),
+        "debug active-leases command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&active_leases_output.stdout),
+        String::from_utf8_lossy(&active_leases_output.stderr)
+    );
+    let active_leases_stdout = String::from_utf8(active_leases_output.stdout)?;
+    assert!(active_leases_stdout.contains("Active leases"));
+    assert!(active_leases_stdout.contains(&run_id.to_string()));
+    assert!(active_leases_stdout.contains("owner="));
+
+    let child_pid = child.id().expect("child process should have a pid");
+    Command::new("kill")
+        .args(["-TERM", &child_pid.to_string()])
+        .output()?;
+    let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
+    wait_for_run_state(&pool, run_id, "RUN_CANCELLED", Duration::from_secs(15)).await?;
+
+    database.drop().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn run_projection_state_consistency_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -461,6 +558,163 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
         "expected cancellation source in explain-exit output"
     );
     assert!(explain_stdout.contains("Cancellation provenance:"));
+
+    database.drop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) =
+        test_database_url_for_test("run_drain_roundtrip_against_postgres")
+    else {
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let temp_dir = TempDir::new()?;
+    write_test_config(temp_dir.path(), &database.database_url)?;
+    let binary = yarli_binary_path()?;
+
+    let pool = connect_postgres(&database.database_url, "run_drain_roundtrip").await?;
+
+    // Spawn a run with two tasks. We'll drain while task 1 is executing and
+    // verify task 2 stays queued and never starts.
+    let stdout_path = temp_dir.path().join("yarli-stdout.log");
+    let stderr_path = temp_dir.path().join("yarli-stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
+    let mut child = tokio::process::Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args([
+            "run",
+            "start",
+            "postgres drain hardening",
+            "--stream",
+            "--cmd",
+            "sleep 2",
+            "--cmd",
+            "echo should-not-run",
+        ])
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()?;
+
+    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+    wait_for_run_activated_event(
+        &pool,
+        &mut child,
+        run_id,
+        Duration::from_secs(30),
+        &stdout_path,
+        &stderr_path,
+    )
+    .await?;
+    wait_for_task_event_for_run(
+        &pool,
+        &mut child,
+        run_id,
+        "task.executing",
+        Duration::from_secs(15),
+        &stdout_path,
+        &stderr_path,
+    )
+    .await?;
+
+    let drain_output = Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args([
+            "run",
+            "drain",
+            &run_id.to_string(),
+            "--reason",
+            "stop after current",
+        ])
+        .output()?;
+    assert!(
+        drain_output.status.success(),
+        "run drain command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&drain_output.stdout),
+        String::from_utf8_lossy(&drain_output.stderr)
+    );
+    let drain_stdout = String::from_utf8(drain_output.stdout)?;
+    assert!(drain_stdout.contains("drain requested"));
+
+    let _child_status = tokio::time::timeout(Duration::from_secs(20), child.wait()).await??;
+
+    wait_for_run_state(&pool, run_id, "RUN_DRAINED", Duration::from_secs(20)).await?;
+    let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
+    assert_eq!(state, "RUN_DRAINED");
+    assert_eq!(exit_reason, Some("drained_by_operator".to_string()));
+
+    assert!(
+        count_events(&pool, "run", "run.drain_requested", run_id).await? >= 1,
+        "expected at least one run.drain_requested event"
+    );
+    assert!(
+        count_events(&pool, "run", "run.drained", run_id).await? >= 1,
+        "expected at least one run.drained event"
+    );
+    assert_eq!(
+        count_task_events_for_run(&pool, run_id, "task.executing").await?,
+        1,
+        "expected exactly one task.executing event for drained run"
+    );
+    assert_eq!(
+        count_task_events_for_run(&pool, run_id, "task.completed").await?,
+        1,
+        "expected exactly one task.completed event for drained run"
+    );
+
+    let task_states = fetch_task_states(&pool, run_id).await?;
+    assert_eq!(
+        task_states.len(),
+        2,
+        "expected two tasks in drain hardening run"
+    );
+    assert_eq!(
+        task_states
+            .iter()
+            .filter(|state| state.as_str() == "TASK_COMPLETE")
+            .count(),
+        1,
+        "expected only one task to complete after drain"
+    );
+    assert!(
+        task_states
+            .iter()
+            .any(|state| state == "TASK_OPEN" || state == "TASK_READY"),
+        "expected queued task to remain unstarted after drain, got {task_states:?}",
+    );
+
+    let status_output = Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["run", "status", &run_id.to_string()])
+        .output()?;
+    assert!(
+        status_output.status.success(),
+        "run status command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status_output.stdout),
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_stdout = String::from_utf8(status_output.stdout)?;
+    assert!(status_stdout.contains("State: RunDrained"));
+
+    let explain_output = Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["run", "explain-exit", &run_id.to_string()])
+        .output()?;
+    assert!(
+        explain_output.status.success(),
+        "run explain-exit command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&explain_output.stdout),
+        String::from_utf8_lossy(&explain_output.stderr)
+    );
+    let explain_stdout = String::from_utf8(explain_output.stdout)?;
+    assert!(explain_stdout.contains("Status: Cancelled"));
+    assert!(explain_stdout.contains("Exit reason: drained_by_operator"));
 
     database.drop().await?;
     Ok(())
@@ -1114,6 +1368,53 @@ async fn wait_for_run_activated_event(
     }
 }
 
+async fn wait_for_task_event_for_run(
+    pool: &PgPool,
+    child: &mut tokio::process::Child,
+    run_id: Uuid,
+    event_type: &str,
+    timeout: Duration,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "task event wait timeout overflow".to_string())?;
+
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events e JOIN tasks t ON e.entity_id = t.task_id::text \
+             WHERE t.run_id = $1 AND e.entity_type = 'task' AND e.event_type = $2",
+        )
+        .bind(run_id)
+        .bind(event_type)
+        .fetch_one(pool)
+        .await?;
+
+        if count > 0 {
+            return Ok(());
+        }
+
+        if let Some(exit_status) = child.try_wait()? {
+            let stdout_content = fs::read_to_string(stdout_path).unwrap_or_default();
+            let stderr_content = fs::read_to_string(stderr_path).unwrap_or_default();
+            return Err(format!(
+                "yarli process exited prematurely with {exit_status} while waiting for \
+                 task event {event_type} for run {run_id}\n\
+                 stdout:\n{stdout_content}\nstderr:\n{stderr_content}"
+            )
+            .into());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(
+                format!("timed out waiting for task event {event_type} for run {run_id}").into(),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn wait_for_run_state_in(
     pool: &PgPool,
     run_id: Uuid,
@@ -1243,6 +1544,7 @@ fn map_run_state_to_db(state: &str) -> Option<&'static str> {
         "RunFailed" => Some("RUN_FAILED"),
         "RunCompleted" => Some("RUN_COMPLETED"),
         "RunCancelled" => Some("RUN_CANCELLED"),
+        "RunDrained" => Some("RUN_DRAINED"),
         _ => None,
     }
 }
@@ -1274,6 +1576,7 @@ fn derive_run_state_from_event(event_type: &str, to_state: Option<&str>) -> Opti
         "run.completed" => Some("RUN_COMPLETED"),
         "run.failed" | "run.gate_failed" => Some("RUN_FAILED"),
         "run.cancelled" => Some("RUN_CANCELLED"),
+        "run.drained" => Some("RUN_DRAINED"),
         _ => None,
     }
 }

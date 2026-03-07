@@ -1064,7 +1064,14 @@ pub(crate) async fn execute_run_plan(
             println!("Using backend: postgres");
             let store = PostgresEventStore::new(&database_url)
                 .map_err(|e| anyhow::anyhow!("failed to initialize postgres event store: {e}"))?;
-            let store = Arc::new(store.with_metrics(metrics.clone()));
+            let store = store.with_metrics(metrics.clone());
+            #[cfg(feature = "chaos")]
+            let store = if let Some(c) = chaos.as_ref() {
+                store.with_chaos(c.clone())
+            } else {
+                store
+            };
+            let store = Arc::new(store);
             let queue =
                 Arc::new(PostgresTaskQueue::new(&database_url).map_err(|e| {
                     anyhow::anyhow!("failed to initialize postgres task queue: {e}")
@@ -1112,6 +1119,10 @@ pub(crate) fn finalize_run_outcome(outcome: &RunExecutionOutcome) -> Result<()> 
         RunState::RunCancelled => {
             println!("Run {} cancelled.", outcome.run_id);
             process::exit(130);
+        }
+        RunState::RunDrained => {
+            println!("Run {} drained by operator.", outcome.run_id);
+            Ok(())
         }
         other => bail!(
             "Run {} ended in unexpected state: {other:?}",

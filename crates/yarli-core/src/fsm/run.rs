@@ -18,6 +18,7 @@ pub enum RunState {
     RunFailed,
     RunCompleted,
     RunCancelled,
+    RunDrained,
 }
 
 impl RunState {
@@ -25,7 +26,10 @@ impl RunState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            RunState::RunCompleted | RunState::RunFailed | RunState::RunCancelled
+            RunState::RunCompleted
+                | RunState::RunFailed
+                | RunState::RunCancelled
+                | RunState::RunDrained
         )
     }
 
@@ -34,12 +38,26 @@ impl RunState {
         use RunState::*;
         match self {
             RunOpen => &[RunActive, RunCancelled],
-            RunActive => &[RunVerifying, RunBlocked, RunFailed, RunCancelled],
-            RunVerifying => &[RunCompleted, RunActive, RunBlocked, RunFailed, RunCancelled],
+            RunActive => &[
+                RunVerifying,
+                RunBlocked,
+                RunFailed,
+                RunCancelled,
+                RunDrained,
+            ],
+            RunVerifying => &[
+                RunCompleted,
+                RunActive,
+                RunBlocked,
+                RunFailed,
+                RunCancelled,
+                RunDrained,
+            ],
             RunBlocked => &[RunActive, RunFailed, RunCancelled],
             RunFailed => &[],
             RunCompleted => &[],
             RunCancelled => &[],
+            RunDrained => &[],
         }
     }
 

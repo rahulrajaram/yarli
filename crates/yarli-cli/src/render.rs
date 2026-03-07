@@ -76,6 +76,13 @@ pub(crate) fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<
         &mut out,
         "Tasks: {total_tasks} total ({complete} complete, {failed} failed, {blocked} blocked, {active} active)"
     )?;
+    if run.drain_requested && !run.state.is_terminal() {
+        writeln!(
+            &mut out,
+            "Drain requested: yes ({})",
+            run.drain_reason.as_deref().unwrap_or("operator request")
+        )?;
+    }
     if run.state == RunState::RunCancelled
         || run.cancellation_source.is_some()
         || run.cancellation_provenance.is_some()
@@ -301,6 +308,13 @@ pub(crate) fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result
         "Exit reason: {}",
         run.exit_reason.as_deref().unwrap_or("none")
     )?;
+    if run.drain_requested && !run.state.is_terminal() {
+        writeln!(
+            &mut out,
+            "Drain requested: {}",
+            run.drain_reason.as_deref().unwrap_or("operator request")
+        )?;
+    }
     writeln!(
         &mut out,
         "Cancellation source: {}",
@@ -1058,6 +1072,38 @@ mod tests {
         assert!(output.contains("RunCompleted"));
         assert!(output.contains(&task_id.to_string()));
         assert!(!output.contains("requires a persistent store"));
+    }
+
+    #[test]
+    fn render_run_status_surfaces_pending_drain_request() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.drain_requested",
+                corr,
+                serde_json::json!({ "reason": "stop after current" }),
+            ))
+            .unwrap();
+
+        let status = render_run_status(&store, run_id).unwrap();
+        assert!(status.contains("Drain requested: yes (stop after current)"));
+
+        let explain = render_run_explain(&store, run_id).unwrap();
+        assert!(explain.contains("Drain requested: stop after current"));
     }
 
     #[test]

@@ -24,6 +24,8 @@ use crate::event_store::{EventQuery, EventStore};
 pub struct PostgresEventStore {
     pool: PgPool,
     metrics: Option<Arc<YarliMetrics>>,
+    #[cfg(feature = "chaos")]
+    chaos: Option<Arc<yarli_chaos::ChaosController>>,
 }
 
 impl PostgresEventStore {
@@ -36,6 +38,8 @@ impl PostgresEventStore {
         Ok(Self {
             pool,
             metrics: None,
+            #[cfg(feature = "chaos")]
+            chaos: None,
         })
     }
 
@@ -44,12 +48,21 @@ impl PostgresEventStore {
         Self {
             pool,
             metrics: None,
+            #[cfg(feature = "chaos")]
+            chaos: None,
         }
     }
 
     /// Attach metrics registry for telemetry.
     pub fn with_metrics(mut self, metrics: Arc<YarliMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    #[cfg(feature = "chaos")]
+    /// Configure chaos controller for fault injection.
+    pub fn with_chaos(mut self, chaos: Arc<yarli_chaos::ChaosController>) -> Self {
+        self.chaos = Some(chaos);
         self
     }
 
@@ -108,7 +121,17 @@ impl EventStore for PostgresEventStore {
     fn append(&self, event: Event) -> Result<(), StoreError> {
         let start = Instant::now();
         let pool = self.pool.clone();
+        #[cfg(feature = "chaos")]
+        let chaos = self.chaos.clone();
         let result = self.run_async(async move {
+            #[cfg(feature = "chaos")]
+            if let Some(chaos) = chaos {
+                chaos
+                    .inject("store_append_event")
+                    .await
+                    .map_err(|e| StoreError::Runtime(e.to_string()))?;
+            }
+
             let event_id = event.event_id;
             let idempotency_key = event.idempotency_key.clone();
             let entity_type = entity_type_to_db(event.entity_type);

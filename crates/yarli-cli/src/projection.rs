@@ -57,6 +57,8 @@ pub(crate) struct RunProjection {
     pub(crate) run_id: Uuid,
     pub(crate) state: RunState,
     pub(crate) exit_reason: Option<String>,
+    pub(crate) drain_requested: bool,
+    pub(crate) drain_reason: Option<String>,
     pub(crate) cancellation_source: Option<CancellationSource>,
     pub(crate) cancellation_provenance: Option<CancellationProvenance>,
     pub(crate) correlation_id: Uuid,
@@ -229,6 +231,7 @@ pub(crate) fn run_state_from_event(event: &Event) -> Option<RunState> {
             "run.parallel_merge_failed" => Some(RunState::RunFailed),
             "run.failed" | "run.gate_failed" => Some(RunState::RunFailed),
             "run.cancelled" => Some(RunState::RunCancelled),
+            "run.drained" => Some(RunState::RunDrained),
             _ => None,
         })
 }
@@ -715,6 +718,8 @@ pub(crate) fn load_run_projection(
     let mut state = RunState::RunOpen;
     let mut objective = None;
     let mut exit_reason = None;
+    let mut drain_requested = false;
+    let mut drain_reason = None;
     let mut cancellation_source = None;
     let mut cancellation_provenance = None;
     let mut correlation_id = run_events[0].correlation_id;
@@ -737,6 +742,15 @@ pub(crate) fn load_run_projection(
         }
         if let Some(next_exit_reason) = event_exit_reason(event) {
             exit_reason = Some(next_exit_reason);
+        }
+        if event.event_type == "run.drain_requested" {
+            drain_requested = true;
+            drain_reason = event_reason(event);
+        } else if matches!(
+            event.event_type.as_str(),
+            "run.completed" | "run.failed" | "run.gate_failed" | "run.cancelled" | "run.drained"
+        ) {
+            drain_requested = false;
         }
         if let Some(next_source) = event_cancellation_source(event) {
             cancellation_source = Some(next_source);
@@ -894,6 +908,8 @@ pub(crate) fn load_run_projection(
         run_id,
         state,
         exit_reason,
+        drain_requested,
+        drain_reason,
         cancellation_source,
         cancellation_provenance,
         correlation_id,

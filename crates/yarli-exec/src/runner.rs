@@ -116,6 +116,8 @@ pub struct LocalCommandRunner {
     /// When set, spawned children are registered so `terminate_children()`
     /// can clean them up on programmatic failure (not just Ctrl+C).
     shutdown: Option<ShutdownController>,
+    #[cfg(feature = "chaos")]
+    chaos: Option<std::sync::Arc<yarli_chaos::ChaosController>>,
 }
 
 impl LocalCommandRunner {
@@ -125,6 +127,8 @@ impl LocalCommandRunner {
             idle_kill_timeout: None,
             metrics: None,
             shutdown: None,
+            #[cfg(feature = "chaos")]
+            chaos: None,
         }
     }
 
@@ -145,6 +149,12 @@ impl LocalCommandRunner {
 
     pub fn with_shutdown(mut self, shutdown: ShutdownController) -> Self {
         self.shutdown = Some(shutdown);
+        self
+    }
+
+    #[cfg(feature = "chaos")]
+    pub fn with_chaos(mut self, chaos: std::sync::Arc<yarli_chaos::ChaosController>) -> Self {
+        self.chaos = Some(chaos);
         self
     }
 
@@ -205,6 +215,14 @@ impl CommandRunner for LocalCommandRunner {
         let cmd_id = execution.id;
 
         // Spawn the child process.
+        #[cfg(feature = "chaos")]
+        if let Some(chaos) = &self.chaos {
+            chaos
+                .inject("exec_command_spawn")
+                .await
+                .map_err(|e| ExecError::Io(std::io::Error::other(e.to_string())))?;
+        }
+
         debug!(command = %request.command, working_dir = %request.working_dir, "spawning command");
 
         let spawn_start = Instant::now();

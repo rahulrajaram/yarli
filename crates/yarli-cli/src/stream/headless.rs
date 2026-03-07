@@ -220,6 +220,7 @@ impl HeadlessRenderer {
             Some(RunState::RunCompleted) => "OK",
             Some(RunState::RunFailed | RunState::RunBlocked) => "FAILED",
             Some(RunState::RunCancelled) => "CANCELLED",
+            Some(RunState::RunDrained) => "DRAINED",
             Some(_) => "DONE",
             None => {
                 if s.tasks_failed > 0 {

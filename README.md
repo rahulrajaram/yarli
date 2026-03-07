@@ -18,7 +18,7 @@ This project is for teams that want reproducible orchestration behavior, auditab
 
 - Config-first orchestration (`yarli.toml`) with plan-driven tranche dispatch.
 - Durable event store and queue backends (Postgres) with in-memory mode for local testing.
-- Explicit operator controls (`pause`, `resume`, `cancel`) and explainability commands.
+- Explicit operator controls (`pause`, `resume`, `cancel`, `drain`) and explainability commands.
 - Policy and gate evaluation over task/run state.
 - Parallel workspace execution with scoped merge and recovery artifacts.
 - Optional memory provider adapters via `[memory.providers.<name>]`.
@@ -122,7 +122,7 @@ Optional metadata on `IMPLEMENTATION_PLAN.md` tranche lines:
 - **Policy gates**: code-defined checks evaluated by YARLI (`yarli gate ...`).
 - **Verification command chain**: plan/config/script-defined command execution (tranche + verification tasks).
 - **Observer mode**: monitoring/reporting only; observer events never gate or mutate active run execution.
-- **Operator controls**: explicit control-plane actions via `yarli run pause|resume|cancel`.
+- **Operator controls**: explicit control-plane actions via `yarli run pause|resume|cancel|drain`.
 
 ### Output Modes
 
@@ -185,6 +185,8 @@ yarli run pause <run-id> --reason "maintenance window"
 yarli run pause --all-active --reason "maintenance window"
 yarli run resume <run-id> --reason "maintenance complete"
 yarli run resume --all-paused --reason "maintenance complete"
+yarli run drain <run-id> --reason "stop after current"
+yarli run drain --all-active --reason "stop after current"
 yarli run cancel <run-id> --reason "operator stop"
 yarli run cancel --all-active --reason "operator stop"
 
@@ -477,7 +479,7 @@ When guard-related telemetry indicates a stop or pivot condition:
 1. `yarli run status <run-id>` — inspect budget and deterioration signals.
 2. `yarli run explain-exit <run-id>` — inspect guard breach reasons and trend summary.
 3. `yarli task explain <task-id>` — inspect task-level budget, usage, and failure provenance.
-4. `yarli run pause|resume|cancel <run-id>` — hold or stop a guarded run while adjusting scope.
+4. `yarli run pause|resume|cancel|drain <run-id>` — hold, stop, or finish-current-then-exit while adjusting scope.
 5. `yarli run continue` — continue only after guard intent has been reviewed.
 
 ### Merge Conflict Recovery

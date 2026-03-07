@@ -548,7 +548,7 @@ pub(crate) fn replace_between(haystack: &str, begin: &str, end: &str, replacemen
 pub(crate) enum Commands {
     #[command(
         about = "Manage orchestration runs (default: config-first plan-driven execution)",
-        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable adapter-backed hints/storage via `yarli.toml` (`[memory] provider = \"default\"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
+        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel|drain`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable adapter-backed hints/storage via `yarli.toml` (`[memory] provider = \"default\"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel|drain ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
     )]
     Run {
         /// Override the prompt file used by default `yarli run` (no subcommand).
@@ -780,6 +780,20 @@ pub(crate) enum RunAction {
         all_paused: bool,
         /// Reason for resume.
         #[arg(short, long, default_value = "resumed by operator")]
+        reason: String,
+    },
+    #[command(
+        about = "Drain active runs after current work finishes (operator control)",
+        long_about = "Drain active runs after current work finishes (operator control).\n\nRequests that selected run(s) stop claiming any new work while allowing the current active task set to finish normally. Once the active set reaches zero, yarli persists continuation state and exits the run as RUN_DRAINED.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to drain all active/verifying runs.\n\nExamples:\n  yarli run drain 019577a2-...\n  yarli run drain --all-active --reason \"stop after current\""
+    )]
+    Drain {
+        /// Run ID to drain (UUID or unique run-list prefix).
+        run_id: Option<String>,
+        /// Drain all active/verifying runs.
+        #[arg(long, default_value_t = false, conflicts_with = "run_id")]
+        all_active: bool,
+        /// Reason for drain request.
+        #[arg(short, long, default_value = "drained by operator")]
         reason: String,
     },
     #[command(

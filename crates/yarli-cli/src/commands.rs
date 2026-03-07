@@ -7,7 +7,7 @@ use yarli_exec::{
 };
 use yarli_observability::{run_analyzer, AuditCategory, YarliMetrics};
 use yarli_queue::scheduler::LiveOutputEvent;
-use yarli_queue::{QueueEntry, QueueStatus};
+use yarli_queue::{PostgresTaskQueue, QueueEntry, QueueStatus, TaskQueue};
 
 use super::*;
 use crate::cli::AuditOutputFormat;
@@ -25,8 +25,8 @@ use yarli_core::entities::continuation::{
     ContinuationIntervention, ContinuationInterventionKind, RetryScope, TaskHealthAction,
 };
 use yarli_store::{
-    InMemoryEventStore, MIGRATION_0001_DOWN, MIGRATION_0001_INIT, MIGRATION_0002_DOWN,
-    MIGRATION_0002_INDEXES, PostgresEventStore,
+    InMemoryEventStore, PostgresEventStore, MIGRATION_0001_DOWN, MIGRATION_0001_INIT,
+    MIGRATION_0002_DOWN, MIGRATION_0002_INDEXES,
 };
 
 fn collect_telemetry_string_values(metadata: Option<&serde_json::Value>) -> Vec<String> {
@@ -590,7 +590,7 @@ pub(crate) async fn cmd_run_continue(
                     payload.run_id
                 );
             }
-            RunState::RunCancelled | RunState::RunBlocked => {
+            RunState::RunCancelled | RunState::RunBlocked | RunState::RunDrained => {
                 bail!(
                     "run {} is {:?} (reason: {}) with no continuation tranche",
                     payload.run_id,
@@ -926,6 +926,10 @@ where
             let lcr = LocalCommandRunner::new().with_shutdown(shutdown.clone());
             let mut lcr = lcr;
             lcr.idle_kill_timeout = idle_kill_timeout;
+            #[cfg(feature = "chaos")]
+            if let Some(c) = chaos.as_ref() {
+                lcr = lcr.with_chaos(c.clone());
+            }
             Arc::new(SelectedCommandRunner::Native(lcr))
         }
         ExecutionRunner::Overwatch => {
@@ -1878,6 +1882,7 @@ pub(crate) fn run_state_db(state: RunState) -> &'static str {
         RunState::RunCompleted => "RUN_COMPLETED",
         RunState::RunFailed => "RUN_FAILED",
         RunState::RunCancelled => "RUN_CANCELLED",
+        RunState::RunDrained => "RUN_DRAINED",
     }
 }
 
@@ -1922,6 +1927,7 @@ pub(crate) fn exit_reason_db(reason: yarli_core::domain::ExitReason) -> &'static
         yarli_core::domain::ExitReason::FailedRuntimeError => "failed_runtime_error",
         yarli_core::domain::ExitReason::MergeConflict => "merge_conflict",
         yarli_core::domain::ExitReason::CancelledByOperator => "cancelled_by_operator",
+        yarli_core::domain::ExitReason::DrainedByOperator => "drained_by_operator",
         yarli_core::domain::ExitReason::TimedOut => "timed_out",
         yarli_core::domain::ExitReason::StalledNoProgress => "stalled_no_progress",
     }
@@ -2961,8 +2967,8 @@ pub(crate) fn persist_continuation_payload_event(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn build_continuation_payload(
     run: &Run,
     tasks: &[&yarli_core::entities::Task],
@@ -2988,7 +2994,6 @@ pub(crate) fn build_continuation_payload(
     )
 }
 
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_continuation_payload_with_gate_failures(
     run: &Run,
@@ -3061,12 +3066,8 @@ fn analyze_retry_recommendation(
             blocker: task.blocker.clone(),
         })
         .collect();
-    let analysis = run_analyzer::analyze_run(
-        run.state,
-        run.exit_reason,
-        &analyzer_tasks,
-        gate_failures,
-    );
+    let analysis =
+        run_analyzer::analyze_run(run.state, run.exit_reason, &analyzer_tasks, gate_failures);
     match analysis.retry_recommendation {
         run_analyzer::RetryScope::Full => RetryScope::Full,
         run_analyzer::RetryScope::Subset { keys } => RetryScope::Subset { keys },
@@ -3082,12 +3083,7 @@ fn extract_gate_failure_names_for_run(store: &dyn EventStore, run_id: Uuid) -> V
     let mut names = run_projection
         .failed_gates
         .iter()
-        .map(|(gate_type, _)| {
-            gate_type
-                .label()
-                .trim_start_matches("gate.")
-                .to_string()
-        })
+        .map(|(gate_type, _)| gate_type.label().trim_start_matches("gate.").to_string())
         .collect::<Vec<_>>();
     names.sort_unstable();
     names.dedup();
@@ -3228,8 +3224,8 @@ fn emit_task_health_transition_audits(
             let Some(sink) = audit_sink else {
                 continue;
             };
-            let factors = serde_json::to_value(transition.factors)
-                .unwrap_or_else(|_| serde_json::json!({}));
+            let factors =
+                serde_json::to_value(transition.factors).unwrap_or_else(|_| serde_json::json!({}));
             let entry = AuditEntry::process_health_transition(
                 transition.previous_level.to_string(),
                 transition.new_level.to_string(),
@@ -3328,9 +3324,11 @@ fn task_health_level_from_status(
 fn task_health_factors_from_payload(
     payload: &serde_json::Value,
 ) -> yarli_exec::introspect::HealthFactors {
-    let factors = payload
-        .get("factors")
-        .or_else(|| payload.get("outcome").and_then(|value| value.get("factors")));
+    let factors = payload.get("factors").or_else(|| {
+        payload
+            .get("outcome")
+            .and_then(|value| value.get("factors"))
+    });
 
     let factor = |key: &str| -> f64 {
         factors
@@ -3394,7 +3392,10 @@ where
     > = task_names
         .iter()
         .map(|(task_id, task_key)| {
-            (*task_id, yarli_exec::introspect::IntrospectionController::new(0, task_key.clone()))
+            (
+                *task_id,
+                yarli_exec::introspect::IntrospectionController::new(0, task_key.clone()),
+            )
         })
         .collect();
     let mut postgres_sync_state = initialize_postgres_sync_state(postgres_sync_config).await?;
@@ -3445,6 +3446,8 @@ where
 
     let mut zero_progress_ticks: u64 = 0;
     let mut paused = false;
+    let mut draining = false;
+    let mut drain_reason: Option<String> = None;
     let collect_run_total_tokens = || -> u64 {
         collect_run_token_totals(store.as_ref(), correlation_id)
             .map(|totals| totals.total_tokens)
@@ -3556,7 +3559,12 @@ where
             _ = heartbeat_interval.tick() => {
                 scheduler.heartbeat_active_leases().await;
                 let stats = scheduler.queue_stats();
-                let heartbeat_message = if paused {
+                let heartbeat_message = if draining {
+                    format!(
+                        "draining: pending={} leased={} tick={} zero_progress_ticks={}",
+                        stats.pending, stats.leased, tick_count, zero_progress_ticks
+                    )
+                } else if paused {
                     format!(
                         "paused: pending={} leased={} tick={} zero_progress_ticks={}",
                         stats.pending, stats.leased, tick_count, zero_progress_ticks
@@ -3583,6 +3591,7 @@ where
                             "queue_pending": stats.pending,
                             "queue_leased": stats.leased,
                             "paused": paused,
+                            "draining": draining,
                             "zero_progress_ticks": zero_progress_ticks,
                             "summary": heartbeat_message,
                         }),
@@ -3599,7 +3608,7 @@ where
             _ = tick_interval.tick() => {
                 tick_count += 1;
 
-                // Poll events FIRST so control signals (pause/resume/cancel)
+                // Poll events FIRST so control signals (pause/resume/cancel/drain)
                 // are processed before any task claiming in the tick below.
                 let _new_events =
                     emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
@@ -3631,14 +3640,26 @@ where
                 match control_signal {
                     Some(OperatorControlSignal::Pause { reason }) => {
                         paused = true;
+                        draining = false;
+                        drain_reason = None;
                         let _ = tx.send(StreamEvent::TransientStatus {
                             message: format!("operator pause: {reason}"),
                         });
                     }
                     Some(OperatorControlSignal::Resume { reason }) => {
                         paused = false;
+                        draining = false;
+                        drain_reason = None;
                         let _ = tx.send(StreamEvent::TransientStatus {
                             message: format!("operator resume: {reason}"),
+                        });
+                    }
+                    Some(OperatorControlSignal::Drain { reason }) => {
+                        paused = false;
+                        draining = true;
+                        drain_reason = Some(reason.clone());
+                        let _ = tx.send(StreamEvent::TransientStatus {
+                            message: format!("operator drain: {reason}"),
                         });
                     }
                     Some(OperatorControlSignal::Cancel { reason }) => {
@@ -3739,16 +3760,70 @@ where
                 }
 
 
-                // Check run projection for pause/resume state.
+                // Check run projection for pause/resume/drain state.
                 if let Ok(Some(run_projection)) = load_run_projection(store.as_ref(), run_id) {
                     if run_projection.state == RunState::RunBlocked && !paused {
                         paused = true;
+                        draining = false;
+                        drain_reason = None;
                     } else if run_projection.state == RunState::RunActive {
                         paused = false;
                     }
+                    if run_projection.drain_requested {
+                        draining = true;
+                        if drain_reason.is_none() {
+                            drain_reason = run_projection.drain_reason.clone();
+                        }
+                    }
                 }
 
-                if paused {
+                if draining {
+                    if run_has_in_flight_work(scheduler, run_id).await {
+                        zero_progress_ticks += 1;
+                    } else {
+                        let reason = drain_reason
+                            .clone()
+                            .unwrap_or_else(|| "drained by operator".to_string());
+                        if finalize_drained_run(scheduler, store, run_id, &reason).await? {
+                            if let Err(err) = sync_postgres_state_if_changed(
+                                scheduler,
+                                run_id,
+                                &mut postgres_sync_state,
+                            )
+                            .await
+                            {
+                                warn!(run_id = %run_id, error = %err, "failed to sync postgres state after operator drain");
+                            }
+                            let drain_events =
+                                emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                            emit_task_health_transition_audits(
+                                &mut task_health_controllers,
+                                &drain_events,
+                                run_id,
+                                scheduler.audit_sink().as_deref(),
+                            );
+                            if let Some(observer) = task_health_observer.as_mut() {
+                                observer.observe_store(store.as_ref());
+                            }
+                            deterioration_observer.observe_store(store.as_ref())?;
+                            if let Some(observer) = memory_observer.as_mut() {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(15),
+                                    observer.observe_events(store.as_ref(), &drain_events),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {}
+                                    Err(_) => warn!("memory observer observe_events timed out after operator drain"),
+                                }
+                            }
+                            draining = false;
+                            zero_progress_ticks = 0;
+                        } else {
+                            zero_progress_ticks += 1;
+                        }
+                    }
+                } else if paused {
                     zero_progress_ticks += 1;
                 } else {
                     // Run a scheduler tick.
@@ -3773,7 +3848,7 @@ where
                         "drive_scheduler tick"
                     );
 
-                    // Post-tick event poll: catch control signals (pause/resume/cancel)
+                    // Post-tick event poll: catch control signals (pause/resume/cancel/drain)
                     // that arrived during command execution within the tick above.
                     // Without this, a missed-tick fires immediately and claims new
                     // tasks before the next pre-tick poll can see the signal.
@@ -3796,14 +3871,26 @@ where
                     match post_tick_signal {
                         Some(OperatorControlSignal::Pause { reason }) => {
                             paused = true;
+                            draining = false;
+                            drain_reason = None;
                             let _ = tx.send(StreamEvent::TransientStatus {
                                 message: format!("operator pause: {reason}"),
                             });
                         }
                         Some(OperatorControlSignal::Resume { reason }) => {
                             paused = false;
+                            draining = false;
+                            drain_reason = None;
                             let _ = tx.send(StreamEvent::TransientStatus {
                                 message: format!("operator resume: {reason}"),
+                            });
+                        }
+                        Some(OperatorControlSignal::Drain { reason }) => {
+                            paused = false;
+                            draining = true;
+                            drain_reason = Some(reason.clone());
+                            let _ = tx.send(StreamEvent::TransientStatus {
+                                message: format!("operator drain: {reason}"),
                             });
                         }
                         Some(OperatorControlSignal::Cancel { reason }) => {
@@ -3903,8 +3990,16 @@ where
                     if let Ok(Some(run_projection)) = load_run_projection(store.as_ref(), run_id) {
                         if run_projection.state == RunState::RunBlocked && !paused {
                             paused = true;
+                            draining = false;
+                            drain_reason = None;
                         } else if run_projection.state == RunState::RunActive {
                             paused = false;
+                        }
+                        if run_projection.drain_requested {
+                            draining = true;
+                            if drain_reason.is_none() {
+                                drain_reason = run_projection.drain_reason.clone();
+                            }
                         }
                     }
 
@@ -4255,6 +4350,75 @@ where
     Ok(run_cancelled)
 }
 
+async fn run_has_in_flight_work<Q, S, R>(scheduler: &Scheduler<Q, S, R>, run_id: Uuid) -> bool
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let reg = scheduler.registry().read().await;
+    let Some(run) = reg.get_run(&run_id) else {
+        return false;
+    };
+    run.task_ids
+        .iter()
+        .filter_map(|task_id| reg.get_task(task_id))
+        .any(|task| {
+            matches!(
+                task.state,
+                TaskState::TaskExecuting | TaskState::TaskWaiting | TaskState::TaskVerifying
+            )
+        })
+}
+
+async fn finalize_drained_run<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    store: &Arc<S>,
+    run_id: Uuid,
+    reason: &str,
+) -> Result<bool>
+where
+    Q: yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_exec::CommandRunner + Clone,
+{
+    let (correlation_id, from_state, transition_event, drained_queue_entries) = {
+        let mut reg = scheduler.registry().write().await;
+        let Some(run) = reg.get_run_mut(&run_id) else {
+            return Ok(false);
+        };
+        if run.state.is_terminal() {
+            return Ok(false);
+        }
+        let correlation_id = run.correlation_id;
+        let from_state = run.state;
+        let transition = run.transition(RunState::RunDrained, reason, "cli", None)?;
+        run.exit_reason = Some(ExitReason::DrainedByOperator);
+        let drained_queue_entries = scheduler.cancel_run_queue(run_id).unwrap_or_else(|err| {
+            warn!(run_id = %run_id, error = %err, "failed to drain queue entries for drained run");
+            0
+        });
+        (
+            correlation_id,
+            from_state,
+            transition,
+            drained_queue_entries,
+        )
+    };
+
+    append_run_drained_transition_event(
+        store.as_ref(),
+        run_id,
+        correlation_id,
+        from_state,
+        &transition_event.reason,
+        drained_queue_entries,
+        Some(format!("{run_id}:drained")),
+    )?;
+
+    Ok(true)
+}
+
 /// Parse a WorktreeState from its serialized form.
 pub(crate) fn parse_worktree_state(s: &str) -> Option<WorktreeState> {
     match s {
@@ -4428,6 +4592,7 @@ pub(crate) const OPERATOR_CONTROL_ACTOR: &str = "cli.operator";
 pub(crate) enum OperatorControlSignal {
     Pause { reason: String },
     Resume { reason: String },
+    Drain { reason: String },
     Cancel { reason: String },
 }
 
@@ -4451,6 +4616,7 @@ pub(crate) fn operator_control_signal_from_event(
     match event.event_type.as_str() {
         "run.blocked" => Some(OperatorControlSignal::Pause { reason }),
         "run.activated" => Some(OperatorControlSignal::Resume { reason }),
+        "run.drain_requested" => Some(OperatorControlSignal::Drain { reason }),
         "run.cancelled" => Some(OperatorControlSignal::Cancel { reason }),
         _ => None,
     }
@@ -6191,6 +6357,39 @@ pub(crate) fn append_run_cancelled_transition_event(
     )
 }
 
+pub(crate) fn append_run_drained_transition_event(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    correlation_id: Uuid,
+    from: RunState,
+    reason: &str,
+    drained_queue_entries: usize,
+    idempotency_key: Option<String>,
+) -> Result<()> {
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: "run.drained".to_string(),
+            payload: serde_json::json!({
+                "from": format!("{:?}", from),
+                "to": format!("{:?}", RunState::RunDrained),
+                "reason": reason,
+                "detail": reason,
+                "exit_reason": ExitReason::DrainedByOperator.to_string(),
+                "drained_queue_entries": drained_queue_entries,
+            }),
+            correlation_id,
+            causation_id: None,
+            actor: OPERATOR_CONTROL_ACTOR.to_string(),
+            idempotency_key,
+        },
+    )
+}
+
 pub(crate) fn append_task_cancelled_event(
     store: &dyn EventStore,
     run_id: Uuid,
@@ -6331,6 +6530,53 @@ pub(crate) fn execute_run_resume_control(
     ))
 }
 
+pub(crate) fn execute_run_drain_control(
+    store: &dyn EventStore,
+    run_id: Uuid,
+    reason: &str,
+) -> Result<String> {
+    let run = match load_run_projection(store, run_id)? {
+        Some(run) => run,
+        None => return Ok(format!("Run {run_id} not found in persisted event log.")),
+    };
+    if run.drain_requested {
+        return Ok(format!("Run {run_id} is already draining."));
+    }
+    if run.state.is_terminal() {
+        return Ok(format!(
+            "Run {run_id} is already terminal ({:?}).",
+            run.state
+        ));
+    }
+    if !matches!(run.state, RunState::RunActive | RunState::RunVerifying) {
+        return Ok(format!(
+            "Run {run_id} is {:?}; drain is not valid from this state.",
+            run.state
+        ));
+    }
+    append_event(
+        store,
+        Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: chrono::Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: run_id.to_string(),
+            event_type: "run.drain_requested".to_string(),
+            payload: serde_json::json!({
+                "reason": reason,
+                "detail": reason,
+            }),
+            correlation_id: run.correlation_id,
+            causation_id: None,
+            actor: OPERATOR_CONTROL_ACTOR.to_string(),
+            idempotency_key: Some(format!("{run_id}:operator_drain_requested")),
+        },
+    )?;
+    Ok(format!(
+        "Run {run_id} drain requested (reason: {reason}); current active work will finish and no new work will be claimed."
+    ))
+}
+
 pub(crate) fn execute_run_cancel_control(
     store: &dyn EventStore,
     queue: &dyn TaskQueue,
@@ -6440,6 +6686,27 @@ pub(crate) fn cmd_run_resume(run_id: Option<&str>, all_paused: bool, reason: &st
         let mut lines = Vec::new();
         for run_id in targets {
             lines.push(execute_run_resume_control(store, run_id, reason)?);
+        }
+        Ok(lines.join("\n"))
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+pub(crate) fn cmd_run_drain(run_id: Option<&str>, all_active: bool, reason: &str) -> Result<()> {
+    let loaded_config = load_runtime_config_for_writes("run drain")?;
+    let output = with_event_store_and_queue(&loaded_config, |store, _queue| {
+        let targets = select_run_targets_for_control(
+            store,
+            run_id,
+            all_active,
+            &[RunState::RunActive, RunState::RunVerifying],
+            "all-active",
+            "drain",
+        )?;
+        let mut lines = Vec::new();
+        for run_id in targets {
+            lines.push(execute_run_drain_control(store, run_id, reason)?);
         }
         Ok(lines.join("\n"))
     })?;
@@ -6613,26 +6880,23 @@ pub(crate) fn cmd_info(
 
 /// `yarli serve` — start the YARLI HTTP API server.
 pub(crate) async fn cmd_serve(bind: &str, port: u16) -> Result<()> {
-    let loaded_config = load_runtime_config_for_reads()
-        .context("failed to load runtime config for API serve");
+    let loaded_config =
+        load_runtime_config_for_reads().context("failed to load runtime config for API serve");
     let loaded_config = match loaded_config {
         Ok(config) => config,
         Err(err) => return Err(err),
     };
 
     let bind = bind.trim();
-    let bind = if bind.is_empty() {
-        "127.0.0.1"
-    } else {
-        bind
-    };
+    let bind = if bind.is_empty() { "127.0.0.1" } else { bind };
 
     let store: Arc<dyn EventStore> = match loaded_config.backend_selection()? {
         BackendSelection::InMemory => Arc::new(InMemoryEventStore::new()),
-        BackendSelection::Postgres { database_url } => Arc::new(
-            PostgresEventStore::new(&database_url)
-                .with_context(|| format!("failed to initialize postgres event store at {database_url}"))?,
-        ),
+        BackendSelection::Postgres { database_url } => {
+            Arc::new(PostgresEventStore::new(&database_url).with_context(|| {
+                format!("failed to initialize postgres event store at {database_url}")
+            })?)
+        }
     };
 
     let listener = tokio::net::TcpListener::bind((bind, port))
@@ -7266,10 +7530,8 @@ pub(crate) fn cmd_audit_query(
 /// `yarli debug queue-depth` — show queue depth grouped by run/class.
 pub(crate) fn cmd_debug_queue_depth() -> Result<()> {
     let loaded_config = load_runtime_config_for_reads()?;
-    let output = with_event_store_and_queue(&loaded_config, |_, queue| {
-        let entries = queue.entries();
-        Ok::<_, anyhow::Error>(render_queue_depth(&entries))
-    })?;
+    let entries = load_debug_queue_entries(&loaded_config)?;
+    let output = render_queue_depth(&entries);
     println!("{output}");
     Ok(())
 }
@@ -7277,13 +7539,25 @@ pub(crate) fn cmd_debug_queue_depth() -> Result<()> {
 /// `yarli debug active-leases` — show currently leased tasks.
 pub(crate) fn cmd_debug_active_leases() -> Result<()> {
     let loaded_config = load_runtime_config_for_reads()?;
-    let output = with_event_store_and_queue(&loaded_config, |_, queue| {
-        let entries = queue.entries();
-        let now = chrono::Utc::now();
-        Ok::<_, anyhow::Error>(render_active_leases(&entries, now))
-    })?;
+    let entries = load_debug_queue_entries(&loaded_config)?;
+    let now = chrono::Utc::now();
+    let output = render_active_leases(&entries, now);
     println!("{output}");
     Ok(())
+}
+
+fn load_debug_queue_entries(loaded_config: &LoadedConfig) -> Result<Vec<QueueEntry>> {
+    match loaded_config.backend_selection()? {
+        BackendSelection::InMemory => {
+            let queue = yarli_queue::InMemoryTaskQueue::new();
+            Ok(queue.entries())
+        }
+        BackendSelection::Postgres { database_url } => {
+            let queue = PostgresTaskQueue::new(&database_url)
+                .map_err(|e| anyhow!("failed to initialize postgres task queue: {e}"))?;
+            Ok(queue.entries())
+        }
+    }
 }
 
 /// `yarli debug resource-usage` — show run resource usage totals.
@@ -7364,7 +7638,8 @@ mod tests {
     use uuid::Uuid;
     use yarli_cli::mode::{RenderMode, TerminalInfo};
     use yarli_core::domain::{
-        CancellationActorKind, CancellationSource, CommandClass, EntityType, Event, SafeMode,
+        CancellationActorKind, CancellationSource, CommandClass, EntityType, Event, ExitReason,
+        SafeMode,
     };
     use yarli_core::entities::run::Run;
     use yarli_core::entities::task::Task;
@@ -7562,7 +7837,7 @@ mod tests {
                 && help_lower.contains("built-in yarli policy gates")
                 && help_lower.contains("verification command chain")
                 && help_lower.contains("observer events are telemetry only")
-                && help_lower.contains("pause|resume|cancel"),
+                && help_lower.contains("pause|resume|cancel|drain"),
             "run --help should mention prompt resolution precedence"
         );
     }
@@ -9065,6 +9340,43 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn execute_run_drain_control_appends_operator_request() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+
+        let output = execute_run_drain_control(&store, run_id, "stop after current").unwrap();
+        assert!(output.contains("drain requested"));
+
+        let projection = load_run_projection(&store, run_id).unwrap().unwrap();
+        assert_eq!(projection.state, RunState::RunActive);
+        assert!(projection.drain_requested);
+        assert_eq!(
+            projection.drain_reason.as_deref(),
+            Some("stop after current")
+        );
+
+        let run_events = store
+            .query(&EventQuery::by_entity(EntityType::Run, run_id.to_string()))
+            .unwrap();
+        assert!(run_events.iter().any(|event| {
+            event.event_type == "run.drain_requested"
+                && event.actor == OPERATOR_CONTROL_ACTOR
+                && event.payload.get("reason").and_then(|v| v.as_str())
+                    == Some("stop after current")
+        }));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drive_scheduler_drains_without_claiming_new_tasks_during_pause() {
         let store = Arc::new(InMemoryEventStore::new());
@@ -9225,6 +9537,146 @@ mod tests {
                 .state,
             TaskState::TaskComplete,
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drive_scheduler_drains_after_current_work_and_exits_cleanly() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+
+        let config = SchedulerConfig {
+            claim_batch_size: 1,
+            tick_interval: Duration::from_millis(25),
+            ..SchedulerConfig::default()
+        };
+
+        let mut scheduler = Scheduler::new(queue.clone(), store.clone(), runner, config.clone());
+
+        let run = Run::new("drain after current", yarli_core::domain::SafeMode::Execute);
+        let run_id = run.id;
+        let correlation_id = run.correlation_id;
+        let primary_task = Task::new(
+            run_id,
+            "primary",
+            "sleep 2",
+            CommandClass::Io,
+            correlation_id,
+        );
+        let primary_task_id = primary_task.id;
+        let mut queued_task = Task::new(
+            run_id,
+            "queued",
+            "sleep 1",
+            CommandClass::Io,
+            correlation_id,
+        );
+        queued_task.depends_on(primary_task_id);
+        let queued_task_id = queued_task.id;
+        let task_names = vec![
+            (primary_task_id, "primary".to_string()),
+            (queued_task_id, "queued".to_string()),
+        ];
+
+        scheduler
+            .submit_run(run, vec![primary_task, queued_task])
+            .await
+            .unwrap();
+
+        let shutdown = ShutdownController::new();
+        let cancel = shutdown.token();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store_for_scheduler = store.clone();
+
+        let run_handle = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(12),
+                drive_scheduler(
+                    &mut scheduler,
+                    &store_for_scheduler,
+                    shutdown,
+                    cancel,
+                    tx,
+                    run_id,
+                    correlation_id,
+                    &task_names,
+                    AutoAdvancePolicy::StableOk,
+                    config::RunTaskHealthConfig::default(),
+                    None,
+                    0.9,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("drive_scheduler timed out")
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(primary_projection) =
+                    load_task_projection(store.as_ref(), primary_task_id).unwrap()
+                {
+                    if primary_projection.state == TaskState::TaskExecuting {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("primary task did not start executing");
+
+        execute_run_drain_control(store.as_ref(), run_id, "stop after current").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pp) = load_task_projection(store.as_ref(), primary_task_id).unwrap() {
+                    if pp.state == TaskState::TaskComplete {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("primary task should complete before drain finalizes");
+
+        let payload = run_handle
+            .await
+            .expect("scheduler loop panicked")
+            .expect("scheduler loop failed");
+
+        assert_eq!(payload.exit_state, RunState::RunDrained);
+        assert_eq!(payload.exit_reason, Some(ExitReason::DrainedByOperator));
+        assert!(
+            payload.next_tranche.is_some(),
+            "drained runs should persist continuation"
+        );
+
+        let run_projection = load_run_projection(store.as_ref(), run_id)
+            .unwrap()
+            .expect("run projection");
+        assert_eq!(run_projection.state, RunState::RunDrained);
+        assert_eq!(
+            run_projection.exit_reason.as_deref(),
+            Some("drained_by_operator")
+        );
+
+        let queued_projection = load_task_projection(store.as_ref(), queued_task_id).unwrap();
+        if let Some(qp) = &queued_projection {
+            assert!(
+                matches!(qp.state, TaskState::TaskReady | TaskState::TaskOpen),
+                "queued task should remain unstarted after drain, got {:?}",
+                qp.state
+            );
+        }
+
+        let stats = queue.stats();
+        assert_eq!(stats.pending, 0, "drain should clear queued entries");
+        assert_eq!(stats.leased, 0, "drain should leave no active leases");
     }
 
     #[test]

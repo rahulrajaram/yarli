@@ -804,12 +804,12 @@ async fn create_worktree_path_already_exists() {
     let mut binding = make_binding(&repo);
     let cancel = CancellationToken::new();
 
-    // Create the worktree path manually before create().
-    let wt_path = repo.join(WORKTREE_DIR).join(format!(
-        "{}-{}",
-        &binding.run_id.to_string()[..SHORT_ID_LEN],
-        &binding.task_id.unwrap().to_string()[..SHORT_ID_LEN],
-    ));
+    // Pin a deterministic path for this test and pre-create it so create()
+    // fails with WorktreePathExists.
+    let wt_path = repo
+        .join(WORKTREE_DIR)
+        .join("existing-path-for-collision-test");
+    binding.set_worktree_path(&wt_path);
     std::fs::create_dir_all(&wt_path).unwrap();
 
     let result = mgr.create(&mut binding, cancel).await;

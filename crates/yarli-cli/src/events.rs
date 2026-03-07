@@ -238,6 +238,7 @@ pub(crate) fn parse_run_state(s: &str) -> Option<RunState> {
         "RunCompleted" => Some(RunState::RunCompleted),
         "RunFailed" => Some(RunState::RunFailed),
         "RunCancelled" => Some(RunState::RunCancelled),
+        "RunDrained" => Some(RunState::RunDrained),
         _ => None,
     }
 }
