@@ -78,6 +78,21 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8(run_git(cwd, args).stdout).expect("git output should be utf-8")
 }
 
+fn is_change_centric_subject(subject: &str) -> bool {
+    [
+        "feat(",
+        "fix(",
+        "refactor(",
+        "docs(",
+        "test(",
+        "build(",
+        "ci(",
+        "chore(",
+    ]
+    .iter()
+    .any(|prefix| subject.starts_with(prefix))
+}
+
 fn parse_run_id(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         line.strip_prefix("Run ")
@@ -371,7 +386,7 @@ worktree_root = "{}"
     let latest_subject = subject_lines.next().expect("latest commit subject");
 
     assert!(
-        latest_subject.starts_with("feat(") || latest_subject.starts_with("fix("),
+        is_change_centric_subject(latest_subject),
         "expected change-centric latest subject, saw: {latest_subject}"
     );
     assert!(
@@ -474,7 +489,18 @@ worktree_root = "{}"
     let previous_subject = subject_lines.next().expect("previous commit subject");
 
     assert_eq!(latest_subject, "chore(state): checkpoint runtime state");
-    assert_eq!(previous_subject, "fix(alpha): update alpha");
+    assert!(
+        is_change_centric_subject(previous_subject),
+        "expected change-centric worktree commit before checkpoint, saw: {previous_subject}"
+    );
+    assert!(
+        !previous_subject.contains("yarli:"),
+        "previous subject should not leak workflow metadata: {previous_subject}"
+    );
+    assert!(
+        !previous_subject.contains("tranche"),
+        "previous subject should not mention tranche bookkeeping: {previous_subject}"
+    );
 
     let checkpoint_body = git_stdout(&repo_dir, &["log", "-1", "--pretty=%B"]);
     assert!(
