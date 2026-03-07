@@ -94,7 +94,7 @@ enforce_plan_tranche_allowed_paths = false
 # Auto-commit YARLI state files after every N tranches (0 = disabled).
 # auto_commit_interval = 1
 # Template for auto-commit messages.
-# auto_commit_message = "yarli: checkpoint after {tranche_key} ({tranches_completed}/{tranches_total})"
+# auto_commit_message = "chore(state): checkpoint runtime state"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"

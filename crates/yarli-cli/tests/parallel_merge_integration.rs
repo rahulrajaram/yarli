@@ -74,6 +74,10 @@ fn run_git(cwd: &Path, args: &[&str]) -> Output {
     output
 }
 
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    String::from_utf8(run_git(cwd, args).stdout).expect("git output should be utf-8")
+}
+
 fn parse_run_id(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         line.strip_prefix("Run ")
@@ -303,6 +307,193 @@ worktree_root = "{}"
     let merged_committed =
         std::fs::read_to_string(repo_dir.join("committed.txt")).expect("read merged committed.txt");
     assert_eq!(merged_committed, "new committed file\n");
+}
+
+#[test]
+fn run_start_parallel_merge_writes_change_centric_commit_history() {
+    let temp_dir = TempDir::new().expect("create temp workspace");
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+    std::fs::create_dir_all(repo_dir.join(".yarl/workspaces")).expect("create worktree root dir");
+
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["checkout", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
+    run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
+    std::fs::write(repo_dir.join("alpha.txt"), "alpha baseline\n").expect("write alpha baseline");
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "initial"]);
+
+    let config = format!(
+        r#"[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+
+[features]
+parallel = true
+parallel_worktree = false
+
+[run]
+auto_commit_interval = 1
+
+[execution]
+working_dir = "."
+worktree_root = "{}"
+"#,
+        repo_dir.join(".yarl/workspaces").display()
+    );
+    std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
+
+    let binary = run_output_path();
+    let task_cmd = "git config user.email test@yarli.dev && git config user.name 'Yarli Test' && printf 'alpha committed\\n' > alpha.txt && printf 'new committed file\\n' > committed.txt && git add -A && git commit -m 'worker commit'";
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel merge commit narrative regression",
+            "--stream",
+            "--cmd",
+            task_cmd,
+        ],
+    );
+
+    assert!(
+        run_output.status.success(),
+        "run start command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr),
+    );
+
+    let subjects = git_stdout(&repo_dir, &["log", "-3", "--pretty=%s"]);
+    let mut subject_lines = subjects.lines();
+    let latest_subject = subject_lines.next().expect("latest commit subject");
+
+    assert!(
+        latest_subject.starts_with("feat(") || latest_subject.starts_with("fix("),
+        "expected change-centric latest subject, saw: {latest_subject}"
+    );
+    assert!(
+        !latest_subject.contains("yarli:"),
+        "latest subject should not leak workflow metadata: {latest_subject}"
+    );
+    assert!(
+        !latest_subject.contains("tranche"),
+        "latest subject should not mention tranche bookkeeping: {latest_subject}"
+    );
+
+    for subject in subjects.lines().take(2) {
+        assert!(
+            !subject.starts_with("yarli:"),
+            "recent commit history should avoid workflow-centric subjects: {subjects}"
+        );
+    }
+
+    let checkpoint_body = git_stdout(
+        &repo_dir,
+        &[
+            "log",
+            "--format=%B%x00",
+            "--grep",
+            "^chore\\(state\\): checkpoint runtime state$",
+            "-n",
+            "1",
+        ],
+    );
+    if !checkpoint_body.trim().is_empty() {
+        assert!(
+            checkpoint_body.contains("yarli-run:"),
+            "checkpoint commit should preserve yarli run attribution:\n{checkpoint_body}"
+        );
+    }
+}
+
+#[test]
+fn run_start_parallel_worktree_auto_commit_writes_checkpoint_message() {
+    let temp_dir = TempDir::new().expect("create temp workspace");
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+    let worktree_root = repo_dir.join(".yarl/workspaces");
+    std::fs::create_dir_all(&worktree_root).expect("create worktree root dir");
+
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["checkout", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
+    run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
+    std::fs::write(repo_dir.join(".gitignore"), ".yarli/\n").expect("write gitignore");
+    std::fs::write(repo_dir.join("alpha.txt"), "alpha baseline\n").expect("write alpha baseline");
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "initial"]);
+
+    let config = format!(
+        r#"[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+
+[features]
+parallel = true
+parallel_worktree = true
+
+[run]
+auto_commit_interval = 1
+
+[execution]
+working_dir = "."
+worktree_root = "{}"
+"#,
+        worktree_root.display()
+    );
+    std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
+
+    let binary = run_output_path();
+    let task_cmd = "printf 'alpha merged\\n' > alpha.txt && mkdir -p .yarli && printf 'version = 1\\n[[tranches]]\\nkey = \"TR-01\"\\nsummary = \"checkpoint\"\\nstatus = \"complete\"\\n' > .yarli/tranches.toml && printf '{\"exit_state\":\"RunCompleted\"}\\n' > .yarli/continuation.json";
+    let run_output = run_yarli(
+        &binary,
+        &repo_dir,
+        &[
+            "run",
+            "start",
+            "parallel worktree checkpoint commit regression",
+            "--stream",
+            "--cmd",
+            task_cmd,
+        ],
+    );
+
+    assert!(
+        run_output.status.success(),
+        "run start command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr),
+    );
+
+    let subjects = git_stdout(&repo_dir, &["log", "-2", "--pretty=%s"]);
+    let mut subject_lines = subjects.lines();
+    let latest_subject = subject_lines.next().expect("latest commit subject");
+    let previous_subject = subject_lines.next().expect("previous commit subject");
+
+    assert_eq!(latest_subject, "chore(state): checkpoint runtime state");
+    assert_eq!(previous_subject, "fix(alpha): update alpha");
+
+    let checkpoint_body = git_stdout(&repo_dir, &["log", "-1", "--pretty=%B"]);
+    assert!(
+        checkpoint_body.contains("yarli-run:"),
+        "checkpoint commit should contain yarli run attribution:\n{checkpoint_body}"
+    );
+    assert!(
+        checkpoint_body.contains("yarli-progress: 1/1"),
+        "checkpoint commit should record progress:\n{checkpoint_body}"
+    );
+    assert!(
+        checkpoint_body.contains("yarli-tranche: unknown"),
+        "ad-hoc run start should currently use the fallback tranche key in checkpoint metadata:\n{checkpoint_body}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("alpha.txt")).unwrap(),
+        "alpha merged\n"
+    );
 }
 
 #[test]

@@ -17,6 +17,7 @@ use yarli_core::entities::worktree_binding::WorktreeBinding;
 use yarli_core::fsm::merge::MergeState;
 use yarli_core::fsm::worktree::WorktreeState;
 
+use crate::commit_message::{generate_commit_message, render_commit_message, DiffSpec};
 use crate::constants::*;
 use crate::error::GitError;
 use crate::submodule::SubmoduleEntry;
@@ -301,7 +302,11 @@ impl LocalMergeOrchestrator {
             .clone();
 
         // Step 3: Perform the merge.
-        let commit_msg = Self::build_commit_message(intent);
+        let commit_msg = if intent.commit_message_template.is_some() {
+            Self::build_commit_message(intent)
+        } else {
+            Self::build_generated_commit_message(&wt_path, intent)
+        };
         let merge_result = match intent.strategy {
             MergeStrategy::MergeNoFf => {
                 self.run_git(
@@ -456,6 +461,26 @@ impl LocalMergeOrchestrator {
             .replace("{target}", &intent.target_ref)
             .replace("{run_id}", &intent.run_id.to_string())
             .replace("{task_id}", &intent.worktree_id.to_string())
+    }
+
+    fn build_generated_commit_message(repo: &Path, intent: &MergeIntent) -> String {
+        let source_ref = intent.source_sha.as_deref().unwrap_or(&intent.source_ref);
+        let message = generate_commit_message(
+            repo,
+            DiffSpec::Range {
+                base: &intent.target_ref,
+                head: source_ref,
+            },
+            &[
+                ("yarli-run".to_string(), intent.run_id.to_string()),
+                ("yarli-task".to_string(), intent.worktree_id.to_string()),
+                ("yarli-source".to_string(), intent.source_ref.clone()),
+                ("yarli-target".to_string(), intent.target_ref.clone()),
+            ],
+            "chore(integration): integrate merged changes",
+            Some("integration"),
+        );
+        render_commit_message(&message)
     }
 }
 

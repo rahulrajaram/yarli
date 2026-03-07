@@ -42,7 +42,7 @@ pub const DOT_GIT_FILE: &str = ".git";
 /// - `{run_id}`: YARLI run ID
 /// - `{task_id}`: YARLI task ID (if applicable)
 pub const MERGE_COMMIT_TEMPLATE: &str =
-    "chore(yarli): merge {source} into {target}\n\nyarli-run: {run_id}\nyarli-task: {task_id}";
+    "chore(integration): integrate merged changes\n\nyarli-run: {run_id}\nyarli-task: {task_id}\nyarli-source: {source}\nyarli-target: {target}";
 
 // ── Timeouts and limits ──────────────────────────────────────────────────
 

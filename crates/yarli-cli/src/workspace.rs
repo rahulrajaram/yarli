@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use tracing::{info, warn};
 use uuid::Uuid;
+use yarli_git::{generate_commit_message, render_commit_message, DiffSpec};
 
 use crate::config;
 use crate::config::LoadedConfig;
@@ -830,6 +831,22 @@ pub(crate) fn cleanup_parallel_workspace(layout: &ParallelWorkspaceLayout) {
 ///
 /// Stages only `.yarli/continuation.json` and `.yarli/tranches.toml`, then commits
 /// with a templated message. Returns `Ok(true)` if a commit was made.
+fn generated_commit_message(
+    repo: &Path,
+    diff: DiffSpec<'_>,
+    metadata: Vec<(String, String)>,
+    fallback_subject: &str,
+    fallback_scope: Option<&str>,
+) -> String {
+    render_commit_message(&generate_commit_message(
+        repo,
+        diff,
+        &metadata,
+        fallback_subject,
+        fallback_scope,
+    ))
+}
+
 pub(crate) fn auto_commit_state_files(
     source_workdir: &Path,
     tranche_key: &str,
@@ -861,14 +878,27 @@ pub(crate) fn auto_commit_state_files(
         return Ok(false);
     }
 
-    let default_template =
-        "yarli: checkpoint after {tranche_key} ({tranches_completed}/{tranches_total})";
-    let template = message_template.unwrap_or(default_template);
-    let message = template
-        .replace("{tranche_key}", tranche_key)
-        .replace("{run_id}", run_id)
-        .replace("{tranches_completed}", &tranches_completed.to_string())
-        .replace("{tranches_total}", &tranches_total.to_string());
+    let message = match message_template {
+        Some(template) => template
+            .replace("{tranche_key}", tranche_key)
+            .replace("{run_id}", run_id)
+            .replace("{tranches_completed}", &tranches_completed.to_string())
+            .replace("{tranches_total}", &tranches_total.to_string()),
+        None => generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                ("yarli-tranche".to_string(), tranche_key.to_string()),
+                (
+                    "yarli-progress".to_string(),
+                    format!("{tranches_completed}/{tranches_total}"),
+                ),
+            ],
+            "chore(state): checkpoint runtime state",
+            Some("state"),
+        ),
+    };
 
     let commit_result = run_git_capture(source_workdir, &["commit", "--no-verify", "-m", &message]);
     match commit_result {
@@ -2206,7 +2236,17 @@ pub(crate) fn merge_worktree_workspace_results(
                 // Stage and commit all changes in the worktree.
                 if !status_text.trim().is_empty() {
                     let _ = run_git_capture(workspace_dir, &["add", "-A"]);
-                    let commit_msg = format!("yarli: task {task_key} work");
+                    let commit_msg = generated_commit_message(
+                        workspace_dir,
+                        DiffSpec::Staged,
+                        vec![
+                            ("yarli-run".to_string(), run_id.to_string()),
+                            ("yarli-task".to_string(), task_key.clone()),
+                            ("yarli-branch".to_string(), branch.clone()),
+                        ],
+                        "chore(workspace): update staged changes",
+                        Some(task_key),
+                    );
                     let commit_result = run_git_capture(
                         workspace_dir,
                         &["commit", "--no-verify", "--allow-empty", "-m", &commit_msg],
@@ -2223,7 +2263,20 @@ pub(crate) fn merge_worktree_workspace_results(
                 }
 
                 // Merge the worktree branch into the main working directory.
-                let merge_msg = format!("yarli: merge {task_key}");
+                let merge_msg = generated_commit_message(
+                    source_workdir,
+                    DiffSpec::Range {
+                        base: "HEAD",
+                        head: branch,
+                    },
+                    vec![
+                        ("yarli-run".to_string(), run_id.to_string()),
+                        ("yarli-task".to_string(), task_key.clone()),
+                        ("yarli-source-branch".to_string(), branch.clone()),
+                    ],
+                    "chore(integration): integrate workspace changes",
+                    Some(task_key),
+                );
                 let merge_result = run_git_capture(
                     source_workdir,
                     &["merge", "--no-ff", branch, "-m", &merge_msg],
@@ -2323,8 +2376,17 @@ pub(crate) fn merge_worktree_workspace_results(
                                         _ => {}
                                     }
                                 }
-                                let repair_msg =
-                                    format!("yarli: auto-repair merge conflict for {task_key}");
+                                let repair_msg = generated_commit_message(
+                                    source_workdir,
+                                    DiffSpec::Staged,
+                                    vec![
+                                        ("yarli-run".to_string(), run_id.to_string()),
+                                        ("yarli-task".to_string(), task_key.clone()),
+                                        ("yarli-resolution".to_string(), "auto-repair".to_string()),
+                                    ],
+                                    "fix(integration): update repaired merge changes",
+                                    Some(task_key),
+                                );
                                 let _ = run_git_capture(
                                     source_workdir,
                                     &["commit", "--no-verify", "--allow-empty", "-m", &repair_msg],
@@ -2412,15 +2474,22 @@ pub(crate) fn merge_worktree_workspace_results(
         }
         // Commit the reapplied dirty state (clean pop or resolved conflicts).
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let reapply_msg = generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                (
+                    "yarli-restore".to_string(),
+                    "pre-existing workspace state after worktree merge".to_string(),
+                ),
+            ],
+            "chore(workspace): restore local workspace changes",
+            Some("workspace"),
+        );
         let _ = run_git_capture(
             source_workdir,
-            &[
-                "commit",
-                "--no-verify",
-                "--allow-empty",
-                "-m",
-                "yarli: reapply pre-existing workspace state after worktree merge",
-            ],
+            &["commit", "--no-verify", "--allow-empty", "-m", &reapply_msg],
         );
     }
 
@@ -2936,7 +3005,19 @@ Operator recovery steps:\n\
         // "does not match index" errors for subsequent patches. These interim
         // commits are transparent to the user (not pushed, can be squashed).
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
-        let commit_msg = format!("yarli: merge workspace result for {task_key}");
+        let commit_msg = generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                ("yarli-task".to_string(), task_key.clone()),
+                ("yarli-workspace-head".to_string(), ws_head.clone()),
+                ("yarli-source-head".to_string(), source_head.clone()),
+                ("yarli-patch".to_string(), patch_path.display().to_string()),
+            ],
+            "chore(integration): integrate workspace result",
+            Some(task_key),
+        );
         let _ = run_git_capture(
             source_workdir,
             &["commit", "--no-verify", "--allow-empty", "-m", &commit_msg],
@@ -3008,15 +3089,22 @@ Operator recovery steps:\n\
         }
         // Commit the reapplied dirty state (clean pop or resolved conflicts).
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let reapply_msg = generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                (
+                    "yarli-restore".to_string(),
+                    "pre-existing workspace state after merge".to_string(),
+                ),
+            ],
+            "chore(workspace): restore local workspace changes",
+            Some("workspace"),
+        );
         let _ = run_git_capture(
             source_workdir,
-            &[
-                "commit",
-                "--no-verify",
-                "--allow-empty",
-                "-m",
-                "yarli: reapply pre-existing workspace state after merge",
-            ],
+            &["commit", "--no-verify", "--allow-empty", "-m", &reapply_msg],
         );
     }
 
@@ -5945,7 +6033,14 @@ worktree_root = "{}"
         // Check git log shows merge commit.
         let (ok, log_output, _) = run_git(&repo, &["log", "--oneline", "-5"]);
         assert!(ok);
-        assert!(log_output.contains("merge alpha"), "git log: {log_output}");
+        assert!(
+            log_output.contains("feat(new-file): add new file"),
+            "git log: {log_output}"
+        );
+        assert!(
+            !log_output.contains("yarli: merge alpha"),
+            "git log should avoid workflow-centric subjects: {log_output}"
+        );
 
         // Merged task worktree should be removed immediately to free slots.
         assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
@@ -6053,10 +6148,17 @@ worktree_root = "{}"
         );
 
         // Verify commit message.
-        let (ok, log, _) = run_git(&repo, &["log", "-1", "--pretty=%s"]);
+        let (ok, log, _) = run_git(&repo, &["log", "-1", "--pretty=%B"]);
         assert!(ok);
-        assert!(log.contains("tranche-001"), "commit message: {log}");
-        assert!(log.contains("1/3"), "commit message: {log}");
+        assert!(
+            log.starts_with("chore(state): checkpoint runtime state"),
+            "commit message: {log}"
+        );
+        assert!(
+            log.contains("yarli-tranche: tranche-001"),
+            "commit message: {log}"
+        );
+        assert!(log.contains("yarli-progress: 1/3"), "commit message: {log}");
     }
 
     #[test]
