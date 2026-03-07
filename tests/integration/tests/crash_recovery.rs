@@ -23,6 +23,7 @@ fn run_state_from_db(value: &str) -> RunState {
         "RUN_FAILED" => RunState::RunFailed,
         "RUN_CANCELLED" => RunState::RunCancelled,
         "RUN_BLOCKED" => RunState::RunBlocked,
+        "RUN_DRAINED" => RunState::RunDrained,
         "RunOpen" => RunState::RunOpen,
         "RunActive" => RunState::RunActive,
         "RunVerifying" => RunState::RunVerifying,
@@ -30,6 +31,7 @@ fn run_state_from_db(value: &str) -> RunState {
         "RunFailed" => RunState::RunFailed,
         "RunCancelled" => RunState::RunCancelled,
         "RunBlocked" => RunState::RunBlocked,
+        "RunDrained" => RunState::RunDrained,
         _ => RunState::RunOpen,
     }
 }
@@ -67,6 +69,7 @@ fn run_state_to_db(state: RunState) -> &'static str {
         RunState::RunFailed => "RUN_FAILED",
         RunState::RunCancelled => "RUN_CANCELLED",
         RunState::RunBlocked => "RUN_BLOCKED",
+        RunState::RunDrained => "RUN_DRAINED",
     }
 }
 
