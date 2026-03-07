@@ -843,7 +843,7 @@ pub(crate) fn auto_commit_state_files(
     for file in &state_files {
         let full = source_workdir.join(file);
         if full.exists() {
-            let output = run_git_capture(source_workdir, &["add", "--", file])?;
+            let output = run_git_capture(source_workdir, &["add", "-f", "--", file])?;
             if output.status.success() {
                 any_staged = true;
             }
@@ -5563,6 +5563,8 @@ worktree_root = "{}"
         run_git_expect_ok(path, &["init"]);
         run_git_expect_ok(path, &["config", "user.email", "test@yarli.dev"]);
         run_git_expect_ok(path, &["config", "user.name", "Test"]);
+        // Make tests deterministic regardless of user-global gitignore patterns.
+        run_git_expect_ok(path, &["config", "core.excludesFile", ".git/info/exclude"]);
     }
 
     #[test]
