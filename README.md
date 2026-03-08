@@ -6,6 +6,8 @@
   Deterministic run/task orchestration with event sourcing, queue scheduling, and safe Git controls.
 </p>
 
+# YARLI
+
 ## What is this?
 
 YARLI is a Rust workspace for executing plan-driven engineering workflows with durable state and explicit operator control. It treats runs, tasks, worktrees, merges, command execution, and policy decisions as state-machine entities persisted through an event log.
@@ -21,6 +23,7 @@ This project is for teams that want reproducible orchestration behavior, auditab
 - Explicit operator controls (`pause`, `resume`, `cancel`, `drain`) and explainability commands.
 - Policy and gate evaluation over task/run state.
 - Parallel workspace execution with scoped merge and recovery artifacts.
+- Startup salvage of abandoned git-worktree run roots before parallel slot allocation.
 - Optional memory provider adapters via `[memory.providers.<name>]`.
 - REST API crate (`yarli-api`) with health, status, control, webhook, and websocket event routes.
 
@@ -39,6 +42,13 @@ cargo build --release -p yarli-cli --bin yarli
 cargo install --path crates/yarli-cli --bin yarli
 yarli --help
 ```
+
+### Shared commithooks
+
+This repo tracks project-local hooks in `.githooks/`. Building `yarli-cli`
+refreshes the shared dispatchers and hook library into `.git/hooks/` and
+`.git/lib/` when `COMMITHOOKS_DIR` or `$HOME/Documents/commithooks` is
+available.
 
 ### Install script
 
@@ -155,6 +165,7 @@ Start, monitor, and explain orchestration runs. `yarli run` (no subcommand) is t
 
 - Parallel mode defaults to enabled (`[features].parallel = true`); requires `[execution].worktree_root`.
 - In parallel mode, YARLI prepares one workspace per task under `execution.worktree_root`.
+- Before creating new git-worktree task slots, YARLI sweeps `execution.worktree_root` for abandoned `run-*` roots, salvages dirty worktrees onto durable branches, and reclaims empty stale roots.
 - On `RunCompleted`, YARLI scopes each task merge to paths that actually differ, then applies a patch with `git apply --3way`.
 - Merge conflict resolution is controlled by `[run].merge_conflict_resolution`: `fail` (default), `manual`, `auto-repair`.
 - Auto-advance policy: `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"` (default: `stable-ok`).
@@ -293,11 +304,20 @@ Manage Postgres migration lifecycle for durable mode.
 ```bash
 yarli migrate status
 yarli migrate up
-yarli migrate up --target 0001
+yarli migrate up --target 0001_init
 yarli migrate down
-yarli migrate down --target 0001 --backup-label rollback_20260224
+yarli migrate down --target 0001_init --backup-label rollback_20260224
 yarli migrate backup --label pre_release
 yarli migrate restore pre_release
+```
+
+### `yarli serve`
+
+Start the HTTP API server for run, task, and audit introspection.
+
+```bash
+yarli serve
+yarli serve --bind 0.0.0.0 --port 8080
 ```
 
 ### `yarli info`
@@ -321,6 +341,12 @@ args = ["exec"]
 ```
 
 YARLI is not currently an MCP server. Agent integration is command-dispatch based.
+
+## gRPC API
+
+YARLI does not currently expose a native gRPC API. I did not find any `.proto`
+files in this repo, and the supported network API surface today is the HTTP
+server from `crates/yarli-api`.
 
 ## REST API
 
@@ -469,6 +495,25 @@ Workspace crates: `yarli-core`, `yarli-store`, `yarli-queue`, `yarli-exec`, `yar
 - API authentication is enabled when `YARLI_API_KEYS` is set (supports `Authorization: Bearer`, `x-api-key`, `api-key` headers).
 - API key rate limiting uses `YARLI_API_RATE_LIMIT_PER_MINUTE` (default 120/min).
 - Durable mode is recommended for write commands; in-memory mode blocks writes unless explicitly allowed.
+
+## Examples
+
+```bash
+# Bootstrap config, then run the default plan-driven loop.
+yarli init
+yarli run --stream
+
+# Start an ad-hoc run with explicit commands.
+yarli run start "full check" -c "cargo fmt --check" -c "cargo test"
+
+# Inspect or control a live run.
+yarli run status <run-id>
+yarli run drain <run-id> --reason "stop after current"
+
+# Recover interrupted worktree state.
+yarli worktree status <run-id>
+yarli worktree recover <worktree-id> --action abort
+```
 
 ## Playbooks
 

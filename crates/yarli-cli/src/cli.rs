@@ -627,7 +627,7 @@ Examples:
 - `yarli migrate down`
 - `yarli migrate down --target 0001`
 - `yarli migrate backup`
-- `yarli migrate restore --label 20260222_120000`
+- `yarli migrate restore 20260222_120000`
 
 `status`: show applied migrations vs code-defined pending migrations.
 `up`: apply pending migrations in order.
@@ -1154,7 +1154,7 @@ in `yarli_migration_backups` to support manual restore if needed."
         long_about = "Create a full data snapshot of migration-related tables.
 
 Backup snapshots are stored in `yarli_migration_backups.<label>` and can be
-restored with `yarli migrate restore --label <label>`."
+restored with `yarli migrate restore <label>`."
     )]
     Backup {
         /// Backup label (defaults to timestamp-based label).
@@ -1166,7 +1166,13 @@ restored with `yarli migrate restore --label <label>`."
         about = "Restore data from a migration backup snapshot",
         long_about = "Restore known migration-related tables from a backup snapshot
 captured by `yarli migrate backup`. This command only restores tables in the
-snapshot schema and writes a warning when schemas differ."
+snapshot schema and writes a warning when schemas differ.
+
+Usage takes a positional snapshot label.
+
+Examples:
+  yarli migrate restore 20260222_120000
+  yarli migrate restore pre_release"
     )]
     Restore {
         /// Snapshot label to restore from.
