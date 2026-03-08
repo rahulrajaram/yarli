@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
 # Project-specific pre-commit checks for yarli (Rust workspace)
 # Called by the dispatcher in .git/hooks/pre-commit
 
@@ -7,6 +9,7 @@ source "$COMMITHOOKS_DIR/lib/common.sh"
 source "$COMMITHOOKS_DIR/lib/lint-rust.sh"
 source "$COMMITHOOKS_DIR/lib/secrets.sh"
 
+commithooks_skip_during_rebase && exit 0
 commithooks_rust_fmt
 commithooks_rust_clippy
 commithooks_scan_secrets_in_diff
