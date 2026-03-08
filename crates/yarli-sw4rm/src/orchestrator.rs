@@ -13,17 +13,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, SafeMode};
-use yarli_core::entities::run::Run;
-use yarli_core::entities::task::{BlockerCode, Task};
-use yarli_core::explain::GateType;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_exec::{CommandRunner, LocalCommandRunner};
-use yarli_queue::{InMemoryTaskQueue, Scheduler, SchedulerConfig};
+use crate::yarli_core::domain::{CommandClass, SafeMode};
+use crate::yarli_core::entities::run::Run;
+use crate::yarli_core::entities::task::{BlockerCode, Task};
+use crate::yarli_core::explain::GateType;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
+use crate::yarli_exec::{CommandRunner, LocalCommandRunner};
+use crate::yarli_queue::{InMemoryTaskQueue, Scheduler, SchedulerConfig};
 
-use crate::config::Sw4rmConfig;
-use crate::messages::{
+use crate::yarli_sw4rm::config::Sw4rmConfig;
+use crate::yarli_sw4rm::messages::{
     FailureType, ImplementationRequest, ImplementationResponse, RepoContext, VerificationFailure,
 };
 
@@ -252,7 +252,7 @@ where
         cancel: &CancellationToken,
         additional_verification: &[String],
     ) -> Result<Vec<VerificationFailure>, OrchestratorError> {
-        let store = Arc::new(yarli_store::InMemoryEventStore::new());
+        let store = Arc::new(crate::yarli_store::InMemoryEventStore::new());
         let queue = Arc::new(InMemoryTaskQueue::new());
         let runner = self.verification_runner.clone();
         let verification_commands = self.compose_verification_commands(additional_verification);
@@ -264,12 +264,12 @@ where
                 .verification
                 .task_gates
                 .clone()
-                .unwrap_or_else(yarli_gates::default_task_gates),
+                .unwrap_or_else(crate::yarli_gates::default_task_gates),
             run_gates: self
                 .verification
                 .run_gates
                 .clone()
-                .unwrap_or_else(yarli_gates::default_run_gates),
+                .unwrap_or_else(crate::yarli_gates::default_run_gates),
             allow_recursive_run: false,
             max_runtime: None,
             idle_timeout: None,
@@ -436,7 +436,7 @@ fn classify_failure(task: &Task) -> FailureType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::MockRouterSender;
+    use crate::yarli_sw4rm::mock::MockRouterSender;
 
     fn test_verification() -> VerificationSpec {
         VerificationSpec {

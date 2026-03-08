@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::domain::{
+use crate::yarli_core::domain::{
     CancellationActorKind, CancellationProvenance, CancellationSource, CancellationStage,
 };
 

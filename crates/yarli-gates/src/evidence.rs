@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, RunId, TaskId};
+use crate::yarli_core::domain::{CommandClass, RunId, TaskId};
 
 /// Evidence type classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

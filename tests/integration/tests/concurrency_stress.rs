@@ -11,8 +11,10 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use yarli_core::domain::CommandClass;
-use yarli_queue::{ClaimRequest, ConcurrencyConfig, InMemoryTaskQueue, QueueStatus, TaskQueue};
+use yarli_cli::yarli_core::domain::CommandClass;
+use yarli_cli::yarli_queue::{
+    ClaimRequest, ConcurrencyConfig, InMemoryTaskQueue, QueueStatus, TaskQueue,
+};
 
 fn assert_single_lease_per_task(queue: &InMemoryTaskQueue, context: &str) {
     let mut leased_task_ids = HashSet::new();

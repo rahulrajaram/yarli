@@ -7,12 +7,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{CancellationProvenance, CancellationSource, ExitReason, RunId, TaskId};
-use crate::entities::run::Run;
-use crate::entities::task::{BlockerCode, Task};
-use crate::explain::DeteriorationTrend;
-use crate::fsm::run::RunState;
-use crate::fsm::task::TaskState;
+use crate::yarli_core::domain::{
+    CancellationProvenance, CancellationSource, ExitReason, RunId, TaskId,
+};
+use crate::yarli_core::entities::run::Run;
+use crate::yarli_core::entities::task::{BlockerCode, Task};
+use crate::yarli_core::explain::DeteriorationTrend;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
 
 /// Structured handoff emitted when a run reaches a terminal state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +39,7 @@ pub struct ContinuationPayload {
 }
 
 mod run_state_pascal_case {
-    use crate::fsm::run::RunState;
+    use crate::yarli_core::fsm::run::RunState;
     use serde::de::Error as DeError;
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -277,7 +279,7 @@ impl ContinuationPayload {
                 interventions: Vec::new(),
             })
         } else if run.state == RunState::RunFailed
-            && run.exit_reason == Some(crate::domain::ExitReason::BlockedGateFailure)
+            && run.exit_reason == Some(crate::yarli_core::domain::ExitReason::BlockedGateFailure)
         {
             // All tasks completed but run-level gates failed. Emit a GateRetry
             // tranche so the operator can re-verify after addressing the gate issue.
@@ -389,9 +391,9 @@ fn planned_next_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CommandClass, SafeMode};
-    use crate::entities::run::Run;
-    use crate::entities::task::Task;
+    use crate::yarli_core::domain::{CommandClass, SafeMode};
+    use crate::yarli_core::entities::run::Run;
+    use crate::yarli_core::entities::task::Task;
 
     fn make_run() -> Run {
         Run::with_config(

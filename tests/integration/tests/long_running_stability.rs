@@ -9,20 +9,25 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use yarli_core::domain::{CommandClass, SafeMode};
-use yarli_core::entities::{Run, Task};
-use yarli_exec::LocalCommandRunner;
-use yarli_queue::{
+use yarli_cli::yarli_core::domain::{CommandClass, SafeMode};
+use yarli_cli::yarli_core::entities::{Run, Task};
+use yarli_cli::yarli_exec::LocalCommandRunner;
+use yarli_cli::yarli_queue::{
     ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
     TaskQueue,
 };
-use yarli_store::{event_store::EventQuery, EventStore, InMemoryEventStore, PostgresEventStore};
+use yarli_cli::yarli_store::{
+    event_store::EventQuery, EventStore, InMemoryEventStore, PostgresEventStore,
+};
 
 #[cfg(unix)]
 use std::fs;
 
 use uuid::Uuid;
-use yarli_integration_tests::{apply_migrations, test_database_url_for_test, TestDatabase};
+#[path = "../src/lib.rs"]
+mod integration_helpers;
+
+use integration_helpers::{apply_migrations, test_database_url_for_test, TestDatabase};
 
 fn make_scheduler_config(
     worker_id: &str,

@@ -4,7 +4,7 @@
 //! - [`CommandRunner`] trait and [`LocalCommandRunner`] implementation for
 //!   spawning child processes with streaming stdout/stderr capture.
 //! - [`CommandJournal`] that wraps a runner and persists all execution events
-//!   to an [`EventStore`](yarli_store::EventStore).
+//!   to an [`EventStore`](crate::yarli_store::EventStore).
 //! - Timeout and cancellation support via `tokio_util::CancellationToken`.
 
 pub mod error;

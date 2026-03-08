@@ -2,10 +2,10 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use tracing::warn;
-use yarli_core::domain::{EntityType, Event};
-use yarli_core::entities::ContinuationPayload;
-use yarli_store::event_store::EventQuery;
-use yarli_store::EventStore;
+use yarli_cli::yarli_core::domain::{EntityType, Event};
+use yarli_cli::yarli_core::entities::ContinuationPayload;
+use yarli_cli::yarli_store::event_store::EventQuery;
+use yarli_cli::yarli_store::EventStore;
 
 use crate::config::{with_event_store, LoadedConfig};
 
@@ -105,10 +105,10 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
     use uuid::Uuid;
-    use yarli_core::domain::EntityType;
-    use yarli_core::fsm::run::RunState;
-    use yarli_core::fsm::task::TaskState;
-    use yarli_store::InMemoryEventStore;
+    use yarli_cli::yarli_core::domain::EntityType;
+    use yarli_cli::yarli_core::fsm::run::RunState;
+    use yarli_cli::yarli_core::fsm::task::TaskState;
+    use yarli_cli::yarli_store::InMemoryEventStore;
 
     #[test]
     fn read_continuation_payload_from_file_if_exists_returns_none_for_missing_file() {
@@ -210,18 +210,20 @@ mod tests {
 
     #[test]
     fn continuation_payload_round_trips_through_file() {
-        use yarli_core::entities::continuation::{ContinuationPayload, RunSummary, TrancheSpec};
+        use yarli_cli::yarli_core::entities::continuation::{
+            ContinuationPayload, RunSummary, TrancheSpec,
+        };
 
         let payload = ContinuationPayload {
             run_id: Uuid::new_v4(),
             objective: "build everything".into(),
             exit_state: RunState::RunFailed,
-            exit_reason: Some(yarli_core::domain::ExitReason::FailedRuntimeError),
+            exit_reason: Some(yarli_cli::yarli_core::domain::ExitReason::FailedRuntimeError),
             cancellation_source: None,
             cancellation_provenance: None,
             completed_at: Utc::now(),
             tasks: vec![
-                yarli_core::entities::continuation::TaskOutcome {
+                yarli_cli::yarli_core::entities::continuation::TaskOutcome {
                     task_id: Uuid::new_v4(),
                     task_key: "build".into(),
                     state: TaskState::TaskComplete,
@@ -229,7 +231,7 @@ mod tests {
                     last_error: None,
                     blocker: None,
                 },
-                yarli_core::entities::continuation::TaskOutcome {
+                yarli_cli::yarli_core::entities::continuation::TaskOutcome {
                     task_id: Uuid::new_v4(),
                     task_key: "test".into(),
                     state: TaskState::TaskFailed,
@@ -247,7 +249,7 @@ mod tests {
             },
             next_tranche: Some(TrancheSpec {
                 suggested_objective: "Retry failed tasks: test".into(),
-                kind: yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
+                kind: yarli_cli::yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
                 retry_task_keys: vec!["test".into()],
                 unfinished_task_keys: vec![],
                 planned_task_keys: vec![],

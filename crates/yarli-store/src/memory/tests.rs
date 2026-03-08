@@ -3,11 +3,11 @@
 use chrono::Utc;
 use uuid::Uuid;
 
-use yarli_core::domain::{CorrelationId, EntityType, Event};
+use crate::yarli_core::domain::{CorrelationId, EntityType, Event};
 
-use crate::event_store::{EventQuery, EventStore};
-use crate::memory::InMemoryEventStore;
-use crate::StoreError;
+use crate::yarli_store::event_store::{EventQuery, EventStore};
+use crate::yarli_store::memory::InMemoryEventStore;
+use crate::yarli_store::StoreError;
 
 /// Helper to create a test event with reasonable defaults.
 fn make_event(entity_type: EntityType, entity_id: &str, event_type: &str) -> Event {

@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use yarli_core::entities::command_execution::{
+use crate::yarli_core::entities::command_execution::{
     CommandExecution, CommandResourceUsage, StreamChunk, StreamType,
 };
-use yarli_core::fsm::command::CommandState;
+use crate::yarli_core::fsm::command::CommandState;
 
-use crate::error::ExecError;
-use crate::runner::{
+use crate::yarli_exec::error::ExecError;
+use crate::yarli_exec::runner::{
     command_id_for_request, estimate_token_usage, CommandRequest, CommandResult, CommandRunner,
 };
 
@@ -513,14 +513,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use axum::extract::{Path, State};
-    use axum::routing::{get, post};
-    use axum::{Json, Router};
+    use axum08::extract::{Path, State};
+    use axum08::routing::{get, post};
+    use axum08::{Json, Router};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
-    use yarli_core::domain::CommandClass;
-    use yarli_core::fsm::command::CommandState;
+    use crate::yarli_core::domain::CommandClass;
+    use crate::yarli_core::fsm::command::CommandState;
 
     use super::*;
 
@@ -594,7 +594,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum08::serve(listener, app).await.unwrap();
         });
         (format!("http://{}", addr), shared)
     }

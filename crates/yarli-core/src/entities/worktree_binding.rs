@@ -10,9 +10,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{CorrelationId, EventId, RunId, TaskId, WorktreeId};
-use crate::error::TransitionError;
-use crate::fsm::worktree::WorktreeState;
+use crate::yarli_core::domain::{CorrelationId, EventId, RunId, TaskId, WorktreeId};
+use crate::yarli_core::error::TransitionError;
+use crate::yarli_core::fsm::worktree::WorktreeState;
 
 use super::transition::Transition;
 

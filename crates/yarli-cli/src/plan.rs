@@ -17,14 +17,14 @@ use crate::config::{
 };
 
 use yarli_cli::mode::RenderMode;
+use yarli_cli::yarli_core::domain::CommandClass;
+use yarli_cli::yarli_core::entities::continuation::ContinuationInterventionKind;
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_observability::{Registry, YarliMetrics};
+use yarli_cli::yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue};
+use yarli_cli::yarli_store::{InMemoryEventStore, PostgresEventStore};
 use yarli_cli::{self, prompt};
-use yarli_core::domain::CommandClass;
-use yarli_core::entities::continuation::ContinuationInterventionKind;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_observability::{Registry, YarliMetrics};
-use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue};
-use yarli_store::{InMemoryEventStore, PostgresEventStore};
 
 /// `yarli run start` — create a run, submit tasks, drive scheduler with stream output.
 #[derive(Debug, Clone)]
@@ -66,7 +66,7 @@ pub(crate) struct RunPlan {
 pub(crate) struct RunExecutionOutcome {
     pub(crate) run_id: Uuid,
     pub(crate) run_state: RunState,
-    pub(crate) continuation_payload: yarli_core::entities::ContinuationPayload,
+    pub(crate) continuation_payload: yarli_cli::yarli_core::entities::ContinuationPayload,
     pub(crate) token_totals: RunTokenTotals,
 }
 
@@ -1040,7 +1040,7 @@ pub(crate) async fn execute_run_plan(
     let metrics = Arc::new(YarliMetrics::new(&mut metrics_registry));
 
     #[cfg(feature = "chaos")]
-    let chaos = Some(Arc::new(yarli_chaos::ChaosController::new()));
+    let chaos = Some(Arc::new(yarli_cli::yarli_chaos::ChaosController::new()));
 
     match loaded_config.backend_selection()? {
         BackendSelection::InMemory => {
@@ -1106,7 +1106,7 @@ pub(crate) fn finalize_run_outcome(outcome: &RunExecutionOutcome) -> Result<()> 
                 .next_tranche
                 .as_ref()
                 .is_some_and(|t| {
-                    t.kind == yarli_core::entities::continuation::TrancheKind::GateRetry
+                    t.kind == yarli_cli::yarli_core::entities::continuation::TrancheKind::GateRetry
                 })
             {
                 eprintln!(
@@ -1207,7 +1207,7 @@ pub(crate) fn print_run_summary(outcome: &RunExecutionOutcome) {
 }
 
 pub(crate) fn format_cancel_provenance_summary(
-    provenance: Option<&yarli_core::domain::CancellationProvenance>,
+    provenance: Option<&yarli_cli::yarli_core::domain::CancellationProvenance>,
 ) -> String {
     let signal = provenance
         .and_then(|p| p.signal_name.as_deref())
@@ -1322,11 +1322,11 @@ pub(crate) fn uuid_v7_timestamp(id: Uuid) -> Option<chrono::DateTime<chrono::Utc
 }
 
 pub(crate) fn build_plan_from_continuation_tranche(
-    tranche: &yarli_core::entities::continuation::TrancheSpec,
+    tranche: &yarli_cli::yarli_core::entities::continuation::TrancheSpec,
     loaded_config: &LoadedConfig,
 ) -> Result<RunPlan> {
     let mut task_keys: Vec<String> = match tranche.kind {
-        yarli_core::entities::continuation::TrancheKind::PlannedNext
+        yarli_cli::yarli_core::entities::continuation::TrancheKind::PlannedNext
             if !tranche.planned_task_keys.is_empty() =>
         {
             tranche.planned_task_keys.clone()
@@ -1433,7 +1433,7 @@ The run quality is deteriorating, so re-check strategy and scope before continui
 - Identify stale assumptions.\n- Narrow scope.\n- Introduce a deliberate reset point in the next step.";
 
 fn tranche_has_strategy_pivot_checkpoint_intervention(
-    tranche: &yarli_core::entities::continuation::TrancheSpec,
+    tranche: &yarli_cli::yarli_core::entities::continuation::TrancheSpec,
 ) -> bool {
     tranche.interventions.iter().any(|intervention| {
         intervention.kind == ContinuationInterventionKind::StrategyPivotCheckpoint
@@ -1449,7 +1449,7 @@ fn append_strategy_pivot_checkpoint_to_command(command: &str) -> String {
 }
 
 pub(crate) fn should_auto_advance_planned_tranche(
-    payload: &yarli_core::entities::ContinuationPayload,
+    payload: &yarli_cli::yarli_core::entities::ContinuationPayload,
     auto_advance: config::AutoAdvanceConfig,
     advances_taken: usize,
 ) -> (bool, String) {
@@ -1466,7 +1466,7 @@ pub(crate) fn should_auto_advance_planned_tranche(
     let Some(tranche) = payload.next_tranche.as_ref() else {
         return (false, "no next tranche available".to_string());
     };
-    if tranche.kind != yarli_core::entities::continuation::TrancheKind::PlannedNext {
+    if tranche.kind != yarli_cli::yarli_core::entities::continuation::TrancheKind::PlannedNext {
         return (
             false,
             "next tranche is retry/unfinished, not planned-next".to_string(),
@@ -2404,13 +2404,13 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
     use yarli_cli::prompt;
-    use yarli_core::domain::{CommandClass, SafeMode};
-    use yarli_core::entities::continuation::TaskHealthAction;
-    use yarli_core::entities::run::Run;
-    use yarli_core::entities::task::Task;
-    use yarli_core::explain::{DeteriorationReport, DeteriorationTrend};
-    use yarli_core::fsm::run::RunState;
-    use yarli_core::fsm::task::TaskState;
+    use yarli_cli::yarli_core::domain::{CommandClass, SafeMode};
+    use yarli_cli::yarli_core::entities::continuation::TaskHealthAction;
+    use yarli_cli::yarli_core::entities::run::Run;
+    use yarli_cli::yarli_core::entities::task::Task;
+    use yarli_cli::yarli_core::explain::{DeteriorationReport, DeteriorationTrend};
+    use yarli_cli::yarli_core::fsm::run::RunState;
+    use yarli_cli::yarli_core::fsm::task::TaskState;
 
     #[test]
     fn run_config_has_run_spec_data_detects_configured_sections() {
@@ -3432,7 +3432,7 @@ cmds = ["echo ok"]
 
     #[test]
     fn continuation_no_tranche_when_all_complete() {
-        use yarli_core::entities::continuation::ContinuationPayload;
+        use yarli_cli::yarli_core::entities::continuation::ContinuationPayload;
 
         let run = Run::new("all done", SafeMode::Execute);
         let mut t1 = Task::new(
@@ -3450,7 +3450,7 @@ cmds = ["echo ok"]
 
     #[test]
     fn continuation_tranche_includes_failed_and_unfinished() {
-        use yarli_core::entities::continuation::ContinuationPayload;
+        use yarli_cli::yarli_core::entities::continuation::ContinuationPayload;
 
         let run = Run::new("mixed", SafeMode::Execute);
         let mut t1 = Task::new(
@@ -3486,7 +3486,7 @@ cmds = ["echo ok"]
 
     #[test]
     fn continuation_planned_next_resolves_command_from_task_catalog() {
-        use yarli_core::entities::continuation::{TrancheKind, TrancheSpec};
+        use yarli_cli::yarli_core::entities::continuation::{TrancheKind, TrancheSpec};
 
         let loaded = write_test_config("");
         let prompt_entry_path = "/tmp/project/PROMPT.md";
@@ -3497,10 +3497,12 @@ cmds = ["echo ok"]
             unfinished_task_keys: vec![],
             planned_task_keys: vec!["two_task".into(), "three_task".into()],
             planned_tranche_key: Some("two".into()),
-            cursor: Some(yarli_core::entities::continuation::TrancheCursor {
-                current_tranche_index: Some(0),
-                next_tranche_index: Some(1),
-            }),
+            cursor: Some(
+                yarli_cli::yarli_core::entities::continuation::TrancheCursor {
+                    current_tranche_index: Some(0),
+                    next_tranche_index: Some(1),
+                },
+            ),
             config_snapshot: serde_json::json!({
                 "runtime": {
                     "working_dir": ".",
@@ -3546,7 +3548,7 @@ cmds = ["echo ok"]
 
     #[test]
     fn continuation_planned_next_appends_strategy_pivot_checkpoint_prompt() {
-        use yarli_core::entities::continuation::{
+        use yarli_cli::yarli_core::entities::continuation::{
             ContinuationIntervention, ContinuationInterventionKind, TrancheKind, TrancheSpec,
         };
 
@@ -3558,10 +3560,12 @@ cmds = ["echo ok"]
             unfinished_task_keys: vec![],
             planned_task_keys: vec!["one_task".into()],
             planned_tranche_key: Some("one".into()),
-            cursor: Some(yarli_core::entities::continuation::TrancheCursor {
-                current_tranche_index: Some(0),
-                next_tranche_index: Some(0),
-            }),
+            cursor: Some(
+                yarli_cli::yarli_core::entities::continuation::TrancheCursor {
+                    current_tranche_index: Some(0),
+                    next_tranche_index: Some(0),
+                },
+            ),
             config_snapshot: serde_json::json!({
                 "runtime": {
                     "working_dir": ".",
@@ -3827,7 +3831,7 @@ cmds = ["echo ok"]
 
     #[test]
     fn auto_advance_requires_planned_next_and_allowed_quality_gate() {
-        use yarli_core::entities::continuation::{
+        use yarli_cli::yarli_core::entities::continuation::{
             ContinuationPayload, ContinuationQualityGate, RunSummary, TrancheKind, TrancheSpec,
         };
 
@@ -3863,7 +3867,8 @@ cmds = ["echo ok"]
                 reason: "improving".into(),
                 trend: Some(DeteriorationTrend::Improving),
                 score: Some(10.0),
-                task_health_action: yarli_core::entities::continuation::TaskHealthAction::Continue,
+                task_health_action:
+                    yarli_cli::yarli_core::entities::continuation::TaskHealthAction::Continue,
             }),
             retry_recommendation: None,
         };

@@ -8,12 +8,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{
+use crate::yarli_core::domain::{
     CancellationProvenance, CancellationSource, CorrelationId, EventId, ExitReason, RunId,
     SafeMode, TaskId,
 };
-use crate::error::TransitionError;
-use crate::fsm::run::RunState;
+use crate::yarli_core::error::TransitionError;
+use crate::yarli_core::fsm::run::RunState;
 
 use super::transition::Transition;
 

@@ -17,9 +17,9 @@ use serde_json::Value;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::adapter::MemoryAdapter;
-use crate::error::MemoryError;
-use crate::types::{
+use crate::yarli_memory::adapter::MemoryAdapter;
+use crate::yarli_memory::error::MemoryError;
+use crate::yarli_memory::types::{
     content_may_contain_secrets, InsertMemory, LinkMemories, MemoryClass, MemoryQuery,
     MemoryRecord, RelationshipKind, ScopeId,
 };

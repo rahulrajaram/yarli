@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use yarli_core::domain::{RunId, TaskId};
+use crate::yarli_core::domain::{RunId, TaskId};
 
 /// Scope constraints for an approval token.
 #[derive(Debug, Clone, Serialize, Deserialize)]

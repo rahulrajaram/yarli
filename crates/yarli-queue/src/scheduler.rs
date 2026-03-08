@@ -18,26 +18,26 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, info_span, warn};
 use uuid::Uuid;
 
-use yarli_core::domain::{
+use crate::yarli_core::domain::{
     CommandClass, EntityType, Event, ExitReason, PolicyDecision, PolicyOutcome, RunId, TaskId,
 };
-use yarli_core::entities::command_execution::StreamChunk;
-use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
-use yarli_core::entities::run::Run;
-use yarli_core::entities::task::{BlockerCode, Task};
-use yarli_core::explain::GateType;
-use yarli_core::fsm::command::CommandState;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError};
-use yarli_gates::{all_passed, collect_failures, evaluate_all, GateContext};
-use yarli_observability::{AuditEntry, AuditSink};
-use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
-use yarli_store::event_store::EventQuery;
-use yarli_store::EventStore;
+use crate::yarli_core::entities::command_execution::StreamChunk;
+use crate::yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
+use crate::yarli_core::entities::run::Run;
+use crate::yarli_core::entities::task::{BlockerCode, Task};
+use crate::yarli_core::explain::GateType;
+use crate::yarli_core::fsm::command::CommandState;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
+use crate::yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError};
+use crate::yarli_gates::{all_passed, collect_failures, evaluate_all, GateContext};
+use crate::yarli_observability::{AuditEntry, AuditSink};
+use crate::yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
+use crate::yarli_store::event_store::EventQuery;
+use crate::yarli_store::EventStore;
 
-use crate::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry};
-use crate::TaskQueue;
+use crate::yarli_queue::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry};
+use crate::yarli_queue::TaskQueue;
 
 /// A live output chunk from a running command, for real-time streaming.
 #[derive(Debug, Clone)]
@@ -133,7 +133,7 @@ impl Default for SchedulerConfig {
             concurrency: ConcurrencyConfig::default(),
             command_timeout: None,
             working_dir: "/tmp".to_string(),
-            task_gates: yarli_gates::default_task_gates(),
+            task_gates: crate::yarli_gates::default_task_gates(),
             // Run-level gates: structural invariants only.
             // Evidence-level gates (RequiredEvidencePresent) are evaluated
             // at task level; run-level context doesn't carry per-task evidence.
@@ -158,16 +158,16 @@ impl Default for SchedulerConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error("queue error: {0}")]
-    Queue(#[from] crate::QueueError),
+    Queue(#[from] crate::yarli_queue::QueueError),
 
     #[error("exec error: {0}")]
     Exec(#[from] ExecError),
 
     #[error("store error: {0}")]
-    Store(#[from] yarli_store::StoreError),
+    Store(#[from] crate::yarli_store::StoreError),
 
     #[error("transition error: {0}")]
-    Transition(#[from] yarli_core::error::TransitionError),
+    Transition(#[from] crate::yarli_core::error::TransitionError),
 
     #[error("task not found: {0}")]
     TaskNotFound(TaskId),
@@ -176,10 +176,10 @@ pub enum SchedulerError {
     RunNotFound(RunId),
 
     #[error("policy error: {0}")]
-    Policy(#[from] yarli_policy::PolicyError),
+    Policy(#[from] crate::yarli_policy::PolicyError),
 
     #[error("audit error: {0}")]
-    Audit(#[from] yarli_observability::AuditError),
+    Audit(#[from] crate::yarli_observability::AuditError),
 
     #[error("run timed out after {0:?}")]
     RunTimedOut(Duration),
@@ -360,9 +360,9 @@ pub struct Scheduler<Q: TaskQueue, S: EventStore, R: CommandRunner> {
     task_working_dirs: Arc<RwLock<HashMap<TaskId, String>>>,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
-    metrics: Option<Arc<yarli_observability::YarliMetrics>>,
+    metrics: Option<Arc<crate::yarli_observability::YarliMetrics>>,
     #[cfg(feature = "chaos")]
-    chaos: Option<Arc<yarli_chaos::ChaosController>>,
+    chaos: Option<Arc<crate::yarli_chaos::ChaosController>>,
     config: SchedulerConfig,
     /// Optional sender for live command output streaming.
     live_output_tx: Option<tokio::sync::mpsc::UnboundedSender<LiveOutputEvent>>,
@@ -423,14 +423,14 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     }
 
     /// Configure metrics sink for telemetry export.
-    pub fn with_metrics(mut self, metrics: Arc<yarli_observability::YarliMetrics>) -> Self {
+    pub fn with_metrics(mut self, metrics: Arc<crate::yarli_observability::YarliMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
     }
 
     #[cfg(feature = "chaos")]
     /// Configure chaos controller for fault injection.
-    pub fn with_chaos(mut self, chaos: Arc<yarli_chaos::ChaosController>) -> Self {
+    pub fn with_chaos(mut self, chaos: Arc<crate::yarli_chaos::ChaosController>) -> Self {
         self.chaos = Some(chaos);
         self
     }
@@ -1125,7 +1125,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
     fn persist_policy_decision(
         &self,
-        decision: &yarli_core::domain::PolicyDecision,
+        decision: &crate::yarli_core::domain::PolicyDecision,
         task_id: TaskId,
         attempt_no: u32,
         correlation_id: Uuid,
@@ -1177,7 +1177,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         queue_id: Uuid,
         attempt_no: u32,
         correlation_id: Uuid,
-        decision: &yarli_core::domain::PolicyDecision,
+        decision: &crate::yarli_core::domain::PolicyDecision,
         command: &str,
     ) -> Result<TaskOutcome, SchedulerError> {
         let mut reg = self.registry.write().await;
@@ -1562,7 +1562,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 let mut gate_ctx = GateContext::for_task(run_id, task_id, &task_key);
                 gate_ctx.command_class = Some(command_class);
                 // Provide command evidence from the execution result
-                gate_ctx.evidence = vec![yarli_core::domain::Evidence {
+                gate_ctx.evidence = vec![crate::yarli_core::domain::Evidence {
                     evidence_id: Uuid::now_v7(),
                     task_id,
                     run_id,
@@ -1635,7 +1635,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                         .iter()
                         .map(|f| {
                             let reason = match &f.result {
-                                yarli_core::explain::GateResult::Failed { reason } => {
+                                crate::yarli_core::explain::GateResult::Failed { reason } => {
                                     reason.clone()
                                 }
                                 _ => "unknown".to_string(),
@@ -2132,9 +2132,9 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                                 .iter()
                                 .map(|f| {
                                     let reason = match &f.result {
-                                        yarli_core::explain::GateResult::Failed { reason } => {
-                                            reason.clone()
-                                        }
+                                        crate::yarli_core::explain::GateResult::Failed {
+                                            reason,
+                                        } => reason.clone(),
                                         _ => "unknown".to_string(),
                                     };
                                     format!("{}: {}", f.gate_type.label(), reason)
@@ -2218,7 +2218,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     }
 
     /// Get queue statistics.
-    pub fn queue_stats(&self) -> crate::queue::QueueStats {
+    pub fn queue_stats(&self) -> crate::yarli_queue::queue::QueueStats {
         self.queue.stats()
     }
 
@@ -2664,11 +2664,11 @@ pub struct TickResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InMemoryTaskQueue;
-    use yarli_core::domain::{CommandClass, SafeMode};
-    use yarli_exec::LocalCommandRunner;
-    use yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
-    use yarli_store::InMemoryEventStore;
+    use crate::yarli_core::domain::{CommandClass, SafeMode};
+    use crate::yarli_exec::LocalCommandRunner;
+    use crate::yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
+    use crate::yarli_queue::InMemoryTaskQueue;
+    use crate::yarli_store::InMemoryEventStore;
 
     fn test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -3294,7 +3294,7 @@ mod tests {
         let store = Arc::new(InMemoryEventStore::new());
         let runner = Arc::new(LocalCommandRunner::new());
         let config = SchedulerConfig {
-            task_gates: yarli_gates::default_task_gates(),
+            task_gates: crate::yarli_gates::default_task_gates(),
             run_gates: vec![
                 GateType::RequiredTasksClosed,
                 GateType::NoUnapprovedGitOps,

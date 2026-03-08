@@ -1,18 +1,21 @@
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::Duration;
-use yarli_chaos::{ChaosController, PanicFault};
-use yarli_core::domain::{CommandClass, EntityType, SafeMode};
-use yarli_core::entities::{Run, Task};
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_exec::LocalCommandRunner;
-use yarli_integration_tests::{
+use yarli_cli::yarli_chaos::{ChaosController, PanicFault};
+use yarli_cli::yarli_core::domain::{CommandClass, EntityType, SafeMode};
+use yarli_cli::yarli_core::entities::{Run, Task};
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_exec::LocalCommandRunner;
+#[path = "../src/lib.rs"]
+mod integration_helpers;
+
+use integration_helpers::{
     apply_migrations, connect_postgres, test_database_url_for_test, TestDatabase,
 };
-use yarli_queue::{PostgresTaskQueue, Scheduler, SchedulerConfig, TaskRegistry};
-use yarli_store::event_store::EventQuery;
-use yarli_store::{EventStore, PostgresEventStore};
+use yarli_cli::yarli_queue::{PostgresTaskQueue, Scheduler, SchedulerConfig, TaskRegistry};
+use yarli_cli::yarli_store::event_store::EventQuery;
+use yarli_cli::yarli_store::{EventStore, PostgresEventStore};
 
 fn run_state_from_db(value: &str) -> RunState {
     match value {

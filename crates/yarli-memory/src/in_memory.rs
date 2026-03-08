@@ -8,9 +8,9 @@ use std::sync::RwLock;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::adapter::MemoryAdapter;
-use crate::error::MemoryError;
-use crate::types::{
+use crate::yarli_memory::adapter::MemoryAdapter;
+use crate::yarli_memory::error::MemoryError;
+use crate::yarli_memory::types::{
     content_may_contain_secrets, InsertMemory, LinkMemories, MemoryQuery, MemoryRecord,
     RelationshipKind, ScopeId,
 };
@@ -324,7 +324,7 @@ impl MemoryAdapter for InMemoryAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::MemoryClass;
+    use crate::yarli_memory::types::MemoryClass;
 
     fn test_scope() -> ScopeId {
         ScopeId::for_run(uuid::Uuid::nil())

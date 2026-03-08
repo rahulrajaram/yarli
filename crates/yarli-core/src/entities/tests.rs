@@ -2,9 +2,9 @@
 
 #[cfg(test)]
 mod run_tests {
-    use crate::domain::{ExitReason, SafeMode};
-    use crate::entities::Run;
-    use crate::fsm::run::RunState;
+    use crate::yarli_core::domain::{ExitReason, SafeMode};
+    use crate::yarli_core::entities::Run;
+    use crate::yarli_core::fsm::run::RunState;
     use uuid::Uuid;
 
     #[test]
@@ -170,10 +170,10 @@ mod run_tests {
 
 #[cfg(test)]
 mod task_tests {
-    use crate::domain::CommandClass;
-    use crate::entities::task::BlockerCode;
-    use crate::entities::Task;
-    use crate::fsm::task::TaskState;
+    use crate::yarli_core::domain::CommandClass;
+    use crate::yarli_core::entities::task::BlockerCode;
+    use crate::yarli_core::entities::Task;
+    use crate::yarli_core::fsm::task::TaskState;
     use uuid::Uuid;
 
     fn make_task() -> Task {
@@ -462,9 +462,9 @@ mod task_tests {
 
 #[cfg(test)]
 mod command_execution_tests {
-    use crate::domain::CommandClass;
-    use crate::entities::CommandExecution;
-    use crate::fsm::command::CommandState;
+    use crate::yarli_core::domain::CommandClass;
+    use crate::yarli_core::entities::CommandExecution;
+    use crate::yarli_core::fsm::command::CommandState;
     use uuid::Uuid;
 
     fn make_cmd() -> CommandExecution {
@@ -594,7 +594,7 @@ mod command_execution_tests {
 
 #[cfg(test)]
 mod transition_tests {
-    use crate::entities::Transition;
+    use crate::yarli_core::entities::Transition;
     use uuid::Uuid;
 
     #[test]
@@ -642,8 +642,8 @@ mod transition_tests {
 
 #[cfg(test)]
 mod worktree_binding_tests {
-    use crate::entities::worktree_binding::{SubmoduleMode, WorktreeBinding};
-    use crate::fsm::worktree::WorktreeState;
+    use crate::yarli_core::entities::worktree_binding::{SubmoduleMode, WorktreeBinding};
+    use crate::yarli_core::fsm::worktree::WorktreeState;
     use uuid::Uuid;
 
     fn make_worktree() -> WorktreeBinding {
@@ -934,8 +934,10 @@ mod worktree_binding_tests {
 
 #[cfg(test)]
 mod merge_intent_tests {
-    use crate::entities::merge_intent::{ConflictRecord, ConflictType, MergeIntent, MergeStrategy};
-    use crate::fsm::merge::MergeState;
+    use crate::yarli_core::entities::merge_intent::{
+        ConflictRecord, ConflictType, MergeIntent, MergeStrategy,
+    };
+    use crate::yarli_core::fsm::merge::MergeState;
     use uuid::Uuid;
 
     fn make_merge() -> MergeIntent {

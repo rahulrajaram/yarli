@@ -7,20 +7,20 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::persistence::query_events;
-use yarli_core::domain::{
+use yarli_cli::yarli_core::domain::{
     CancellationActorKind, CancellationProvenance, CancellationSource, CancellationStage,
     EntityType, Event,
 };
-use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
-use yarli_core::entities::merge_intent::MergeIntent;
-use yarli_core::entities::worktree_binding::{SubmoduleMode, WorktreeBinding};
-use yarli_core::explain::DeteriorationReport;
-use yarli_core::fsm::merge::MergeState;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_core::fsm::worktree::WorktreeState;
-use yarli_store::event_store::EventQuery;
-use yarli_store::EventStore;
+use yarli_cli::yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
+use yarli_cli::yarli_core::entities::merge_intent::MergeIntent;
+use yarli_cli::yarli_core::entities::worktree_binding::{SubmoduleMode, WorktreeBinding};
+use yarli_cli::yarli_core::explain::DeteriorationReport;
+use yarli_cli::yarli_core::fsm::merge::MergeState;
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_core::fsm::worktree::WorktreeState;
+use yarli_cli::yarli_store::event_store::EventQuery;
+use yarli_cli::yarli_store::EventStore;
 
 use crate::observers::MemoryHintsReport;
 use crate::plan::{PlannedTranche, RunTokenTotals};

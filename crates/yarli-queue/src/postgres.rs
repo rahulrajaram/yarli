@@ -8,16 +8,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::thread;
 
+use crate::yarli_core::domain::{CommandClass, RunId, TaskId};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 use tracing::warn;
 use uuid::Uuid;
-use yarli_core::domain::{CommandClass, RunId, TaskId};
 
-use crate::error::QueueError;
-use crate::queue::{
+use crate::yarli_queue::error::QueueError;
+use crate::yarli_queue::queue::{
     ClaimRequest, ConcurrencyConfig, QueueEntry, QueueStats, QueueStatus, TaskQueue,
 };
 
@@ -991,14 +991,14 @@ fn row_to_queue_entry(row: PgRow) -> Result<QueueEntry, QueueError> {
 
 #[cfg(test)]
 mod tests {
-    use yarli_core::domain::CommandClass;
+    use crate::yarli_core::domain::CommandClass;
 
     use super::{
         classify_unique_violation, command_class_from_db, command_class_to_db,
         queue_status_from_db, queue_status_to_db, UniqueViolation, CLAIM_CANDIDATES_SCOPED_SQL,
         CLAIM_CANDIDATES_SQL,
     };
-    use crate::queue::QueueStatus;
+    use crate::yarli_queue::queue::QueueStatus;
 
     #[test]
     fn claim_sql_uses_skip_locked() {

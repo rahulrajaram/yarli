@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use yarli_core::fsm::merge::MergeState;
-use yarli_core::fsm::worktree::WorktreeState;
+use crate::yarli_core::fsm::merge::MergeState;
+use crate::yarli_core::fsm::worktree::WorktreeState;
 
 /// Top-level error type for all git-plane operations.
 #[derive(Debug, Error)]
@@ -132,11 +132,11 @@ pub enum GitError {
 
     /// State transition error from yarli-core.
     #[error("transition error: {0}")]
-    Transition(#[from] yarli_core::error::TransitionError),
+    Transition(#[from] crate::yarli_core::error::TransitionError),
 
     /// Exec error from yarli-exec command runner.
     #[error("exec error: {0}")]
-    Exec(#[from] yarli_exec::error::ExecError),
+    Exec(#[from] crate::yarli_exec::error::ExecError),
 }
 
 /// Forbidden git operations (Section 12.12, default-deny).

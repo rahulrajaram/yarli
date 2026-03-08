@@ -15,11 +15,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use yarli_core::domain::CancellationProvenance;
-use yarli_core::domain::TaskId;
-use yarli_core::entities::continuation::TaskHealthAction;
-use yarli_core::explain::DeteriorationTrend;
-use yarli_core::fsm::task::TaskState;
+use crate::yarli_core::domain::CancellationProvenance;
+use crate::yarli_core::domain::TaskId;
+use crate::yarli_core::entities::continuation::TaskHealthAction;
+use crate::yarli_core::explain::DeteriorationTrend;
+use crate::yarli_core::fsm::task::TaskState;
 
 use super::events::{StreamEvent, TaskView};
 use super::spinner::{Spinner, GLYPH_BLOCKED, GLYPH_COMPLETE, GLYPH_FAILED, GLYPH_PENDING};
@@ -359,8 +359,8 @@ impl StreamRenderer {
     fn push_run_transition(
         &mut self,
         run_id: uuid::Uuid,
-        from: yarli_core::fsm::run::RunState,
-        to: yarli_core::fsm::run::RunState,
+        from: crate::yarli_core::fsm::run::RunState,
+        to: crate::yarli_core::fsm::run::RunState,
         reason: Option<&str>,
         at: DateTime<Utc>,
         progress: ProgressSnapshot,
@@ -401,7 +401,7 @@ impl StreamRenderer {
     /// Push a continuation summary block to scrollback.
     fn push_continuation_summary(
         &mut self,
-        payload: &yarli_core::entities::ContinuationPayload,
+        payload: &crate::yarli_core::entities::ContinuationPayload,
     ) -> io::Result<()> {
         let s = &payload.summary;
 
@@ -434,7 +434,7 @@ impl StreamRenderer {
             })?;
         }
 
-        let cancelled = payload.exit_state == yarli_core::fsm::run::RunState::RunCancelled;
+        let cancelled = payload.exit_state == crate::yarli_core::fsm::run::RunState::RunCancelled;
         if cancelled || payload.cancellation_source.is_some() {
             let source = payload
                 .cancellation_source
@@ -783,8 +783,8 @@ fn display_run_id(run_id: uuid::Uuid) -> String {
 }
 
 /// Determine visual tier for a run state.
-fn tier_for_run_state(state: yarli_core::fsm::run::RunState) -> Tier {
-    use yarli_core::fsm::run::RunState;
+fn tier_for_run_state(state: crate::yarli_core::fsm::run::RunState) -> Tier {
+    use crate::yarli_core::fsm::run::RunState;
     match state {
         RunState::RunFailed | RunState::RunBlocked => Tier::Urgent,
         RunState::RunActive | RunState::RunVerifying => Tier::Active,
@@ -852,19 +852,19 @@ mod tests {
 
     #[test]
     fn tier_for_blocked_run() {
-        use yarli_core::fsm::run::RunState;
+        use crate::yarli_core::fsm::run::RunState;
         assert_eq!(tier_for_run_state(RunState::RunBlocked), Tier::Urgent);
     }
 
     #[test]
     fn tier_for_active_run() {
-        use yarli_core::fsm::run::RunState;
+        use crate::yarli_core::fsm::run::RunState;
         assert_eq!(tier_for_run_state(RunState::RunActive), Tier::Active);
     }
 
     #[test]
     fn tier_for_completed_run() {
-        use yarli_core::fsm::run::RunState;
+        use crate::yarli_core::fsm::run::RunState;
         assert_eq!(tier_for_run_state(RunState::RunCompleted), Tier::Contextual);
     }
 

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use yarli_core::domain::TaskId;
-use yarli_core::fsm::task::TaskState;
+use crate::yarli_core::domain::TaskId;
+use crate::yarli_core::fsm::task::TaskState;
 
 use crate::stream::TaskView;
 
@@ -124,11 +124,11 @@ pub struct PanelManager {
     /// Current run objective.
     pub objective: Option<String>,
     /// Current run state.
-    pub run_state: Option<yarli_core::fsm::run::RunState>,
+    pub run_state: Option<crate::yarli_core::fsm::run::RunState>,
     /// Help overlay visible.
     pub show_help: bool,
     /// Continuation payload from run exit.
-    pub continuation_payload: Option<yarli_core::entities::ContinuationPayload>,
+    pub continuation_payload: Option<crate::yarli_core::entities::ContinuationPayload>,
 }
 
 impl PanelManager {

@@ -10,18 +10,18 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use yarli_core::entities::merge_intent::{
+use crate::yarli_core::entities::merge_intent::{
     ConflictRecord, ConflictType, MergeIntent, MergeStrategy,
 };
-use yarli_core::entities::worktree_binding::WorktreeBinding;
-use yarli_core::fsm::merge::MergeState;
-use yarli_core::fsm::worktree::WorktreeState;
+use crate::yarli_core::entities::worktree_binding::WorktreeBinding;
+use crate::yarli_core::fsm::merge::MergeState;
+use crate::yarli_core::fsm::worktree::WorktreeState;
 
-use crate::commit_message::{generate_commit_message, render_commit_message, DiffSpec};
-use crate::constants::*;
-use crate::error::GitError;
-use crate::submodule::SubmoduleEntry;
-use crate::worktree::{LocalWorktreeManager, WorktreeManager};
+use crate::yarli_git::commit_message::{generate_commit_message, render_commit_message, DiffSpec};
+use crate::yarli_git::constants::*;
+use crate::yarli_git::error::GitError;
+use crate::yarli_git::submodule::SubmoduleEntry;
+use crate::yarli_git::worktree::{LocalWorktreeManager, WorktreeManager};
 
 /// Result of a merge precheck (Section 12.6).
 #[derive(Debug)]
@@ -174,7 +174,7 @@ impl LocalMergeOrchestrator {
         cwd: &Path,
         args: &[&str],
         cancel: &CancellationToken,
-    ) -> Result<crate::worktree::GitCommandOutput, GitError> {
+    ) -> Result<crate::yarli_git::worktree::GitCommandOutput, GitError> {
         self.wt_manager.run_git(cwd, args, cancel).await
     }
 

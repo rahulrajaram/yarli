@@ -19,7 +19,7 @@ pub enum ExecError {
 
     /// Invalid state transition on the command entity.
     #[error("transition error: {0}")]
-    Transition(#[from] yarli_core::error::TransitionError),
+    Transition(#[from] crate::yarli_core::error::TransitionError),
 
     /// The command was killed (e.g. during shutdown).
     #[error("command killed: {reason}")]

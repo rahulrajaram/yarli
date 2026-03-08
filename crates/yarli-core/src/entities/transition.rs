@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{CorrelationId, EventId};
+use crate::yarli_core::domain::{CorrelationId, EventId};
 
 /// A state transition event. Produced by entity state machines and persisted
 /// to the event log before any side effects proceed (Invariant 4).

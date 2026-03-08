@@ -4,9 +4,9 @@ use chrono::Utc;
 use std::path::Path;
 use uuid::Uuid;
 
-use yarli_core::domain::{EntityType, Event};
-use yarli_core::entities::continuation::{ContinuationPayload, RunSummary};
-use yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::domain::{EntityType, Event};
+use yarli_cli::yarli_core::entities::continuation::{ContinuationPayload, RunSummary};
+use yarli_cli::yarli_core::fsm::run::RunState;
 
 use crate::config::LoadedConfig;
 

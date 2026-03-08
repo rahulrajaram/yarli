@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use yarli_core::domain::{RunId, TaskId};
+use crate::yarli_core::domain::{RunId, TaskId};
 
 /// Memory class (Section 14.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

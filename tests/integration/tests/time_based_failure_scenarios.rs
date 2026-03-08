@@ -16,18 +16,21 @@ use sqlx::PgPool;
 use tokio::time::{self, Duration as TokioDuration};
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, Event, SafeMode};
-use yarli_core::entities::{Run, Task};
-use yarli_core::fsm::run::RunState;
-use yarli_exec::LocalCommandRunner;
-use yarli_integration_tests::{
+use yarli_cli::yarli_core::domain::{CommandClass, Event, SafeMode};
+use yarli_cli::yarli_core::entities::{Run, Task};
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_exec::LocalCommandRunner;
+#[path = "../src/lib.rs"]
+mod integration_helpers;
+
+use integration_helpers::{
     apply_migrations, connect_postgres, test_database_url_for_test, TestDatabase,
 };
-use yarli_queue::{
+use yarli_cli::yarli_queue::{
     ClaimRequest, ConcurrencyConfig, InMemoryTaskQueue, PostgresTaskQueue, QueueStatus,
     ResourceBudgetConfig, Scheduler, SchedulerConfig, TaskQueue,
 };
-use yarli_store::{EventStore, InMemoryEventStore};
+use yarli_cli::yarli_store::{EventStore, InMemoryEventStore};
 
 fn make_scheduler_config(
     worker_id: &str,
@@ -322,7 +325,7 @@ async fn concurrent_event_appends_keep_timestamp_ordering() {
             let event = Event {
                 event_id: Uuid::now_v7(),
                 occurred_at: base + ChronoDuration::milliseconds(seq),
-                entity_type: yarli_core::domain::EntityType::Task,
+                entity_type: yarli_cli::yarli_core::domain::EntityType::Task,
                 entity_id: Uuid::now_v7().to_string(),
                 event_type: "task.event".to_string(),
                 payload: serde_json::json!({ "seq": seq }),

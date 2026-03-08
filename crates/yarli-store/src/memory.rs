@@ -6,10 +6,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-use yarli_core::domain::{Event, EventId};
+use crate::yarli_core::domain::{Event, EventId};
 
-use crate::error::StoreError;
-use crate::event_store::{EventQuery, EventStore};
+use crate::yarli_store::error::StoreError;
+use crate::yarli_store::event_store::{EventQuery, EventStore};
 
 /// In-memory event store backed by a `Vec<Event>` behind a `RwLock`.
 ///

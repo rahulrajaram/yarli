@@ -3,10 +3,10 @@
 //! Provides detection of uninitialized/dirty submodules and policy-based
 //! validation of submodule SHA changes across merges.
 
-use yarli_core::entities::worktree_binding::SubmoduleMode;
+use crate::yarli_core::entities::worktree_binding::SubmoduleMode;
 
-use crate::constants::*;
-use crate::error::GitError;
+use crate::yarli_git::constants::*;
+use crate::yarli_git::error::GitError;
 
 /// A single entry from `git submodule status` output.
 #[derive(Debug, Clone, PartialEq, Eq)]

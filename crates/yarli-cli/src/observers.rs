@@ -11,13 +11,15 @@ use serde_json::Value;
 use tracing::warn;
 use uuid::Uuid;
 
-use yarli_core::domain::Event;
-use yarli_core::explain::{DeteriorationFactor, DeteriorationReport, DeteriorationTrend};
-use yarli_memory::{
+use yarli_cli::yarli_core::domain::Event;
+use yarli_cli::yarli_core::explain::{
+    DeteriorationFactor, DeteriorationReport, DeteriorationTrend,
+};
+use yarli_cli::yarli_memory::{
     InsertMemory, MemoryAdapter, MemoryClass, MemoryCliAdapter, MemoryQuery, ScopeId,
 };
-use yarli_store::event_store::EventQuery;
-use yarli_store::EventStore;
+use yarli_cli::yarli_store::event_store::EventQuery;
+use yarli_cli::yarli_store::EventStore;
 
 use crate::config::{LoadedConfig, MemoryProviderKind};
 use crate::plan::RunPlan;
@@ -54,7 +56,7 @@ pub(crate) struct MemoryObserver {
     run_objective: String,
     task_keys: Vec<String>,
     task_names: BTreeMap<Uuid, String>,
-    audit_sink: Option<yarli_observability::JsonlAuditSink>,
+    audit_sink: Option<yarli_cli::yarli_observability::JsonlAuditSink>,
     run_start_done: bool,
 }
 
@@ -71,7 +73,7 @@ impl MemoryObserver {
         inject_on_failure: bool,
         task_keys: Vec<String>,
         task_names: &[(Uuid, String)],
-        audit_sink: Option<yarli_observability::JsonlAuditSink>,
+        audit_sink: Option<yarli_cli::yarli_observability::JsonlAuditSink>,
     ) -> Self {
         let project_scope = ScopeId(format!("project/{project_id}"));
         Self {
@@ -134,7 +136,7 @@ impl MemoryObserver {
                     Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: Utc::now(),
-                        entity_type: yarli_core::domain::EntityType::Run,
+                        entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                         entity_id: self.run_id.to_string(),
                         event_type: "run.observer.memory_hints".to_string(),
                         payload: serde_json::to_value(&report).unwrap_or_else(|_| {
@@ -157,7 +159,7 @@ impl MemoryObserver {
                     Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: Utc::now(),
-                        entity_type: yarli_core::domain::EntityType::Run,
+                        entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                         entity_id: self.run_id.to_string(),
                         event_type: "run.observer.memory_query_failed".to_string(),
                         payload: serde_json::json!({
@@ -204,25 +206,28 @@ impl MemoryObserver {
     pub(crate) async fn observe_run_end(
         &self,
         store: &dyn EventStore,
-        payload: &yarli_core::entities::ContinuationPayload,
+        payload: &yarli_cli::yarli_core::entities::ContinuationPayload,
         gate_failures: &[String],
     ) {
         if !self.enabled {
             return;
         }
 
-        let analyzer_tasks: Vec<yarli_observability::run_analyzer::TaskOutcome> = payload
-            .tasks
-            .iter()
-            .map(|t| yarli_observability::run_analyzer::TaskOutcome {
-                task_key: t.task_key.clone(),
-                state: t.state,
-                last_error: t.last_error.clone(),
-                blocker: t.blocker.clone(),
-            })
-            .collect();
+        let analyzer_tasks: Vec<yarli_cli::yarli_observability::run_analyzer::TaskOutcome> =
+            payload
+                .tasks
+                .iter()
+                .map(
+                    |t| yarli_cli::yarli_observability::run_analyzer::TaskOutcome {
+                        task_key: t.task_key.clone(),
+                        state: t.state,
+                        last_error: t.last_error.clone(),
+                        blocker: t.blocker.clone(),
+                    },
+                )
+                .collect();
 
-        let analysis = yarli_observability::run_analyzer::analyze_run(
+        let analysis = yarli_cli::yarli_observability::run_analyzer::analyze_run(
             payload.exit_state,
             payload.exit_reason,
             &analyzer_tasks,
@@ -230,20 +235,23 @@ impl MemoryObserver {
         );
 
         // Emit analysis event
-        let pattern_names = yarli_observability::run_analyzer::pattern_names(&analysis.patterns);
+        let pattern_names =
+            yarli_cli::yarli_observability::run_analyzer::pattern_names(&analysis.patterns);
         let recommendation_str = serde_json::to_string(&analysis.retry_recommendation)
             .unwrap_or_else(|_| "unknown".to_string());
 
         if let Some(lesson) = &analysis.run_lesson {
             if let Some(sink) = &self.audit_sink {
-                let audit_entry = yarli_observability::AuditEntry::run_analysis(
+                let audit_entry = yarli_cli::yarli_observability::AuditEntry::run_analysis(
                     &pattern_names,
                     recommendation_str.as_str(),
                     analysis.confidence,
                     Some(lesson),
                     self.run_id,
                 );
-                if let Err(err) = yarli_observability::AuditSink::append(sink, &audit_entry) {
+                if let Err(err) =
+                    yarli_cli::yarli_observability::AuditSink::append(sink, &audit_entry)
+                {
                     warn!(error = %err, "failed to append run analysis audit entry");
                 }
             }
@@ -254,7 +262,7 @@ impl MemoryObserver {
             Event {
                 event_id: Uuid::now_v7(),
                 occurred_at: Utc::now(),
-                entity_type: yarli_core::domain::EntityType::Run,
+                entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                 entity_id: self.run_id.to_string(),
                 event_type: "run.observer.analysis".to_string(),
                 payload: serde_json::to_value(&analysis).unwrap_or_else(|_| {
@@ -280,9 +288,9 @@ impl MemoryObserver {
                 lesson
             ));
 
-            let mut semantic = yarli_memory::InsertMemory::new(
+            let mut semantic = yarli_cli::yarli_memory::InsertMemory::new(
                 self.project_scope.clone(),
-                yarli_memory::MemoryClass::Semantic,
+                yarli_cli::yarli_memory::MemoryClass::Semantic,
                 content,
             );
             semantic
@@ -303,7 +311,7 @@ impl MemoryObserver {
                         Event {
                             event_id: Uuid::now_v7(),
                             occurred_at: Utc::now(),
-                            entity_type: yarli_core::domain::EntityType::Run,
+                            entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                             entity_id: self.run_id.to_string(),
                             event_type: "run.observer.analysis_memory_stored".to_string(),
                             payload: serde_json::json!({
@@ -325,7 +333,7 @@ impl MemoryObserver {
                         Event {
                             event_id: Uuid::now_v7(),
                             occurred_at: Utc::now(),
-                            entity_type: yarli_core::domain::EntityType::Run,
+                            entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                             entity_id: self.run_id.to_string(),
                             event_type: "run.observer.analysis_memory_store_failed".to_string(),
                             payload: serde_json::json!({
@@ -399,7 +407,7 @@ impl MemoryObserver {
                     Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: Utc::now(),
-                        entity_type: yarli_core::domain::EntityType::Task,
+                        entity_type: yarli_cli::yarli_core::domain::EntityType::Task,
                         entity_id: task_id.to_string(),
                         event_type: "task.observer.memory_stored".to_string(),
                         payload: serde_json::json!({
@@ -420,7 +428,7 @@ impl MemoryObserver {
                     Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: Utc::now(),
-                        entity_type: yarli_core::domain::EntityType::Task,
+                        entity_type: yarli_cli::yarli_core::domain::EntityType::Task,
                         entity_id: task_id.to_string(),
                         event_type: "task.observer.memory_store_failed".to_string(),
                         payload: serde_json::json!({
@@ -483,7 +491,7 @@ impl MemoryObserver {
                     Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: Utc::now(),
-                        entity_type: yarli_core::domain::EntityType::Task,
+                        entity_type: yarli_cli::yarli_core::domain::EntityType::Task,
                         entity_id: task_id.to_string(),
                         event_type: "task.observer.memory_hints".to_string(),
                         payload: serde_json::to_value(&report).unwrap_or_else(|_| {
@@ -506,7 +514,7 @@ impl MemoryObserver {
                     Event {
                         event_id: Uuid::now_v7(),
                         occurred_at: Utc::now(),
-                        entity_type: yarli_core::domain::EntityType::Task,
+                        entity_type: yarli_cli::yarli_core::domain::EntityType::Task,
                         entity_id: task_id.to_string(),
                         event_type: "task.observer.memory_query_failed".to_string(),
                         payload: serde_json::json!({
@@ -645,7 +653,7 @@ impl TaskHealthArtifactObserver {
                 let status_event = Event {
                     event_id: Uuid::now_v7(),
                     occurred_at: captured_at,
-                    entity_type: yarli_core::domain::EntityType::Run,
+                    entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                     entity_id: self.run_id.to_string(),
                     event_type: "run.observer.task_health".to_string(),
                     payload,
@@ -877,7 +885,7 @@ impl DeteriorationObserver {
                 Event {
                     event_id: Uuid::now_v7(),
                     occurred_at: Utc::now(),
-                    entity_type: yarli_core::domain::EntityType::Run,
+                    entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                     entity_id: self.run_id.to_string(),
                     event_type: "run.observer.deterioration_detected".to_string(),
                     payload: signal.to_payload(&report),
@@ -894,7 +902,7 @@ impl DeteriorationObserver {
                 Event {
                     event_id: Uuid::now_v7(),
                     occurred_at: Utc::now(),
-                    entity_type: yarli_core::domain::EntityType::Run,
+                    entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                     entity_id: self.run_id.to_string(),
                     event_type: "run.observer.deterioration_cycle".to_string(),
                     payload: serde_json::json!({
@@ -922,7 +930,7 @@ impl DeteriorationObserver {
             Event {
                 event_id: Uuid::now_v7(),
                 occurred_at: Utc::now(),
-                entity_type: yarli_core::domain::EntityType::Run,
+                entity_type: yarli_cli::yarli_core::domain::EntityType::Run,
                 entity_id: self.run_id.to_string(),
                 event_type: "run.observer.deterioration".to_string(),
                 payload: serde_json::json!({
@@ -1785,10 +1793,10 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use uuid::Uuid;
-    use yarli_core::domain::EntityType;
-    use yarli_core::explain::DeteriorationTrend;
-    use yarli_store::event_store::EventQuery;
-    use yarli_store::InMemoryEventStore;
+    use yarli_cli::yarli_core::domain::EntityType;
+    use yarli_cli::yarli_core::explain::DeteriorationTrend;
+    use yarli_cli::yarli_store::event_store::EventQuery;
+    use yarli_cli::yarli_store::InMemoryEventStore;
 
     #[test]
     fn deterioration_scoring_distinguishes_stable_vs_deteriorating_trails() {
@@ -2344,15 +2352,15 @@ mod tests {
 
     // --- observe_run_end integration (run_analyzer path) ---
 
-    use yarli_core::entities::continuation::{ContinuationPayload, RunSummary};
-    use yarli_core::fsm::run::RunState;
-    use yarli_core::fsm::task::TaskState;
-    use yarli_observability::run_analyzer;
+    use yarli_cli::yarli_core::entities::continuation::{ContinuationPayload, RunSummary};
+    use yarli_cli::yarli_core::fsm::run::RunState;
+    use yarli_cli::yarli_core::fsm::task::TaskState;
+    use yarli_cli::yarli_observability::run_analyzer;
 
     fn make_continuation_payload(
         exit_state: RunState,
-        exit_reason: Option<yarli_core::domain::ExitReason>,
-        tasks: Vec<yarli_core::entities::continuation::TaskOutcome>,
+        exit_reason: Option<yarli_cli::yarli_core::domain::ExitReason>,
+        tasks: Vec<yarli_cli::yarli_core::entities::continuation::TaskOutcome>,
     ) -> ContinuationPayload {
         let total = tasks.len() as u32;
         let completed = tasks
@@ -2388,8 +2396,8 @@ mod tests {
     fn make_task_outcome(
         key: &str,
         state: TaskState,
-    ) -> yarli_core::entities::continuation::TaskOutcome {
-        yarli_core::entities::continuation::TaskOutcome {
+    ) -> yarli_cli::yarli_core::entities::continuation::TaskOutcome {
+        yarli_cli::yarli_core::entities::continuation::TaskOutcome {
             task_id: Uuid::new_v4(),
             task_key: key.to_string(),
             state,
@@ -2403,7 +2411,7 @@ mod tests {
     fn observe_run_end_analyzer_stores_lesson_on_failure() {
         let payload = make_continuation_payload(
             RunState::RunFailed,
-            Some(yarli_core::domain::ExitReason::BlockedOpenTasks),
+            Some(yarli_cli::yarli_core::domain::ExitReason::BlockedOpenTasks),
             vec![make_task_outcome("build", TaskState::TaskComplete), {
                 let mut t = make_task_outcome("test", TaskState::TaskFailed);
                 t.last_error = Some("exit code 1".to_string());
@@ -2439,7 +2447,7 @@ mod tests {
     fn observe_run_end_analyzer_skips_clean_completion() {
         let payload = make_continuation_payload(
             RunState::RunCompleted,
-            Some(yarli_core::domain::ExitReason::CompletedAllGates),
+            Some(yarli_cli::yarli_core::domain::ExitReason::CompletedAllGates),
             vec![
                 make_task_outcome("build", TaskState::TaskComplete),
                 make_task_outcome("test", TaskState::TaskComplete),
@@ -2474,7 +2482,7 @@ mod tests {
     fn observe_run_end_analyzer_emits_analysis_event() {
         let payload = make_continuation_payload(
             RunState::RunFailed,
-            Some(yarli_core::domain::ExitReason::BlockedGateFailure),
+            Some(yarli_cli::yarli_core::domain::ExitReason::BlockedGateFailure),
             vec![
                 make_task_outcome("build", TaskState::TaskComplete),
                 make_task_outcome("test", TaskState::TaskComplete),
@@ -2513,7 +2521,7 @@ mod tests {
     fn observe_run_end_analyzer_includes_gate_failures() {
         let payload = make_continuation_payload(
             RunState::RunFailed,
-            Some(yarli_core::domain::ExitReason::BlockedGateFailure),
+            Some(yarli_cli::yarli_core::domain::ExitReason::BlockedGateFailure),
             vec![make_task_outcome("build", TaskState::TaskComplete)],
         );
 

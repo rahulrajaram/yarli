@@ -3,15 +3,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::constants::*;
-use crate::error::*;
-use crate::merge::{LocalMergeOrchestrator, MergeLockMap, MergeOrchestrator};
-use crate::worktree::{LocalWorktreeManager, WorktreeManager};
+use crate::yarli_git::constants::*;
+use crate::yarli_git::error::*;
+use crate::yarli_git::merge::{LocalMergeOrchestrator, MergeLockMap, MergeOrchestrator};
+use crate::yarli_git::worktree::{LocalWorktreeManager, WorktreeManager};
 
-use yarli_core::entities::merge_intent::{MergeIntent, MergeStrategy};
-use yarli_core::entities::worktree_binding::WorktreeBinding;
-use yarli_core::fsm::merge::MergeState;
-use yarli_core::fsm::worktree::WorktreeState;
+use crate::yarli_core::entities::merge_intent::{MergeIntent, MergeStrategy};
+use crate::yarli_core::entities::worktree_binding::WorktreeBinding;
+use crate::yarli_core::fsm::merge::MergeState;
+use crate::yarli_core::fsm::worktree::WorktreeState;
 
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -225,7 +225,7 @@ fn io_error_conversion() {
 
 #[test]
 fn transition_error_conversion() {
-    let te = yarli_core::error::TransitionError::TerminalState("WtClosed".into());
+    let te = crate::yarli_core::error::TransitionError::TerminalState("WtClosed".into());
     let err: GitError = te.into();
     assert!(err.to_string().contains("WtClosed"));
 }
@@ -1809,14 +1809,14 @@ fn merge_parse_conflicts() {
     assert_eq!(conflicts[1].path, "file2.rs");
     assert_eq!(
         conflicts[0].conflict_type,
-        yarli_core::entities::merge_intent::ConflictType::Text
+        crate::yarli_core::entities::merge_intent::ConflictType::Text
     );
 }
 
 // ── Submodule policy enforcement tests ─────────────────────────────────
 
-use crate::submodule::{SubmoduleEntry, SubmoduleStatus};
-use yarli_core::entities::worktree_binding::SubmoduleMode;
+use crate::yarli_core::entities::worktree_binding::SubmoduleMode;
+use crate::yarli_git::submodule::{SubmoduleEntry, SubmoduleStatus};
 
 #[tokio::test]
 async fn submodule_status_returns_empty_for_no_submodules() {

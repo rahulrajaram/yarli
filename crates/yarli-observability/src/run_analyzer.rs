@@ -5,10 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use yarli_core::domain::ExitReason;
-use yarli_core::entities::task::BlockerCode;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
+use crate::yarli_core::domain::ExitReason;
+use crate::yarli_core::entities::task::BlockerCode;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
 
 /// Outcome record for a single task (mirrors continuation::TaskOutcome but decoupled).
 #[derive(Debug, Clone)]

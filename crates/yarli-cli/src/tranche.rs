@@ -638,12 +638,12 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
     use uuid::Uuid;
-    use yarli_core::entities::continuation::{
+    use yarli_cli::yarli_core::entities::continuation::{
         ContinuationPayload, ContinuationQualityGate, RunSummary, TaskHealthAction, TrancheKind,
         TrancheSpec,
     };
-    use yarli_core::explain::DeteriorationTrend;
-    use yarli_core::fsm::run::RunState;
+    use yarli_cli::yarli_core::explain::DeteriorationTrend;
+    use yarli_cli::yarli_core::fsm::run::RunState;
 
     #[test]
     fn auto_advance_blocks_stable_quality_gate() {
@@ -805,7 +805,7 @@ mod tests {
             run_id: Uuid::new_v4(),
             objective: "x".into(),
             exit_state: RunState::RunFailed,
-            exit_reason: Some(yarli_core::domain::ExitReason::BlockedGateFailure),
+            exit_reason: Some(yarli_cli::yarli_core::domain::ExitReason::BlockedGateFailure),
             cancellation_source: None,
             cancellation_provenance: None,
             completed_at: Utc::now(),

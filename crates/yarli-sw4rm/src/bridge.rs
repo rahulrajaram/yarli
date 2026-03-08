@@ -10,10 +10,10 @@ use sw4rm_sdk::{EnvelopeData, PreemptionManager};
 use tracing::info;
 use uuid::Uuid;
 
-use yarli_core::domain::CancellationSource;
-use yarli_core::domain::{EntityType, Event};
-use yarli_core::shutdown::ShutdownController;
-use yarli_store::EventStore;
+use crate::yarli_core::domain::CancellationSource;
+use crate::yarli_core::domain::{EntityType, Event};
+use crate::yarli_core::shutdown::ShutdownController;
+use crate::yarli_store::EventStore;
 
 /// Bridges sw4rm preemption to yarli's shutdown controller.
 #[derive(Clone)]
@@ -70,7 +70,7 @@ impl ShutdownBridge {
 pub fn log_envelope_to_store<S: EventStore>(
     store: &S,
     envelope: &EnvelopeData,
-) -> Result<(), yarli_store::StoreError> {
+) -> Result<(), crate::yarli_store::StoreError> {
     let event = Event {
         event_id: Uuid::now_v7(),
         occurred_at: Utc::now(),
@@ -96,9 +96,9 @@ pub fn log_envelope_to_store<S: EventStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::yarli_store::InMemoryEventStore;
     use sw4rm_sdk::EnvelopeBuilder;
     use tokio_util::sync::CancellationToken;
-    use yarli_store::InMemoryEventStore;
 
     #[test]
     fn shutdown_bridge_clone_shares_state() {

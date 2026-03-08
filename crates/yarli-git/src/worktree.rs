@@ -12,12 +12,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use yarli_core::entities::worktree_binding::WorktreeBinding;
-use yarli_core::fsm::worktree::WorktreeState;
+use crate::yarli_core::entities::worktree_binding::WorktreeBinding;
+use crate::yarli_core::fsm::worktree::WorktreeState;
 
-use crate::constants::*;
-use crate::error::{GitError, InterruptedOp, RecoveryAction};
-use crate::submodule::{self, SubmoduleEntry};
+use crate::yarli_git::constants::*;
+use crate::yarli_git::error::{GitError, InterruptedOp, RecoveryAction};
+use crate::yarli_git::submodule::{self, SubmoduleEntry};
 
 /// Output from a git command execution.
 #[derive(Debug)]
@@ -94,7 +94,7 @@ pub trait WorktreeManager: Send + Sync {
     /// that changes conform to the configured [`SubmoduleMode`].
     fn verify_submodule_policy(
         &self,
-        mode: yarli_core::entities::worktree_binding::SubmoduleMode,
+        mode: crate::yarli_core::entities::worktree_binding::SubmoduleMode,
         before: &[SubmoduleEntry],
         after: &[SubmoduleEntry],
     ) -> Result<(), GitError>;
@@ -649,7 +649,7 @@ impl WorktreeManager for LocalWorktreeManager {
 
     fn verify_submodule_policy(
         &self,
-        mode: yarli_core::entities::worktree_binding::SubmoduleMode,
+        mode: crate::yarli_core::entities::worktree_binding::SubmoduleMode,
         before: &[SubmoduleEntry],
         after: &[SubmoduleEntry],
     ) -> Result<(), GitError> {

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::messages::{ImplementationRequest, ImplementationResponse};
-use crate::orchestrator::RouterSender;
+use crate::yarli_sw4rm::messages::{ImplementationRequest, ImplementationResponse};
+use crate::yarli_sw4rm::orchestrator::RouterSender;
 
 /// Mock router sender that records sent requests and returns canned responses.
 #[derive(Debug, Clone)]
@@ -48,11 +48,11 @@ impl RouterSender for MockRouterSender {
     async fn send_implementation_request(
         &self,
         request: ImplementationRequest,
-    ) -> Result<ImplementationResponse, crate::orchestrator::OrchestratorError> {
+    ) -> Result<ImplementationResponse, crate::yarli_sw4rm::orchestrator::OrchestratorError> {
         self.sent_requests.lock().await.push(request);
         let mut responses = self.responses.lock().await;
         if responses.is_empty() {
-            return Err(crate::orchestrator::OrchestratorError::LlmTimeout);
+            return Err(crate::yarli_sw4rm::orchestrator::OrchestratorError::LlmTimeout);
         }
         Ok(responses.remove(0))
     }

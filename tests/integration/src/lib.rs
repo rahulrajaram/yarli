@@ -8,7 +8,7 @@ use std::time::Duration;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, PgPool};
 use uuid::Uuid;
-use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
+use yarli_cli::yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
 
 pub const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
 pub const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";

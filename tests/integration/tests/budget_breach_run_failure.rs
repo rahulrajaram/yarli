@@ -12,17 +12,17 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, SafeMode};
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_exec::LocalCommandRunner;
-use yarli_queue::{
+use yarli_cli::yarli_core::domain::{CommandClass, SafeMode};
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_exec::LocalCommandRunner;
+use yarli_cli::yarli_queue::{
     ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
 };
-use yarli_store::{EventStore, InMemoryEventStore};
+use yarli_cli::yarli_store::{EventStore, InMemoryEventStore};
 
-fn make_run(objective: &str) -> yarli_core::entities::Run {
-    yarli_core::entities::Run::new(objective, SafeMode::Execute)
+fn make_run(objective: &str) -> yarli_cli::yarli_core::entities::Run {
+    yarli_cli::yarli_core::entities::Run::new(objective, SafeMode::Execute)
 }
 
 fn make_task(
@@ -30,8 +30,14 @@ fn make_task(
     key: &str,
     command: &str,
     correlation_id: Uuid,
-) -> yarli_core::entities::Task {
-    yarli_core::entities::Task::new(run_id, key, command, CommandClass::Io, correlation_id)
+) -> yarli_cli::yarli_core::entities::Task {
+    yarli_cli::yarli_core::entities::Task::new(
+        run_id,
+        key,
+        command,
+        CommandClass::Io,
+        correlation_id,
+    )
 }
 
 #[tokio::test]

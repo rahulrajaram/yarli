@@ -16,7 +16,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
-use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES, MIGRATION_0003_RUN_DRAINED_STATE};
+use yarli_cli::yarli_store::{
+    MIGRATION_0001_INIT, MIGRATION_0002_INDEXES, MIGRATION_0003_RUN_DRAINED_STATE,
+};
 
 const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
 const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";

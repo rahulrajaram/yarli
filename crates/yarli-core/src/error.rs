@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::fsm::{
+use crate::yarli_core::fsm::{
     command::CommandState, merge::MergeState, run::RunState, task::TaskState,
     worktree::WorktreeState,
 };

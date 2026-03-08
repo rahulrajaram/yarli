@@ -9,10 +9,10 @@ use std::sync::RwLock;
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, RunId, TaskId};
+use crate::yarli_core::domain::{CommandClass, RunId, TaskId};
 
-use crate::error::QueueError;
-use crate::queue::{
+use crate::yarli_queue::error::QueueError;
+use crate::yarli_queue::queue::{
     ClaimRequest, ConcurrencyConfig, QueueEntry, QueueStats, QueueStatus, TaskQueue,
 };
 

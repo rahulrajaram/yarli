@@ -14,9 +14,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, RunId, TaskId};
+use crate::yarli_core::domain::{CommandClass, RunId, TaskId};
 
-use crate::QueueError;
+use crate::yarli_queue::QueueError;
 
 /// Status of a queue entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -19,8 +19,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
 
 use super::copy_mode::CopyMode;
 use super::input::{map_key_event, DashboardAction};
@@ -30,7 +30,7 @@ use super::widgets::CollapsiblePanel;
 use crate::stream::events::StreamEvent;
 use crate::stream::spinner::{Spinner, GLYPH_BLOCKED, GLYPH_COMPLETE, GLYPH_FAILED, GLYPH_PENDING};
 use crate::stream::style::Tier;
-use yarli_observability::{AuditSink, JsonlAuditSink};
+use crate::yarli_observability::{AuditSink, JsonlAuditSink};
 
 /// Configuration for the dashboard renderer.
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ impl Default for DashboardConfig {
 pub struct DashboardRenderer {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     state: PanelManager,
-    spinners: std::collections::HashMap<yarli_core::domain::TaskId, Spinner>,
+    spinners: std::collections::HashMap<crate::yarli_core::domain::TaskId, Spinner>,
     config: DashboardConfig,
     copy_mode: CopyMode,
     overlays: OverlayStack,
@@ -480,7 +480,7 @@ fn build_audit_lines_from_file(path: &Path) -> io::Result<Vec<Line<'static>>> {
 /// Build task list lines with state glyphs and timing.
 pub fn build_task_list_lines<'a>(
     state: &PanelManager,
-    spinners: &std::collections::HashMap<yarli_core::domain::TaskId, Spinner>,
+    spinners: &std::collections::HashMap<crate::yarli_core::domain::TaskId, Spinner>,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
 

@@ -13,10 +13,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{RunId, TaskId};
-use crate::entities::command_execution::{CommandResourceUsage, TokenUsage};
-use crate::fsm::run::RunState;
-use crate::fsm::task::TaskState;
+use crate::yarli_core::domain::{RunId, TaskId};
+use crate::yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
 
 // ---------------------------------------------------------------------------
 // Gate types (Section 11.1)

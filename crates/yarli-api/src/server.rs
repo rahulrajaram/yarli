@@ -1,3 +1,5 @@
+#[cfg(feature = "debug-api")]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::sync::{
@@ -6,6 +8,19 @@ use std::sync::{
 };
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::yarli_core::domain::{EntityType, Event};
+#[cfg(feature = "debug-api")]
+use crate::yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
+use crate::yarli_core::explain::DeteriorationReport;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
+use crate::yarli_observability::{encode_metrics, YarliMetrics};
+#[cfg(feature = "debug-api")]
+use crate::yarli_queue::QueueError;
+#[cfg(feature = "debug-api")]
+use crate::yarli_queue::TaskQueue;
+use crate::yarli_store::event_store::EventQuery;
+use crate::yarli_store::{EventStore, StoreError};
 use axum::extract::{
     ws::{Message, WebSocket, WebSocketUpgrade},
     Extension, Path, Query, State,
@@ -25,19 +40,6 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
-use yarli_core::domain::{EntityType, Event};
-#[cfg(feature = "debug-api")]
-use yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
-use yarli_core::explain::DeteriorationReport;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_observability::{encode_metrics, YarliMetrics};
-#[cfg(feature = "debug-api")]
-use yarli_queue::QueueError;
-#[cfg(feature = "debug-api")]
-use yarli_queue::TaskQueue;
-use yarli_store::event_store::EventQuery;
-use yarli_store::{EventStore, StoreError};
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const API_KEYS_ENV: &str = "YARLI_API_KEYS";
@@ -123,7 +125,7 @@ impl ApiState {
     }
 
     #[cfg(feature = "debug-api")]
-    pub fn new_with_queue_and_security(
+    pub(crate) fn new_with_queue_and_security(
         store: Arc<dyn EventStore>,
         queue: Arc<dyn TaskQueue>,
         security: ApiSecurityConfig,
@@ -425,10 +427,22 @@ pub fn router_with_queue(store: Arc<dyn EventStore>, queue: Arc<dyn TaskQueue>) 
     start_webhook_dispatcher(state.clone());
 
     build_api_router(state.clone())
-        .route("/v1/tasks/:task_id/priority", post(task_override_priority))
-        .route("/debug/queue-depth", get(debug_queue_depth))
-        .route("/debug/active-leases", get(debug_active_leases))
-        .route("/debug/resource-usage/:run_id", get(debug_resource_usage))
+        .route(
+            "/v1/tasks/:task_id/priority",
+            post(task_override_priority).with_state(state.clone()),
+        )
+        .route(
+            "/debug/queue-depth",
+            get(debug_queue_depth).with_state(state.clone()),
+        )
+        .route(
+            "/debug/active-leases",
+            get(debug_active_leases).with_state(state.clone()),
+        )
+        .route(
+            "/debug/resource-usage/:run_id",
+            get(debug_resource_usage).with_state(state),
+        )
 }
 
 pub async fn serve(
@@ -2171,11 +2185,11 @@ async fn debug_queue_depth(
     for entry in entries {
         let status = entry.status;
         let status_key = match status {
-            yarli_queue::queue::QueueStatus::Pending => "pending",
-            yarli_queue::queue::QueueStatus::Leased => "leased",
-            yarli_queue::queue::QueueStatus::Completed => "completed",
-            yarli_queue::queue::QueueStatus::Failed => "failed",
-            yarli_queue::queue::QueueStatus::Cancelled => "cancelled",
+            crate::yarli_queue::queue::QueueStatus::Pending => "pending",
+            crate::yarli_queue::queue::QueueStatus::Leased => "leased",
+            crate::yarli_queue::queue::QueueStatus::Completed => "completed",
+            crate::yarli_queue::queue::QueueStatus::Failed => "failed",
+            crate::yarli_queue::queue::QueueStatus::Cancelled => "cancelled",
         };
 
         overall.add(status_key);
@@ -2235,7 +2249,7 @@ async fn debug_active_leases(
     let active_leases = queue
         .entries()
         .into_iter()
-        .filter(|entry| matches!(entry.status, yarli_queue::queue::QueueStatus::Leased))
+        .filter(|entry| matches!(entry.status, crate::yarli_queue::queue::QueueStatus::Leased))
         .map(|entry| ActiveLeaseResponse {
             queue_id: entry.queue_id,
             run_id: entry.run_id,
@@ -2698,16 +2712,16 @@ fn collect_api_resource_totals(events: &[Event]) -> ResourceUsageTotals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "debug-api")]
+    use crate::yarli_core::domain::CommandClass;
+    #[cfg(feature = "debug-api")]
+    use crate::yarli_queue::InMemoryTaskQueue;
+    use crate::yarli_store::InMemoryEventStore;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use chrono::Duration;
     use serde_json::json;
     use tower::ServiceExt;
-    #[cfg(feature = "debug-api")]
-    use yarli_core::domain::CommandClass;
-    #[cfg(feature = "debug-api")]
-    use yarli_queue::InMemoryTaskQueue;
-    use yarli_store::InMemoryEventStore;
 
     #[tokio::test]
     async fn health_endpoint_returns_ok() {

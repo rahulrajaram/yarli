@@ -23,28 +23,34 @@ use yarli_cli::dashboard::{DashboardConfig, DashboardRenderer};
 use yarli_cli::mode::{self, RenderMode, TerminalInfo};
 use yarli_cli::prompt;
 use yarli_cli::stream::{HeadlessRenderer, StreamConfig, StreamEvent, StreamRenderer};
-use yarli_core::domain::{
+use yarli_cli::yarli_core::domain::{
     CancellationActorKind, CancellationProvenance, CancellationSource, CancellationStage,
     CommandClass, EntityType, Event, Evidence, PolicyOutcome, SafeMode,
 };
-use yarli_core::entities::merge_intent::MergeStrategy;
-use yarli_core::entities::run::Run;
-use yarli_core::entities::task::Task;
-use yarli_core::entities::worktree_binding::{SubmoduleMode, WorktreeBinding};
-use yarli_core::explain::{DeteriorationReport, DeteriorationTrend, GateResult, GateType};
-use yarli_core::fsm::merge::MergeState;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_core::fsm::worktree::WorktreeState;
-use yarli_core::shutdown::ShutdownController;
-use yarli_gates::{default_run_gates, default_task_gates, evaluate_all, GateContext};
-use yarli_git::error::{GitError, RecoveryAction};
-use yarli_git::{LocalMergeOrchestrator, LocalWorktreeManager, MergeOrchestrator, WorktreeManager};
-use yarli_observability::{init_tracing, AuditEntry, AuditSink, JsonlAuditSink, TracingConfig};
-use yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
-use yarli_queue::{ResourceBudgetConfig, Scheduler, SchedulerConfig};
-use yarli_store::event_store::EventQuery;
-use yarli_store::EventStore;
+use yarli_cli::yarli_core::entities::merge_intent::MergeStrategy;
+use yarli_cli::yarli_core::entities::run::Run;
+use yarli_cli::yarli_core::entities::task::Task;
+use yarli_cli::yarli_core::entities::worktree_binding::{SubmoduleMode, WorktreeBinding};
+use yarli_cli::yarli_core::explain::{
+    DeteriorationReport, DeteriorationTrend, GateResult, GateType,
+};
+use yarli_cli::yarli_core::fsm::merge::MergeState;
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_core::fsm::worktree::WorktreeState;
+use yarli_cli::yarli_core::shutdown::ShutdownController;
+use yarli_cli::yarli_gates::{default_run_gates, default_task_gates, evaluate_all, GateContext};
+use yarli_cli::yarli_git::error::{GitError, RecoveryAction};
+use yarli_cli::yarli_git::{
+    LocalMergeOrchestrator, LocalWorktreeManager, MergeOrchestrator, WorktreeManager,
+};
+use yarli_cli::yarli_observability::{
+    init_tracing, AuditEntry, AuditSink, JsonlAuditSink, TracingConfig,
+};
+use yarli_cli::yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
+use yarli_cli::yarli_queue::{ResourceBudgetConfig, Scheduler, SchedulerConfig};
+use yarli_cli::yarli_store::event_store::EventQuery;
+use yarli_cli::yarli_store::EventStore;
 
 use clap::Parser;
 

@@ -11,11 +11,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::events::StreamEvent;
-use yarli_core::domain::CancellationProvenance;
-use yarli_core::entities::continuation::TaskHealthAction;
-use yarli_core::explain::DeteriorationTrend;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
+use crate::yarli_core::domain::CancellationProvenance;
+use crate::yarli_core::entities::continuation::TaskHealthAction;
+use crate::yarli_core::explain::DeteriorationTrend;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
 
 /// Counts for the final run summary.
 #[derive(Default)]
@@ -286,10 +286,10 @@ fn force_pivot_guidance(trend: Option<&DeteriorationTrend>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::yarli_core::fsm::run::RunState;
     use chrono::Utc;
     use std::time::Duration;
     use uuid::Uuid;
-    use yarli_core::fsm::run::RunState;
 
     #[test]
     fn headless_counts_complete_tasks() {
@@ -433,10 +433,10 @@ mod tests {
 
     #[test]
     fn headless_handles_run_exited_without_panic() {
-        use yarli_core::domain::{CommandClass, SafeMode};
-        use yarli_core::entities::continuation::ContinuationPayload;
-        use yarli_core::entities::run::Run;
-        use yarli_core::entities::task::Task;
+        use crate::yarli_core::domain::{CommandClass, SafeMode};
+        use crate::yarli_core::entities::continuation::ContinuationPayload;
+        use crate::yarli_core::entities::run::Run;
+        use crate::yarli_core::entities::task::Task;
 
         let run = Run::new("test", SafeMode::Execute);
         let mut t = Task::new(
@@ -456,7 +456,9 @@ mod tests {
 
     #[test]
     fn run_exited_summary_overrides_transition_failure_counts() {
-        use yarli_core::entities::continuation::{ContinuationPayload, RunSummary, TrancheSpec};
+        use crate::yarli_core::entities::continuation::{
+            ContinuationPayload, RunSummary, TrancheSpec,
+        };
 
         let mut renderer = HeadlessRenderer::new();
         let run_id = Uuid::new_v4();
@@ -490,7 +492,7 @@ mod tests {
                 },
                 next_tranche: Some(TrancheSpec {
                     suggested_objective: "next".into(),
-                    kind: yarli_core::entities::continuation::TrancheKind::PlannedNext,
+                    kind: crate::yarli_core::entities::continuation::TrancheKind::PlannedNext,
                     retry_task_keys: Vec::new(),
                     unfinished_task_keys: Vec::new(),
                     planned_task_keys: vec!["t2".into()],

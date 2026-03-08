@@ -1,8 +1,8 @@
 //! Gate engine error types.
 
+use crate::yarli_core::explain::GateType;
 use thiserror::Error;
 use uuid::Uuid;
-use yarli_core::explain::GateType;
 
 /// Errors from gate evaluation.
 #[derive(Debug, Error)]
@@ -25,7 +25,7 @@ pub enum GateError {
 
     /// Event store error during gate evaluation.
     #[error("store error: {0}")]
-    Store(#[from] yarli_store::StoreError),
+    Store(#[from] crate::yarli_store::StoreError),
 
     /// Task or run not found.
     #[error("entity not found: {0}")]

@@ -12,16 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use yarli_core::domain::{CommandClass, SafeMode};
-use yarli_core::entities::{Run, Task};
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_core::shutdown::ShutdownController;
-use yarli_exec::LocalCommandRunner;
-use yarli_queue::{
+use yarli_cli::yarli_core::domain::{CommandClass, SafeMode};
+use yarli_cli::yarli_core::entities::{Run, Task};
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_core::shutdown::ShutdownController;
+use yarli_cli::yarli_exec::LocalCommandRunner;
+use yarli_cli::yarli_queue::{
     ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
 };
-use yarli_store::InMemoryEventStore;
+use yarli_cli::yarli_store::InMemoryEventStore;
 
 #[tokio::test]
 async fn graceful_shutdown_cancels_running_tasks() {
@@ -175,8 +175,8 @@ async fn scheduler_loop_with_cancellation_completes_fast_task() {
 #[cfg(unix)]
 #[tokio::test]
 async fn terminate_children_kills_tracked_processes() {
-    use yarli_core::entities::command_execution::StreamChunk;
-    use yarli_exec::{CommandRequest, CommandRunner};
+    use yarli_cli::yarli_core::entities::command_execution::StreamChunk;
+    use yarli_cli::yarli_exec::{CommandRequest, CommandRunner};
 
     let shutdown = ShutdownController::new();
     let runner = LocalCommandRunner::new().with_shutdown(shutdown.clone());

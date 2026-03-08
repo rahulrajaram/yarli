@@ -9,11 +9,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use yarli_core::domain::{Evidence, RunId, TaskId};
-use yarli_core::explain::{GateResult, GateType};
-use yarli_core::fsm::task::TaskState;
+use crate::yarli_core::domain::{Evidence, RunId, TaskId};
+use crate::yarli_core::explain::{GateResult, GateType};
+use crate::yarli_core::fsm::task::TaskState;
 
-use crate::evidence::validate_evidence_schema;
+use crate::yarli_gates::evidence::validate_evidence_schema;
 
 // ---------------------------------------------------------------------------
 // Gate evaluation context
@@ -46,7 +46,7 @@ pub struct GateContext {
     /// Policy violations found during evaluation.
     pub policy_violations: Vec<String>,
     /// Command class of the task (for evidence schema validation).
-    pub command_class: Option<yarli_core::domain::CommandClass>,
+    pub command_class: Option<crate::yarli_core::domain::CommandClass>,
 }
 
 impl GateContext {
@@ -281,9 +281,9 @@ fn eval_required_evidence_present(ctx: &GateContext) -> (GateResult, Option<Stri
 fn eval_tests_passed(ctx: &GateContext) -> (GateResult, Option<String>) {
     // Look for test report evidence first
     for ev in &ctx.evidence {
-        if let Ok(report) =
-            serde_json::from_value::<crate::evidence::TestReportEvidence>(ev.payload.clone())
-        {
+        if let Ok(report) = serde_json::from_value::<crate::yarli_gates::evidence::TestReportEvidence>(
+            ev.payload.clone(),
+        ) {
             if report.failed > 0 {
                 return (
                     GateResult::Failed {
@@ -423,7 +423,7 @@ fn eval_policy_clean(ctx: &GateContext) -> (GateResult, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarli_core::domain::{CommandClass, Evidence};
+    use crate::yarli_core::domain::{CommandClass, Evidence};
 
     fn make_evidence(payload: serde_json::Value) -> Evidence {
         Evidence {

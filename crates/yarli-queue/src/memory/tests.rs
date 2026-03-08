@@ -3,11 +3,13 @@
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, RunId};
+use crate::yarli_core::domain::{CommandClass, RunId};
 
-use crate::memory::InMemoryTaskQueue;
-use crate::queue::{ClaimRequest, ConcurrencyConfig, QueueStats, QueueStatus, TaskQueue};
-use crate::QueueError;
+use crate::yarli_queue::memory::InMemoryTaskQueue;
+use crate::yarli_queue::queue::{
+    ClaimRequest, ConcurrencyConfig, QueueStats, QueueStatus, TaskQueue,
+};
+use crate::yarli_queue::QueueError;
 
 fn make_run_id() -> RunId {
     Uuid::now_v7()

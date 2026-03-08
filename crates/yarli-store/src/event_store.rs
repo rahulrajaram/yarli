@@ -5,9 +5,9 @@
 //! proceed (Invariant 4). The store supports event-sourced replay to
 //! reconstruct materialized state (Invariant 6, Section 18.2).
 
-use yarli_core::domain::{CorrelationId, EntityType, Event, EventId};
+use crate::yarli_core::domain::{CorrelationId, EntityType, Event, EventId};
 
-use crate::StoreError;
+use crate::yarli_store::StoreError;
 
 /// Query filter for retrieving events.
 #[derive(Debug, Default, Clone)]

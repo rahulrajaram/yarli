@@ -11,8 +11,8 @@
 //! - Large outputs stored as artifacts; memory stores summaries + references
 //! - Memory operation failures produce explicit warnings/events
 
-use crate::error::MemoryError;
-use crate::types::{InsertMemory, LinkMemories, MemoryQuery, MemoryRecord, ScopeId};
+use crate::yarli_memory::error::MemoryError;
+use crate::yarli_memory::types::{InsertMemory, LinkMemories, MemoryQuery, MemoryRecord, ScopeId};
 
 /// Async memory adapter trait.
 ///

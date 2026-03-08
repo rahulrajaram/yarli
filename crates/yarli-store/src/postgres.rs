@@ -8,16 +8,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+use crate::yarli_core::domain::{EntityType, Event, EventId};
+use crate::yarli_observability::YarliMetrics;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 use tracing::warn;
-use yarli_core::domain::{EntityType, Event, EventId};
-use yarli_observability::YarliMetrics;
 
-use crate::error::StoreError;
-use crate::event_store::{EventQuery, EventStore};
+use crate::yarli_store::error::StoreError;
+use crate::yarli_store::event_store::{EventQuery, EventStore};
 
 /// Postgres-backed event store.
 #[derive(Debug, Clone)]
@@ -25,7 +25,7 @@ pub struct PostgresEventStore {
     pool: PgPool,
     metrics: Option<Arc<YarliMetrics>>,
     #[cfg(feature = "chaos")]
-    chaos: Option<Arc<yarli_chaos::ChaosController>>,
+    chaos: Option<Arc<crate::yarli_chaos::ChaosController>>,
 }
 
 impl PostgresEventStore {
@@ -61,7 +61,7 @@ impl PostgresEventStore {
 
     #[cfg(feature = "chaos")]
     /// Configure chaos controller for fault injection.
-    pub fn with_chaos(mut self, chaos: Arc<yarli_chaos::ChaosController>) -> Self {
+    pub fn with_chaos(mut self, chaos: Arc<crate::yarli_chaos::ChaosController>) -> Self {
         self.chaos = Some(chaos);
         self
     }
@@ -444,7 +444,7 @@ fn row_to_event(row: PgRow) -> Result<Event, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use yarli_core::domain::EntityType;
+    use crate::yarli_core::domain::EntityType;
 
     use super::{
         classify_unique_violation, entity_type_from_db, entity_type_to_db, UniqueViolation,

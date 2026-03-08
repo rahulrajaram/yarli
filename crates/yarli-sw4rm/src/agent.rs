@@ -12,27 +12,28 @@ use sw4rm_sdk::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::bridge::ShutdownBridge;
-use crate::config::Sw4rmConfig;
-use crate::messages::{OrchestrationReport, CT_ORCHESTRATION_REPORT};
-use crate::orchestrator::{ObjectiveParams, OrchestratorLoop, RouterSender};
+use crate::yarli_exec::{CommandRunner, LocalCommandRunner};
+use crate::yarli_sw4rm::bridge::ShutdownBridge;
+use crate::yarli_sw4rm::config::Sw4rmConfig;
+use crate::yarli_sw4rm::messages::{OrchestrationReport, CT_ORCHESTRATION_REPORT};
+use crate::yarli_sw4rm::orchestrator::{ObjectiveParams, OrchestratorLoop, RouterSender};
 
 /// YarliAgent implements `sw4rm_sdk::Agent` to act as an orchestrator
 /// in the sw4rm protocol.
-pub struct YarliAgent<R: RouterSender> {
+pub struct YarliAgent<R: RouterSender, V: CommandRunner = LocalCommandRunner> {
     agent_config: AgentConfig,
     preemption: PreemptionManager,
     #[allow(dead_code)]
     sw4rm_config: Sw4rmConfig,
-    orchestrator: Arc<OrchestratorLoop<R>>,
+    orchestrator: Arc<OrchestratorLoop<R, V>>,
     shutdown_bridge: Option<ShutdownBridge>,
 }
 
-impl<R: RouterSender + 'static> YarliAgent<R> {
+impl<R: RouterSender + 'static, V: CommandRunner + Clone + 'static> YarliAgent<R, V> {
     pub fn new(
         agent_config: AgentConfig,
         sw4rm_config: Sw4rmConfig,
-        orchestrator: Arc<OrchestratorLoop<R>>,
+        orchestrator: Arc<OrchestratorLoop<R, V>>,
     ) -> Self {
         Self {
             agent_config,
@@ -168,7 +169,9 @@ impl<R: RouterSender + 'static> YarliAgent<R> {
 }
 
 #[async_trait]
-impl<R: RouterSender + 'static> sw4rm_sdk::Agent for YarliAgent<R> {
+impl<R: RouterSender + 'static, V: CommandRunner + Clone + 'static> sw4rm_sdk::Agent
+    for YarliAgent<R, V>
+{
     async fn on_message(&mut self, envelope: EnvelopeData) -> sw4rm_sdk::Result<()> {
         match envelope.content_type.as_str() {
             CT_SCHEDULER_COMMAND_V1 => self.handle_scheduler_command(&envelope).await,
@@ -207,11 +210,11 @@ impl<R: RouterSender + 'static> sw4rm_sdk::Agent for YarliAgent<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::ImplementationResponse;
-    use crate::mock::MockRouterSender;
-    use crate::orchestrator::{VerificationCommand, VerificationSpec};
+    use crate::yarli_core::domain::CommandClass;
+    use crate::yarli_sw4rm::messages::ImplementationResponse;
+    use crate::yarli_sw4rm::mock::MockRouterSender;
+    use crate::yarli_sw4rm::orchestrator::{VerificationCommand, VerificationSpec};
     use sw4rm_sdk::{Agent, EnvelopeBuilder, SchedulerCommandV1, SchedulerStage};
-    use yarli_core::domain::CommandClass;
 
     fn test_agent() -> YarliAgent<MockRouterSender> {
         let config = AgentConfig::new("test-agent".into(), "Test Agent".into());
@@ -300,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_with_shutdown_bridge() {
-        let shutdown = yarli_core::shutdown::ShutdownController::new();
+        let shutdown = crate::yarli_core::shutdown::ShutdownController::new();
         let bridge = ShutdownBridge::new(shutdown.clone());
         let agent = test_agent().with_shutdown_bridge(bridge);
         assert!(agent.shutdown_bridge.is_some());
@@ -308,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_cancellation_wired_through_bridge() {
-        let shutdown = yarli_core::shutdown::ShutdownController::new();
+        let shutdown = crate::yarli_core::shutdown::ShutdownController::new();
         let bridge = ShutdownBridge::new(shutdown.clone());
 
         // Pre-cancel the shutdown controller

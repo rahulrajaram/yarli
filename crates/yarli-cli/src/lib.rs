@@ -25,3 +25,30 @@ pub mod dashboard;
 pub mod mode;
 pub mod prompt;
 pub mod stream;
+
+#[path = "../../yarli-api/src/lib.rs"]
+pub mod yarli_api;
+#[cfg(feature = "chaos")]
+#[path = "../../yarli-chaos/src/lib.rs"]
+pub mod yarli_chaos;
+#[path = "../../yarli-core/src/lib.rs"]
+pub mod yarli_core;
+#[path = "../../yarli-exec/src/lib.rs"]
+pub mod yarli_exec;
+#[path = "../../yarli-gates/src/lib.rs"]
+pub mod yarli_gates;
+#[path = "../../yarli-git/src/lib.rs"]
+pub mod yarli_git;
+#[path = "../../yarli-memory/src/lib.rs"]
+pub mod yarli_memory;
+#[path = "../../yarli-observability/src/lib.rs"]
+pub mod yarli_observability;
+#[path = "../../yarli-policy/src/lib.rs"]
+pub mod yarli_policy;
+#[path = "../../yarli-queue/src/lib.rs"]
+pub mod yarli_queue;
+#[path = "../../yarli-store/src/lib.rs"]
+pub mod yarli_store;
+#[cfg(any(feature = "sw4rm", feature = "test-support"))]
+#[path = "../../yarli-sw4rm/src/lib.rs"]
+pub mod yarli_sw4rm;

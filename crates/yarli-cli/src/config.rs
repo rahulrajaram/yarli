@@ -11,11 +11,11 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use serde::{de::Deserializer, Deserialize, Serialize};
 use sqlx::postgres::PgConnectOptions;
-use yarli_core::domain::SafeMode;
-use yarli_core::entities::continuation::TaskHealthAction;
-use yarli_observability::JsonlAuditSink;
-use yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, TaskQueue};
-use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
+use yarli_cli::yarli_core::domain::SafeMode;
+use yarli_cli::yarli_core::entities::continuation::TaskHealthAction;
+use yarli_cli::yarli_observability::JsonlAuditSink;
+use yarli_cli::yarli_queue::{InMemoryTaskQueue, PostgresTaskQueue, TaskQueue};
+use yarli_cli::yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore};
 
 pub const DEFAULT_CONFIG_PATH: &str = "yarli.toml";
 const DATABASE_URL_ENV: &str = "DATABASE_URL";
@@ -673,7 +673,7 @@ pub struct YarliConfig {
     /// sw4rm agent integration (only compiled with `sw4rm` feature).
     #[cfg(feature = "sw4rm")]
     #[serde(default)]
-    pub sw4rm: yarli_sw4rm::Sw4rmConfig,
+    pub sw4rm: yarli_cli::yarli_sw4rm::Sw4rmConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,93 +1,130 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/yarli-core",
-    "crates/yarli-store",
-    "crates/yarli-queue",
-    "crates/yarli-exec",
-    "crates/yarli-git",
-    "crates/yarli-gates",
-    "crates/yarli-policy",
-    "crates/yarli-memory",
-    "crates/yarli-observability",
-    "crates/yarli-sw4rm",
-    "crates/yarli-api",
-    "crates/yarli-cli",
-    "tests/integration", "crates/yarli-chaos",
-]
-
-[workspace.package]
+[package]
+name = "yarli"
+description = "CLI, stream mode renderer, interactive TUI, scheduler, store, and API"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
+build = "crates/yarli-cli/build.rs"
 
-[workspace.dependencies]
-# Core domain
-yarli-core = { path = "crates/yarli-core" }
-yarli-store = { path = "crates/yarli-store" }
-yarli-queue = { path = "crates/yarli-queue" }
-yarli-exec = { path = "crates/yarli-exec" }
-yarli-git = { path = "crates/yarli-git" }
-yarli-gates = { path = "crates/yarli-gates" }
-yarli-policy = { path = "crates/yarli-policy" }
-yarli-memory = { path = "crates/yarli-memory" }
-yarli-observability = { path = "crates/yarli-observability" }
-yarli-sw4rm = { path = "crates/yarli-sw4rm" }
-yarli-cli = { path = "crates/yarli-cli" }
-yarli-chaos = { path = "crates/yarli-chaos" }
+[lib]
+name = "yarli_cli"
+path = "crates/yarli-cli/src/lib.rs"
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+[[bin]]
+name = "yarli"
+path = "crates/yarli-cli/src/main.rs"
 
-# Agent protocol
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+futures-util = { version = "0.3", features = ["sink"] }
 sw4rm-sdk = "0.4"
 async-trait = "0.1"
-
-# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
-
-# IDs and time
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-
-# Error handling
 thiserror = "2"
 anyhow = "1"
-
-# Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.27"
-
-# Observability
 opentelemetry = "0.26"
 opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.26"
-
-# Metrics
 prometheus-client = "0.23"
-
-# TUI
 ratatui = "0.29"
 crossterm = "0.28"
 owo-colors = "4"
-
-# CLI
 clap = { version = "4", features = ["derive"] }
-
-# Config
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+libc = "0.2"
 
-# Testing
+[features]
+default = []
+sw4rm = []
+chaos = []
+debug-api = []
+test-support = []
+
+[dev-dependencies]
 assert_matches = "1.5"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+axum08 = { package = "axum", version = "0.8" }
+
+[[test]]
+name = "yarli_api_postgres_integration"
+path = "crates/yarli-api/tests/postgres_integration.rs"
+
+[[test]]
+name = "yarli_parallel_merge_integration"
+path = "crates/yarli-cli/tests/parallel_merge_integration.rs"
+
+[[test]]
+name = "yarli_cli_postgres_integration"
+path = "crates/yarli-cli/tests/postgres_integration.rs"
+
+[[test]]
+name = "yarli_tranches_preflight_integration"
+path = "crates/yarli-cli/tests/tranches_preflight_integration.rs"
+
+[[test]]
+name = "yarli_queue_postgres_integration"
+path = "crates/yarli-queue/tests/postgres_integration.rs"
+
+[[test]]
+name = "yarli_store_postgres_integration"
+path = "crates/yarli-store/tests/postgres_integration.rs"
+
+[[test]]
+name = "budget_breach_run_failure"
+path = "tests/integration/tests/budget_breach_run_failure.rs"
+
+[[test]]
+name = "concurrency_stress"
+path = "tests/integration/tests/concurrency_stress.rs"
+
+[[test]]
+name = "concurrent_runs"
+path = "tests/integration/tests/concurrent_runs.rs"
+
+[[test]]
+name = "crash_recovery"
+path = "tests/integration/tests/crash_recovery.rs"
+required-features = ["chaos"]
+
+[[test]]
+name = "event_trail_consistency"
+path = "tests/integration/tests/event_trail_consistency.rs"
+
+[[test]]
+name = "gate_verification_retry"
+path = "tests/integration/tests/gate_verification_retry.rs"
+
+[[test]]
+name = "graceful_shutdown"
+path = "tests/integration/tests/graceful_shutdown.rs"
+
+[[test]]
+name = "long_running_stability"
+path = "tests/integration/tests/long_running_stability.rs"
+
+[[test]]
+name = "multi_task_lifecycle"
+path = "tests/integration/tests/multi_task_lifecycle.rs"
+
+[[test]]
+name = "resource_exhaustion"
+path = "tests/integration/tests/resource_exhaustion.rs"
+
+[[test]]
+name = "time_based_failure_scenarios"
+path = "tests/integration/tests/time_based_failure_scenarios.rs"

@@ -6,9 +6,9 @@ use chrono::{Duration, Utc};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::ConnectOptions;
 use uuid::Uuid;
-use yarli_core::domain::{CommandClass, EntityType, Event};
-use yarli_queue::{ClaimRequest, ConcurrencyConfig, PostgresTaskQueue, TaskQueue};
-use yarli_store::{
+use yarli_cli::yarli_core::domain::{CommandClass, EntityType, Event};
+use yarli_cli::yarli_queue::{ClaimRequest, ConcurrencyConfig, PostgresTaskQueue, TaskQueue};
+use yarli_cli::yarli_store::{
     EventStore, PostgresEventStore, MIGRATION_0001_INIT, MIGRATION_0002_INDEXES,
     MIGRATION_0003_RUN_DRAINED_STATE,
 };
@@ -440,7 +440,7 @@ async fn replay_idempotency_no_duplicate_terminal_transition_postgres(
     );
 
     // Query by entity confirms only one terminal transition exists
-    use yarli_store::event_store::EventQuery;
+    use yarli_cli::yarli_store::event_store::EventQuery;
     let task_events = store.query(&EventQuery {
         entity_type: Some(EntityType::Task),
         entity_id: Some(task_id.to_string()),

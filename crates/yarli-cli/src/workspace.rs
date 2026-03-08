@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
-use yarli_git::{generate_commit_message, render_commit_message, DiffSpec};
+use yarli_cli::yarli_git::{generate_commit_message, render_commit_message, DiffSpec};
 
 use crate::config;
 use crate::config::LoadedConfig;
@@ -3574,7 +3574,7 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
     use uuid::Uuid;
-    use yarli_core::domain::CommandClass;
+    use yarli_cli::yarli_core::domain::CommandClass;
 
     fn run_git(repo: &Path, args: &[&str]) -> (bool, String, String) {
         let output = Command::new("git")

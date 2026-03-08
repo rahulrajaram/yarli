@@ -10,10 +10,12 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, PolicyDecision, PolicyOutcome, RunId, SafeMode, TaskId};
+use crate::yarli_core::domain::{
+    CommandClass, PolicyDecision, PolicyOutcome, RunId, SafeMode, TaskId,
+};
 
-use crate::error::PolicyError;
-use crate::token::ApprovalToken;
+use crate::yarli_policy::error::PolicyError;
+use crate::yarli_policy::token::ApprovalToken;
 
 // ---------------------------------------------------------------------------
 // Action types
@@ -766,7 +768,7 @@ mod tests {
         let run_id = Uuid::new_v4();
 
         // Add token for git_push on this run
-        let scope = crate::token::TokenScope {
+        let scope = crate::yarli_policy::token::TokenScope {
             action: "git_push".to_string(),
             repo_path: None,
             branch: None,
@@ -804,7 +806,7 @@ mod tests {
         let mut engine = PolicyEngine::with_defaults();
         let run_id = Uuid::new_v4();
 
-        let scope = crate::token::TokenScope {
+        let scope = crate::yarli_policy::token::TokenScope {
             action: "git_push".to_string(),
             repo_path: None,
             branch: None,
@@ -839,7 +841,7 @@ mod tests {
         let mut engine = PolicyEngine::with_defaults();
         let run_id = Uuid::new_v4();
 
-        let scope = crate::token::TokenScope {
+        let scope = crate::yarli_policy::token::TokenScope {
             action: "git_push".to_string(),
             repo_path: None,
             branch: None,

@@ -5,9 +5,9 @@ use chrono::Utc;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::ConnectOptions;
 use uuid::Uuid;
-use yarli_core::domain::{EntityType, Event};
-use yarli_store::event_store::EventQuery;
-use yarli_store::{
+use yarli_cli::yarli_core::domain::{EntityType, Event};
+use yarli_cli::yarli_store::event_store::EventQuery;
+use yarli_cli::yarli_store::{
     EventStore, PostgresEventStore, MIGRATION_0001_INIT, MIGRATION_0002_INDEXES,
     MIGRATION_0003_RUN_DRAINED_STATE,
 };

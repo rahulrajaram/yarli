@@ -8,9 +8,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{CorrelationId, EventId, MergeIntentId, RunId, WorktreeId};
-use crate::error::TransitionError;
-use crate::fsm::merge::MergeState;
+use crate::yarli_core::domain::{CorrelationId, EventId, MergeIntentId, RunId, WorktreeId};
+use crate::yarli_core::error::TransitionError;
+use crate::yarli_core::fsm::merge::MergeState;
 
 use super::transition::Transition;
 

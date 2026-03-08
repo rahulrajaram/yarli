@@ -1,13 +1,13 @@
 //! Command handlers extracted from `main.rs`.
 
 use anyhow::anyhow;
-use yarli_exec::{
+use yarli_cli::yarli_exec::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
     OverwatchRunnerConfig,
 };
-use yarli_observability::{run_analyzer, AuditCategory, YarliMetrics};
-use yarli_queue::scheduler::LiveOutputEvent;
-use yarli_queue::{PostgresTaskQueue, QueueEntry, QueueStatus, TaskQueue};
+use yarli_cli::yarli_observability::{run_analyzer, AuditCategory, YarliMetrics};
+use yarli_cli::yarli_queue::scheduler::LiveOutputEvent;
+use yarli_cli::yarli_queue::{PostgresTaskQueue, QueueEntry, QueueStatus, TaskQueue};
 
 use super::*;
 use crate::cli::AuditOutputFormat;
@@ -20,11 +20,11 @@ use crate::workspace::{
     MergeResolutionConfig, ParallelWorkspaceMergeApplyError, ParallelWorkspaceMergeFailureKind,
     ParallelWorkspaceMergeReport, ParallelWorkspaceMode,
 };
-use yarli_core::domain::ExitReason;
-use yarli_core::entities::continuation::{
+use yarli_cli::yarli_core::domain::ExitReason;
+use yarli_cli::yarli_core::entities::continuation::{
     ContinuationIntervention, ContinuationInterventionKind, RetryScope, TaskHealthAction,
 };
-use yarli_store::{
+use yarli_cli::yarli_store::{
     InMemoryEventStore, PostgresEventStore, MIGRATION_0001_DOWN, MIGRATION_0001_INIT,
     MIGRATION_0002_DOWN, MIGRATION_0002_INDEXES, MIGRATION_0003_DOWN,
     MIGRATION_0003_RUN_DRAINED_STATE,
@@ -212,12 +212,12 @@ impl QueueDepthTotals {
     }
 }
 
-fn class_label(class: yarli_core::domain::CommandClass) -> &'static str {
+fn class_label(class: yarli_cli::yarli_core::domain::CommandClass) -> &'static str {
     match class {
-        yarli_core::domain::CommandClass::Io => "io",
-        yarli_core::domain::CommandClass::Cpu => "cpu",
-        yarli_core::domain::CommandClass::Git => "git",
-        yarli_core::domain::CommandClass::Tool => "tool",
+        yarli_cli::yarli_core::domain::CommandClass::Io => "io",
+        yarli_cli::yarli_core::domain::CommandClass::Cpu => "cpu",
+        yarli_cli::yarli_core::domain::CommandClass::Git => "git",
+        yarli_cli::yarli_core::domain::CommandClass::Tool => "tool",
     }
 }
 
@@ -460,7 +460,7 @@ impl CommandRunner for SelectedCommandRunner {
         &self,
         request: CommandRequest,
         cancel: CancellationToken,
-    ) -> Result<CommandResult, yarli_exec::ExecError> {
+    ) -> Result<CommandResult, yarli_cli::yarli_exec::ExecError> {
         match self {
             Self::Native(runner) => runner.run(request, cancel).await,
             Self::Overwatch(runner) => runner.run(request, cancel).await,
@@ -512,7 +512,7 @@ fn sw4rm_verification_runner(loaded_config: &LoadedConfig) -> Result<SelectedCom
 async fn load_continuation_payload_for_continue(
     file: &Path,
     loaded_config: &LoadedConfig,
-) -> Result<yarli_core::entities::ContinuationPayload> {
+) -> Result<yarli_cli::yarli_core::entities::ContinuationPayload> {
     let wait_timeout_secs = loaded_config.config().run.continue_wait_timeout_seconds;
     let deadline = (wait_timeout_secs > 0)
         .then(|| tokio::time::Instant::now() + Duration::from_secs(wait_timeout_secs));
@@ -890,7 +890,7 @@ pub(crate) async fn cmd_run_start_with_backend<Q, S>(
     queue: Arc<Q>,
     allow_recursive_run_override: bool,
     metrics: Arc<YarliMetrics>,
-    #[cfg(feature = "chaos")] chaos: Option<Arc<yarli_chaos::ChaosController>>,
+    #[cfg(feature = "chaos")] chaos: Option<Arc<yarli_cli::yarli_chaos::ChaosController>>,
 ) -> Result<RunExecutionOutcome>
 where
     Q: TaskQueue + 'static,
@@ -1545,20 +1545,21 @@ where
             parallel_merge_retry_task_keys.dedup();
             continuation_payload.next_tranche =
                 (!parallel_merge_retry_task_keys.is_empty()).then(|| {
-                    yarli_core::entities::continuation::TrancheSpec {
-                        suggested_objective: format!(
-                            "Recover merge finalization by re-running tasks: {}",
-                            parallel_merge_retry_task_keys.join(", ")
-                        ),
-                        kind: yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
-                        retry_task_keys: parallel_merge_retry_task_keys.clone(),
-                        unfinished_task_keys: Vec::new(),
-                        planned_task_keys: Vec::new(),
-                        planned_tranche_key: None,
-                        cursor: None,
-                        config_snapshot: run_snapshot.clone(),
-                        interventions: Vec::new(),
-                    }
+                    yarli_cli::yarli_core::entities::continuation::TrancheSpec {
+                    suggested_objective: format!(
+                        "Recover merge finalization by re-running tasks: {}",
+                        parallel_merge_retry_task_keys.join(", ")
+                    ),
+                    kind:
+                        yarli_cli::yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
+                    retry_task_keys: parallel_merge_retry_task_keys.clone(),
+                    unfinished_task_keys: Vec::new(),
+                    planned_task_keys: Vec::new(),
+                    planned_tranche_key: None,
+                    cursor: None,
+                    config_snapshot: run_snapshot.clone(),
+                    interventions: Vec::new(),
+                }
                 });
             eprintln!("Run {run_id} completed core tasks, but parallel merge did not finalize;");
             if continuation_payload.next_tranche.is_some() {
@@ -1651,7 +1652,7 @@ where
 /// connects to the sw4rm runtime, and enters the agent message loop.
 #[cfg(feature = "sw4rm")]
 pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
-    use yarli_sw4rm::{
+    use yarli_cli::yarli_sw4rm::{
         orchestrator::{VerificationCommand, VerificationSpec},
         OrchestratorLoop, ShutdownBridge, YarliAgent,
     };
@@ -1705,10 +1706,10 @@ pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
             .iter()
             .map(|t| {
                 let class = match t.class.as_deref().unwrap_or("io") {
-                    "cpu" => yarli_core::domain::CommandClass::Cpu,
-                    "git" => yarli_core::domain::CommandClass::Git,
-                    "tool" => yarli_core::domain::CommandClass::Tool,
-                    _ => yarli_core::domain::CommandClass::Io,
+                    "cpu" => yarli_cli::yarli_core::domain::CommandClass::Cpu,
+                    "git" => yarli_cli::yarli_core::domain::CommandClass::Git,
+                    "tool" => yarli_cli::yarli_core::domain::CommandClass::Tool,
+                    _ => yarli_cli::yarli_core::domain::CommandClass::Io,
                 };
                 VerificationCommand {
                     task_key: t.key.clone(),
@@ -1729,7 +1730,7 @@ pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
             commands: vec![VerificationCommand {
                 task_key: "build".to_string(),
                 command: "cargo build".to_string(),
-                class: yarli_core::domain::CommandClass::Cpu,
+                class: yarli_cli::yarli_core::domain::CommandClass::Cpu,
             }],
             working_dir: loaded_config.config().execution.working_dir.clone(),
             task_gates: None,
@@ -1740,7 +1741,7 @@ pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
     // NOTE: Using MockRouterSender — real RouterClient transport not yet implemented.
     // The agent will boot and register but LLM dispatch will not function.
     eprintln!("WARNING: using mock router sender — real sw4rm transport not yet implemented");
-    let router = std::sync::Arc::new(yarli_sw4rm::mock::MockRouterSender::new());
+    let router = std::sync::Arc::new(yarli_cli::yarli_sw4rm::mock::MockRouterSender::new());
     let command_runner = sw4rm_verification_runner(loaded_config)?;
     let orchestrator = std::sync::Arc::new(
         OrchestratorLoop::new(router, sw4rm_config.clone(), verification)
@@ -1919,29 +1920,35 @@ pub(crate) fn safe_mode_db(mode: SafeMode) -> &'static str {
     }
 }
 
-pub(crate) fn exit_reason_db(reason: yarli_core::domain::ExitReason) -> &'static str {
+pub(crate) fn exit_reason_db(reason: yarli_cli::yarli_core::domain::ExitReason) -> &'static str {
     match reason {
-        yarli_core::domain::ExitReason::CompletedAllGates => "completed_all_gates",
-        yarli_core::domain::ExitReason::BlockedOpenTasks => "blocked_open_tasks",
-        yarli_core::domain::ExitReason::BlockedGateFailure => "blocked_gate_failure",
-        yarli_core::domain::ExitReason::FailedPolicyDenial => "failed_policy_denial",
-        yarli_core::domain::ExitReason::FailedRuntimeError => "failed_runtime_error",
-        yarli_core::domain::ExitReason::MergeConflict => "merge_conflict",
-        yarli_core::domain::ExitReason::CancelledByOperator => "cancelled_by_operator",
-        yarli_core::domain::ExitReason::DrainedByOperator => "drained_by_operator",
-        yarli_core::domain::ExitReason::TimedOut => "timed_out",
-        yarli_core::domain::ExitReason::StalledNoProgress => "stalled_no_progress",
+        yarli_cli::yarli_core::domain::ExitReason::CompletedAllGates => "completed_all_gates",
+        yarli_cli::yarli_core::domain::ExitReason::BlockedOpenTasks => "blocked_open_tasks",
+        yarli_cli::yarli_core::domain::ExitReason::BlockedGateFailure => "blocked_gate_failure",
+        yarli_cli::yarli_core::domain::ExitReason::FailedPolicyDenial => "failed_policy_denial",
+        yarli_cli::yarli_core::domain::ExitReason::FailedRuntimeError => "failed_runtime_error",
+        yarli_cli::yarli_core::domain::ExitReason::MergeConflict => "merge_conflict",
+        yarli_cli::yarli_core::domain::ExitReason::CancelledByOperator => "cancelled_by_operator",
+        yarli_cli::yarli_core::domain::ExitReason::DrainedByOperator => "drained_by_operator",
+        yarli_cli::yarli_core::domain::ExitReason::TimedOut => "timed_out",
+        yarli_cli::yarli_core::domain::ExitReason::StalledNoProgress => "stalled_no_progress",
     }
 }
 
-pub(crate) fn task_blocker_db(blocker: &yarli_core::entities::task::BlockerCode) -> String {
+pub(crate) fn task_blocker_db(
+    blocker: &yarli_cli::yarli_core::entities::task::BlockerCode,
+) -> String {
     match blocker {
-        yarli_core::entities::task::BlockerCode::DependencyPending => "dependency_pending".into(),
-        yarli_core::entities::task::BlockerCode::MergeConflict => "merge_conflict".into(),
-        yarli_core::entities::task::BlockerCode::PolicyDenial => "policy_denial".into(),
-        yarli_core::entities::task::BlockerCode::GateFailure => "gate_failure".into(),
-        yarli_core::entities::task::BlockerCode::ManualHold => "manual_hold".into(),
-        yarli_core::entities::task::BlockerCode::Custom(value) => value.clone(),
+        yarli_cli::yarli_core::entities::task::BlockerCode::DependencyPending => {
+            "dependency_pending".into()
+        }
+        yarli_cli::yarli_core::entities::task::BlockerCode::MergeConflict => {
+            "merge_conflict".into()
+        }
+        yarli_cli::yarli_core::entities::task::BlockerCode::PolicyDenial => "policy_denial".into(),
+        yarli_cli::yarli_core::entities::task::BlockerCode::GateFailure => "gate_failure".into(),
+        yarli_cli::yarli_core::entities::task::BlockerCode::ManualHold => "manual_hold".into(),
+        yarli_cli::yarli_core::entities::task::BlockerCode::Custom(value) => value.clone(),
     }
 }
 
@@ -1992,9 +1999,9 @@ async fn build_postgres_sync_signature<Q, S, R>(
     run_id: Uuid,
 ) -> Option<String>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let reg = scheduler.registry().read().await;
     let run = reg.get_run(&run_id)?;
@@ -2020,9 +2027,9 @@ async fn collect_postgres_sync_snapshot<Q, S, R>(
     run_id: Uuid,
 ) -> Option<PostgresSyncSnapshot>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let reg = scheduler.registry().read().await;
     let run = reg.get_run(&run_id)?;
@@ -2048,9 +2055,9 @@ async fn sync_postgres_state_if_changed<Q, S, R>(
     sync_state: &mut PostgresSyncState,
 ) -> Result<bool>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let Some(pool) = sync_state.pool.as_ref() else {
         return Ok(false);
@@ -2078,9 +2085,9 @@ pub(crate) async fn sync_postgres_state<Q, S, R>(
     run_id: Uuid,
 ) -> Result<()>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let BackendSelection::Postgres { database_url } = loaded_config.backend_selection()? else {
         return Ok(());
@@ -2101,9 +2108,9 @@ async fn sync_postgres_state_with_pool<Q, S, R>(
     run_id: Uuid,
 ) -> Result<()>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let Some(snapshot) = collect_postgres_sync_snapshot(scheduler, run_id).await else {
         return Ok(());
@@ -2863,7 +2870,7 @@ pub(crate) fn compute_quality_gate(
     run_total_tokens: u64,
     max_run_total_tokens: Option<u64>,
     soft_token_cap_ratio: f64,
-) -> yarli_core::entities::continuation::ContinuationQualityGate {
+) -> yarli_cli::yarli_core::entities::continuation::ContinuationQualityGate {
     let soft_cap_triggered = match max_run_total_tokens {
         Some(max_tokens) if max_tokens > 0 => {
             soft_token_cap_ratio.is_finite()
@@ -2940,7 +2947,7 @@ pub(crate) fn compute_quality_gate(
         .map(|report| (Some(report.trend), Some(report.score)))
         .unwrap_or_default();
 
-    yarli_core::entities::continuation::ContinuationQualityGate {
+    yarli_cli::yarli_core::entities::continuation::ContinuationQualityGate {
         allow_auto_advance,
         reason,
         trend,
@@ -2951,7 +2958,7 @@ pub(crate) fn compute_quality_gate(
 
 pub(crate) fn persist_continuation_payload_event(
     store: &dyn EventStore,
-    payload: &yarli_core::entities::ContinuationPayload,
+    payload: &yarli_cli::yarli_core::entities::ContinuationPayload,
     correlation_id: Uuid,
 ) -> Result<()> {
     append_event(
@@ -2977,7 +2984,7 @@ pub(crate) fn persist_continuation_payload_event(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_continuation_payload(
     run: &Run,
-    tasks: &[&yarli_core::entities::Task],
+    tasks: &[&yarli_cli::yarli_core::entities::Task],
     report: Option<&DeteriorationReport>,
     auto_advance_policy: AutoAdvancePolicy,
     task_health: config::RunTaskHealthConfig,
@@ -2985,7 +2992,7 @@ pub(crate) fn build_continuation_payload(
     max_run_total_tokens: Option<u64>,
     soft_token_cap_ratio: f64,
     deterioration_cycle_detected: bool,
-) -> yarli_core::entities::ContinuationPayload {
+) -> yarli_cli::yarli_core::entities::ContinuationPayload {
     build_continuation_payload_with_gate_failures(
         run,
         tasks,
@@ -3003,7 +3010,7 @@ pub(crate) fn build_continuation_payload(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_continuation_payload_with_gate_failures(
     run: &Run,
-    tasks: &[&yarli_core::entities::Task],
+    tasks: &[&yarli_cli::yarli_core::entities::Task],
     report: Option<&DeteriorationReport>,
     auto_advance_policy: AutoAdvancePolicy,
     task_health: config::RunTaskHealthConfig,
@@ -3012,8 +3019,8 @@ pub(crate) fn build_continuation_payload_with_gate_failures(
     soft_token_cap_ratio: f64,
     deterioration_cycle_detected: bool,
     gate_failures: &[String],
-) -> yarli_core::entities::ContinuationPayload {
-    let mut payload = yarli_core::entities::ContinuationPayload::build(run, tasks);
+) -> yarli_cli::yarli_core::entities::ContinuationPayload {
+    let mut payload = yarli_cli::yarli_core::entities::ContinuationPayload::build(run, tasks);
     let mut quality_gate = compute_quality_gate(
         report,
         auto_advance_policy,
@@ -3029,7 +3036,7 @@ pub(crate) fn build_continuation_payload_with_gate_failures(
         && deterioration_cycle_detected
         && had_strategy_pivot_checkpoint
     {
-        quality_gate = yarli_core::entities::continuation::ContinuationQualityGate {
+        quality_gate = yarli_cli::yarli_core::entities::continuation::ContinuationQualityGate {
             allow_auto_advance: false,
             reason: "deterioration cycle persisted after strategy pivot; summarize and schedule follow-up tranche".to_string(),
             trend: quality_gate.trend,
@@ -3060,7 +3067,7 @@ pub(crate) fn build_continuation_payload_with_gate_failures(
 
 fn analyze_retry_recommendation(
     run: &Run,
-    tasks: &[&yarli_core::entities::Task],
+    tasks: &[&yarli_cli::yarli_core::entities::Task],
     gate_failures: &[String],
 ) -> RetryScope {
     let analyzer_tasks: Vec<run_analyzer::TaskOutcome> = tasks
@@ -3191,11 +3198,11 @@ pub(crate) fn with_cancellation_diagnostics(
 fn emit_task_health_transition_audits(
     task_health_controllers: &mut std::collections::HashMap<
         Uuid,
-        yarli_exec::introspect::IntrospectionController,
+        yarli_cli::yarli_exec::introspect::IntrospectionController,
     >,
     events: &[Event],
     run_id: Uuid,
-    audit_sink: Option<&dyn yarli_observability::AuditSink>,
+    audit_sink: Option<&dyn yarli_cli::yarli_observability::AuditSink>,
 ) {
     for event in events {
         if event.event_type != "run.observer.task_health" {
@@ -3254,7 +3261,7 @@ fn emit_task_health_transition_audits(
 
 fn task_health_report_from_payload(
     payload: &serde_json::Value,
-) -> Option<yarli_exec::introspect::HealthReport> {
+) -> Option<yarli_cli::yarli_exec::introspect::HealthReport> {
     let score = payload
         .get("score")
         .and_then(serde_json::Value::as_f64)
@@ -3285,11 +3292,11 @@ fn task_health_report_from_payload(
 
     let level = task_health_level_from_status(status, score)?;
 
-    Some(yarli_exec::introspect::HealthReport {
+    Some(yarli_cli::yarli_exec::introspect::HealthReport {
         score: score.unwrap_or(match level {
-            yarli_exec::introspect::HealthLevel::Healthy => 1.0,
-            yarli_exec::introspect::HealthLevel::Degraded => 0.5,
-            yarli_exec::introspect::HealthLevel::Stuck => 0.1,
+            yarli_cli::yarli_exec::introspect::HealthLevel::Healthy => 1.0,
+            yarli_cli::yarli_exec::introspect::HealthLevel::Degraded => 0.5,
+            yarli_cli::yarli_exec::introspect::HealthLevel::Stuck => 0.1,
         }),
         level,
         factors: task_health_factors_from_payload(payload),
@@ -3299,9 +3306,11 @@ fn task_health_report_from_payload(
 fn task_health_level_from_status(
     status: &str,
     score: Option<f64>,
-) -> Option<yarli_exec::introspect::HealthLevel> {
+) -> Option<yarli_cli::yarli_exec::introspect::HealthLevel> {
     if let Some(score) = score {
-        return Some(yarli_exec::introspect::HealthLevel::from_score(score));
+        return Some(yarli_cli::yarli_exec::introspect::HealthLevel::from_score(
+            score,
+        ));
     }
 
     let normalized = status.trim().to_ascii_lowercase();
@@ -3314,14 +3323,14 @@ fn task_health_level_from_status(
         || normalized.contains("improving")
         || normalized.contains("continue")
     {
-        Some(yarli_exec::introspect::HealthLevel::Healthy)
+        Some(yarli_cli::yarli_exec::introspect::HealthLevel::Healthy)
     } else if normalized.contains("degraded") || normalized.contains("deteriorating") {
-        Some(yarli_exec::introspect::HealthLevel::Degraded)
+        Some(yarli_cli::yarli_exec::introspect::HealthLevel::Degraded)
     } else if normalized.contains("stuck")
         || normalized.contains("error")
         || normalized.contains("fail")
     {
-        Some(yarli_exec::introspect::HealthLevel::Stuck)
+        Some(yarli_cli::yarli_exec::introspect::HealthLevel::Stuck)
     } else {
         None
     }
@@ -3329,7 +3338,7 @@ fn task_health_level_from_status(
 
 fn task_health_factors_from_payload(
     payload: &serde_json::Value,
-) -> yarli_exec::introspect::HealthFactors {
+) -> yarli_cli::yarli_exec::introspect::HealthFactors {
     let factors = payload.get("factors").or_else(|| {
         payload
             .get("outcome")
@@ -3344,7 +3353,7 @@ fn task_health_factors_from_payload(
             .unwrap_or(1.0)
     };
 
-    yarli_exec::introspect::HealthFactors {
+    yarli_cli::yarli_exec::introspect::HealthFactors {
         output_recency: factor("output_recency"),
         io_delta: factor("io_delta"),
         cpu_utilization: factor("cpu_utilization"),
@@ -3372,11 +3381,11 @@ pub(crate) async fn drive_scheduler<Q, S, R>(
     mut task_health_observer: Option<observers::TaskHealthArtifactObserver>,
     mut memory_observer: Option<observers::MemoryObserver>,
     postgres_sync_config: Option<&LoadedConfig>,
-) -> Result<yarli_core::entities::ContinuationPayload>
+) -> Result<yarli_cli::yarli_core::entities::ContinuationPayload>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3394,13 +3403,16 @@ where
     );
     let mut task_health_controllers: std::collections::HashMap<
         Uuid,
-        yarli_exec::introspect::IntrospectionController,
+        yarli_cli::yarli_exec::introspect::IntrospectionController,
     > = task_names
         .iter()
         .map(|(task_id, task_key)| {
             (
                 *task_id,
-                yarli_exec::introspect::IntrospectionController::new(0, task_key.clone()),
+                yarli_cli::yarli_exec::introspect::IntrospectionController::new(
+                    0,
+                    task_key.clone(),
+                ),
             )
         })
         .collect();
@@ -3528,7 +3540,7 @@ where
                     let run = reg.get_run(&run_id).ok_or_else(|| {
                         anyhow::anyhow!("run {run_id} missing from registry after cancellation")
                     })?;
-                    let tasks: Vec<&yarli_core::entities::Task> = run
+                    let tasks: Vec<&yarli_cli::yarli_core::entities::Task> = run
                         .task_ids
                         .iter()
                         .filter_map(|tid| reg.get_task(tid))
@@ -3735,7 +3747,7 @@ where
                                     "run {run_id} missing from registry after operator cancel"
                                 )
                             })?;
-                            let tasks: Vec<&yarli_core::entities::Task> = run
+                            let tasks: Vec<&yarli_cli::yarli_core::entities::Task> = run
                                 .task_ids
                                 .iter()
                                 .filter_map(|tid| reg.get_task(tid))
@@ -3955,7 +3967,7 @@ where
                                         "run {run_id} missing from registry after operator cancel (post-tick)"
                                     )
                                 })?;
-                                let tasks: Vec<&yarli_core::entities::Task> = run
+                                let tasks: Vec<&yarli_cli::yarli_core::entities::Task> = run
                                     .task_ids
                                     .iter()
                                     .filter_map(|tid| reg.get_task(tid))
@@ -4035,7 +4047,7 @@ where
                     if let Some(run) = reg.get_run(&run_id) {
                         if run.state.is_terminal() {
                             info!(state = ?run.state, ticks = tick_count, "run reached terminal state");
-                            let tasks: Vec<&yarli_core::entities::Task> = run
+                            let tasks: Vec<&yarli_cli::yarli_core::entities::Task> = run
                                 .task_ids
                                 .iter()
                                 .filter_map(|tid| reg.get_task(tid))
@@ -4141,9 +4153,9 @@ pub(crate) async fn cancel_active_run<Q, S, R>(
     provenance: Option<CancellationProvenance>,
 ) -> Result<bool>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let (correlation_id, task_ids) = {
         let reg = scheduler.registry().read().await;
@@ -4364,9 +4376,9 @@ where
 
 async fn run_has_in_flight_work<Q, S, R>(scheduler: &Scheduler<Q, S, R>, run_id: Uuid) -> bool
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let reg = scheduler.registry().read().await;
     let Some(run) = reg.get_run(&run_id) else {
@@ -4390,9 +4402,9 @@ async fn finalize_drained_run<Q, S, R>(
     reason: &str,
 ) -> Result<bool>
 where
-    Q: yarli_queue::TaskQueue,
+    Q: yarli_cli::yarli_queue::TaskQueue,
     S: EventStore,
-    R: yarli_exec::CommandRunner + Clone,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
     let (correlation_id, from_state, transition_event, drained_queue_entries) = {
         let mut reg = scheduler.registry().write().await;
@@ -5338,7 +5350,7 @@ pub(crate) fn merge_apply_idempotency_key(
 pub(crate) fn persist_merge_policy_decision(
     store: &dyn EventStore,
     merge: &MergeProjection,
-    decision: &yarli_core::domain::PolicyDecision,
+    decision: &yarli_cli::yarli_core::domain::PolicyDecision,
     operation: &str,
 ) -> Result<()> {
     append_event(
@@ -5372,7 +5384,7 @@ pub(crate) fn persist_merge_policy_decision(
 
 pub(crate) fn append_merge_policy_audit(
     sink: Option<&dyn AuditSink>,
-    decision: &yarli_core::domain::PolicyDecision,
+    decision: &yarli_cli::yarli_core::domain::PolicyDecision,
     merge: &MergeProjection,
     operation: &str,
 ) -> Result<()> {
@@ -5398,7 +5410,7 @@ pub(crate) fn evaluate_merge_policy(
     merge: &MergeProjection,
     safe_mode: SafeMode,
     actor: &str,
-) -> Result<yarli_core::domain::PolicyDecision> {
+) -> Result<yarli_cli::yarli_core::domain::PolicyDecision> {
     let run_id = merge
         .run_id
         .ok_or_else(|| anyhow::anyhow!("merge intent {} missing run context", merge.merge_id))?;
@@ -6326,7 +6338,7 @@ pub(crate) fn append_run_cancelled_transition_event(
                 "to": format!("{:?}", RunState::RunCancelled),
                 "reason": reason,
                 "detail": reason,
-                "exit_reason": yarli_core::domain::ExitReason::CancelledByOperator.to_string(),
+                "exit_reason": yarli_cli::yarli_core::domain::ExitReason::CancelledByOperator.to_string(),
                 "cancellation_source": cancellation_source.to_string(),
                 "cancellation_provenance": provenance,
             }),
@@ -6926,7 +6938,7 @@ pub(crate) async fn cmd_serve(bind: &str, port: u16) -> Result<()> {
         }
     };
 
-    axum::serve(listener, yarli_api::router(store))
+    axum::serve(listener, yarli_cli::yarli_api::router(store))
         .with_graceful_shutdown(graceful_shutdown)
         .await
         .map_err(|error| anyhow!("API server encountered an error: {error}"))?;
@@ -6965,7 +6977,7 @@ pub(crate) fn execute_task_annotate(
     task_id: Uuid,
     detail: &str,
 ) -> Result<String> {
-    use yarli_core::domain::EntityType;
+    use yarli_cli::yarli_core::domain::EntityType;
 
     // Verify the task exists.
     let task_events = query_events(
@@ -7561,7 +7573,7 @@ pub(crate) fn cmd_debug_active_leases() -> Result<()> {
 fn load_debug_queue_entries(loaded_config: &LoadedConfig) -> Result<Vec<QueueEntry>> {
     match loaded_config.backend_selection()? {
         BackendSelection::InMemory => {
-            let queue = yarli_queue::InMemoryTaskQueue::new();
+            let queue = yarli_cli::yarli_queue::InMemoryTaskQueue::new();
             Ok(queue.entries())
         }
         BackendSelection::Postgres { database_url } => {
@@ -7643,30 +7655,33 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
     use yarli_cli::mode::{RenderMode, TerminalInfo};
-    use yarli_core::domain::{
+    use yarli_cli::yarli_core::domain::{
         CancellationActorKind, CancellationSource, CommandClass, EntityType, Event, ExitReason,
         SafeMode,
     };
-    use yarli_core::entities::run::Run;
-    use yarli_core::entities::task::Task;
-    use yarli_core::entities::worktree_binding::WorktreeBinding;
-    use yarli_core::explain::GateType;
-    use yarli_core::fsm::run::RunState;
-    use yarli_core::fsm::task::TaskState;
-    use yarli_core::shutdown::ShutdownController;
-    use yarli_exec::LocalCommandRunner;
-    use yarli_gates::default_task_gates;
-    use yarli_git::{LocalWorktreeManager, WorktreeManager};
-    use yarli_observability::{AuditCategory, AuditEntry, InMemoryAuditSink, JsonlAuditSink};
-    use yarli_queue::{InMemoryTaskQueue, SchedulerConfig, TaskQueue};
-    use yarli_store::event_store::EventQuery;
-    use yarli_store::InMemoryEventStore;
+    use yarli_cli::yarli_core::entities::run::Run;
+    use yarli_cli::yarli_core::entities::task::Task;
+    use yarli_cli::yarli_core::entities::worktree_binding::WorktreeBinding;
+    use yarli_cli::yarli_core::explain::GateType;
+    use yarli_cli::yarli_core::fsm::run::RunState;
+    use yarli_cli::yarli_core::fsm::task::TaskState;
+    use yarli_cli::yarli_core::shutdown::ShutdownController;
+    use yarli_cli::yarli_exec::LocalCommandRunner;
+    use yarli_cli::yarli_gates::default_task_gates;
+    use yarli_cli::yarli_git::{LocalWorktreeManager, WorktreeManager};
+    use yarli_cli::yarli_observability::{
+        AuditCategory, AuditEntry, InMemoryAuditSink, JsonlAuditSink,
+    };
+    use yarli_cli::yarli_queue::{InMemoryTaskQueue, SchedulerConfig, TaskQueue};
+    use yarli_cli::yarli_store::event_store::EventQuery;
+    use yarli_cli::yarli_store::InMemoryEventStore;
 
     fn run_git(repo: &Path, args: &[&str]) -> (bool, String, String) {
         let output = Command::new("git")
@@ -7684,6 +7699,42 @@ mod tests {
     fn run_git_expect_ok(repo: &Path, args: &[&str]) {
         let (ok, _stdout, stderr) = run_git(repo, args);
         assert!(ok, "git {:?} failed: {stderr}", args);
+    }
+
+    fn with_isolated_runtime_env<T>(operation: impl FnOnce() -> T) -> T {
+        static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        struct EnvGuard {
+            previous_dir: std::path::PathBuf,
+            previous_database_url: Option<String>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.previous_dir)
+                    .expect("restore previous working directory");
+                match &self.previous_database_url {
+                    Some(value) => std::env::set_var("DATABASE_URL", value),
+                    None => std::env::remove_var("DATABASE_URL"),
+                }
+            }
+        }
+
+        let _lock = TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock isolated runtime env");
+        let temp_dir = TempDir::new().expect("create isolated temp dir");
+        let guard = EnvGuard {
+            previous_dir: std::env::current_dir().expect("read current working directory"),
+            previous_database_url: std::env::var("DATABASE_URL").ok(),
+        };
+        std::env::set_current_dir(temp_dir.path()).expect("switch to isolated temp dir");
+        std::env::remove_var("DATABASE_URL");
+
+        let result = operation();
+        drop(guard);
+        result
     }
 
     fn seed_worktree_event_payload(
@@ -7793,7 +7844,10 @@ mod tests {
         let runner = Arc::new(LocalCommandRunner::new());
         let scheduler = Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
 
-        let run = Run::new("drive cancel", yarli_core::domain::SafeMode::Execute);
+        let run = Run::new(
+            "drive cancel",
+            yarli_cli::yarli_core::domain::SafeMode::Execute,
+        );
         let run_id = run.id;
         let correlation_id = run.correlation_id;
         let task = Task::new(run_id, "task-1", command, CommandClass::Io, correlation_id);
@@ -8027,7 +8081,7 @@ mod tests {
 
     #[test]
     fn cmd_task_unblock_blocks_in_memory_writes_by_default() {
-        let result = cmd_task_unblock(VALID_UUID, "test reason");
+        let result = with_isolated_runtime_env(|| cmd_task_unblock(VALID_UUID, "test reason"));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -8037,13 +8091,13 @@ mod tests {
 
     #[test]
     fn cmd_run_status_rejects_invalid_uuid() {
-        let result = cmd_run_status("bad");
+        let result = with_isolated_runtime_env(|| cmd_run_status("bad"));
         assert!(result.is_err());
     }
 
     #[test]
     fn cmd_run_explain_rejects_invalid_uuid() {
-        let result = cmd_run_explain("bad");
+        let result = with_isolated_runtime_env(|| cmd_run_explain("bad"));
         assert!(result.is_err());
     }
 
@@ -8107,7 +8161,7 @@ mod tests {
 
     #[test]
     fn cmd_gate_rerun_accepts_valid_gate() {
-        let result = cmd_gate_rerun(VALID_UUID, Some("tests_passed"));
+        let result = with_isolated_runtime_env(|| cmd_gate_rerun(VALID_UUID, Some("tests_passed")));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -8117,7 +8171,7 @@ mod tests {
 
     #[test]
     fn cmd_gate_rerun_blocks_in_memory_writes_by_default() {
-        let result = cmd_gate_rerun(VALID_UUID, None);
+        let result = with_isolated_runtime_env(|| cmd_gate_rerun(VALID_UUID, None));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -8257,9 +8311,10 @@ mod tests {
 
     #[test]
     fn cmd_worktree_recover_blocks_in_memory_writes_by_default() {
-        let abort = cmd_worktree_recover(VALID_UUID, "abort");
-        let resume = cmd_worktree_recover(VALID_UUID, "resume");
-        let manual_block = cmd_worktree_recover(VALID_UUID, "manual-block");
+        let abort = with_isolated_runtime_env(|| cmd_worktree_recover(VALID_UUID, "abort"));
+        let resume = with_isolated_runtime_env(|| cmd_worktree_recover(VALID_UUID, "resume"));
+        let manual_block =
+            with_isolated_runtime_env(|| cmd_worktree_recover(VALID_UUID, "manual-block"));
         assert!(abort.is_err());
         assert!(resume.is_err());
         assert!(manual_block.is_err());
@@ -8422,9 +8477,15 @@ mod tests {
 
     #[test]
     fn cmd_merge_request_blocks_in_memory_writes_by_default() {
-        let merge_no_ff = cmd_merge_request("feat", "main", VALID_UUID, "merge-no-ff");
-        let rebase_then_ff = cmd_merge_request("feat", "main", VALID_UUID, "rebase-then-ff");
-        let squash_merge = cmd_merge_request("feat", "main", VALID_UUID, "squash-merge");
+        let merge_no_ff = with_isolated_runtime_env(|| {
+            cmd_merge_request("feat", "main", VALID_UUID, "merge-no-ff")
+        });
+        let rebase_then_ff = with_isolated_runtime_env(|| {
+            cmd_merge_request("feat", "main", VALID_UUID, "rebase-then-ff")
+        });
+        let squash_merge = with_isolated_runtime_env(|| {
+            cmd_merge_request("feat", "main", VALID_UUID, "squash-merge")
+        });
         assert!(merge_no_ff.is_err());
         assert!(rebase_then_ff.is_err());
         assert!(squash_merge.is_err());
@@ -8969,7 +9030,10 @@ mod tests {
         let runner = Arc::new(LocalCommandRunner::new());
         let scheduler = Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
 
-        let run = Run::new("cancel me", yarli_core::domain::SafeMode::Observe);
+        let run = Run::new(
+            "cancel me",
+            yarli_cli::yarli_core::domain::SafeMode::Observe,
+        );
         let run_id = run.id;
         let corr = run.correlation_id;
         let task = Task::new(run_id, "task-1", "sleep 60", CommandClass::Io, corr);
@@ -9102,7 +9166,7 @@ mod tests {
             Scheduler::new(queue, store.clone(), runner, SchedulerConfig::default());
         let run = Run::new(
             "drive operator cancel",
-            yarli_core::domain::SafeMode::Execute,
+            yarli_cli::yarli_core::domain::SafeMode::Execute,
         );
         let run_id = run.id;
         let correlation_id = run.correlation_id;
@@ -9403,7 +9467,10 @@ mod tests {
 
         let mut scheduler = Scheduler::new(queue, store.clone(), runner, config.clone());
 
-        let run = Run::new("drain and resume", yarli_core::domain::SafeMode::Execute);
+        let run = Run::new(
+            "drain and resume",
+            yarli_cli::yarli_core::domain::SafeMode::Execute,
+        );
         let run_id = run.id;
         let correlation_id = run.correlation_id;
         let primary_task = Task::new(
@@ -9565,7 +9632,10 @@ mod tests {
 
         let mut scheduler = Scheduler::new(queue.clone(), store.clone(), runner, config.clone());
 
-        let run = Run::new("drain after current", yarli_core::domain::SafeMode::Execute);
+        let run = Run::new(
+            "drain after current",
+            yarli_cli::yarli_core::domain::SafeMode::Execute,
+        );
         let run_id = run.id;
         let correlation_id = run.correlation_id;
         let primary_task = Task::new(

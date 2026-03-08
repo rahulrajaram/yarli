@@ -4,9 +4,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use yarli_cli::stream::StreamEvent;
-use yarli_core::domain::Event;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_core::domain::Event;
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
 
 pub(crate) fn emit_initial_stream_state(
     tx: &mpsc::UnboundedSender<StreamEvent>,

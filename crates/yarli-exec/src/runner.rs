@@ -14,22 +14,22 @@ use std::fs;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use crate::yarli_observability::YarliMetrics;
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use yarli_observability::YarliMetrics;
 
-use yarli_core::domain::{CommandClass, CorrelationId, RunId, TaskId};
-use yarli_core::entities::command_execution::{
+use crate::yarli_core::domain::{CommandClass, CorrelationId, RunId, TaskId};
+use crate::yarli_core::entities::command_execution::{
     CommandExecution, CommandResourceUsage, StreamChunk, StreamType, TokenUsage,
 };
-use yarli_core::fsm::command::CommandState;
-use yarli_core::shutdown::ShutdownController;
+use crate::yarli_core::fsm::command::CommandState;
+use crate::yarli_core::shutdown::ShutdownController;
 
-use crate::error::ExecError;
+use crate::yarli_exec::error::ExecError;
 
 /// Derive a deterministic command ID from an idempotency key.
 ///
@@ -117,7 +117,7 @@ pub struct LocalCommandRunner {
     /// can clean them up on programmatic failure (not just Ctrl+C).
     shutdown: Option<ShutdownController>,
     #[cfg(feature = "chaos")]
-    chaos: Option<std::sync::Arc<yarli_chaos::ChaosController>>,
+    chaos: Option<std::sync::Arc<crate::yarli_chaos::ChaosController>>,
 }
 
 impl LocalCommandRunner {
@@ -153,7 +153,10 @@ impl LocalCommandRunner {
     }
 
     #[cfg(feature = "chaos")]
-    pub fn with_chaos(mut self, chaos: std::sync::Arc<yarli_chaos::ChaosController>) -> Self {
+    pub fn with_chaos(
+        mut self,
+        chaos: std::sync::Arc<crate::yarli_chaos::ChaosController>,
+    ) -> Self {
         self.chaos = Some(chaos);
         self
     }

@@ -9,10 +9,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use yarli_core::domain::TaskId;
-use yarli_core::entities::ContinuationPayload;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
+use crate::yarli_core::domain::TaskId;
+use crate::yarli_core::entities::ContinuationPayload;
+use crate::yarli_core::fsm::run::RunState;
+use crate::yarli_core::fsm::task::TaskState;
 
 /// Events the stream renderer can consume.
 #[derive(Debug, Clone)]

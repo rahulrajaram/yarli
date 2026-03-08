@@ -16,23 +16,28 @@ use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-use yarli_core::domain::{CommandClass, EntityType, Event, SafeMode};
-use yarli_core::entities::command_execution::{
+use yarli_cli::yarli_core::domain::{CommandClass, EntityType, Event, SafeMode};
+use yarli_cli::yarli_core::entities::command_execution::{
     CommandExecution, CommandResourceUsage, StreamChunk, TokenUsage,
 };
-use yarli_core::entities::task::Task;
-use yarli_core::entities::Run;
-use yarli_core::fsm::command::CommandState;
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_exec::{CommandRequest, CommandResult, CommandRunner, ExecError, LocalCommandRunner};
-use yarli_queue::{
+use yarli_cli::yarli_core::entities::task::Task;
+use yarli_cli::yarli_core::entities::Run;
+use yarli_cli::yarli_core::fsm::command::CommandState;
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_exec::{
+    CommandRequest, CommandResult, CommandRunner, ExecError, LocalCommandRunner,
+};
+use yarli_cli::yarli_queue::{
     ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
     TaskQueue,
 };
-use yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore, StoreError};
+use yarli_cli::yarli_store::{EventStore, InMemoryEventStore, PostgresEventStore, StoreError};
 
-use yarli_integration_tests::{apply_migrations, test_database_url_for_test, TestDatabase};
+#[path = "../src/lib.rs"]
+mod integration_helpers;
+
+use integration_helpers::{apply_migrations, test_database_url_for_test, TestDatabase};
 
 fn make_scheduler_config(
     worker_id: &str,
@@ -97,13 +102,13 @@ impl EventStore for FlakyEventStore {
         self.inner.append(event)
     }
 
-    fn get(&self, event_id: yarli_core::domain::EventId) -> Result<Event, StoreError> {
+    fn get(&self, event_id: yarli_cli::yarli_core::domain::EventId) -> Result<Event, StoreError> {
         self.inner.get(event_id)
     }
 
     fn query(
         &self,
-        query: &yarli_store::event_store::EventQuery,
+        query: &yarli_cli::yarli_store::event_store::EventQuery,
     ) -> Result<Vec<Event>, StoreError> {
         self.inner.query(query)
     }

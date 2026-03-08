@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use yarli_core::domain::{PolicyOutcome, RunId, TaskId};
+use crate::yarli_core::domain::{PolicyOutcome, RunId, TaskId};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -82,7 +82,7 @@ pub struct AuditEntry {
 
 impl AuditEntry {
     /// Create a policy decision audit entry from a domain PolicyDecision.
-    pub fn from_policy_decision(decision: &yarli_core::domain::PolicyDecision) -> Self {
+    pub fn from_policy_decision(decision: &crate::yarli_core::domain::PolicyDecision) -> Self {
         Self {
             audit_id: Uuid::now_v7(),
             timestamp: Utc::now(),
@@ -399,7 +399,7 @@ impl AuditSink for InMemoryAuditSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarli_core::domain::PolicyDecision;
+    use crate::yarli_core::domain::PolicyDecision;
 
     // ---- AuditEntry constructors ----
 

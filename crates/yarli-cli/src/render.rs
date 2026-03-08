@@ -7,13 +7,15 @@ use std::path::PathBuf;
 use anyhow::Result;
 use uuid::Uuid;
 
-use yarli_core::domain::{EntityType, Event};
-use yarli_core::explain::{explain_run, explain_task, GateResult, RunSnapshot, TaskSnapshot};
-use yarli_core::fsm::run::RunState;
-use yarli_core::fsm::task::TaskState;
-use yarli_gates::all_passed;
-use yarli_store::event_store::EventQuery;
-use yarli_store::EventStore;
+use yarli_cli::yarli_core::domain::{EntityType, Event};
+use yarli_cli::yarli_core::explain::{
+    explain_run, explain_task, GateResult, RunSnapshot, TaskSnapshot,
+};
+use yarli_cli::yarli_core::fsm::run::RunState;
+use yarli_cli::yarli_core::fsm::task::TaskState;
+use yarli_cli::yarli_gates::all_passed;
+use yarli_cli::yarli_store::event_store::EventQuery;
+use yarli_cli::yarli_store::EventStore;
 
 use crate::commands::format_cancel_provenance_summary;
 use crate::events::task_id_from_command_event;
@@ -586,7 +588,7 @@ pub(crate) fn render_gate_rerun_output(
     task_id: Uuid,
     run_id: Uuid,
     selected_count: usize,
-    evaluations: &[yarli_gates::GateEvaluation],
+    evaluations: &[yarli_cli::yarli_gates::GateEvaluation],
 ) -> Result<String> {
     let mut output = String::new();
     writeln!(&mut output, "Gate re-run for task {task_id}")?;
@@ -641,7 +643,7 @@ pub(crate) fn render_worktree_status(store: &dyn EventStore, run_id: Uuid) -> Re
     let events = query_events(store, &EventQuery::by_correlation(run.correlation_id))?;
     let worktree_events: Vec<Event> = events
         .into_iter()
-        .filter(|event| event.entity_type == yarli_core::domain::EntityType::Worktree)
+        .filter(|event| event.entity_type == yarli_cli::yarli_core::domain::EntityType::Worktree)
         .collect();
     let worktrees = collect_entity_projections(&worktree_events);
 
@@ -709,7 +711,7 @@ pub(crate) fn render_merge_status(store: &dyn EventStore, merge_id: Uuid) -> Res
 pub(crate) fn render_run_list(store: &dyn EventStore) -> Result<String> {
     let run_events = query_events(
         store,
-        &EventQuery::by_entity_type(yarli_core::domain::EntityType::Run),
+        &EventQuery::by_entity_type(yarli_cli::yarli_core::domain::EntityType::Run),
     )?;
 
     if run_events.is_empty() {
@@ -744,7 +746,7 @@ pub(crate) fn render_run_list(store: &dyn EventStore) -> Result<String> {
     // Count tasks per run.
     let task_events = query_events(
         store,
-        &EventQuery::by_entity_type(yarli_core::domain::EntityType::Task),
+        &EventQuery::by_entity_type(yarli_cli::yarli_core::domain::EntityType::Task),
     )?;
     let mut task_counts: HashMap<String, (u32, u32, u32)> = HashMap::new(); // total, complete, failed
                                                                             // Map task_id -> run_id via correlation_id.
@@ -969,9 +971,9 @@ mod tests {
     use tokio::sync::mpsc;
     use uuid::Uuid;
     use yarli_cli::stream::StreamEvent;
-    use yarli_core::domain::{EntityType, Event};
-    use yarli_core::entities::worktree_binding::WorktreeBinding;
-    use yarli_store::InMemoryEventStore;
+    use yarli_cli::yarli_core::domain::{EntityType, Event};
+    use yarli_cli::yarli_core::entities::worktree_binding::WorktreeBinding;
+    use yarli_cli::yarli_store::InMemoryEventStore;
 
     #[allow(dead_code)]
     fn run_git(repo: &Path, args: &[&str]) -> (bool, String, String) {

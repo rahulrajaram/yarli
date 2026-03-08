@@ -11,14 +11,14 @@ use std::path::PathBuf;
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::yarli_core::domain::{EntityType, Event};
+use crate::yarli_core::entities::command_execution::{StreamChunk, StreamType};
+use crate::yarli_observability::audit::{AuditEntry, AuditSink};
+use crate::yarli_store::EventStore;
 use tracing::warn;
-use yarli_core::domain::{EntityType, Event};
-use yarli_core::entities::command_execution::{StreamChunk, StreamType};
-use yarli_observability::audit::{AuditEntry, AuditSink};
-use yarli_store::EventStore;
 
-use crate::error::ExecError;
-use crate::runner::{
+use crate::yarli_exec::error::ExecError;
+use crate::yarli_exec::runner::{
     command_id_from_idempotency_key, CommandRequest, CommandResult, CommandRunner,
 };
 
@@ -127,9 +127,9 @@ impl<'a, R: CommandRunner, S: EventStore> CommandJournal<'a, R, S> {
 
         // Persist the terminal event.
         let terminal_event_type = match result.execution.state {
-            yarli_core::fsm::command::CommandState::CmdExited => "command.exited",
-            yarli_core::fsm::command::CommandState::CmdTimedOut => "command.timed_out",
-            yarli_core::fsm::command::CommandState::CmdKilled => "command.killed",
+            crate::yarli_core::fsm::command::CommandState::CmdExited => "command.exited",
+            crate::yarli_core::fsm::command::CommandState::CmdTimedOut => "command.timed_out",
+            crate::yarli_core::fsm::command::CommandState::CmdKilled => "command.killed",
             _ => "command.completed",
         };
 
@@ -346,12 +346,12 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use crate::yarli_core::domain::{CommandClass, EntityType};
+    use crate::yarli_store::event_store::EventQuery;
+    use crate::yarli_store::InMemoryEventStore;
     use tokio_util::sync::CancellationToken;
-    use yarli_core::domain::{CommandClass, EntityType};
-    use yarli_store::event_store::EventQuery;
-    use yarli_store::InMemoryEventStore;
 
-    use crate::runner::LocalCommandRunner;
+    use crate::yarli_exec::runner::LocalCommandRunner;
 
     #[tokio::test]
     async fn test_journal_persists_events_for_successful_command() {
@@ -630,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn test_journal_emits_audit_entry_on_exit() {
         let store = InMemoryEventStore::new();
-        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let audit = crate::yarli_observability::audit::InMemoryAuditSink::new();
         let runner = LocalCommandRunner::new();
         let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
         let cancel = CancellationToken::new();
@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].category,
-            yarli_observability::audit::AuditCategory::CommandExecution
+            crate::yarli_observability::audit::AuditCategory::CommandExecution
         );
         assert!(entries[0].action.contains("echo audit-test"));
     }
@@ -661,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn test_journal_audit_entry_on_kill() {
         let store = InMemoryEventStore::new();
-        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let audit = crate::yarli_observability::audit::InMemoryAuditSink::new();
         let runner = LocalCommandRunner::new();
         let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
         let cancel = CancellationToken::new();
@@ -689,14 +689,14 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].category,
-            yarli_observability::audit::AuditCategory::CommandExecution
+            crate::yarli_observability::audit::AuditCategory::CommandExecution
         );
     }
 
     #[tokio::test]
     async fn test_journal_audit_records_duration() {
         let store = InMemoryEventStore::new();
-        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let audit = crate::yarli_observability::audit::InMemoryAuditSink::new();
         let runner = LocalCommandRunner::new();
         let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
         let cancel = CancellationToken::new();
@@ -749,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn test_journal_audit_stderr_excerpt() {
         let store = InMemoryEventStore::new();
-        let audit = yarli_observability::audit::InMemoryAuditSink::new();
+        let audit = crate::yarli_observability::audit::InMemoryAuditSink::new();
         let runner = LocalCommandRunner::new();
         let journal = CommandJournal::new(runner, &store).with_audit_sink(&audit);
         let cancel = CancellationToken::new();
