@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
 # Project-specific pre-push checks for yarli (Rust workspace)
 # Called by the dispatcher in .git/hooks/pre-push
 

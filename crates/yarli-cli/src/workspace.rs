@@ -5,12 +5,13 @@ use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
+use yarli_git::{generate_commit_message, render_commit_message, DiffSpec};
 
 use crate::config;
 use crate::config::LoadedConfig;
@@ -415,6 +416,27 @@ fn prepare_parallel_workspace_layout_copy(
 const MAX_WORKTREES: usize = 10;
 const WORKTREE_SLOT_WAIT_INITIAL_SECONDS: u64 = 1;
 const WORKTREE_SLOT_WAIT_MAX_SECONDS: u64 = 30;
+const RUN_WORKSPACE_LEASE_FILE: &str = ".yarli-run-lease.json";
+const LEGACY_RUN_WORKSPACE_RECLAIM_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunWorkspaceLease {
+    pid: u32,
+    created_at: String,
+    source_workdir: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitWorktreeRecord {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct OrphanedWorkspaceSweepReport {
+    reclaimed_roots: usize,
+    salvaged_branches: Vec<String>,
+}
 
 /// Check if `git worktree` is available in the given directory.
 pub(crate) fn git_worktree_available(cwd: &Path) -> bool {
@@ -423,19 +445,53 @@ pub(crate) fn git_worktree_available(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Count existing worktrees (excluding the main worktree).
-pub(crate) fn count_existing_worktrees(cwd: &Path) -> Result<usize> {
+fn list_git_worktrees(cwd: &Path) -> Result<Vec<GitWorktreeRecord>> {
     let output = run_git_capture(cwd, &["worktree", "list", "--porcelain"])?;
     ensure_git_success(
         output.clone(),
         cwd,
         &["worktree", "list", "--porcelain"],
-        "count existing worktrees",
+        "list git worktrees",
     )?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    // Each worktree block starts with "worktree <path>". The first is always main.
-    let count = text.lines().filter(|l| l.starts_with("worktree ")).count();
-    Ok(count.saturating_sub(1))
+
+    let mut worktrees = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(path) = current_path.take() {
+                worktrees.push(GitWorktreeRecord {
+                    path,
+                    branch: current_branch.take(),
+                });
+            }
+            current_path = Some(PathBuf::from(path));
+            current_branch = None;
+            continue;
+        }
+
+        if let Some(branch) = line.strip_prefix("branch ") {
+            current_branch = branch
+                .strip_prefix("refs/heads/")
+                .map(str::to_string)
+                .or_else(|| (!branch.contains("(detached)")).then(|| branch.to_string()));
+        }
+    }
+
+    if let Some(path) = current_path {
+        worktrees.push(GitWorktreeRecord {
+            path,
+            branch: current_branch,
+        });
+    }
+
+    Ok(worktrees)
+}
+
+/// Count existing worktrees (excluding the main worktree).
+pub(crate) fn count_existing_worktrees(cwd: &Path) -> Result<usize> {
+    Ok(list_git_worktrees(cwd)?.len().saturating_sub(1))
 }
 
 /// Prune stale worktree metadata.
@@ -445,8 +501,386 @@ pub(crate) fn prune_stale_worktrees(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_run_workspace_lease(run_workspace_root: &Path, source_workdir: &Path) -> Result<()> {
+    let lease = RunWorkspaceLease {
+        pid: process::id(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        source_workdir: source_workdir.display().to_string(),
+    };
+    let lease_bytes =
+        serde_json::to_vec_pretty(&lease).context("serialize run workspace lease metadata")?;
+    fs::write(
+        run_workspace_root.join(RUN_WORKSPACE_LEASE_FILE),
+        lease_bytes,
+    )
+    .with_context(|| {
+        format!(
+            "write run workspace lease at {}",
+            run_workspace_root.display()
+        )
+    })
+}
+
+fn load_run_workspace_lease(run_workspace_root: &Path) -> Option<RunWorkspaceLease> {
+    let path = run_workspace_root.join(RUN_WORKSPACE_LEASE_FILE);
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+fn stale_run_workspace_reason(
+    run_workspace_root: &Path,
+    now: SystemTime,
+    legacy_age: Duration,
+) -> Option<String> {
+    if let Some(lease) = load_run_workspace_lease(run_workspace_root) {
+        if process_is_alive(lease.pid) {
+            return None;
+        }
+        return Some(format!(
+            "lease owner pid {} is no longer running",
+            lease.pid
+        ));
+    }
+
+    let modified_at = fs::metadata(run_workspace_root).ok()?.modified().ok()?;
+    let age = now.duration_since(modified_at).ok()?;
+    (age >= legacy_age).then(|| {
+        format!(
+            "legacy run workspace root is older than {}s without a live lease",
+            legacy_age.as_secs()
+        )
+    })
+}
+
+fn resolve_head_oid(repo: &Path, rev: &str) -> Result<String> {
+    let output = run_git_capture(repo, &["rev-parse", rev])?;
+    ensure_git_success(
+        output.clone(),
+        repo,
+        &["rev-parse", rev],
+        "resolve git revision",
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn worktree_has_changes(workspace_dir: &Path) -> Result<bool> {
+    let output = run_git_capture(workspace_dir, &["status", "--porcelain"])?;
+    ensure_git_success(
+        output.clone(),
+        workspace_dir,
+        &["status", "--porcelain"],
+        "inspect worktree status",
+    )?;
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn create_salvage_branch_name(run_workspace_root: &Path, workspace_dir: &Path) -> String {
+    let root = run_workspace_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(sanitize_task_key_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "run".to_string());
+    let workspace = workspace_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(sanitize_task_key_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "workspace".to_string());
+    let suffix = &Uuid::now_v7().simple().to_string()[..8];
+    format!("yarli/salvage/{root}/{workspace}-{suffix}")
+}
+
+fn ensure_salvage_branch(
+    source_workdir: &Path,
+    run_workspace_root: &Path,
+    workspace_dir: &Path,
+    branch: Option<&str>,
+) -> Result<String> {
+    if let Some(branch) = branch {
+        return Ok(branch.to_string());
+    }
+
+    let workspace_head = resolve_head_oid(workspace_dir, "HEAD")?;
+    let salvage_branch = create_salvage_branch_name(run_workspace_root, workspace_dir);
+    let output = run_git_capture(
+        source_workdir,
+        &["branch", &salvage_branch, &workspace_head],
+    )?;
+    ensure_git_success(
+        output,
+        source_workdir,
+        &["branch", &salvage_branch, &workspace_head],
+        "create salvage branch for orphaned worktree",
+    )?;
+    Ok(salvage_branch)
+}
+
+fn commit_orphaned_worktree_changes(
+    source_workdir: &Path,
+    run_workspace_root: &Path,
+    workspace_dir: &Path,
+    branch: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    if !worktree_has_changes(workspace_dir)? {
+        return Ok(());
+    }
+
+    let add_output = run_git_capture(workspace_dir, &["add", "-A"])?;
+    ensure_git_success(
+        add_output,
+        workspace_dir,
+        &["add", "-A"],
+        "stage orphaned worktree changes for salvage",
+    )?;
+
+    let fallback_scope = branch
+        .and_then(|value| value.rsplit('/').next())
+        .or_else(|| workspace_dir.file_name().and_then(|value| value.to_str()));
+    let commit_msg = generated_commit_message(
+        workspace_dir,
+        DiffSpec::Staged,
+        vec![
+            ("yarli-salvage".to_string(), "true".to_string()),
+            ("yarli-salvage-reason".to_string(), reason.to_string()),
+            (
+                "yarli-salvage-workspace-root".to_string(),
+                run_workspace_root.display().to_string(),
+            ),
+            (
+                "yarli-source-workdir".to_string(),
+                source_workdir.display().to_string(),
+            ),
+        ],
+        "chore(recovery): salvage abandoned worktree changes",
+        fallback_scope,
+    );
+    let commit_output =
+        run_git_capture(workspace_dir, &["commit", "--no-verify", "-m", &commit_msg])?;
+    ensure_git_success(
+        commit_output,
+        workspace_dir,
+        &["commit", "--no-verify", "-m", &commit_msg],
+        "commit orphaned worktree changes for salvage",
+    )?;
+    Ok(())
+}
+
+fn sweep_orphaned_run_workspaces_with_now(
+    source_workdir: &Path,
+    worktree_root: &Path,
+    now: SystemTime,
+) -> Result<OrphanedWorkspaceSweepReport> {
+    let mut report = OrphanedWorkspaceSweepReport::default();
+    let source_head = resolve_head_oid(source_workdir, "HEAD")?;
+
+    for entry in fs::read_dir(worktree_root).with_context(|| {
+        format!(
+            "read configured worktree_root {} for orphaned workspace scan",
+            worktree_root.display()
+        )
+    })? {
+        let entry = entry?;
+        let run_workspace_root = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = run_workspace_root
+            .file_name()
+            .and_then(|value| value.to_str())
+        else {
+            continue;
+        };
+        if !name.starts_with("run-") {
+            continue;
+        }
+
+        let Some(reason) =
+            stale_run_workspace_reason(&run_workspace_root, now, LEGACY_RUN_WORKSPACE_RECLAIM_AGE)
+        else {
+            continue;
+        };
+
+        let worktrees = list_git_worktrees(source_workdir)?;
+        let mut root_reclaimable = true;
+        for record in worktrees
+            .into_iter()
+            .filter(|record| record.path.starts_with(&run_workspace_root))
+        {
+            if let Err(err) = commit_orphaned_worktree_changes(
+                source_workdir,
+                &run_workspace_root,
+                &record.path,
+                record.branch.as_deref(),
+                &reason,
+            ) {
+                root_reclaimable = false;
+                warn!(
+                    workspace = %record.path.display(),
+                    reason = %reason,
+                    error = %err,
+                    "failed to salvage orphaned worktree changes; preserving workspace for manual recovery"
+                );
+                continue;
+            }
+
+            let keep_branch = resolve_head_oid(&record.path, "HEAD")
+                .map(|workspace_head| workspace_head != source_head)
+                .unwrap_or(true);
+            let salvaged_branch = if keep_branch {
+                match ensure_salvage_branch(
+                    source_workdir,
+                    &run_workspace_root,
+                    &record.path,
+                    record.branch.as_deref(),
+                ) {
+                    Ok(branch) => Some(branch),
+                    Err(err) => {
+                        root_reclaimable = false;
+                        warn!(
+                            workspace = %record.path.display(),
+                            reason = %reason,
+                            error = %err,
+                            "failed to preserve orphaned worktree branch; preserving workspace for manual recovery"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let path_str = record.path.display().to_string();
+            let remove_args = ["worktree", "remove", &path_str, "--force"];
+            match run_git_capture(source_workdir, &remove_args) {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    warn!(
+                        workspace = %record.path.display(),
+                        reason = %reason,
+                        stderr = %String::from_utf8_lossy(&output.stderr),
+                        "failed to remove orphaned git worktree"
+                    );
+                    root_reclaimable = false;
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        workspace = %record.path.display(),
+                        reason = %reason,
+                        error = %err,
+                        "failed to remove orphaned git worktree"
+                    );
+                    root_reclaimable = false;
+                    continue;
+                }
+            }
+
+            if let Some(branch) = salvaged_branch.as_ref() {
+                report.salvaged_branches.push(branch.clone());
+                info!(
+                    branch,
+                    workspace = %record.path.display(),
+                    reason = %reason,
+                    "salvaged orphaned worktree onto preserved branch"
+                );
+            } else if let Some(branch) = record.branch.as_deref() {
+                match run_git_capture(source_workdir, &["branch", "-D", branch]) {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => {
+                        warn!(
+                            branch,
+                            reason = %reason,
+                            stderr = %String::from_utf8_lossy(&output.stderr),
+                            "failed to delete orphaned worktree branch"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(branch, reason = %reason, error = %err, "failed to delete orphaned worktree branch");
+                    }
+                }
+            }
+        }
+
+        let _ = prune_stale_worktrees(source_workdir);
+        if !root_reclaimable {
+            warn!(
+                workspace_root = %run_workspace_root.display(),
+                reason = %reason,
+                "preserving orphaned run workspace root after incomplete salvage"
+            );
+            continue;
+        }
+        let still_registered = list_git_worktrees(source_workdir)?
+            .into_iter()
+            .any(|record| record.path.starts_with(&run_workspace_root));
+        if still_registered {
+            warn!(
+                workspace_root = %run_workspace_root.display(),
+                reason = %reason,
+                "orphaned run workspace root still has registered worktrees after cleanup attempt"
+            );
+            continue;
+        }
+
+        match fs::remove_dir_all(&run_workspace_root) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(
+                    workspace_root = %run_workspace_root.display(),
+                    reason = %reason,
+                    error = %err,
+                    "failed to remove orphaned run workspace root"
+                );
+                continue;
+            }
+        }
+
+        report.reclaimed_roots += 1;
+        info!(
+            workspace_root = %run_workspace_root.display(),
+            reason = %reason,
+            "reclaimed orphaned run workspace root before worktree slot allocation"
+        );
+    }
+
+    Ok(report)
+}
+
+fn sweep_orphaned_run_workspaces(
+    source_workdir: &Path,
+    worktree_root: &Path,
+) -> Result<OrphanedWorkspaceSweepReport> {
+    sweep_orphaned_run_workspaces_with_now(source_workdir, worktree_root, SystemTime::now())
+}
+
 /// Wait until enough worktree slots are available for `needed` worktrees.
-fn wait_for_available_worktree_slots(source_workdir: &Path, needed: usize) -> Result<usize> {
+fn wait_for_available_worktree_slots(
+    source_workdir: &Path,
+    worktree_root: &Path,
+    needed: usize,
+) -> Result<usize> {
     if needed > MAX_WORKTREES {
         bail!(
             "creating {} worktrees would exceed the maximum of {}; reduce parallel task count",
@@ -458,6 +892,7 @@ fn wait_for_available_worktree_slots(source_workdir: &Path, needed: usize) -> Re
     let mut wait_seconds = WORKTREE_SLOT_WAIT_INITIAL_SECONDS;
     loop {
         prune_stale_worktrees(source_workdir)?;
+        let recovery_report = sweep_orphaned_run_workspaces(source_workdir, worktree_root)?;
         let existing = count_existing_worktrees(source_workdir)?;
         if existing + needed <= MAX_WORKTREES {
             return Ok(existing);
@@ -467,6 +902,8 @@ fn wait_for_available_worktree_slots(source_workdir: &Path, needed: usize) -> Re
             existing_worktrees = existing,
             requested_worktrees = needed,
             max_worktrees = MAX_WORKTREES,
+            reclaimed_orphaned_roots = recovery_report.reclaimed_roots,
+            salvaged_orphaned_branches = recovery_report.salvaged_branches.len(),
             wait_seconds,
             "worktree limit reached, waiting for slots to free"
         );
@@ -522,8 +959,19 @@ fn prepare_parallel_workspace_layout_worktree(
         );
     }
 
+    let startup_recovery = sweep_orphaned_run_workspaces(&source_workdir, &worktree_root)?;
+    if startup_recovery.reclaimed_roots > 0 || !startup_recovery.salvaged_branches.is_empty() {
+        println!(
+            "Recovered {} abandoned run workspace(s) before starting this run.",
+            startup_recovery.reclaimed_roots
+        );
+        for branch in &startup_recovery.salvaged_branches {
+            println!("  Preserved salvage branch: {branch}");
+        }
+    }
+
     let needed = plan.tasks.len();
-    let _existing = wait_for_available_worktree_slots(&source_workdir, needed)?;
+    let _existing = wait_for_available_worktree_slots(&source_workdir, &worktree_root, needed)?;
 
     let source_head_at_creation = run_git_capture(&source_workdir, &["rev-parse", "HEAD"])
         .ok()
@@ -538,6 +986,7 @@ fn prepare_parallel_workspace_layout_worktree(
             run_workspace_root.display()
         )
     })?;
+    write_run_workspace_lease(&run_workspace_root, &source_workdir)?;
 
     let mut task_workspace_dirs = Vec::with_capacity(needed);
     let mut worktree_branches = Vec::with_capacity(needed);
@@ -830,6 +1279,22 @@ pub(crate) fn cleanup_parallel_workspace(layout: &ParallelWorkspaceLayout) {
 ///
 /// Stages only `.yarli/continuation.json` and `.yarli/tranches.toml`, then commits
 /// with a templated message. Returns `Ok(true)` if a commit was made.
+fn generated_commit_message(
+    repo: &Path,
+    diff: DiffSpec<'_>,
+    metadata: Vec<(String, String)>,
+    fallback_subject: &str,
+    fallback_scope: Option<&str>,
+) -> String {
+    render_commit_message(&generate_commit_message(
+        repo,
+        diff,
+        &metadata,
+        fallback_subject,
+        fallback_scope,
+    ))
+}
+
 pub(crate) fn auto_commit_state_files(
     source_workdir: &Path,
     tranche_key: &str,
@@ -861,14 +1326,27 @@ pub(crate) fn auto_commit_state_files(
         return Ok(false);
     }
 
-    let default_template =
-        "yarli: checkpoint after {tranche_key} ({tranches_completed}/{tranches_total})";
-    let template = message_template.unwrap_or(default_template);
-    let message = template
-        .replace("{tranche_key}", tranche_key)
-        .replace("{run_id}", run_id)
-        .replace("{tranches_completed}", &tranches_completed.to_string())
-        .replace("{tranches_total}", &tranches_total.to_string());
+    let message = match message_template {
+        Some(template) => template
+            .replace("{tranche_key}", tranche_key)
+            .replace("{run_id}", run_id)
+            .replace("{tranches_completed}", &tranches_completed.to_string())
+            .replace("{tranches_total}", &tranches_total.to_string()),
+        None => generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                ("yarli-tranche".to_string(), tranche_key.to_string()),
+                (
+                    "yarli-progress".to_string(),
+                    format!("{tranches_completed}/{tranches_total}"),
+                ),
+            ],
+            "chore(state): checkpoint runtime state",
+            Some("state"),
+        ),
+    };
 
     let commit_result = run_git_capture(source_workdir, &["commit", "--no-verify", "-m", &message]);
     match commit_result {
@@ -2206,7 +2684,17 @@ pub(crate) fn merge_worktree_workspace_results(
                 // Stage and commit all changes in the worktree.
                 if !status_text.trim().is_empty() {
                     let _ = run_git_capture(workspace_dir, &["add", "-A"]);
-                    let commit_msg = format!("yarli: task {task_key} work");
+                    let commit_msg = generated_commit_message(
+                        workspace_dir,
+                        DiffSpec::Staged,
+                        vec![
+                            ("yarli-run".to_string(), run_id.to_string()),
+                            ("yarli-task".to_string(), task_key.clone()),
+                            ("yarli-branch".to_string(), branch.clone()),
+                        ],
+                        "chore(workspace): update staged changes",
+                        Some(task_key),
+                    );
                     let commit_result = run_git_capture(
                         workspace_dir,
                         &["commit", "--no-verify", "--allow-empty", "-m", &commit_msg],
@@ -2223,7 +2711,20 @@ pub(crate) fn merge_worktree_workspace_results(
                 }
 
                 // Merge the worktree branch into the main working directory.
-                let merge_msg = format!("yarli: merge {task_key}");
+                let merge_msg = generated_commit_message(
+                    source_workdir,
+                    DiffSpec::Range {
+                        base: "HEAD",
+                        head: branch,
+                    },
+                    vec![
+                        ("yarli-run".to_string(), run_id.to_string()),
+                        ("yarli-task".to_string(), task_key.clone()),
+                        ("yarli-source-branch".to_string(), branch.clone()),
+                    ],
+                    "chore(integration): integrate workspace changes",
+                    Some(task_key),
+                );
                 let merge_result = run_git_capture(
                     source_workdir,
                     &["merge", "--no-ff", branch, "-m", &merge_msg],
@@ -2323,8 +2824,17 @@ pub(crate) fn merge_worktree_workspace_results(
                                         _ => {}
                                     }
                                 }
-                                let repair_msg =
-                                    format!("yarli: auto-repair merge conflict for {task_key}");
+                                let repair_msg = generated_commit_message(
+                                    source_workdir,
+                                    DiffSpec::Staged,
+                                    vec![
+                                        ("yarli-run".to_string(), run_id.to_string()),
+                                        ("yarli-task".to_string(), task_key.clone()),
+                                        ("yarli-resolution".to_string(), "auto-repair".to_string()),
+                                    ],
+                                    "fix(integration): update repaired merge changes",
+                                    Some(task_key),
+                                );
                                 let _ = run_git_capture(
                                     source_workdir,
                                     &["commit", "--no-verify", "--allow-empty", "-m", &repair_msg],
@@ -2412,15 +2922,22 @@ pub(crate) fn merge_worktree_workspace_results(
         }
         // Commit the reapplied dirty state (clean pop or resolved conflicts).
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let reapply_msg = generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                (
+                    "yarli-restore".to_string(),
+                    "pre-existing workspace state after worktree merge".to_string(),
+                ),
+            ],
+            "chore(workspace): restore local workspace changes",
+            Some("workspace"),
+        );
         let _ = run_git_capture(
             source_workdir,
-            &[
-                "commit",
-                "--no-verify",
-                "--allow-empty",
-                "-m",
-                "yarli: reapply pre-existing workspace state after worktree merge",
-            ],
+            &["commit", "--no-verify", "--allow-empty", "-m", &reapply_msg],
         );
     }
 
@@ -2936,7 +3453,19 @@ Operator recovery steps:\n\
         // "does not match index" errors for subsequent patches. These interim
         // commits are transparent to the user (not pushed, can be squashed).
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
-        let commit_msg = format!("yarli: merge workspace result for {task_key}");
+        let commit_msg = generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                ("yarli-task".to_string(), task_key.clone()),
+                ("yarli-workspace-head".to_string(), ws_head.clone()),
+                ("yarli-source-head".to_string(), source_head.clone()),
+                ("yarli-patch".to_string(), patch_path.display().to_string()),
+            ],
+            "chore(integration): integrate workspace result",
+            Some(task_key),
+        );
         let _ = run_git_capture(
             source_workdir,
             &["commit", "--no-verify", "--allow-empty", "-m", &commit_msg],
@@ -3008,15 +3537,22 @@ Operator recovery steps:\n\
         }
         // Commit the reapplied dirty state (clean pop or resolved conflicts).
         let _ = run_git_capture(source_workdir, &["add", "-A"]);
+        let reapply_msg = generated_commit_message(
+            source_workdir,
+            DiffSpec::Staged,
+            vec![
+                ("yarli-run".to_string(), run_id.to_string()),
+                (
+                    "yarli-restore".to_string(),
+                    "pre-existing workspace state after merge".to_string(),
+                ),
+            ],
+            "chore(workspace): restore local workspace changes",
+            Some("workspace"),
+        );
         let _ = run_git_capture(
             source_workdir,
-            &[
-                "commit",
-                "--no-verify",
-                "--allow-empty",
-                "-m",
-                "yarli: reapply pre-existing workspace state after merge",
-            ],
+            &["commit", "--no-verify", "--allow-empty", "-m", &reapply_msg],
         );
     }
 
@@ -5636,6 +6172,189 @@ worktree_root = "{}"
         assert_eq!(count_existing_worktrees(&repo).unwrap(), 2);
     }
 
+    #[test]
+    fn sweep_orphaned_run_workspaces_removes_empty_dead_lease_root() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let worktree_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let run_root = worktree_root.join("run-stale");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let wt1 = run_root.join("001-alpha");
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/stale/001-alpha",
+                &wt1.display().to_string(),
+                "HEAD",
+            ],
+        );
+
+        let stale_lease = serde_json::json!({
+            "pid": 999_999u32,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "source_workdir": repo.display().to_string(),
+        });
+        std::fs::write(
+            run_root.join(RUN_WORKSPACE_LEASE_FILE),
+            serde_json::to_vec_pretty(&stale_lease).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 1);
+        let report = sweep_orphaned_run_workspaces(&repo, &worktree_root).unwrap();
+        assert_eq!(report.reclaimed_roots, 1);
+        assert!(report.salvaged_branches.is_empty());
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
+        assert!(
+            !run_root.exists(),
+            "stale run workspace root should be removed"
+        );
+        let deleted_branch =
+            run_git_capture(&repo, &["rev-parse", "--verify", "yarli/stale/001-alpha"]);
+        assert!(
+            deleted_branch
+                .map(|output| !output.status.success())
+                .unwrap_or(true),
+            "empty stale worktree branch should be deleted after reclaim"
+        );
+    }
+
+    #[test]
+    fn sweep_orphaned_run_workspaces_salvages_dirty_dead_lease_root() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let worktree_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let run_root = worktree_root.join("run-stale");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let wt1 = run_root.join("001-alpha");
+        let branch = "yarli/stale/001-alpha";
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &wt1.display().to_string(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(wt1.join("README.md"), "hello\nsalvaged change\n").unwrap();
+
+        let stale_lease = serde_json::json!({
+            "pid": 999_999u32,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "source_workdir": repo.display().to_string(),
+        });
+        std::fs::write(
+            run_root.join(RUN_WORKSPACE_LEASE_FILE),
+            serde_json::to_vec_pretty(&stale_lease).unwrap(),
+        )
+        .unwrap();
+
+        let report = sweep_orphaned_run_workspaces(&repo, &worktree_root).unwrap();
+        assert_eq!(report.reclaimed_roots, 1);
+        assert_eq!(report.salvaged_branches, vec![branch.to_string()]);
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
+        assert!(
+            !run_root.exists(),
+            "stale run workspace root should be removed"
+        );
+
+        let branch_head = run_git_capture(&repo, &["rev-parse", branch]).unwrap();
+        assert!(
+            branch_head.status.success(),
+            "salvage branch should be retained"
+        );
+        let source_head = run_git_capture(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(
+            String::from_utf8_lossy(&branch_head.stdout).trim(),
+            String::from_utf8_lossy(&source_head.stdout).trim(),
+            "salvage branch should retain work beyond source HEAD"
+        );
+
+        let body = run_git_capture(&repo, &["show", "-s", "--format=%B", branch]).unwrap();
+        let body_text = String::from_utf8_lossy(&body.stdout);
+        assert!(
+            body_text.contains("yarli-salvage: true"),
+            "salvage commit should record salvage metadata: {body_text}"
+        );
+    }
+
+    #[test]
+    fn sweep_orphaned_run_workspaces_keeps_live_lease_root() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let worktree_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let run_root = worktree_root.join("run-live");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let wt1 = run_root.join("001-alpha");
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/live/001-alpha",
+                &wt1.display().to_string(),
+                "HEAD",
+            ],
+        );
+
+        write_run_workspace_lease(&run_root, &repo).unwrap();
+
+        let report = sweep_orphaned_run_workspaces(&repo, &worktree_root).unwrap();
+        assert_eq!(report.reclaimed_roots, 0);
+        assert!(report.salvaged_branches.is_empty());
+        assert_eq!(count_existing_worktrees(&repo).unwrap(), 1);
+        assert!(
+            run_root.exists(),
+            "live run workspace root should be preserved"
+        );
+    }
+
+    #[test]
+    fn stale_run_workspace_reason_flags_old_legacy_root_without_lease() {
+        let temp = TempDir::new().unwrap();
+        let run_root = temp.path().join("run-legacy");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let modified_at = std::fs::metadata(&run_root).unwrap().modified().unwrap();
+        let future_now = modified_at + LEGACY_RUN_WORKSPACE_RECLAIM_AGE + Duration::from_secs(1);
+
+        let reason =
+            stale_run_workspace_reason(&run_root, future_now, LEGACY_RUN_WORKSPACE_RECLAIM_AGE);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|value| value.contains("legacy run workspace root")),
+            "expected legacy root reclaim reason, got {reason:?}"
+        );
+    }
+
     fn make_planned_task(key: &str) -> PlannedTask {
         PlannedTask {
             task_key: key.into(),
@@ -5945,7 +6664,14 @@ worktree_root = "{}"
         // Check git log shows merge commit.
         let (ok, log_output, _) = run_git(&repo, &["log", "--oneline", "-5"]);
         assert!(ok);
-        assert!(log_output.contains("merge alpha"), "git log: {log_output}");
+        assert!(
+            log_output.contains("feat(new-file): add new file"),
+            "git log: {log_output}"
+        );
+        assert!(
+            !log_output.contains("yarli: merge alpha"),
+            "git log should avoid workflow-centric subjects: {log_output}"
+        );
 
         // Merged task worktree should be removed immediately to free slots.
         assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
@@ -6053,10 +6779,17 @@ worktree_root = "{}"
         );
 
         // Verify commit message.
-        let (ok, log, _) = run_git(&repo, &["log", "-1", "--pretty=%s"]);
+        let (ok, log, _) = run_git(&repo, &["log", "-1", "--pretty=%B"]);
         assert!(ok);
-        assert!(log.contains("tranche-001"), "commit message: {log}");
-        assert!(log.contains("1/3"), "commit message: {log}");
+        assert!(
+            log.starts_with("chore(state): checkpoint runtime state"),
+            "commit message: {log}"
+        );
+        assert!(
+            log.contains("yarli-tranche: tranche-001"),
+            "commit message: {log}"
+        );
+        assert!(log.contains("yarli-progress: 1/3"), "commit message: {log}");
     }
 
     #[test]
@@ -6129,10 +6862,14 @@ worktree_root = "{}"
         // Verify git log shows merge + reapply commits.
         let (ok, log, _) = run_git(&repo, &["log", "--oneline", "-5"]);
         assert!(ok);
-        assert!(log.contains("merge task"), "git log: {log}");
+        assert!(log.contains("feat(state): update state"), "git log: {log}");
         assert!(
-            log.contains("reapply pre-existing"),
+            log.contains("chore(workspace): restore local workspace changes"),
             "should reapply stashed state: {log}"
+        );
+        assert!(
+            !log.contains("merge task") && !log.contains("reapply pre-existing"),
+            "git log should avoid workflow-centric subjects: {log}"
         );
 
         // Verify no stash entries remain.

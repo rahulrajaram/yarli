@@ -8,7 +8,10 @@ use sqlx::ConnectOptions;
 use uuid::Uuid;
 use yarli_core::domain::{CommandClass, EntityType, Event};
 use yarli_queue::{ClaimRequest, ConcurrencyConfig, PostgresTaskQueue, TaskQueue};
-use yarli_store::{EventStore, PostgresEventStore, MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
+use yarli_store::{
+    EventStore, PostgresEventStore, MIGRATION_0001_INIT, MIGRATION_0002_INDEXES,
+    MIGRATION_0003_RUN_DRAINED_STATE,
+};
 
 const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
 const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";
@@ -520,6 +523,7 @@ async fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::
     for statement in MIGRATION_0001_INIT
         .split(';')
         .chain(MIGRATION_0002_INDEXES.split(';'))
+        .chain(MIGRATION_0003_RUN_DRAINED_STATE.split(';'))
     {
         let statement = statement.trim();
         if statement.is_empty() {

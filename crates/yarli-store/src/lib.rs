@@ -12,6 +12,8 @@ pub mod postgres;
 
 pub const MIGRATION_0001_INIT: &str = include_str!("../migrations/0001_init.sql");
 pub const MIGRATION_0002_INDEXES: &str = include_str!("../migrations/0002_indexes.sql");
+pub const MIGRATION_0003_RUN_DRAINED_STATE: &str =
+    include_str!("../migrations/0003_run_drained_state.sql");
 pub const MIGRATION_0001_DOWN: &str = r#"
 DROP TABLE IF EXISTS task_queue CASCADE;
 DROP TABLE IF EXISTS leases CASCADE;
@@ -58,6 +60,43 @@ DROP INDEX IF EXISTS idx_task_queue_run_status;
 DROP INDEX IF EXISTS idx_task_queue_class_status;
 DROP INDEX IF EXISTS ux_task_queue_active_task;
 "#;
+pub const MIGRATION_0003_DOWN: &str = r#"
+ALTER TABLE runs
+    DROP CONSTRAINT IF EXISTS runs_state_check;
+
+ALTER TABLE runs
+    ADD CONSTRAINT runs_state_check
+    CHECK (
+        state IN (
+            'RUN_OPEN',
+            'RUN_ACTIVE',
+            'RUN_VERIFYING',
+            'RUN_BLOCKED',
+            'RUN_FAILED',
+            'RUN_COMPLETED',
+            'RUN_CANCELLED'
+        )
+    );
+
+ALTER TABLE runs
+    DROP CONSTRAINT IF EXISTS runs_exit_reason_check;
+
+ALTER TABLE runs
+    ADD CONSTRAINT runs_exit_reason_check
+    CHECK (
+        exit_reason IS NULL
+        OR exit_reason IN (
+            'completed_all_gates',
+            'blocked_open_tasks',
+            'blocked_gate_failure',
+            'failed_policy_denial',
+            'failed_runtime_error',
+            'cancelled_by_operator',
+            'timed_out',
+            'stalled_no_progress'
+        )
+    );
+"#;
 
 pub use error::StoreError;
 pub use event_store::EventStore;
@@ -66,7 +105,7 @@ pub use postgres::PostgresEventStore;
 
 #[cfg(test)]
 mod migration_tests {
-    use super::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
+    use super::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES, MIGRATION_0003_RUN_DRAINED_STATE};
 
     #[test]
     fn init_migration_contains_required_tables() {
@@ -108,6 +147,22 @@ mod migration_tests {
     }
 
     #[test]
+    fn drained_run_migration_contains_new_run_state() {
+        assert!(
+            MIGRATION_0001_INIT.contains("'RUN_DRAINED'"),
+            "expected fresh schema to allow RUN_DRAINED"
+        );
+        assert!(
+            MIGRATION_0001_INIT.contains("'drained_by_operator'"),
+            "expected fresh schema to allow drained_by_operator"
+        );
+        assert!(
+            MIGRATION_0003_RUN_DRAINED_STATE.contains("RUN_DRAINED"),
+            "expected follow-up migration to add RUN_DRAINED support"
+        );
+    }
+
+    #[test]
     fn down_migrations_are_defined() {
         assert!(
             super::MIGRATION_0001_DOWN.contains("DROP TABLE IF EXISTS runs"),
@@ -116,6 +171,10 @@ mod migration_tests {
         assert!(
             super::MIGRATION_0002_DOWN.contains("DROP INDEX IF EXISTS idx_events_occurred_at"),
             "expected down migration rollback for index"
+        );
+        assert!(
+            super::MIGRATION_0003_DOWN.contains("DROP CONSTRAINT IF EXISTS runs_state_check"),
+            "expected rollback for drained run migration"
         );
     }
 }

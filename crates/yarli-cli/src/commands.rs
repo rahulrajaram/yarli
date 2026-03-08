@@ -26,7 +26,8 @@ use yarli_core::entities::continuation::{
 };
 use yarli_store::{
     InMemoryEventStore, PostgresEventStore, MIGRATION_0001_DOWN, MIGRATION_0001_INIT,
-    MIGRATION_0002_DOWN, MIGRATION_0002_INDEXES,
+    MIGRATION_0002_DOWN, MIGRATION_0002_INDEXES, MIGRATION_0003_DOWN,
+    MIGRATION_0003_RUN_DRAINED_STATE,
 };
 
 fn collect_telemetry_string_values(metadata: Option<&serde_json::Value>) -> Vec<String> {
@@ -2186,7 +2187,7 @@ const MIGRATION_TABLE_NAME: &str = "yarli_schema_migrations";
 const MIGRATION_BACKUP_SCHEMA: &str = "yarli_migration_backups";
 const MIGRATION_LOCK_KEY: i64 = 6_021_202_602;
 
-const MIGRATIONS: [MigrationDefinition; 2] = [
+const MIGRATIONS: [MigrationDefinition; 3] = [
     MigrationDefinition {
         version: 1,
         name: "0001_init",
@@ -2198,6 +2199,12 @@ const MIGRATIONS: [MigrationDefinition; 2] = [
         name: "0002_indexes",
         up_sql: MIGRATION_0002_INDEXES,
         down_sql: MIGRATION_0002_DOWN,
+    },
+    MigrationDefinition {
+        version: 3,
+        name: "0003_run_drained_state",
+        up_sql: MIGRATION_0003_RUN_DRAINED_STATE,
+        down_sql: MIGRATION_0003_DOWN,
     },
 ];
 

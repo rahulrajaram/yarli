@@ -1645,8 +1645,12 @@ async fn merge_commit_message_has_attribution() {
         "commit should contain yarli-task attribution"
     );
     assert!(
-        msg.contains("chore(yarli): merge"),
-        "commit should use conventional commits format: {msg}"
+        msg.starts_with("feat(feature): add feature"),
+        "commit should describe the merged change: {msg}"
+    );
+    assert!(
+        !msg.contains("chore(yarli): merge"),
+        "commit should avoid workflow-centric subjects: {msg}"
     );
 }
 
@@ -1708,15 +1712,16 @@ fn merge_build_commit_message() {
     let wt_id = Uuid::now_v7();
     let corr_id = Uuid::now_v7();
 
-    let intent = MergeIntent::new(run_id, wt_id, "feature/branch", "main", corr_id);
+    let intent = MergeIntent::new(run_id, wt_id, "feature/branch", "main", corr_id)
+        .with_commit_template("chore(integration): integrate {source}");
 
     let msg = LocalMergeOrchestrator::build_commit_message(&intent);
     assert!(
-        msg.contains("chore(yarli): merge feature/branch into main"),
-        "default template should use conventional commits: {msg}"
+        msg.contains("chore(integration): integrate feature/branch"),
+        "custom template should be rendered: {msg}"
     );
-    assert!(msg.contains(&run_id.to_string()));
-    assert!(msg.contains(&wt_id.to_string()));
+    assert!(!msg.contains(&run_id.to_string()));
+    assert!(!msg.contains(&wt_id.to_string()));
 }
 
 #[tokio::test]

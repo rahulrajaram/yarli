@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Project-specific post-merge checks for yarli
+# Called by the dispatcher in .git/hooks/post-merge
+
+COMMITHOOKS_DIR="${COMMITHOOKS_DIR:-$(git rev-parse --git-dir)}"
+source "$COMMITHOOKS_DIR/lib/common.sh"
+source "$COMMITHOOKS_DIR/lib/deps.sh"
+
+commithooks_reinstall_if_changed
