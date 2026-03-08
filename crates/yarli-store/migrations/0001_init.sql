@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS runs (
             'RUN_BLOCKED',
             'RUN_FAILED',
             'RUN_COMPLETED',
-            'RUN_CANCELLED'
+            'RUN_CANCELLED',
+            'RUN_DRAINED'
         )
     ),
     safe_mode TEXT NOT NULL CHECK (
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS runs (
             'failed_policy_denial',
             'failed_runtime_error',
             'cancelled_by_operator',
+            'drained_by_operator',
             'timed_out',
             'stalled_no_progress'
         )

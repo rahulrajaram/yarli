@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
-use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES};
+use yarli_store::{MIGRATION_0001_INIT, MIGRATION_0002_INDEXES, MIGRATION_0003_RUN_DRAINED_STATE};
 
 const TEST_DATABASE_URL_ENV: &str = "YARLI_TEST_DATABASE_URL";
 const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";
@@ -580,9 +580,10 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
 
     let pool = connect_postgres(&database.database_url, "run_drain_roundtrip").await?;
 
-    // Spawn a run with two tasks. Keep task 1 long enough that drain can be
-    // requested deterministically while it's still executing, then verify task
-    // 2 stays queued and never starts.
+    // Spawn a run with two long-running tasks so whichever one the scheduler
+    // starts first will still be executing when the separate operator-control
+    // process persists the drain request. The other task should remain queued
+    // and never start.
     let stdout_path = temp_dir.path().join("yarli-stdout.log");
     let stderr_path = temp_dir.path().join("yarli-stderr.log");
     let stdout_file = std::fs::File::create(&stdout_path)?;
@@ -595,9 +596,9 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
             "postgres drain hardening",
             "--stream",
             "--cmd",
-            "sleep 8",
+            "sleep 5",
             "--cmd",
-            "echo should-not-run",
+            "sleep 5",
         ])
         .stdout(stdout_file)
         .stderr(stderr_file)
@@ -1876,6 +1877,7 @@ async fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::
     for statement in MIGRATION_0001_INIT
         .split(';')
         .chain(MIGRATION_0002_INDEXES.split(';'))
+        .chain(MIGRATION_0003_RUN_DRAINED_STATE.split(';'))
     {
         let statement = statement.trim();
         if statement.is_empty() {
