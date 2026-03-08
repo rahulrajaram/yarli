@@ -5,6 +5,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/rahulrajaram/yarli"
+homepage = "https://github.com/rahulrajaram/yarli"
+documentation = "https://docs.rs/yarli"
 build = "crates/yarli-cli/build.rs"
 
 [lib]

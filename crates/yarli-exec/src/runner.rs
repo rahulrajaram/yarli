@@ -95,11 +95,11 @@ pub trait CommandRunner: Send + Sync {
     /// 2. Capture stdout/stderr as StreamChunks.
     /// 3. Respect the cancellation token for graceful shutdown.
     /// 4. Apply timeout if configured.
-    async fn run(
+    fn run(
         &self,
         request: CommandRequest,
         cancel: CancellationToken,
-    ) -> Result<CommandResult, ExecError>;
+    ) -> impl std::future::Future<Output = Result<CommandResult, ExecError>> + Send;
 }
 
 /// Local command runner that spawns OS processes via `tokio::process`.
