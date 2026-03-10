@@ -601,6 +601,14 @@ pub(crate) enum Commands {
         action: AuditAction,
     },
     #[command(
+        about = "Validate structured tranche evidence files",
+        long_about = "Validate structured evidence files in .yarli/evidence.\n\nChecks TOML frontmatter, filename-to-tranche matching, required markdown headings, and basic metadata consistency.\n\nExamples:\n  yarli evidence validate\n  yarli evidence validate --path .yarli/evidence/IWIRE-GATE-01.md"
+    )]
+    Evidence {
+        #[command(subcommand)]
+        action: EvidenceAction,
+    },
+    #[command(
         about = "Manage the structured plan (tranches file)",
         long_about = "Manage the structured plan in .yarli/tranches.toml.\n\nExamples:\n  yarli plan tranche add --key TP-05 --summary \"Config loader\"\n  yarli plan tranche complete --key TP-05\n  yarli plan tranche list\n  yarli plan tranche remove --key TP-05\n  yarli plan validate"
     )]
@@ -1025,6 +1033,19 @@ pub(crate) enum AuditOutputFormat {
     Table,
     Json,
     Csv,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum EvidenceAction {
+    #[command(
+        about = "Validate structured evidence markdown",
+        long_about = "Validate structured evidence markdown.\n\nBy default this checks every `*.md` file in `.yarli/evidence`.\nYou can also point at a single file.\n\nExamples:\n  yarli evidence validate\n  yarli evidence validate --path .yarli/evidence/IWIRE-GATE-01.md"
+    )]
+    Validate {
+        /// Evidence directory or a single evidence markdown file.
+        #[arg(long, default_value = ".yarli/evidence")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

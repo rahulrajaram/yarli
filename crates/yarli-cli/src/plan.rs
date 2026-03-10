@@ -15,6 +15,7 @@ use crate::config::{
     ensure_write_backend_guard, AutoAdvancePolicy, BackendSelection, LoadedConfig,
     RunPlanGuardModeConfig,
 };
+use crate::evidence::evidence_file_format_instructions;
 
 use yarli_cli::mode::RenderMode;
 use yarli_cli::yarli_core::domain::CommandClass;
@@ -337,7 +338,7 @@ pub(crate) fn build_tranche_task_prompt(
     let mut instruction_lines = vec![
         "1. Read PROMPT and plan context from the workspace paths above.".to_string(),
         "2. Implement only the target tranche if it is still incomplete.".to_string(),
-        "3. Update IMPLEMENTATION_PLAN.md status. Write verification evidence to .yarli/evidence/I<id>.md.".to_string(),
+        "3. Update IMPLEMENTATION_PLAN.md status. Write structured evidence to .yarli/evidence/I<tranche-key>.md.".to_string(),
         "4. Run the tranche's required verification commands before finishing.".to_string(),
     ];
     let mut instruction_counter = 5;
@@ -391,7 +392,7 @@ pub(crate) fn build_tranche_task_prompt(
     };
 
     format!(
-        "YARLI tranche task {}/{}.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nTarget tranche: {}.\nTarget summary: {}\n{}{}{}Mode: implementation.\n\nInstructions:\n{}",
+        "YARLI tranche task {}/{}.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nTarget tranche: {}.\nTarget summary: {}\n{}{}{}Mode: implementation.\n\nInstructions:\n{}\n\n{}",
         index + 1,
         total,
         objective,
@@ -402,7 +403,8 @@ pub(crate) fn build_tranche_task_prompt(
         tranche_group_line,
         allowed_paths_line,
         contract,
-        instructions
+        instructions,
+        evidence_file_format_instructions()
     )
 }
 
@@ -413,11 +415,12 @@ pub(crate) fn build_verification_task_prompt(
     open_tranche_count: usize,
 ) -> String {
     format!(
-        "YARLI verification task.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nOpen tranche count seen at dispatch: {}.\nMode: verification-only.\n\nInstructions:\n1. Verify current workspace state against PROMPT.md and IMPLEMENTATION_PLAN.md.\n2. Run verification commands and capture concrete results.\n3. Write verification evidence to .yarli/evidence/I<id>.md for each verified tranche. Update status in IMPLEMENTATION_PLAN.md only if needed.\n4. Do not invent completion claims.",
+        "YARLI verification task.\nObjective: {}\nPrompt file: {}\nPlan file: {}\nOpen tranche count seen at dispatch: {}.\nMode: verification-only.\n\nInstructions:\n1. Verify current workspace state against PROMPT.md and IMPLEMENTATION_PLAN.md.\n2. Run verification commands and capture concrete results.\n3. Write structured evidence to .yarli/evidence/I<tranche-key>.md for each verified tranche. Update status in IMPLEMENTATION_PLAN.md only if needed.\n4. Use `task_type = \"verification\"` unless you also implemented code in this task.\n5. Do not invent completion claims.\n\n{}",
         objective,
         loaded_prompt.entry_path.display(),
         plan_path.display(),
-        open_tranche_count
+        open_tranche_count,
+        evidence_file_format_instructions()
     )
 }
 
@@ -3263,6 +3266,45 @@ enforce_plan_tranche_allowed_paths = true
         assert!(prompt.contains("Verification command: `cargo test --workspace`."));
         assert!(prompt.contains("Per-tranche max_tokens: 42000."));
         assert!(prompt.contains("Mode: implementation."));
+        assert!(prompt.contains("schema_version = 1"));
+        assert!(prompt.contains("task_type = \"implementation\""));
+        assert!(prompt.contains("## Verification"));
+    }
+
+    #[test]
+    fn verification_prompt_includes_structured_evidence_contract() {
+        let temp = TempDir::new().unwrap();
+        let loaded_prompt = prompt::LoadedPrompt {
+            entry_path: temp.path().join("PROMPT.md"),
+            expanded_text: "".to_string(),
+            snapshot: prompt::PromptSnapshot {
+                entry_path: temp.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "snapshot-hash".to_string(),
+                included_files: Vec::new(),
+            },
+            run_spec: prompt::RunSpec {
+                version: 1,
+                objective: Some("Verify current workspace".to_string()),
+                tasks: prompt::RunSpecTasks::default(),
+                tranches: None,
+                plan_guard: None,
+            },
+        };
+
+        let prompt = build_verification_task_prompt(
+            &loaded_prompt,
+            temp.path().join("IMPLEMENTATION_PLAN.md").as_path(),
+            "verify current workspace",
+            4,
+        );
+
+        assert!(prompt.contains("Mode: verification-only."));
+        assert!(prompt.contains("task_type = \"implementation\""));
+        assert!(
+            prompt.contains("Use `task_type = \"verification\"` unless you also implemented code")
+        );
+        assert!(prompt.contains("schema_version = 1"));
+        assert!(prompt.contains("## Changes"));
     }
 
     #[test]

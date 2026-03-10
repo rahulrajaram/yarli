@@ -58,6 +58,7 @@ mod cli;
 mod commands;
 mod config;
 mod events;
+mod evidence;
 mod observers;
 mod persistence;
 mod plan;
@@ -72,8 +73,8 @@ use crate::persistence::*;
 use crate::plan::*;
 use crate::projection::*;
 use cli::{
-    AuditAction, Cli, Commands, DebugAction, GateAction, MergeAction, MigrateAction, PlanAction,
-    RunAction, TaskAction, TrancheAction, WorktreeAction,
+    AuditAction, Cli, Commands, DebugAction, EvidenceAction, GateAction, MergeAction,
+    MigrateAction, PlanAction, RunAction, TaskAction, TrancheAction, WorktreeAction,
 };
 use commands::*;
 
@@ -330,6 +331,9 @@ async fn run() -> Result<()> {
                 limit,
                 format,
             ),
+        },
+        Commands::Evidence { action } => match action {
+            EvidenceAction::Validate { path } => evidence::cmd_evidence_validate(&path),
         },
         Commands::Plan { action } => match action {
             PlanAction::Tranche { action } => match action {
