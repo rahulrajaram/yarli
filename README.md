@@ -32,7 +32,7 @@ This project is for teams that want reproducible orchestration behavior, auditab
 ### Build from source
 
 ```bash
-cargo build --release -p yarli --bin yarli
+cargo build --release
 ./target/release/yarli --help
 ```
 
@@ -182,6 +182,9 @@ yarli run --prompt-file prompts/I8C.md --stream
 # Start an ad-hoc run with explicit commands (one task per --cmd).
 yarli run start "verify" --cmd "cargo fmt --all" --cmd "cargo test --workspace" --stream
 
+# Start using a named pace from yarli.toml.
+yarli run start "deploy" --pace deploy -w /opt/app --timeout 600
+
 # Query status (run-id can be a full UUID or unique prefix from `yarli run list`).
 yarli run status <run-id>
 
@@ -203,9 +206,11 @@ yarli run cancel --all-active --reason "operator stop"
 
 # Continue from the latest persisted continuation payload.
 yarli run continue
+yarli run continue --file .yarli/continuation.json
 
 # Legacy pace-based execution.
 yarli run batch --pace ci
+yarli run batch --objective "nightly check" -w /repo --timeout 900
 ```
 
 Plan guard (recommended for tranche/card workflows):
@@ -273,6 +278,15 @@ yarli audit tail --category policy_decision
 yarli audit query --run-id <run-id> --task-id <task-id>
 yarli audit query --category gate_evaluation --since 2026-02-20T00:00:00Z --before 2026-02-22T23:59:59Z
 yarli audit query --category policy_decision --format csv --limit 50
+```
+
+### `yarli evidence`
+
+Validate structured tranche evidence files in `.yarli/evidence/`. Checks TOML frontmatter, filename-to-tranche matching, required markdown headings, and metadata consistency.
+
+```bash
+yarli evidence validate
+yarli evidence validate --path .yarli/evidence/IWIRE-GATE-01.md
 ```
 
 ### `yarli plan`
