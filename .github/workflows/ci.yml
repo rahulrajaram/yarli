@@ -72,7 +72,7 @@ jobs:
       - name: Store Postgres integration tests
         run: |
           set -euo pipefail
-          cargo test -p yarli-store --test postgres_integration -- --nocapture | tee /tmp/yarli-store-postgres-integration.log
+          cargo test -p yarli --test yarli_store_postgres_integration -- --nocapture | tee /tmp/yarli-store-postgres-integration.log
           if grep -q "skipping postgres integration test" /tmp/yarli-store-postgres-integration.log; then
             echo "skip-path detected in yarli-store postgres integration tests"
             exit 1
@@ -81,7 +81,7 @@ jobs:
       - name: Queue Postgres integration tests
         run: |
           set -euo pipefail
-          cargo test -p yarli-queue --test postgres_integration -- --nocapture | tee /tmp/yarli-queue-postgres-integration.log
+          cargo test -p yarli --test yarli_queue_postgres_integration -- --nocapture | tee /tmp/yarli-queue-postgres-integration.log
           if grep -q "skipping postgres integration test" /tmp/yarli-queue-postgres-integration.log; then
             echo "skip-path detected in yarli-queue postgres integration tests"
             exit 1
@@ -90,7 +90,7 @@ jobs:
       - name: CLI Postgres integration tests
         run: |
           set -euo pipefail
-          cargo test -p yarli-cli --test postgres_integration -- --nocapture | tee /tmp/yarli-cli-postgres-integration.log
+          cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture | tee /tmp/yarli-cli-postgres-integration.log
           if grep -q "skipping postgres integration test" /tmp/yarli-cli-postgres-integration.log; then
             echo "skip-path detected in yarli-cli postgres integration tests"
             exit 1

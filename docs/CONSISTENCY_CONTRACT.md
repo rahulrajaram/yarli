@@ -126,16 +126,16 @@ A verifier determines Loop-7 PASS by executing every check and confirming every 
 
 | # | Invariant | Executable Check | Expected Outcome | PASS Criteria |
 |---|-----------|-----------------|-------------------|---------------|
-| SC-1 | Single-active-lease: at most one worker holds a queue lease per entry | `cargo test -p yarli-queue -- concurrent_claims_no_double_leasing --nocapture` | Exit 0, `test result: ok` | No duplicate lease observed across 5 concurrent claimants |
-| SC-2 | Single-active-lease under Postgres FOR UPDATE SKIP LOCKED | `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-queue --test postgres_integration -- --nocapture` | Exit 0, concurrent-claim test passes | Postgres-backed concurrent claim yields no double-lease |
-| SC-3 | No duplicate terminal transition per task attempt | `cargo test -p yarli-core -- terminal_state_rejects --nocapture` | Exit 0, `test result: ok` | All 5 entity types reject transition from terminal state |
-| SC-4 | Durable-state-before-side-effects on restart/replay | `cargo test -p yarli-queue -- scheduler --nocapture` | Exit 0, scheduler lifecycle tests pass | Events persisted before command spawn; replay produces consistent state |
-| SC-5 | Idempotency key replay prevents duplicate events | `cargo test -p yarli-store -- idempotency --nocapture` | Exit 0, `test result: ok` | Duplicate idempotency keys rejected; unique keys accepted |
-| SC-6 | Idempotency keys unique per attempt (no cross-retry collision) | `cargo test -p yarli-queue -- idempotency_keys_unique --nocapture` | Exit 0, `test result: ok` | Each retry attempt generates distinct idempotency keys |
-| SC-7 | Budget breach → immediate TaskFailed, no retry | `cargo test -p yarli-queue -- test_budget_exceeded_fails_task_without_retry --nocapture` | Exit 0, `test result: ok` | Task transitions to TaskFailed with reason="budget_exceeded", not retried |
-| SC-8 | Run-level budget enforcement across tasks | `cargo test -p yarli-queue -- test_run_token_budget_exceeded_across_tasks --nocapture` | Exit 0, `test result: ok` | Cumulative token budget enforced, run cannot complete after breach |
-| SC-9 | Stale lease reclamation with attempt increment | `cargo test -p yarli-queue -- reclaim_stale --nocapture` | Exit 0, `test result: ok` | Expired leases reclaimed; attempt_no incremented |
-| SC-10 | Queue rejects duplicate enqueue of active task | `cargo test -p yarli-queue -- enqueue_duplicate_active --nocapture` | Exit 0, `test result: ok` | DuplicateTask error on active re-enqueue |
+| SC-1 | Single-active-lease: at most one worker holds a queue lease per entry | `cargo test -p yarli concurrent_claims_no_double_leasing -- --nocapture` | Exit 0, `test result: ok` | No duplicate lease observed across 5 concurrent claimants |
+| SC-2 | Single-active-lease under Postgres FOR UPDATE SKIP LOCKED | `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_queue_postgres_integration concurrent_claim_no_duplicate_lease_postgres -- --nocapture` | Exit 0, concurrent-claim test passes | Postgres-backed concurrent claim yields no double-lease |
+| SC-3 | No duplicate terminal transition per task attempt | `cargo test -p yarli terminal_state_rejects -- --nocapture` | Exit 0, `test result: ok` | All 5 entity types reject transition from terminal state |
+| SC-4 | Durable-state-before-side-effects on restart/replay | `cargo test -p yarli scheduler -- --nocapture` | Exit 0, scheduler lifecycle tests pass | Events persisted before command spawn; replay produces consistent state |
+| SC-5 | Idempotency key replay prevents duplicate events | `cargo test -p yarli idempotency -- --nocapture` | Exit 0, `test result: ok` | Duplicate idempotency keys rejected; unique keys accepted |
+| SC-6 | Idempotency keys unique per attempt (no cross-retry collision) | `cargo test -p yarli test_idempotency_keys_unique_per_attempt -- --nocapture` | Exit 0, `test result: ok` | Each retry attempt generates distinct idempotency keys |
+| SC-7 | Budget breach → immediate TaskFailed, no retry | `cargo test -p yarli test_budget_exceeded_fails_task_without_retry -- --nocapture` | Exit 0, `test result: ok` | Task transitions to TaskFailed with reason="budget_exceeded", not retried |
+| SC-8 | Run-level budget enforcement across tasks | `cargo test -p yarli test_run_token_budget_exceeded_across_tasks -- --nocapture` | Exit 0, `test result: ok` | Cumulative token budget enforced, run cannot complete after breach |
+| SC-9 | Stale lease reclamation with attempt increment | `cargo test -p yarli reclaim_stale -- --nocapture` | Exit 0, `test result: ok` | Expired leases reclaimed; attempt_no incremented |
+| SC-10 | Queue rejects duplicate enqueue of active task | `cargo test -p yarli enqueue_duplicate_active -- --nocapture` | Exit 0, `test result: ok` | DuplicateTask error on active re-enqueue |
 
 ### 3.1 Verifier Coverage
 
@@ -149,9 +149,9 @@ These matrix checks are enforced by the one-command verifier:
 
 These guarantees are also proven by:
 
-- **Unit tests**: `cargo test -p yarli-core` (FSM transition validation, terminal immutability, entity models).
-- **Scheduler tests**: `cargo test -p yarli-queue` (budget enforcement, lease lifecycle, idempotency).
-- **Postgres integration tests**: strict execution under `YARLI_REQUIRE_POSTGRES_TESTS=1` (idempotency key dedup, queue claim semantics).
+- **Unit tests**: `cargo test -p yarli terminal_state_rejects -- --nocapture` (FSM transition validation, terminal immutability, entity models).
+- **Scheduler tests**: `cargo test -p yarli scheduler -- --nocapture` (budget enforcement, lease lifecycle, idempotency).
+- **Postgres integration tests**: `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_queue_postgres_integration -- --nocapture` (idempotency key dedup, queue claim semantics).
 - **One-command acceptance**: `bash scripts/verify_acceptance_rubric.sh <loop-id>`.
 
 See `docs/OPERATIONS.md` for operator verification workflows and `docs/ACCEPTANCE_RUBRIC.md` for rubric criteria.

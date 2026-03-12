@@ -109,7 +109,7 @@ if [[ "$workspace_ec" -ne 0 ]]; then
 fi
 
 strict_missing_log="${evidence_dir}/02-strict-missing-env.log"
-strict_missing_cmd='unset YARLI_TEST_DATABASE_URL; YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-store --test postgres_integration -- --nocapture'
+strict_missing_cmd='unset YARLI_TEST_DATABASE_URL; YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_store_postgres_integration -- --nocapture'
 run_check "$strict_missing_log" "$strict_missing_cmd"
 strict_missing_ec=$?
 append_summary_entry "$strict_missing_cmd" "$strict_missing_ec" "$strict_missing_log"
@@ -133,7 +133,7 @@ if [[ -z "${YARLI_TEST_DATABASE_URL:-}" ]]; then
   strict_cli_ec=1
 else
   strict_store_log="${evidence_dir}/03-strict-store.log"
-  strict_store_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-store --test postgres_integration -- --nocapture'
+  strict_store_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_store_postgres_integration -- --nocapture'
   run_check "$strict_store_log" "$strict_store_cmd"
   strict_store_ec=$?
   append_summary_entry "$strict_store_cmd" "$strict_store_ec" "$strict_store_log"
@@ -142,7 +142,7 @@ else
   fi
 
   strict_queue_log="${evidence_dir}/04-strict-queue.log"
-  strict_queue_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-queue --test postgres_integration -- --nocapture'
+  strict_queue_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_queue_postgres_integration -- --nocapture'
   run_check "$strict_queue_log" "$strict_queue_cmd"
   strict_queue_ec=$?
   append_summary_entry "$strict_queue_cmd" "$strict_queue_ec" "$strict_queue_log"
@@ -151,7 +151,7 @@ else
   fi
 
   strict_cli_log="${evidence_dir}/05-strict-cli.log"
-  strict_cli_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-cli --test postgres_integration -- --nocapture'
+  strict_cli_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture'
   run_check "$strict_cli_log" "$strict_cli_cmd"
   strict_cli_ec=$?
   append_summary_entry "$strict_cli_cmd" "$strict_cli_ec" "$strict_cli_log"
@@ -170,7 +170,7 @@ else
 
   if [[ "$is_loop_r8" -eq 1 ]]; then
     packaging_build_log="${evidence_dir}/15-packaging-build.log"
-    packaging_build_cmd='cargo build --workspace --release'
+    packaging_build_cmd='cargo build --release -p yarli --bin yarli'
     run_check "$packaging_build_log" "$packaging_build_cmd"
     packaging_build_ec=$?
     append_summary_entry "$packaging_build_cmd" "$packaging_build_ec" "$packaging_build_log"
@@ -178,14 +178,7 @@ else
       failures=$((failures + 1))
     fi
 
-    loop8_api_smoke_log="${evidence_dir}/16-r8-api-smoke.log"
-    loop8_api_smoke_cmd='cargo test -p yarli-api -- --nocapture'
-    run_check "$loop8_api_smoke_log" "$loop8_api_smoke_cmd"
-    loop8_api_smoke_ec=$?
-    append_summary_entry "$loop8_api_smoke_cmd" "$loop8_api_smoke_ec" "$loop8_api_smoke_log"
-    if [[ "$loop8_api_smoke_ec" -ne 0 ]]; then
-      failures=$((failures + 1))
-    fi
+    loop8_api_smoke_log="$workspace_log"
 
     if ! rg -q "test health_endpoint_returns_ok" "$loop8_api_smoke_log"; then
       failures=$((failures + 1))
@@ -196,7 +189,7 @@ else
     fi
 
     loop8_api_deploy_smoke_log="${evidence_dir}/17-r8-loop-id-api-deploy.log"
-    loop8_api_deploy_smoke_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-api --test postgres_integration -- --nocapture'
+    loop8_api_deploy_smoke_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_api_postgres_integration -- --nocapture'
     run_check "$loop8_api_deploy_smoke_log" "$loop8_api_deploy_smoke_cmd"
     loop8_api_deploy_smoke_ec=$?
     append_summary_entry "$loop8_api_deploy_smoke_cmd" "$loop8_api_deploy_smoke_ec" "$loop8_api_deploy_smoke_log"
@@ -219,7 +212,7 @@ else
 fi
 
 governance_budget_log="${evidence_dir}/07-governance-budget.log"
-governance_budget_cmd='cargo test -p yarli-queue -- test_budget_exceeded --nocapture'
+governance_budget_cmd='cargo test -p yarli test_budget_exceeded -- --nocapture'
 run_check "$governance_budget_log" "$governance_budget_cmd"
 governance_budget_ec=$?
 append_summary_entry "$governance_budget_cmd" "$governance_budget_ec" "$governance_budget_log"
@@ -228,7 +221,7 @@ if [[ "$governance_budget_ec" -ne 0 ]]; then
 fi
 
 governance_explain_log="${evidence_dir}/08-governance-explain.log"
-governance_explain_cmd='cargo test -p yarli-core -- budget_exceeded_task --nocapture'
+governance_explain_cmd='cargo test -p yarli budget_exceeded_task -- --nocapture'
 run_check "$governance_explain_log" "$governance_explain_cmd"
 governance_explain_ec=$?
 append_summary_entry "$governance_explain_cmd" "$governance_explain_ec" "$governance_explain_log"
@@ -237,7 +230,7 @@ if [[ "$governance_explain_ec" -ne 0 ]]; then
 fi
 
 governance_cli_log="${evidence_dir}/09-governance-cli.log"
-governance_cli_cmd='cargo test -p yarli-cli -- budget --nocapture'
+governance_cli_cmd='cargo test -p yarli budget -- --nocapture'
 run_check "$governance_cli_log" "$governance_cli_cmd"
 governance_cli_ec=$?
 append_summary_entry "$governance_cli_cmd" "$governance_cli_ec" "$governance_cli_log"
@@ -276,7 +269,7 @@ fi
 # Loop-7: Postgres concurrency/replay invariant tests
 if [[ -n "${YARLI_TEST_DATABASE_URL:-}" ]]; then
   concurrency_log="${evidence_dir}/13-concurrency-replay.log"
-  concurrency_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-queue --test postgres_integration -- --nocapture'
+  concurrency_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_queue_postgres_integration -- --nocapture'
   run_check "$concurrency_log" "$concurrency_cmd"
   concurrency_ec=$?
   append_summary_entry "$concurrency_cmd" "$concurrency_ec" "$concurrency_log"
@@ -287,7 +280,7 @@ fi
 
 # Loop-7: Capacity/budget stress proofs (parallel budget accounting)
 budget_stress_log="${evidence_dir}/14-budget-stress.log"
-budget_stress_cmd='cargo test -p yarli-queue -- test_parallel_tasks_budget_accounting --nocapture'
+budget_stress_cmd='cargo test -p yarli test_parallel_tasks_budget_accounting_consistency -- --nocapture'
 run_check "$budget_stress_log" "$budget_stress_cmd"
 budget_stress_ec=$?
 append_summary_entry "$budget_stress_cmd" "$budget_stress_ec" "$budget_stress_log"

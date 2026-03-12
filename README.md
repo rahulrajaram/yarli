@@ -10,7 +10,7 @@
 
 ## What is this?
 
-YARLI is a Rust workspace for executing plan-driven engineering workflows with durable state and explicit operator control. It treats runs, tasks, worktrees, merges, command execution, and policy decisions as state-machine entities persisted through an event log.
+YARLI is a Rust project for executing plan-driven engineering workflows with durable state and explicit operator control. It treats runs, tasks, worktrees, merges, command execution, and policy decisions as state-machine entities persisted through an event log.
 
 The primary workflow is `yarli run`: resolve prompt context, discover open tranches, dispatch execution tasks, and emit explainable run/task status. YARLI supports both local ephemeral development and durable Postgres-backed operation.
 
@@ -32,20 +32,20 @@ This project is for teams that want reproducible orchestration behavior, auditab
 ### Build from source
 
 ```bash
-cargo build --release -p yarli-cli --bin yarli
+cargo build --release -p yarli --bin yarli
 ./target/release/yarli --help
 ```
 
 ### Cargo install (local path)
 
 ```bash
-cargo install --path crates/yarli-cli --bin yarli
+cargo install --path . --bin yarli --locked
 yarli --help
 ```
 
 ### Shared commithooks
 
-This repo tracks project-local hooks in `.githooks/`. Building `yarli-cli`
+This repo tracks project-local hooks in `.githooks/`. Building `yarli`
 refreshes the shared dispatchers and hook library into `.git/hooks/` and
 `.git/lib/` when `COMMITHOOKS_DIR` or `$HOME/Documents/commithooks` is
 available.
@@ -486,7 +486,7 @@ Bootstrap per repo: `memory-backend init -y`
 +---------------+
 ```
 
-Workspace crates: `yarli-core`, `yarli-store`, `yarli-queue`, `yarli-exec`, `yarli-git`, `yarli-gates`, `yarli-policy`, `yarli-memory`, `yarli-observability`, `yarli-sw4rm`, `yarli-api`, `yarli-cli`.
+Key implementation modules and integration tests still live under `crates/yarli-*`, but Cargo now builds through the single root package `yarli`.
 
 ## Security
 

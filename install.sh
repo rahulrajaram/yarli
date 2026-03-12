@@ -8,7 +8,7 @@ INSTALL_DIR="$HOME/.local/bin"
 BINARY_NAME="yarli"
 
 echo "Building yarli in release mode..."
-cargo build --release -p yarli-cli --bin yarli
+cargo build --release -p yarli --bin yarli
 
 echo "Creating install directory: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
