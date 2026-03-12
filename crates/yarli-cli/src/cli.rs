@@ -488,7 +488,7 @@ parallel = true
 backend = "claude"
 prompt_mode = "arg"
 command = "claude"
-args = ["-p", "--dangerously-skip-permissions", "--model", "sonnet-4.5"]
+args = ["-p", "--dangerously-skip-permissions", "--model", "sonnet-4.6"]
 # env_unset = ["CLAUDECODE"]
 
 [event_loop]

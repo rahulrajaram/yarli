@@ -12,7 +12,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
 
-RUN cargo build --locked --release --package yarli-cli --bin yarli --target x86_64-unknown-linux-musl
+RUN cargo build --locked --release --package yarli --bin yarli --target x86_64-unknown-linux-musl
 RUN strip target/x86_64-unknown-linux-musl/release/yarli
 
 FROM alpine:3.21 AS runtime

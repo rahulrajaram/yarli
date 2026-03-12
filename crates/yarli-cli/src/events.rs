@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use yarli_cli::stream::StreamEvent;
+use yarli_cli::stream::{normalize_output_lines, normalize_output_lines_with_options};
 use yarli_cli::yarli_core::domain::Event;
 use yarli_cli::yarli_core::fsm::run::RunState;
 use yarli_cli::yarli_core::fsm::task::TaskState;
@@ -67,11 +68,12 @@ pub(crate) fn stream_task_catalog_entries(event: &Event) -> Vec<(Uuid, String, V
 ///
 /// When `suppress_command_output` is true, `command.output` events are skipped
 /// because those chunks were already forwarded via the live streaming channel.
-pub(crate) fn event_to_stream_event(
+pub(crate) fn event_to_stream_events(
     event: &Event,
     task_names: &[(Uuid, String)],
     suppress_command_output: bool,
-) -> Option<StreamEvent> {
+    verbose_command_output: bool,
+) -> Vec<StreamEvent> {
     let task_name = |entity_id: &str| -> String {
         if let Ok(id) = entity_id.parse::<Uuid>() {
             task_names
@@ -105,7 +107,7 @@ pub(crate) fn event_to_stream_event(
 
             let name = task_name(&event.entity_id);
 
-            Some(StreamEvent::TaskTransition {
+            vec![StreamEvent::TaskTransition {
                 task_id: event.entity_id.parse().unwrap_or(Uuid::nil()),
                 task_name: name,
                 from,
@@ -119,7 +121,7 @@ pub(crate) fn event_to_stream_event(
                     .or_else(|| event.payload.get("reason").and_then(|v| v.as_str()))
                     .map(String::from),
                 at: event.occurred_at,
-            })
+            }]
         }
         "run.activated" | "run.verifying" | "run.blocked" | "run.completed" | "run.failed"
         | "run.cancelled" => {
@@ -142,13 +144,13 @@ pub(crate) fn event_to_stream_event(
 
             let run_id = event.entity_id.parse().unwrap_or(Uuid::nil());
 
-            Some(StreamEvent::RunTransition {
+            vec![StreamEvent::RunTransition {
                 run_id,
                 from,
                 to,
                 reason,
                 at: event.occurred_at,
-            })
+            }]
         }
         "run.observer.progress" => {
             let summary = event
@@ -157,15 +159,15 @@ pub(crate) fn event_to_stream_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("progress update")
                 .to_string();
-            Some(StreamEvent::TransientStatus { message: summary })
+            vec![StreamEvent::TransientStatus { message: summary }]
         }
         "command.output" => {
             if suppress_command_output {
-                return None;
+                return Vec::new();
             }
             let line = extract_command_output_line(&event.payload);
             if line.trim().is_empty() {
-                return None;
+                return Vec::new();
             }
             let task_id = task_id_from_command_event(event).unwrap_or_else(Uuid::nil);
             let task_entity = if task_id == Uuid::nil() {
@@ -174,13 +176,16 @@ pub(crate) fn event_to_stream_event(
                 task_id.to_string()
             };
             let name = task_name(&task_entity);
-            Some(StreamEvent::CommandOutput {
-                task_id,
-                task_name: name,
-                line,
-            })
+            normalize_output_lines_with_options(&line, verbose_command_output)
+                .into_iter()
+                .map(|line| StreamEvent::CommandOutput {
+                    task_id,
+                    task_name: name.clone(),
+                    line,
+                })
+                .collect()
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -198,18 +203,20 @@ pub(crate) fn extract_command_output_line(payload: &Value) -> String {
             chunks
                 .iter()
                 .filter_map(|chunk| chunk.get("data").and_then(|value| value.as_str()))
-                .filter(|line| !line.trim().is_empty())
+                .flat_map(normalize_output_lines)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     if !chunk_lines.is_empty() {
         return chunk_lines.join("\n");
     }
-    payload
-        .get("line")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string()
+    normalize_output_lines(
+        payload
+            .get("line")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+    )
+    .join("\n")
 }
 
 /// Parse a TaskState from its serialized form.

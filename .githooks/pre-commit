@@ -4,7 +4,7 @@ set -euo pipefail
 # Project-specific pre-commit checks for yarli (Rust workspace)
 # Called by the dispatcher in .git/hooks/pre-commit
 
-COMMITHOOKS_DIR="${COMMITHOOKS_DIR:-$(git rev-parse --git-dir)}"
+COMMITHOOKS_DIR="${COMMITHOOKS_DIR:-$(git rev-parse --git-common-dir 2>/dev/null || git rev-parse --git-dir)}"
 source "$COMMITHOOKS_DIR/lib/common.sh"
 source "$COMMITHOOKS_DIR/lib/lint-rust.sh"
 source "$COMMITHOOKS_DIR/lib/secrets.sh"

@@ -764,7 +764,7 @@ pub(crate) async fn cmd_run_default(
             (tasks, tranches, "legacy-prompt", Some(run_spec.clone()))
         }
         Err(err) if !has_effective_run_spec => {
-            warn!(
+            info!(
                 error = %err,
                 "plan-driven dispatch unavailable for plain prompt; dispatching prompt text directly"
             );
@@ -1019,7 +1019,8 @@ where
         max_run_io_write_bytes: loaded_config.config().budgets.max_run_io_write_bytes,
     };
 
-    let mut scheduler = Scheduler::new(queue, store.clone(), runner, config).with_metrics(metrics);
+    let mut scheduler =
+        Scheduler::new(queue, store.clone(), runner, config).with_metrics(metrics.clone());
 
     #[cfg(feature = "chaos")]
     if let Some(c) = chaos {
@@ -1249,6 +1250,7 @@ where
     let mut continuation_payload = drive_scheduler(
         &mut scheduler,
         &store,
+        &metrics,
         shutdown.clone(),
         cancel,
         scheduler_tx,
@@ -1260,6 +1262,7 @@ where
         loaded_config.config().budgets.max_run_total_tokens,
         loaded_config.config().run.soft_token_cap_ratio,
         loaded_config.config().ui.cancellation_diagnostics,
+        loaded_config.config().ui.verbose_output,
         observers::build_task_health_observer(run_id, correlation_id, &task_names),
         observers::build_memory_observer(
             loaded_config,
@@ -1584,30 +1587,68 @@ where
         warn!(error = %e, "failed to persist continuation payload event");
     }
 
-    let cont_dir = PathBuf::from(".yarli");
-    if let Err(e) = fs::create_dir_all(&cont_dir) {
-        warn!(error = %e, "failed to create .yarli directory");
-    } else {
-        let cont_path = cont_dir.join("continuation.json");
-        match serde_json::to_string_pretty(&continuation_payload) {
-            Ok(json) => {
-                if let Err(e) = fs::write(&cont_path, json) {
-                    warn!(error = %e, "failed to write continuation file");
-                } else {
-                    info!(path = %cont_path.display(), "wrote continuation file");
+    if continuation_payload.exit_state == RunState::RunCompleted {
+        let verify_workdir = PathBuf::from(&plan.workdir);
+        let verify_passed =
+            match run_tranche_verify_command(&plan, &verify_workdir, plan.timeout_secs) {
+                Ok(passed) => passed,
+                Err(err) => {
+                    warn!(
+                        run_id = %run_id,
+                        error = %err,
+                        "tranche verify command errored; treating as failed"
+                    );
+                    false
+                }
+            };
+
+        // Derive the tranche key for audit trail.
+        let tranche_key = plan
+            .current_tranche_index
+            .and_then(|i| plan.tranche_plan.get(i))
+            .map(|t| t.key.as_str())
+            .unwrap_or("unknown");
+
+        if verify_passed {
+            if let Some(sink) = scheduler.audit_sink() {
+                let entry = AuditEntry::gate_evaluation(
+                    format!("tranche.verify.{tranche_key}"),
+                    true,
+                    "tranche verify command passed",
+                    run_id,
+                    None,
+                );
+                if let Err(err) = sink.append(&entry) {
+                    warn!(error = %err, "failed to write tranche verify audit entry");
                 }
             }
-            Err(e) => warn!(error = %e, "failed to serialize continuation payload"),
-        }
-    }
 
-    if continuation_payload.exit_state == RunState::RunCompleted {
-        if let Err(err) = maybe_mark_current_structured_tranche_complete(&plan) {
+            if let Err(err) = maybe_mark_current_structured_tranche_complete(&plan) {
+                warn!(
+                    run_id = %run_id,
+                    error = %err,
+                    error_chain = %format!("{err:#}"),
+                    "failed to auto-complete structured tranche status"
+                );
+            }
+        } else {
+            if let Some(sink) = scheduler.audit_sink() {
+                let entry = AuditEntry::gate_evaluation(
+                    format!("tranche.verify.{tranche_key}"),
+                    false,
+                    "tranche verify command failed",
+                    run_id,
+                    None,
+                );
+                if let Err(err) = sink.append(&entry) {
+                    warn!(error = %err, "failed to write tranche verify audit entry");
+                }
+            }
+
             warn!(
                 run_id = %run_id,
-                error = %err,
-                error_chain = %format!("{err:#}"),
-                "failed to auto-complete structured tranche status"
+                tranche_key = %tranche_key,
+                "tranche verify failed; skipping auto-complete"
             );
         }
     }
@@ -1632,9 +1673,16 @@ where
     // and the renderer's `blocking_recv` loop can terminate.
     drop(tx);
 
-    // Wait for renderer to finish.
-    renderer_handle
-        .await
+    // Wait for renderer to finish, but persist the continuation artifact even if
+    // the renderer exits with an error so operators can still inspect final state.
+    let renderer_result = renderer_handle.await;
+
+    match write_continuation_payload_file(&continuation_payload) {
+        Ok(path) => info!(path = %path.display(), "wrote continuation file"),
+        Err(e) => warn!(error = %e, "failed to write continuation file"),
+    }
+
+    renderer_result
         .context("renderer task panicked")?
         .context("renderer error")?;
 
@@ -2980,6 +3028,19 @@ pub(crate) fn persist_continuation_payload_event(
     )
 }
 
+pub(crate) fn write_continuation_payload_file(
+    payload: &yarli_cli::yarli_core::entities::ContinuationPayload,
+) -> Result<PathBuf> {
+    let cont_dir = PathBuf::from(".yarli");
+    fs::create_dir_all(&cont_dir).context("failed to create .yarli directory")?;
+
+    let cont_path = cont_dir.join("continuation.json");
+    let json = serde_json::to_string_pretty(payload)
+        .context("failed to serialize continuation payload")?;
+    fs::write(&cont_path, json).context("failed to write continuation file contents")?;
+    Ok(cont_path)
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_continuation_payload(
@@ -3367,6 +3428,7 @@ fn task_health_factors_from_payload(
 pub(crate) async fn drive_scheduler<Q, S, R>(
     scheduler: &mut Scheduler<Q, S, R>,
     store: &Arc<S>,
+    metrics: &Arc<YarliMetrics>,
     shutdown: ShutdownController,
     cancel: CancellationToken,
     tx: mpsc::UnboundedSender<StreamEvent>,
@@ -3378,6 +3440,7 @@ pub(crate) async fn drive_scheduler<Q, S, R>(
     max_run_total_tokens: Option<u64>,
     soft_token_cap_ratio: f64,
     cancellation_diagnostics: bool,
+    verbose_command_output: bool,
     mut task_health_observer: Option<observers::TaskHealthArtifactObserver>,
     mut memory_observer: Option<observers::MemoryObserver>,
     postgres_sync_config: Option<&LoadedConfig>,
@@ -3387,6 +3450,7 @@ where
     S: EventStore,
     R: yarli_cli::yarli_exec::CommandRunner + Clone,
 {
+    let mut command_class_cache: HashMap<Uuid, String> = HashMap::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
@@ -3454,11 +3518,16 @@ where
                     .find(|(tid, _)| *tid == event.task_id)
                     .map(|(_, n)| n.clone())
                     .unwrap_or_else(|| event.task_id.to_string());
-                let _ = stream_tx_live.send(StreamEvent::CommandOutput {
-                    task_id: event.task_id,
-                    task_name: name,
-                    line: event.chunk.data,
-                });
+                for line in yarli_cli::stream::normalize_output_lines_with_options(
+                    &event.chunk.data,
+                    verbose_command_output,
+                ) {
+                    let _ = stream_tx_live.send(StreamEvent::CommandOutput {
+                        task_id: event.task_id,
+                        task_name: name.clone(),
+                        line,
+                    });
+                }
             }
         }));
 
@@ -3513,13 +3582,22 @@ where
                     warn!(run_id = %run_id, error = %err, "failed to sync postgres state after cancellation");
                 }
                 let _new_events =
-                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                    emit_new_stream_events(
+                        store,
+                        &tx,
+                        task_names,
+                        &mut stream_cursor,
+                        live_streaming_active,
+                        verbose_command_output,
+                    )?;
                 emit_task_health_transition_audits(
                     &mut task_health_controllers,
                     &_new_events,
                     run_id,
                     scheduler.audit_sink().as_deref(),
                 );
+                record_stream_metrics(scheduler, &_new_events, metrics, &mut command_class_cache)
+                    .await;
                 if let Some(observer) = task_health_observer.as_mut() {
                     observer.observe_store(store.as_ref());
                 }
@@ -3629,7 +3707,14 @@ where
                 // Poll events FIRST so control signals (pause/resume/cancel/drain)
                 // are processed before any task claiming in the tick below.
                 let _new_events =
-                    emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                    emit_new_stream_events(
+                        store,
+                        &tx,
+                        task_names,
+                        &mut stream_cursor,
+                        live_streaming_active,
+                        verbose_command_output,
+                    )?;
                 emit_task_health_transition_audits(
                     &mut task_health_controllers,
                     &_new_events,
@@ -3718,7 +3803,14 @@ where
                             warn!(run_id = %run_id, error = %err, "failed to sync postgres state after operator cancellation");
                         }
                         let cancel_events =
-                            emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                            emit_new_stream_events(
+                                store,
+                                &tx,
+                                task_names,
+                                &mut stream_cursor,
+                                live_streaming_active,
+                                verbose_command_output,
+                            )?;
                         emit_task_health_transition_audits(
                             &mut task_health_controllers,
                             &cancel_events,
@@ -3813,7 +3905,14 @@ where
                                 warn!(run_id = %run_id, error = %err, "failed to sync postgres state after operator drain");
                             }
                             let drain_events =
-                                emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                                emit_new_stream_events(
+                                    store,
+                                    &tx,
+                                    task_names,
+                                    &mut stream_cursor,
+                                    live_streaming_active,
+                                    verbose_command_output,
+                                )?;
                             emit_task_health_transition_audits(
                                 &mut task_health_controllers,
                                 &drain_events,
@@ -3871,13 +3970,27 @@ where
                     // Without this, a missed-tick fires immediately and claims new
                     // tasks before the next pre-tick poll can see the signal.
                     let post_tick_events =
-                        emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                        emit_new_stream_events(
+                            store,
+                            &tx,
+                            task_names,
+                            &mut stream_cursor,
+                            live_streaming_active,
+                            verbose_command_output,
+                        )?;
                     emit_task_health_transition_audits(
                         &mut task_health_controllers,
                         &post_tick_events,
                         run_id,
                         scheduler.audit_sink().as_deref(),
                     );
+                    record_stream_metrics(
+                        scheduler,
+                        &post_tick_events,
+                        metrics,
+                        &mut command_class_cache,
+                    )
+                    .await;
                     let post_tick_signal = post_tick_events
                         .iter()
                         .filter_map(|event| operator_control_signal_from_event(event, run_id))
@@ -3949,13 +4062,27 @@ where
                                 warn!(run_id = %run_id, error = %err, "failed to sync postgres state after post-tick operator cancellation");
                             }
                             let _cancel_events =
-                                emit_new_stream_events(store, &tx, task_names, &mut stream_cursor, live_streaming_active)?;
+                                emit_new_stream_events(
+                                    store,
+                                    &tx,
+                                    task_names,
+                                    &mut stream_cursor,
+                                    live_streaming_active,
+                                    verbose_command_output,
+                                )?;
                             emit_task_health_transition_audits(
                                 &mut task_health_controllers,
                                 &_cancel_events,
                                 run_id,
                                 scheduler.audit_sink().as_deref(),
                             );
+                            record_stream_metrics(
+                                scheduler,
+                                &_cancel_events,
+                                metrics,
+                                &mut command_class_cache,
+                            )
+                            .await;
                             if let Some(observer) = task_health_observer.as_mut() {
                                 observer.observe_store(store.as_ref());
                             }
@@ -4116,6 +4243,7 @@ pub(crate) fn emit_new_stream_events<S: EventStore>(
     task_names: &[(Uuid, String)],
     cursor: &mut IncrementalEventCursor,
     suppress_command_output: bool,
+    verbose_command_output: bool,
 ) -> Result<Vec<Event>> {
     let new_events = cursor.read_new_events(store.as_ref())?;
 
@@ -4136,12 +4264,147 @@ pub(crate) fn emit_new_stream_events<S: EventStore>(
                 worker_id: worker_id.to_string(),
             });
         }
-        if let Some(se) = event_to_stream_event(event, task_names, suppress_command_output) {
+        for se in event_to_stream_events(
+            event,
+            task_names,
+            suppress_command_output,
+            verbose_command_output,
+        ) {
             let _ = tx.send(se);
         }
     }
 
     Ok(new_events)
+}
+
+fn parse_task_id_from_command_event(event: &Event) -> Option<Uuid> {
+    if event.entity_type != EntityType::Command {
+        return None;
+    }
+    let idempotency_key = event.idempotency_key.as_deref()?;
+    idempotency_key
+        .split(":cmd:")
+        .next()
+        .and_then(|task_id| task_id.parse().ok())
+}
+
+fn parse_duration_seconds(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .filter(|duration_ms| duration_ms.is_finite() && *duration_ms >= 0.0)
+        .map(|duration_ms| duration_ms / 1000.0)
+        .or_else(|| {
+            value
+                .as_u64()
+                .map(|duration_ms| duration_ms as f64 / 1000.0)
+        })
+        .or_else(|| {
+            value
+                .as_i64()
+                .filter(|duration_ms| *duration_ms >= 0)
+                .map(|duration_ms| duration_ms as f64 / 1000.0)
+        })
+}
+
+async fn record_stream_metrics<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    events: &[Event],
+    metrics: &Arc<YarliMetrics>,
+    command_class_cache: &mut HashMap<Uuid, String>,
+) where
+    Q: yarli_cli::yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
+{
+    for event in events {
+        match event.entity_type {
+            EntityType::Task if event.event_type == "task.completed" => {
+                let Ok(task_id) = event.entity_id.parse::<Uuid>() else {
+                    continue;
+                };
+                let class_label =
+                    resolve_command_class_label(scheduler, task_id, None, command_class_cache)
+                        .await;
+                metrics
+                    .record_task_transition(task_state_db(TaskState::TaskComplete), &class_label);
+            }
+            EntityType::Gate if event.event_type == "gate.evaluated" => {
+                let status = event
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if status.eq_ignore_ascii_case("failed") {
+                    if let Some(gate) = event
+                        .payload
+                        .get("gate")
+                        .or_else(|| event.payload.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        metrics.record_gate_failure(gate);
+                    }
+                }
+            }
+            EntityType::Command
+                if matches!(
+                    event.event_type.as_str(),
+                    "command.exited" | "command.timed_out" | "command.killed"
+                ) =>
+            {
+                let Some(task_id) = parse_task_id_from_command_event(event) else {
+                    continue;
+                };
+                let class_label = resolve_command_class_label(
+                    scheduler,
+                    task_id,
+                    event.payload.get("command_class"),
+                    command_class_cache,
+                )
+                .await;
+                if let Some(duration_seconds) = event
+                    .payload
+                    .get("duration_ms")
+                    .and_then(parse_duration_seconds)
+                {
+                    metrics.record_command_duration(&class_label, duration_seconds);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn resolve_command_class_label<Q, S, R>(
+    scheduler: &Scheduler<Q, S, R>,
+    task_id: Uuid,
+    payload_value: Option<&serde_json::Value>,
+    cache: &mut HashMap<Uuid, String>,
+) -> String
+where
+    Q: yarli_cli::yarli_queue::TaskQueue,
+    S: EventStore,
+    R: yarli_cli::yarli_exec::CommandRunner + Clone,
+{
+    if let Some(class) = cache.get(&task_id) {
+        return class.clone();
+    }
+
+    if let Some(class) = payload_value
+        .and_then(parse_command_class_value)
+        .map(|class| class_label(class).to_string())
+    {
+        cache.insert(task_id, class.clone());
+        return class;
+    }
+
+    let class = {
+        let reg = scheduler.registry().read().await;
+        reg.get_task(&task_id)
+            .map(|task| class_label(task.command_class).to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    cache.insert(task_id, class.clone());
+    class
 }
 
 pub(crate) async fn cancel_active_run<Q, S, R>(
@@ -6886,10 +7149,31 @@ pub(crate) fn cmd_info(
     println!("Terminal:");
     println!("  TTY:     {}", info.is_tty);
     println!("  Size:    {}x{}", info.cols, info.rows);
+    println!(
+        "  Colors:  {}",
+        match info.color_support {
+            yarli_cli::mode::TerminalColorSupport::None => "none",
+            yarli_cli::mode::TerminalColorSupport::Ansi16 => "ansi16",
+            yarli_cli::mode::TerminalColorSupport::TrueColor => "truecolor",
+        }
+    );
     println!("  Dashboard capable: {}", info.supports_dashboard());
     println!();
     println!("Render mode: {:?}", render_mode);
-    println!("Backend: {}", loaded_config.config().core.backend.as_str());
+    println!(
+        "Storage backend: {}",
+        loaded_config.config().core.backend.as_str()
+    );
+    println!(
+        "Agent backend: {}",
+        loaded_config
+            .config()
+            .cli
+            .backend
+            .as_deref()
+            .or(loaded_config.config().cli.command.as_deref())
+            .unwrap_or("custom")
+    );
     println!(
         "Execution runner: {:?}",
         loaded_config.config().execution.runner
@@ -7654,6 +7938,7 @@ mod tests {
     use clap::CommandFactory;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
@@ -7677,7 +7962,8 @@ mod tests {
     use yarli_cli::yarli_gates::default_task_gates;
     use yarli_cli::yarli_git::{LocalWorktreeManager, WorktreeManager};
     use yarli_cli::yarli_observability::{
-        AuditCategory, AuditEntry, InMemoryAuditSink, JsonlAuditSink,
+        encode_metrics, AuditCategory, AuditEntry, InMemoryAuditSink, JsonlAuditSink, Registry,
+        YarliMetrics,
     };
     use yarli_cli::yarli_queue::{InMemoryTaskQueue, SchedulerConfig, TaskQueue};
     use yarli_cli::yarli_store::event_store::EventQuery;
@@ -7857,6 +8143,12 @@ mod tests {
         (scheduler, store, run_id, correlation_id, task_names)
     }
 
+    fn setup_test_metrics() -> (Registry, Arc<YarliMetrics>) {
+        let mut registry = Registry::default();
+        let metrics = Arc::new(YarliMetrics::new(&mut registry));
+        (registry, metrics)
+    }
+
     #[tokio::test]
     async fn postgres_sync_signature_changes_only_on_state_transitions() {
         let (scheduler, _store, run_id, _correlation_id, _task_names) =
@@ -7914,6 +8206,7 @@ mod tests {
             is_tty: true,
             cols: 120,
             rows: 40,
+            color_support: yarli_cli::mode::TerminalColorSupport::Ansi16,
         };
         assert_eq!(
             resolve_render_mode(&tty_large, false, false, UiMode::Stream).unwrap(),
@@ -7931,6 +8224,7 @@ mod tests {
             is_tty: true,
             cols: 120,
             rows: 40,
+            color_support: yarli_cli::mode::TerminalColorSupport::Ansi16,
         };
         assert_eq!(
             resolve_render_mode(&tty_large, true, false, UiMode::Tui).unwrap(),
@@ -7965,6 +8259,135 @@ mod tests {
         assert!(version.contains("commit "));
         assert!(version.contains("date "));
         assert!(version.contains("build "));
+    }
+
+    #[test]
+    fn write_continuation_payload_file_writes_default_artifact() {
+        with_isolated_runtime_env(|| {
+            let payload = sample_continuation_payload(Uuid::now_v7(), "write artifact");
+            let path = write_continuation_payload_file(&payload).expect("write continuation file");
+            assert_eq!(path, Path::new(".yarli").join("continuation.json"));
+            assert!(path.exists(), "continuation artifact should exist");
+
+            let persisted =
+                crate::persistence::read_continuation_payload_from_file_if_exists(&path)
+                    .expect("read continuation file")
+                    .expect("continuation payload should be present");
+            assert_eq!(persisted.run_id, payload.run_id);
+            assert_eq!(persisted.objective, payload.objective);
+        });
+    }
+
+    #[test]
+    fn continuation_file_stays_absent_until_renderer_stops() {
+        with_isolated_runtime_env(|| {
+            let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+            runtime.block_on(async {
+                let payload = sample_continuation_payload(Uuid::now_v7(), "stream ordering");
+                let continuation_path = Path::new(".yarli").join("continuation.json");
+                let observed_during_run_exited = Arc::new(AtomicBool::new(false));
+
+                let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+                let observed_clone = observed_during_run_exited.clone();
+                let continuation_path_for_renderer = continuation_path.clone();
+                let renderer_handle = tokio::task::spawn_blocking(move || -> Result<()> {
+                    match rx.blocking_recv() {
+                        Some(StreamEvent::RunExited { .. }) => {
+                            observed_clone
+                                .store(continuation_path_for_renderer.exists(), Ordering::SeqCst);
+                        }
+                        other => panic!("expected RunExited event, got {other:?}"),
+                    }
+
+                    while rx.blocking_recv().is_some() {}
+                    Ok(())
+                });
+
+                let _ = tx.send(StreamEvent::RunExited {
+                    payload: payload.clone(),
+                });
+                drop(tx);
+
+                renderer_handle
+                    .await
+                    .expect("renderer task should join")
+                    .expect("renderer should finish cleanly");
+
+                assert!(
+                    !observed_during_run_exited.load(Ordering::SeqCst),
+                    "continuation file should remain absent while the renderer is still active"
+                );
+                assert!(
+                    !continuation_path.exists(),
+                    "continuation file should still be absent before local-only persistence"
+                );
+
+                write_continuation_payload_file(&payload).expect("write continuation file");
+                assert!(
+                    continuation_path.exists(),
+                    "continuation file should be restored after renderer shutdown"
+                );
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn record_stream_metrics_emits_task_gate_and_command_metrics() {
+        let (scheduler, _store, run_id, correlation_id, task_names) =
+            setup_drive_scheduler_fixture("printf 'ok\\n'").await;
+        let task_id = task_names[0].0;
+        let command_id = Uuid::now_v7();
+        let (registry, metrics) = setup_test_metrics();
+        let mut command_class_cache = HashMap::new();
+        let events = vec![
+            make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.completed",
+                correlation_id,
+                serde_json::json!({
+                    "from": "TaskVerifying",
+                    "to": "TaskComplete",
+                    "attempt_no": 1
+                }),
+            ),
+            make_event(
+                EntityType::Gate,
+                run_id.to_string(),
+                "gate.evaluated",
+                correlation_id,
+                serde_json::json!({
+                    "gate": "gate.tests_passed",
+                    "status": "failed"
+                }),
+            ),
+            Event {
+                event_id: Uuid::now_v7(),
+                occurred_at: Utc::now(),
+                entity_type: EntityType::Command,
+                entity_id: command_id.to_string(),
+                event_type: "command.exited".to_string(),
+                payload: serde_json::json!({
+                    "exit_code": 0,
+                    "duration_ms": 250
+                }),
+                correlation_id,
+                causation_id: None,
+                actor: "test".to_string(),
+                idempotency_key: Some(format!("{task_id}:cmd:1:terminal")),
+            },
+        ];
+
+        record_stream_metrics(&scheduler, &events, &metrics, &mut command_class_cache).await;
+
+        let output = encode_metrics(&registry);
+        assert!(output.contains("yarli_tasks_total"));
+        assert!(output.contains("state=\"TASK_COMPLETE\""));
+        assert!(output.contains("command_class=\"io\""));
+        assert!(output.contains("yarli_gate_failures_total"));
+        assert!(output.contains("gate=\"gate.tests_passed\""));
+        assert!(output.contains("yarli_command_duration_seconds_count"));
+        assert!(output.contains("command_class=\"io\""));
     }
 
     #[test]
@@ -9089,6 +9512,7 @@ mod tests {
         let shutdown = ShutdownController::new();
         let cancel = shutdown.token();
         let (tx, _rx) = mpsc::unbounded_channel();
+        let (_registry, metrics) = setup_test_metrics();
 
         let shutdown_signal = shutdown.clone();
         tokio::spawn(async move {
@@ -9101,6 +9525,7 @@ mod tests {
             drive_scheduler(
                 &mut scheduler,
                 &store,
+                &metrics,
                 shutdown,
                 cancel,
                 tx,
@@ -9111,6 +9536,7 @@ mod tests {
                 config::RunTaskHealthConfig::default(),
                 None,
                 0.9,
+                false,
                 false,
                 None,
                 None,
@@ -9196,6 +9622,7 @@ mod tests {
         let shutdown = ShutdownController::new();
         let cancel = shutdown.token();
         let (tx, _rx) = mpsc::unbounded_channel();
+        let (_registry, metrics) = setup_test_metrics();
 
         let store_for_signal = store.clone();
         tokio::spawn(async move {
@@ -9223,6 +9650,7 @@ mod tests {
             drive_scheduler(
                 &mut scheduler,
                 &store,
+                &metrics,
                 shutdown,
                 cancel,
                 tx,
@@ -9233,6 +9661,7 @@ mod tests {
                 config::RunTaskHealthConfig::default(),
                 None,
                 0.9,
+                false,
                 false,
                 None,
                 None,
@@ -9286,6 +9715,7 @@ mod tests {
         let shutdown = ShutdownController::new();
         let cancel = shutdown.token();
         let (tx, _rx) = mpsc::unbounded_channel();
+        let (_registry, metrics) = setup_test_metrics();
 
         let shutdown_signal = shutdown.clone();
         tokio::spawn(async move {
@@ -9298,6 +9728,7 @@ mod tests {
             drive_scheduler(
                 &mut scheduler,
                 &store,
+                &metrics,
                 shutdown,
                 cancel,
                 tx,
@@ -9308,6 +9739,7 @@ mod tests {
                 config::RunTaskHealthConfig::default(),
                 None,
                 0.9,
+                false,
                 false,
                 None,
                 None,
@@ -9506,6 +9938,7 @@ mod tests {
         let cancel = shutdown.token();
         let (tx, _rx) = mpsc::unbounded_channel();
         let store_for_scheduler = store.clone();
+        let (_registry, metrics) = setup_test_metrics();
 
         let run_handle = tokio::spawn(async move {
             tokio::time::timeout(
@@ -9513,6 +9946,7 @@ mod tests {
                 drive_scheduler(
                     &mut scheduler,
                     &store_for_scheduler,
+                    &metrics,
                     shutdown,
                     cancel,
                     tx,
@@ -9523,6 +9957,7 @@ mod tests {
                     config::RunTaskHealthConfig::default(),
                     None,
                     0.9,
+                    false,
                     false,
                     None,
                     None,
@@ -9669,6 +10104,7 @@ mod tests {
         let cancel = shutdown.token();
         let (tx, _rx) = mpsc::unbounded_channel();
         let store_for_scheduler = store.clone();
+        let (_registry, metrics) = setup_test_metrics();
 
         let run_handle = tokio::spawn(async move {
             tokio::time::timeout(
@@ -9676,6 +10112,7 @@ mod tests {
                 drive_scheduler(
                     &mut scheduler,
                     &store_for_scheduler,
+                    &metrics,
                     shutdown,
                     cancel,
                     tx,
@@ -9686,6 +10123,7 @@ mod tests {
                     config::RunTaskHealthConfig::default(),
                     None,
                     0.9,
+                    false,
                     false,
                     None,
                     None,

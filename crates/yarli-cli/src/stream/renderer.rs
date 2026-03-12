@@ -9,7 +9,9 @@ use std::io::{self, Stdout, Write};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use ratatui::backend::CrosstermBackend;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+use ratatui::layout::{Position, Size};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
@@ -29,6 +31,108 @@ use super::style::Tier;
 const DEFAULT_VIEWPORT_HEIGHT: u16 = 8;
 const RUN_ID_DISPLAY_LEN: usize = 12;
 const TRANSIENT_STATUS_EMIT_SECS: i64 = 30;
+type StreamTerminal = Terminal<CursorProbeBackend<CrosstermBackend<Stdout>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorProbeStrategy {
+    #[allow(dead_code)]
+    QueryTerminal,
+    AnchorBottomRow,
+}
+
+#[derive(Debug)]
+struct CursorProbeBackend<B> {
+    inner: B,
+    strategy: CursorProbeStrategy,
+    last_known_cursor: Option<Position>,
+}
+
+impl<B> CursorProbeBackend<B> {
+    fn new(inner: B, strategy: CursorProbeStrategy) -> Self {
+        Self {
+            inner,
+            strategy,
+            last_known_cursor: None,
+        }
+    }
+}
+
+impl<B> CursorProbeBackend<B>
+where
+    B: Backend,
+{
+    fn anchor_bottom_row(&mut self) -> io::Result<Position> {
+        let position = fallback_cursor_position(self.inner.size()?);
+        self.inner.set_cursor_position(position)?;
+        self.last_known_cursor = Some(position);
+        Ok(position)
+    }
+}
+
+impl<B> Backend for CursorProbeBackend<B>
+where
+    B: Backend,
+{
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        let position = match self.strategy {
+            CursorProbeStrategy::QueryTerminal => match self.inner.get_cursor_position() {
+                Ok(position) => position,
+                Err(_) => {
+                    self.strategy = CursorProbeStrategy::AnchorBottomRow;
+                    self.anchor_bottom_row()?
+                }
+            },
+            CursorProbeStrategy::AnchorBottomRow => self.anchor_bottom_row()?,
+        };
+        self.last_known_cursor = Some(position);
+        Ok(position)
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        self.last_known_cursor = Some(position);
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Configuration for the stream renderer.
 #[derive(Debug, Clone)]
@@ -54,7 +158,7 @@ impl Default for StreamConfig {
 /// active task status with spinners, and pushes completed transitions
 /// to the native scrollback above.
 pub struct StreamRenderer {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: StreamTerminal,
     config: StreamConfig,
     /// Active tasks being tracked in the viewport.
     tasks: HashMap<TaskId, TaskView>,
@@ -75,13 +179,25 @@ pub struct StreamRenderer {
 impl StreamRenderer {
     /// Create a new stream renderer with inline viewport.
     pub fn new(config: StreamConfig) -> io::Result<Self> {
-        let backend = CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::with_options(
+        enable_raw_mode()?;
+        // Avoid DSR cursor probing on startup. Some PTY hosts advertise a TTY but never answer
+        // the probe, which leaks `ESC[6n` and forces a headless fallback.
+        let backend = CursorProbeBackend::new(
+            CrosstermBackend::new(io::stdout()),
+            CursorProbeStrategy::AnchorBottomRow,
+        );
+        let terminal = match Terminal::with_options(
             backend,
             TerminalOptions {
                 viewport: Viewport::Inline(config.viewport_height),
             },
-        )?;
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             terminal,
@@ -643,15 +759,10 @@ impl StreamRenderer {
     pub fn restore(&mut self) -> io::Result<()> {
         // Clear the inline viewport area so leftover spinner lines don't linger.
         self.terminal.clear()?;
+        disable_raw_mode()?;
         io::stdout().flush()?;
         Ok(())
     }
-
-    /// Get mutable access to the terminal (for cleanup, etc.).
-    pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
-        &mut self.terminal
-    }
-
     fn push_transient_status_line(
         &mut self,
         message: &str,
@@ -782,6 +893,13 @@ fn display_run_id(run_id: uuid::Uuid) -> String {
     compact[..RUN_ID_DISPLAY_LEN.min(compact.len())].to_string()
 }
 
+fn fallback_cursor_position(size: Size) -> Position {
+    Position {
+        x: 0,
+        y: size.height.saturating_sub(1),
+    }
+}
+
 /// Determine visual tier for a run state.
 fn tier_for_run_state(state: crate::yarli_core::fsm::run::RunState) -> Tier {
     use crate::yarli_core::fsm::run::RunState;
@@ -811,6 +929,138 @@ fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::WindowSize;
+
+    #[derive(Debug, Clone, Copy)]
+    struct StubBackend {
+        size: Size,
+        cursor: Position,
+        fail_cursor_probe: bool,
+    }
+
+    impl StubBackend {
+        fn new(size: Size) -> Self {
+            Self {
+                size,
+                cursor: Position::ORIGIN,
+                fail_cursor_probe: false,
+            }
+        }
+
+        fn failing_probe(size: Size) -> Self {
+            Self {
+                fail_cursor_probe: true,
+                ..Self::new(size)
+            }
+        }
+    }
+
+    impl Backend for StubBackend {
+        fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            if self.fail_cursor_probe {
+                Err(io::Error::other("cursor probe failed"))
+            } else {
+                Ok(self.cursor)
+            }
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.cursor = position.into();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::default(),
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fallback_cursor_position_anchors_to_last_row() {
+        assert_eq!(
+            fallback_cursor_position(Size::new(120, 40)),
+            Position::new(0, 39)
+        );
+        assert_eq!(
+            fallback_cursor_position(Size::new(120, 0)),
+            Position::ORIGIN
+        );
+    }
+
+    #[test]
+    fn cursor_probe_backend_uses_backend_probe_when_available() {
+        let mut backend = CursorProbeBackend::new(
+            StubBackend::new(Size::new(80, 24)),
+            CursorProbeStrategy::QueryTerminal,
+        );
+        assert_eq!(
+            backend.get_cursor_position().expect("probe should succeed"),
+            Position::ORIGIN
+        );
+    }
+
+    #[test]
+    fn cursor_probe_backend_falls_back_without_input_tty() {
+        let mut backend = CursorProbeBackend::new(
+            StubBackend::failing_probe(Size::new(80, 24)),
+            CursorProbeStrategy::AnchorBottomRow,
+        );
+        assert_eq!(
+            backend
+                .get_cursor_position()
+                .expect("fallback should succeed"),
+            Position::new(0, 23)
+        );
+    }
+
+    #[test]
+    fn cursor_probe_backend_degrades_after_probe_failure() {
+        let mut backend = CursorProbeBackend::new(
+            StubBackend::failing_probe(Size::new(90, 30)),
+            CursorProbeStrategy::QueryTerminal,
+        );
+        assert_eq!(
+            backend
+                .get_cursor_position()
+                .expect("fallback should succeed"),
+            Position::new(0, 29)
+        );
+        assert_eq!(
+            backend
+                .get_cursor_position()
+                .expect("fallback should stay active"),
+            Position::new(0, 29)
+        );
+    }
 
     #[test]
     fn format_duration_short() {

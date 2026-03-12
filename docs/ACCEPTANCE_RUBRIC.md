@@ -27,7 +27,7 @@ No partial pass state is allowed.
 2. Strict negative-path verification
 - Run strict mode without DB URL:
   - `unset YARLI_TEST_DATABASE_URL`
-  - `YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-store --test postgres_integration -- --nocapture`
+  - `YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_store_postgres_integration -- --nocapture`
 - Require non-zero exit code.
 - Require output line:
   - `postgres integration tests require YARLI_TEST_DATABASE_URL when YARLI_REQUIRE_POSTGRES_TESTS=1`
@@ -37,9 +37,9 @@ No partial pass state is allowed.
   - `YARLI_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55432/postgres`
   - `YARLI_REQUIRE_POSTGRES_TESTS=1`
 - Run:
-  - `cargo test -p yarli-store --test postgres_integration -- --nocapture`
-  - `cargo test -p yarli-queue --test postgres_integration -- --nocapture`
-  - `cargo test -p yarli-cli --test postgres_integration -- --nocapture`
+  - `cargo test -p yarli --test yarli_store_postgres_integration -- --nocapture`
+  - `cargo test -p yarli --test yarli_queue_postgres_integration -- --nocapture`
+  - `cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture`
 - Each command must exit `0` and show test success output.
 
 4. Non-skip enforcement in strict runs
@@ -48,11 +48,11 @@ No partial pass state is allowed.
 
 5. Governance and budget enforcement verification
 - Run budget enforcement unit tests:
-  - `cargo test -p yarli-queue -- test_budget_exceeded --nocapture`
+  - `cargo test -p yarli test_budget_exceeded -- --nocapture`
 - Run governance explain tests:
-  - `cargo test -p yarli-core -- budget_exceeded_task --nocapture`
+  - `cargo test -p yarli budget_exceeded_task -- --nocapture`
 - Run governance CLI surface tests:
-  - `cargo test -p yarli-cli -- budget --nocapture`
+  - `cargo test -p yarli budget -- --nocapture`
 - All must exit `0` with test success output.
 
 6. Evidence integrity checks
@@ -62,14 +62,14 @@ No partial pass state is allowed.
 
 7. Scale-consistency: Postgres concurrency/replay invariant tests (Loop R7)
 - Run Postgres-backed concurrency and replay tests:
-  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-queue --test postgres_integration -- --nocapture`
+  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_queue_postgres_integration -- --nocapture`
 - Require exit code `0` with test success output.
 - Must prove: concurrent lease claims under Postgres produce no duplicate leases; replay from persisted state is deterministic.
 
 8. Scale-consistency: capacity/budget stress proofs (Loop R7)
 - Run budget enforcement stress tests:
-  - `cargo test -p yarli-queue -- test_budget_exceeded_fails_task_without_retry --nocapture`
-  - `cargo test -p yarli-queue -- test_run_token_budget_exceeded_across_tasks --nocapture`
+  - `cargo test -p yarli test_budget_exceeded_fails_task_without_retry -- --nocapture`
+  - `cargo test -p yarli test_run_token_budget_exceeded_across_tasks -- --nocapture`
 - Require exit code `0` with test success output for each.
 - Must prove: budget governance under parallel workload transitions to explicit failure, no silent continuation.
 
@@ -92,13 +92,13 @@ No partial pass state is allowed.
 
 11. Loop-8 packaging/deployment smoke checks
 - Run release build for deterministic packaging signal:
-  - `cargo build --workspace --release`
-- Run API smoke surface checks in strict Postgres mode:
-  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-api -- --nocapture`
+  - `cargo build --release -p yarli --bin yarli`
+- Reuse the baseline workspace suite for in-process API smoke signals:
+  - `cargo test --workspace`
 - Run API/deploy-style read-your-writes smoke:
-  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-api --test postgres_integration -- --nocapture`
+  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_api_postgres_integration -- --nocapture`
 - Run CLI write/read smoke with durable Postgres:
-  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli-cli --test postgres_integration -- --nocapture`
+  - `YARLI_TEST_DATABASE_URL=... YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture`
 - Each command must exit `0` in strict mode and the logs must contain:
   - `health_endpoint_returns_ok`
   - `run_status_endpoint_replays_persisted_events`

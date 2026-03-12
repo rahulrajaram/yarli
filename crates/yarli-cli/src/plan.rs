@@ -91,7 +91,8 @@ pub(crate) use crate::tranche::{
     cmd_plan_tranche_remove, cmd_plan_validate, discover_plan_dispatch_entries,
     enforce_plan_guard_post_run, maybe_mark_current_structured_tranche_complete,
     plan_path_for_prompt_entry, read_tranches_file_in, run_spec_plan_guard_preflight,
-    tranches_file_path, validate_structured_tranches_preflight_for_prompt,
+    run_tranche_verify_command, tranches_file_path,
+    validate_structured_tranches_preflight_for_prompt,
 };
 #[cfg(test)]
 pub(crate) use crate::tranche::{
@@ -482,7 +483,7 @@ pub(crate) fn build_plan_driven_run_sequence(
     let plan_text = fs::read_to_string(&plan_path)
         .with_context(|| format!("failed to read plan file {}", plan_path.display()))?;
 
-    let open_tranches: Vec<ImplementationPlanEntry> = match read_tranches_file_in(tranches_base_dir)
+    let all_tranches: Vec<ImplementationPlanEntry> = match read_tranches_file_in(tranches_base_dir)
     {
         Ok(Some(tf)) => {
             info!(
@@ -491,9 +492,6 @@ pub(crate) fn build_plan_driven_run_sequence(
                 "using structured tranches file"
             );
             tf.to_entries()
-                .into_iter()
-                .filter(|e| !e.is_complete)
-                .collect()
         }
         Ok(None) => {
             debug!(
@@ -501,9 +499,6 @@ pub(crate) fn build_plan_driven_run_sequence(
                 "no structured tranches file, falling back to markdown parsing"
             );
             discover_plan_dispatch_entries(&plan_text)
-                .into_iter()
-                .filter(|e| !e.is_complete)
-                .collect()
         }
         Err(e) => {
             return Err(e.context(format!(
@@ -512,6 +507,15 @@ pub(crate) fn build_plan_driven_run_sequence(
             )));
         }
     };
+    let open_tranches = filter_plan_dispatch_entries_for_run_spec(
+        all_tranches
+            .iter()
+            .filter(|entry| !entry.is_complete)
+            .cloned()
+            .collect(),
+        &all_tranches,
+        &loaded_prompt.run_spec,
+    )?;
 
     if open_tranches.is_empty() && plan_text.len() > 50 {
         let total_parsed = discover_plan_dispatch_entries(&plan_text).len();
@@ -587,6 +591,48 @@ pub(crate) fn build_plan_driven_run_sequence(
     });
 
     Ok((task_catalog, tranche_plan))
+}
+
+fn filter_plan_dispatch_entries_for_run_spec(
+    open_tranches: Vec<ImplementationPlanEntry>,
+    all_tranches: &[ImplementationPlanEntry],
+    run_spec: &prompt::RunSpec,
+) -> Result<Vec<ImplementationPlanEntry>> {
+    let mut scoped = open_tranches;
+
+    if let Some(explicit_tranches) = run_spec.tranches.as_ref() {
+        let mut selected = Vec::new();
+        for tranche in &explicit_tranches.items {
+            let all_entry = all_tranches
+                .iter()
+                .find(|entry| entry.key == tranche.key)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("run spec references unknown tranche key {}", tranche.key)
+                })?;
+            if all_entry.is_complete {
+                continue;
+            }
+            if let Some(open_entry) = scoped.iter().find(|entry| entry.key == tranche.key) {
+                selected.push(open_entry.clone());
+            }
+        }
+        scoped = selected;
+    }
+
+    if let Some(plan_guard) = run_spec.plan_guard.as_ref() {
+        let target_exists = all_tranches
+            .iter()
+            .any(|entry| entry.key == plan_guard.target);
+        if !target_exists {
+            bail!(
+                "plan_guard target {} does not exist in the resolved plan/tranches set",
+                plan_guard.target
+            );
+        }
+        scoped.retain(|entry| entry.key == plan_guard.target);
+    }
+
+    Ok(scoped)
 }
 
 pub(crate) fn build_plain_prompt_run_sequence(
@@ -1047,7 +1093,17 @@ pub(crate) async fn execute_run_plan(
 
     match loaded_config.backend_selection()? {
         BackendSelection::InMemory => {
-            println!("Using backend: in-memory");
+            println!("Storage backend: in-memory");
+            println!(
+                "Agent backend:   {}",
+                loaded_config
+                    .config()
+                    .cli
+                    .backend
+                    .as_deref()
+                    .or(loaded_config.config().cli.command.as_deref())
+                    .unwrap_or("custom")
+            );
             let store = Arc::new(InMemoryEventStore::new());
             let queue = Arc::new(InMemoryTaskQueue::new());
             crate::cmd_run_start_with_backend(
@@ -1064,7 +1120,17 @@ pub(crate) async fn execute_run_plan(
             .await
         }
         BackendSelection::Postgres { database_url } => {
-            println!("Using backend: postgres");
+            println!("Storage backend: postgres");
+            println!(
+                "Agent backend:   {}",
+                loaded_config
+                    .config()
+                    .cli
+                    .backend
+                    .as_deref()
+                    .or(loaded_config.config().cli.command.as_deref())
+                    .unwrap_or("custom")
+            );
             let store = PostgresEventStore::new(&database_url)
                 .map_err(|e| anyhow::anyhow!("failed to initialize postgres event store: {e}"))?;
             let store = store.with_metrics(metrics.clone());
@@ -2033,7 +2099,9 @@ pub(crate) fn maybe_mark_current_structured_tranche_complete(plan: &RunPlan) -> 
     let Some(current_tranche) = plan.tranche_plan.get(current_index) else {
         return Ok(false);
     };
-    if current_tranche.key.eq_ignore_ascii_case("verification") {
+    if current_tranche.key.eq_ignore_ascii_case("verification")
+        || current_tranche.key.eq_ignore_ascii_case("prompt")
+    {
         return Ok(false);
     }
 
@@ -2803,6 +2871,83 @@ prompt_mode = "arg"
     }
 
     #[test]
+    fn plan_driven_sequence_scopes_structured_dispatch_to_prompt_tranche_key() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "validate scoped dispatch"
+
+[tasks]
+items = [
+  { key = "verify-stream-prompt", cmd = "echo verify", class = "tool" },
+]
+
+[tranches]
+items = [
+  { key = "NXT-017", objective = "Validate scoped dispatch", task_keys = ["verify-stream-prompt"] },
+]
+
+[plan_guard]
+target = "NXT-017"
+mode = "implement"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "1. NXT-017 Validate scoped dispatch. (incomplete)\n2. API-METRICS-02 Bridge metrics. (incomplete)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "API-METRICS-02"
+summary = "Bridge metrics"
+status = "incomplete"
+
+[[tranches]]
+key = "NXT-017"
+summary = "Validate scoped dispatch"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &repo.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&repo.path().join("PROMPT.md")).unwrap();
+        let (tasks, tranches) = build_plan_driven_run_sequence(
+            &loaded_config,
+            &loaded_prompt,
+            "validate scoped dispatch",
+        )
+        .unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tranches.len(), 2);
+        assert_eq!(tranches[0].key, "NXT-017");
+        assert_eq!(tranches[1].key, "verification");
+        assert!(tasks[0].command.contains("Target tranche: NXT-017."));
+        assert!(!tasks[0].command.contains("API-METRICS-02"));
+    }
+
+    #[test]
     fn plan_driven_sequence_uses_tranches_file_near_resolved_plan_not_cwd() {
         let repo = TempDir::new().unwrap();
         std::fs::write(
@@ -3009,6 +3154,40 @@ prompt_mode = "arg"
         assert_eq!(tasks[0].task_key, "prompt-001");
         assert!(tasks[0].command.contains("plain prompt"));
         assert!(tasks[0].command.contains("Implement step 2.3."));
+    }
+
+    #[test]
+    fn prompt_tranche_is_not_marked_as_structured_complete() {
+        let temp = TempDir::new().unwrap();
+        let prompt_path = temp.path().join("PROMPT.md");
+        std::fs::write(&prompt_path, "# Prompt\n").unwrap();
+
+        let plan = RunPlan {
+            objective: "yarli run [prompt]".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: ".".to_string(),
+            timeout_secs: 300,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: prompt_path.display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "prompt".to_string(),
+                objective: "yarli run [prompt]".to_string(),
+                task_keys: vec!["prompt-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        assert!(
+            !maybe_mark_current_structured_tranche_complete(&plan).unwrap(),
+            "plain prompt runs should not try to mutate structured tranche state"
+        );
     }
 
     #[test]

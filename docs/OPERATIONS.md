@@ -111,14 +111,14 @@ export YARLI_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55432/post
 export YARLI_REQUIRE_POSTGRES_TESTS=1
 
 # Packaging/build step
-cargo build --workspace --release
+cargo build --release -p yarli --bin yarli
 
 # API smoke checks (in-process and persistent read paths)
-cargo test -p yarli-api -- --nocapture
-cargo test -p yarli-api --test postgres_integration -- --nocapture
+cargo test --workspace
+cargo test -p yarli --test yarli_api_postgres_integration -- --nocapture
 
 # Durable CLI write/read roundtrip
-cargo test -p yarli-cli --test postgres_integration -- --nocapture
+cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture
 ```
 
 Expected smoke signals:
@@ -398,14 +398,14 @@ Run these commands to verify budget governance under parallel workload:
 
 ```bash
 # Single-task budget breach: task exceeds token limit, fails without retry
-cargo test -p yarli-queue scheduler::tests::test_budget_exceeded_fails_task_without_retry -- --nocapture
+cargo test -p yarli test_budget_exceeded_fails_task_without_retry -- --nocapture
 
 # Run-level budget breach: cumulative tokens across tasks exceed run limit
-cargo test -p yarli-queue scheduler::tests::test_run_token_budget_exceeded_across_tasks -- --nocapture
+cargo test -p yarli test_run_token_budget_exceeded_across_tasks -- --nocapture
 
 # Parallel-task budget stress: 4 concurrent tasks with tight run budget,
 # proves accounting consistency and no silent continuation after breach
-cargo test -p yarli-queue scheduler::tests::test_parallel_tasks_budget_accounting_consistency -- --nocapture
+cargo test -p yarli test_parallel_tasks_budget_accounting_consistency -- --nocapture
 
 # Command execution resource capture (exec layer)
 cargo test -p yarli-exec -- --nocapture
@@ -551,7 +551,7 @@ Sanity-check strict mode fails fast when DB env is missing:
 ```bash
 unset YARLI_TEST_DATABASE_URL
 export YARLI_REQUIRE_POSTGRES_TESTS=1
-cargo test -p yarli-store --test postgres_integration -- --nocapture
+cargo test -p yarli --test yarli_store_postgres_integration -- --nocapture
 ```
 
 Expected result: command fails and includes
@@ -562,9 +562,9 @@ Run strict Postgres integration suites (real execution path):
 ```bash
 export YARLI_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55432/postgres
 export YARLI_REQUIRE_POSTGRES_TESTS=1
-cargo test -p yarli-store --test postgres_integration -- --nocapture
-cargo test -p yarli-queue --test postgres_integration -- --nocapture
-cargo test -p yarli-cli --test postgres_integration -- --nocapture
+cargo test -p yarli --test yarli_store_postgres_integration -- --nocapture
+cargo test -p yarli --test yarli_queue_postgres_integration -- --nocapture
+cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture
 ```
 
 True execution signals:
