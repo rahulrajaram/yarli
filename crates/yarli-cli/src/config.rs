@@ -458,12 +458,49 @@ pub(crate) fn build_cli_command(invocation: &CliInvocationConfig, prompt_text: &
 
 const PREFLIGHT_MARKER: &str = "YARLI_PREFLIGHT_OK";
 
-/// Exercise the configured CLI backend with a trivial prompt to verify it works
-/// before dispatching real tasks. Catches missing binaries, bad flags, permission
-/// failures, and auth issues early.
-pub(crate) fn preflight_cli_backend(invocation: &CliInvocationConfig) -> Result<()> {
-    let preflight_prompt = format!("Respond with exactly: {PREFLIGHT_MARKER}");
-    let cmd = build_cli_command(invocation, &preflight_prompt);
+fn has_claude_model_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--model")
+}
+
+fn fallback_preflight_invocation(invocation: &CliInvocationConfig) -> Option<CliInvocationConfig> {
+    let command_file = Path::new(&invocation.command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if command_file != "claude" {
+        return None;
+    }
+    if !has_claude_model_flag(&invocation.args) {
+        return None;
+    }
+
+    let mut filtered_args = Vec::with_capacity(invocation.args.len());
+    let mut skip_next = false;
+    for arg in &invocation.args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--model" {
+            skip_next = true;
+            continue;
+        }
+        filtered_args.push(arg.clone());
+    }
+
+    Some(CliInvocationConfig {
+        command: invocation.command.clone(),
+        args: filtered_args,
+        prompt_mode: invocation.prompt_mode,
+        env_unset: invocation.env_unset.clone(),
+    })
+}
+
+fn execute_preflight_command(
+    invocation: &CliInvocationConfig,
+    preflight_prompt: &str,
+) -> Result<()> {
+    let cmd = build_cli_command(invocation, preflight_prompt);
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -500,6 +537,24 @@ pub(crate) fn preflight_cli_backend(invocation: &CliInvocationConfig) -> Result<
     }
 
     Ok(())
+}
+
+/// Exercise the configured CLI backend with a trivial prompt to verify it works
+/// before dispatching real tasks. Catches missing binaries, bad flags, permission
+/// failures, and auth issues early.
+pub(crate) fn preflight_cli_backend(invocation: &CliInvocationConfig) -> Result<()> {
+    let preflight_prompt = format!("Respond with exactly: {PREFLIGHT_MARKER}");
+    match execute_preflight_command(invocation, &preflight_prompt) {
+        Ok(()) => Ok(()),
+        Err(primary_error) => {
+            if let Some(fallback) = fallback_preflight_invocation(invocation) {
+                if let Ok(()) = execute_preflight_command(&fallback, &preflight_prompt) {
+                    return Ok(());
+                }
+            }
+            Err(primary_error)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1861,16 +1916,36 @@ parallel = false
     fn build_cli_command_applies_env_unset_prefix() {
         let invocation = CliInvocationConfig {
             command: "claude".to_string(),
-            args: vec!["--model".to_string(), "sonnet-4.5".to_string()],
+            args: vec!["--model".to_string(), "sonnet-4.6".to_string()],
             prompt_mode: PromptMode::Arg,
             env_unset: vec!["CLAUDECODE".to_string(), "FOO".to_string()],
         };
 
         let command = build_cli_command(&invocation, "hello");
         assert!(
-            command.contains("'env' '-u' 'CLAUDECODE' '-u' 'FOO' 'claude' '--model' 'sonnet-4.5'")
+            command.contains("'env' '-u' 'CLAUDECODE' '-u' 'FOO' 'claude' '--model' 'sonnet-4.6'")
         );
         assert!(command.ends_with(" 'hello'"));
+    }
+
+    #[test]
+    fn fallback_preflight_invocation_removes_claude_model() {
+        let invocation = CliInvocationConfig {
+            command: "claude".to_string(),
+            args: vec![
+                "--print".to_string(),
+                "--model".to_string(),
+                "claude-sonnet-4-6".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        let fallback = fallback_preflight_invocation(&invocation).unwrap();
+        assert_eq!(
+            fallback.args,
+            vec!["--print", "--dangerously-skip-permissions"]
+        );
     }
 
     #[test]
@@ -1881,7 +1956,7 @@ parallel = false
             r#"
 [cli]
 command = "claude"
-args = ["--model", "sonnet-4.5"]
+args = ["--model", "sonnet-4.6"]
 env_unset = ["BAD-NAME"]
 "#,
         );

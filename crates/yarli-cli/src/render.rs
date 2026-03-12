@@ -1335,7 +1335,9 @@ mod tests {
             }),
         );
 
-        let mapped = event_to_stream_event(&event, &[], false).expect("progress event should map");
+        let mapped = event_to_stream_events(&event, &[], false, false)
+            .pop()
+            .expect("progress event should map");
         match mapped {
             StreamEvent::TransientStatus { message, .. } => {
                 assert_eq!(message, "heartbeat pending=1 leased=0");
@@ -1368,18 +1370,28 @@ mod tests {
             idempotency_key: Some(format!("{task_id}:cmd:1:output")),
         };
 
-        let mapped =
-            event_to_stream_event(&event, &[(task_id, "tranche-001-i5".to_string())], false)
-                .expect("command output should map");
-        match mapped {
+        let mapped = event_to_stream_events(
+            &event,
+            &[(task_id, "tranche-001-i5".to_string())],
+            false,
+            false,
+        );
+        assert_eq!(mapped.len(), 2);
+        match &mapped[0] {
             StreamEvent::CommandOutput {
                 task_id: mapped_task_id,
                 task_name,
                 line,
             } => {
-                assert_eq!(mapped_task_id, task_id);
+                assert_eq!(*mapped_task_id, task_id);
                 assert_eq!(task_name, "tranche-001-i5");
-                assert_eq!(line, "line one\nline two");
+                assert_eq!(line, "line one");
+            }
+            other => panic!("expected command output stream event, got {other:?}"),
+        }
+        match &mapped[1] {
+            StreamEvent::CommandOutput { line, .. } => {
+                assert_eq!(line, "line two");
             }
             other => panic!("expected command output stream event, got {other:?}"),
         }
@@ -1407,7 +1419,7 @@ mod tests {
         };
 
         assert!(
-            event_to_stream_event(&event, &[], false).is_none(),
+            event_to_stream_events(&event, &[], false, false).is_empty(),
             "empty command output should not emit stream event"
         );
     }

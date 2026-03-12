@@ -7,6 +7,54 @@
 
 use std::io::{self, IsTerminal};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalColorSupport {
+    None,
+    Ansi16,
+    TrueColor,
+}
+
+impl TerminalColorSupport {
+    pub fn detect_from_env() -> Self {
+        Self::detect_with(|key| std::env::var(key).ok())
+    }
+
+    fn detect_with(get_env: impl Fn(&str) -> Option<String>) -> Self {
+        if get_env("NO_COLOR").is_some() {
+            return Self::None;
+        }
+
+        let colorterm = get_env("COLORTERM")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+            return Self::TrueColor;
+        }
+
+        let term = get_env("TERM").unwrap_or_default().to_ascii_lowercase();
+        if term.contains("truecolor") || term.contains("24bit") || term.contains("direct") {
+            return Self::TrueColor;
+        }
+
+        if get_env("TERM_PROGRAM")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("wezterm")
+        {
+            return Self::TrueColor;
+        }
+
+        if get_env("KITTY_WINDOW_ID").is_some() {
+            return Self::TrueColor;
+        }
+
+        Self::Ansi16
+    }
+
+    pub fn is_truecolor(self) -> bool {
+        matches!(self, Self::TrueColor)
+    }
+}
+
 /// Rendering mode for the CLI output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
@@ -28,6 +76,7 @@ pub struct TerminalInfo {
     pub is_tty: bool,
     pub cols: u16,
     pub rows: u16,
+    pub color_support: TerminalColorSupport,
 }
 
 impl TerminalInfo {
@@ -35,7 +84,17 @@ impl TerminalInfo {
     pub fn detect() -> Self {
         let is_tty = io::stdout().is_terminal();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
-        Self { is_tty, cols, rows }
+        let color_support = if is_tty {
+            TerminalColorSupport::detect_from_env()
+        } else {
+            TerminalColorSupport::None
+        };
+        Self {
+            is_tty,
+            cols,
+            rows,
+            color_support,
+        }
     }
 
     /// Whether the terminal meets minimum size requirements for dashboard mode.
@@ -93,6 +152,7 @@ mod tests {
             is_tty: true,
             cols: 120,
             rows: 40,
+            color_support: TerminalColorSupport::Ansi16,
         }
     }
 
@@ -101,6 +161,7 @@ mod tests {
             is_tty: true,
             cols: 60,
             rows: 20,
+            color_support: TerminalColorSupport::Ansi16,
         }
     }
 
@@ -109,6 +170,7 @@ mod tests {
             is_tty: false,
             cols: 120,
             rows: 40,
+            color_support: TerminalColorSupport::None,
         }
     }
 
@@ -117,6 +179,7 @@ mod tests {
             is_tty: true,
             cols: 79,
             rows: 40,
+            color_support: TerminalColorSupport::Ansi16,
         }
     }
 
@@ -125,6 +188,7 @@ mod tests {
             is_tty: true,
             cols: 120,
             rows: 23,
+            color_support: TerminalColorSupport::Ansi16,
         }
     }
 
@@ -161,8 +225,37 @@ mod tests {
             is_tty: true,
             cols: MIN_DASHBOARD_COLS,
             rows: MIN_DASHBOARD_ROWS,
+            color_support: TerminalColorSupport::Ansi16,
         };
         assert!(info.supports_dashboard());
+    }
+
+    #[test]
+    fn detects_truecolor_from_colorterm() {
+        let detected = TerminalColorSupport::detect_with(|key| match key {
+            "COLORTERM" => Some("truecolor".to_string()),
+            _ => None,
+        });
+        assert_eq!(detected, TerminalColorSupport::TrueColor);
+    }
+
+    #[test]
+    fn detects_truecolor_from_term_suffix() {
+        let detected = TerminalColorSupport::detect_with(|key| match key {
+            "TERM" => Some("xterm-direct".to_string()),
+            _ => None,
+        });
+        assert_eq!(detected, TerminalColorSupport::TrueColor);
+    }
+
+    #[test]
+    fn no_color_disables_color_output() {
+        let detected = TerminalColorSupport::detect_with(|key| match key {
+            "NO_COLOR" => Some("1".to_string()),
+            "COLORTERM" => Some("truecolor".to_string()),
+            _ => None,
+        });
+        assert_eq!(detected, TerminalColorSupport::None);
     }
 
     // --- select_render_mode ---

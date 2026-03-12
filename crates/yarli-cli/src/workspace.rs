@@ -1196,10 +1196,15 @@ fn copy_directory_files_recursive(src_dir: &Path, dst_dir: &Path) -> Result<()> 
 
 /// Sync runtime state artifacts from a task workspace back to source.
 ///
-/// This ensures `.yarli/tranches.toml` and evidence survive even when the
-/// worktree had no tracked code changes (skip path).
+/// This ensures continuation state and evidence survive even when the worktree
+/// had no tracked code changes (skip path).
+///
+/// **Note:** `.yarli/tranches.toml` is intentionally excluded from this sync.
+/// Tranche completion status is managed by the orchestrator (post-merge
+/// verification in `commands.rs`), not copied from the worktree.  Copying it
+/// back would overwrite concurrent completion updates made to the source's file
+/// while the worktree was running.
 fn sync_workspace_state_artifacts(source_workdir: &Path, workspace_dir: &Path) -> Result<()> {
-    copy_state_file_if_present(source_workdir, workspace_dir, ".yarli/tranches.toml")?;
     copy_state_file_if_present(source_workdir, workspace_dir, ".yarli/continuation.json")?;
 
     let evidence_src = workspace_dir.join(".yarli/evidence");
@@ -6679,7 +6684,7 @@ worktree_root = "{}"
     }
 
     #[test]
-    fn worktree_merge_skip_syncs_tranche_state_and_releases_slot() {
+    fn worktree_merge_skip_preserves_source_tranche_state_and_releases_slot() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(repo.join(".yarli")).unwrap();
@@ -6740,9 +6745,9 @@ worktree_root = "{}"
         assert!(report.merged_task_keys.is_empty());
         assert_eq!(report.skipped_task_keys, vec!["task"]);
 
-        // Ignored runtime state should still sync back to source workspace.
+        // Source tranches.toml should be preserved (not overwritten by worktree's copy).
         let synced = std::fs::read_to_string(repo.join(".yarli/tranches.toml")).unwrap();
-        assert_eq!(synced, "status = \"complete\"\n");
+        assert_eq!(synced, "status = \"incomplete\"\n");
 
         // Skipped task worktree should also be removed immediately.
         assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);

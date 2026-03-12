@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{bail, Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use yarli_cli::prompt;
 
 use crate::plan::{
@@ -244,7 +244,9 @@ pub(crate) fn maybe_mark_current_structured_tranche_complete(plan: &RunPlan) -> 
     let Some(current_tranche) = plan.tranche_plan.get(current_index) else {
         return Ok(false);
     };
-    if current_tranche.key.eq_ignore_ascii_case("verification") {
+    if current_tranche.key.eq_ignore_ascii_case("verification")
+        || current_tranche.key.eq_ignore_ascii_case("prompt")
+    {
         return Ok(false);
     }
 
@@ -286,6 +288,123 @@ pub(crate) fn maybe_mark_current_structured_tranche_complete(plan: &RunPlan) -> 
         "auto-marked structured tranche as complete"
     );
     Ok(true)
+}
+
+/// Run the tranche's `verify` command (if any) and return whether it passed.
+///
+/// Returns `Ok(true)` (default pass) when:
+/// - there is no current tranche index,
+/// - the tranche key is a special key ("verification" / "prompt"),
+/// - there is no prompt snapshot,
+/// - no `.yarli/tranches.toml` exists,
+/// - the key is not found in the file, or
+/// - the tranche definition has no `verify` field.
+///
+/// On spawn failure the command is treated as failed (`Ok(false)`).
+pub(crate) fn run_tranche_verify_command(
+    plan: &RunPlan,
+    workdir: &Path,
+    timeout_secs: u64,
+) -> Result<bool> {
+    let Some(current_index) = plan.current_tranche_index else {
+        return Ok(true);
+    };
+    let Some(current_tranche) = plan.tranche_plan.get(current_index) else {
+        return Ok(true);
+    };
+    if current_tranche.key.eq_ignore_ascii_case("verification")
+        || current_tranche.key.eq_ignore_ascii_case("prompt")
+    {
+        return Ok(true);
+    }
+
+    let Some(prompt_snapshot) = plan.prompt_snapshot.as_ref() else {
+        return Ok(true);
+    };
+    let prompt_entry_path = PathBuf::from(&prompt_snapshot.entry_path);
+    let plan_path = plan_path_for_prompt_entry(&prompt_entry_path)?;
+    let tranches_base_dir = plan_path
+        .parent()
+        .context("plan file has no parent directory")?;
+
+    let Some(tf) = read_tranches_file_in(tranches_base_dir)? else {
+        return Ok(true);
+    };
+    let Some(def) = tf
+        .tranches
+        .iter()
+        .find(|def| def.key.eq_ignore_ascii_case(&current_tranche.key))
+    else {
+        return Ok(true);
+    };
+
+    let Some(verify_cmd) = def.verify.as_deref() else {
+        return Ok(true);
+    };
+
+    info!(
+        tranche_key = %current_tranche.key,
+        verify_cmd = %verify_cmd,
+        workdir = %workdir.display(),
+        "running tranche verify command"
+    );
+
+    let mut child = match process::Command::new("sh")
+        .args(["-c", verify_cmd])
+        .current_dir(workdir)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                tranche_key = %current_tranche.key,
+                error = %err,
+                "failed to spawn tranche verify command"
+            );
+            return Ok(false);
+        }
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let passed = status.success();
+                info!(
+                    tranche_key = %current_tranche.key,
+                    exit_code = status.code(),
+                    passed,
+                    "tranche verify command finished"
+                );
+                return Ok(passed);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    warn!(
+                        tranche_key = %current_tranche.key,
+                        timeout_secs,
+                        "tranche verify command timed out; killing"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(err) => {
+                warn!(
+                    tranche_key = %current_tranche.key,
+                    error = %err,
+                    "error polling tranche verify command"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(false);
+            }
+        }
+    }
 }
 
 pub(crate) fn validate_tranche_definition(def: &TrancheDefinition) -> Result<()> {
@@ -1816,5 +1935,292 @@ status = "incomplete"
         let repo_tf = read_tranches_file_in(repo.path()).unwrap().unwrap();
         assert_eq!(repo_tf.tranches.len(), 1);
         assert_eq!(repo_tf.tranches[0].status, TrancheStatus::Incomplete);
+    }
+
+    #[test]
+    fn auto_complete_structured_tranche_skips_plain_prompt_tranche() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "ST-01"
+summary = "Structured tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let plan = RunPlan {
+            objective: "yarli run [prompt]".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: ".".to_string(),
+            timeout_secs: 1,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "prompt".to_string(),
+                objective: "yarli run [prompt]".to_string(),
+                task_keys: vec!["prompt-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let updated = maybe_mark_current_structured_tranche_complete(&plan).unwrap();
+        assert!(
+            !updated,
+            "plain prompt tranche should not alter structured file"
+        );
+
+        let repo_tf = read_tranches_file_in(repo.path()).unwrap().unwrap();
+        assert_eq!(repo_tf.tranches.len(), 1);
+        assert_eq!(repo_tf.tranches[0].status, TrancheStatus::Incomplete);
+    }
+
+    // ---- run_tranche_verify_command tests ----
+
+    #[test]
+    fn verify_command_passes_with_no_verify_field() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. VT-01 `Verify test`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "VT-01"
+summary = "Verify test tranche"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let plan = RunPlan {
+            objective: "verify test".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: repo.path().display().to_string(),
+            timeout_secs: 10,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "VT-01".to_string(),
+                objective: "verify test".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let passed = run_tranche_verify_command(&plan, repo.path(), 10).unwrap();
+        assert!(passed, "no verify field should default to pass");
+    }
+
+    #[test]
+    fn verify_command_passes_when_exit_zero() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. VT-02 `Verify pass`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "VT-02"
+summary = "Verify pass tranche"
+status = "incomplete"
+verify = "true"
+"#,
+        )
+        .unwrap();
+
+        let plan = RunPlan {
+            objective: "verify pass".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: repo.path().display().to_string(),
+            timeout_secs: 10,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "VT-02".to_string(),
+                objective: "verify pass".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let passed = run_tranche_verify_command(&plan, repo.path(), 10).unwrap();
+        assert!(passed, "exit 0 should pass verification");
+    }
+
+    #[test]
+    fn verify_command_fails_when_exit_nonzero() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. VT-03 `Verify fail`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "VT-03"
+summary = "Verify fail tranche"
+status = "incomplete"
+verify = "false"
+"#,
+        )
+        .unwrap();
+
+        let plan = RunPlan {
+            objective: "verify fail".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: repo.path().display().to_string(),
+            timeout_secs: 10,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "VT-03".to_string(),
+                objective: "verify fail".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let passed = run_tranche_verify_command(&plan, repo.path(), 10).unwrap();
+        assert!(!passed, "exit non-zero should fail verification");
+    }
+
+    #[test]
+    fn verify_command_skips_for_prompt_key() {
+        let plan = RunPlan {
+            objective: "prompt run".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: ".".to_string(),
+            timeout_secs: 10,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "prompt".to_string(),
+                objective: "prompt run".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let passed = run_tranche_verify_command(&plan, Path::new("."), 10).unwrap();
+        assert!(passed, "prompt key should skip and default to pass");
+    }
+
+    #[test]
+    fn verify_command_skips_for_no_prompt_snapshot() {
+        let plan = RunPlan {
+            objective: "no snapshot".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: ".".to_string(),
+            timeout_secs: 10,
+            pace: None,
+            prompt_snapshot: None,
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "NXT-01".to_string(),
+                objective: "no snapshot".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let passed = run_tranche_verify_command(&plan, Path::new("."), 10).unwrap();
+        assert!(passed, "no prompt snapshot should default to pass");
+    }
+
+    #[test]
+    fn verify_command_skips_when_no_tranches_file() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. VT-06 `No file`: incomplete.\n",
+        )
+        .unwrap();
+        // Intentionally no .yarli/tranches.toml
+
+        let plan = RunPlan {
+            objective: "no tranches file".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: repo.path().display().to_string(),
+            timeout_secs: 10,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "VT-06".to_string(),
+                objective: "no tranches file".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let passed = run_tranche_verify_command(&plan, repo.path(), 10).unwrap();
+        assert!(passed, "missing tranches file should default to pass");
     }
 }

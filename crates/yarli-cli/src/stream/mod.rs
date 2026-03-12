@@ -5,12 +5,14 @@
 //! Active tasks shown via ratatui `Viewport::Inline` with braille spinners.
 //! Used in CI, pipes, small terminals.
 
+pub mod backend_output;
 pub mod events;
 pub mod headless;
 pub mod renderer;
 pub mod spinner;
 pub mod style;
 
+pub use backend_output::{normalize_output_lines, normalize_output_lines_with_options};
 pub use events::{StreamEvent, TaskView};
 pub use headless::HeadlessRenderer;
 pub use renderer::{StreamConfig, StreamRenderer};
