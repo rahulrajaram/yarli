@@ -15,8 +15,11 @@ use tracing::{debug, error, info, warn};
 use crate::yarli_exec::{CommandRunner, LocalCommandRunner};
 use crate::yarli_sw4rm::bridge::ShutdownBridge;
 use crate::yarli_sw4rm::config::Sw4rmConfig;
-use crate::yarli_sw4rm::messages::{OrchestrationReport, CT_ORCHESTRATION_REPORT};
+use crate::yarli_sw4rm::messages::{
+    OrchestrationReport, CT_IMPLEMENTATION_RESPONSE, CT_ORCHESTRATION_REPORT,
+};
 use crate::yarli_sw4rm::orchestrator::{ObjectiveParams, OrchestratorLoop, RouterSender};
+use crate::yarli_sw4rm::transport::{CorrelationRegistry, ReportSender};
 
 /// YarliAgent implements `sw4rm_sdk::Agent` to act as an orchestrator
 /// in the sw4rm protocol.
@@ -27,6 +30,12 @@ pub struct YarliAgent<R: RouterSender, V: CommandRunner = LocalCommandRunner> {
     sw4rm_config: Sw4rmConfig,
     orchestrator: Arc<OrchestratorLoop<R, V>>,
     shutdown_bridge: Option<ShutdownBridge>,
+    /// Correlation registry shared with the GrpcRouterSender.
+    /// When a response arrives in `on_message`, the registry completes the
+    /// corresponding oneshot channel.
+    correlations: Option<Arc<CorrelationRegistry>>,
+    /// Report sender for delivering orchestration reports to the sw4rm router.
+    report_sender: Option<Arc<ReportSender>>,
 }
 
 impl<R: RouterSender + 'static, V: CommandRunner + Clone + 'static> YarliAgent<R, V> {
@@ -41,7 +50,21 @@ impl<R: RouterSender + 'static, V: CommandRunner + Clone + 'static> YarliAgent<R
             sw4rm_config,
             orchestrator,
             shutdown_bridge: None,
+            correlations: None,
+            report_sender: None,
         }
+    }
+
+    /// Attach a correlation registry (shared with GrpcRouterSender).
+    pub fn with_correlations(mut self, correlations: Arc<CorrelationRegistry>) -> Self {
+        self.correlations = Some(correlations);
+        self
+    }
+
+    /// Attach a report sender for delivering orchestration reports.
+    pub fn with_report_sender(mut self, sender: Arc<ReportSender>) -> Self {
+        self.report_sender = Some(sender);
+        self
     }
 
     /// Attach a shutdown bridge for preemption forwarding.
@@ -146,18 +169,24 @@ impl<R: RouterSender + 'static, V: CommandRunner + Clone + 'static> YarliAgent<R
             }
         };
 
-        // Emit the report as an envelope. We log if it fails rather than
-        // propagating, since the orchestration itself already completed.
+        // Emit the report as an envelope via the report sender (if wired).
         match EnvelopeBuilder::new(self.agent_config.agent_id.clone(), 1).with_json_payload(&report)
         {
             Ok(builder) => {
-                let _report_envelope = builder
+                let report_envelope = builder
                     .with_content_type(CT_ORCHESTRATION_REPORT.to_string())
                     .with_correlation_id(correlation_id)
                     .build();
 
-                // TODO: send via router/scheduler client when real transport is wired
-                debug!("orchestration report built (pending transport)");
+                if let Some(ref sender) = self.report_sender {
+                    if let Err(e) = sender.send_envelope(&report_envelope).await {
+                        warn!(error = %e, "failed to send orchestration report");
+                    } else {
+                        debug!("orchestration report sent via transport");
+                    }
+                } else {
+                    debug!("orchestration report built (no transport wired)");
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to build orchestration report envelope");
@@ -175,6 +204,37 @@ impl<R: RouterSender + 'static, V: CommandRunner + Clone + 'static> sw4rm_sdk::A
     async fn on_message(&mut self, envelope: EnvelopeData) -> sw4rm_sdk::Result<()> {
         match envelope.content_type.as_str() {
             CT_SCHEDULER_COMMAND_V1 => self.handle_scheduler_command(&envelope).await,
+            CT_IMPLEMENTATION_RESPONSE => {
+                // Complete the pending correlation so GrpcRouterSender unblocks.
+                if let Some(ref registry) = self.correlations {
+                    match envelope
+                        .json_payload::<crate::yarli_sw4rm::messages::ImplementationResponse>()
+                    {
+                        Ok(response) => {
+                            let corr_id = uuid::Uuid::parse_str(&envelope.correlation_id)
+                                .unwrap_or_else(|_| uuid::Uuid::nil());
+                            if registry.complete(corr_id, response) {
+                                debug!(
+                                    correlation_id = %envelope.correlation_id,
+                                    "implementation response completed correlation"
+                                );
+                            } else {
+                                warn!(
+                                    correlation_id = %envelope.correlation_id,
+                                    "no pending correlation for implementation response"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "failed to parse implementation response payload"
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
             other => {
                 debug!(content_type = other, "ignoring unknown message type");
                 Ok(())

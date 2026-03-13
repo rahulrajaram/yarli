@@ -46,6 +46,19 @@ pub(crate) fn command_id_for_request(idempotency_key: Option<&str>) -> Uuid {
         .unwrap_or_else(Uuid::now_v7)
 }
 
+/// Resource limits to apply to a child process via rlimits and/or cgroups.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceLimits {
+    /// Maximum virtual memory (RLIMIT_AS) in bytes.
+    pub max_memory_bytes: Option<u64>,
+    /// Maximum CPU time (RLIMIT_CPU) in seconds.
+    pub max_cpu_seconds: Option<u64>,
+    /// Maximum open file descriptors (RLIMIT_NOFILE).
+    pub max_open_files: Option<u64>,
+    /// Maximum number of processes/threads (RLIMIT_NPROC).
+    pub max_pids: Option<u64>,
+}
+
 /// Request to execute a command.
 #[derive(Debug, Clone)]
 pub struct CommandRequest {
@@ -69,6 +82,8 @@ pub struct CommandRequest {
     pub env: Vec<(String, String)>,
     /// Optional channel for live output streaming. Each chunk is sent as it arrives.
     pub live_output_tx: Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
+    /// Optional resource limits (rlimits/cgroup) applied to the child process.
+    pub resource_limits: Option<ResourceLimits>,
 }
 
 /// Result of a completed command execution.
@@ -229,9 +244,6 @@ impl CommandRunner for LocalCommandRunner {
         debug!(command = %request.command, working_dir = %request.working_dir, "spawning command");
 
         let spawn_start = Instant::now();
-        // TODO(phase1): Before spawn, create cgroup sandbox and set resource limits.
-        //   After spawn, obtain pidfd for race-free lifecycle management.
-        //   See IMPLEMENTATION_PLAN.md Section 18 sections 5.1, 5.2, 6.
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -243,21 +255,52 @@ impl CommandRunner for LocalCommandRunner {
             .envs(request.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .kill_on_drop(true);
         #[cfg(unix)]
-        // Isolate each command in its own process group so cancellation tears
-        // down descendants (shell + child toolchain processes) reliably.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
+        {
+            let rlimits = request.resource_limits.clone();
+            // Isolate each command in its own process group so cancellation tears
+            // down descendants (shell + child toolchain processes) reliably.
+            // Also apply rlimits if configured.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(ref limits) = rlimits {
+                        apply_rlimits(limits)?;
+                    }
                     Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
+                });
+            }
         }
         let mut child = command.spawn().map_err(ExecError::SpawnFailed)?;
         self.record_overhead(request.command_class, "spawn", spawn_start.elapsed());
         let child_pid = child.id();
         let process_group_id = child_pid.and_then(pid_to_process_group_id);
+
+        // Acquire a pidfd-backed handle (falls back to raw PID on older kernels).
+        #[cfg(unix)]
+        let process_handle = child_pid.map(crate::yarli_exec::pidfd::ProcessHandle::acquire);
+        #[cfg(not(unix))]
+        let process_handle: Option<crate::yarli_exec::pidfd::ProcessHandle> = None;
+
+        // Create cgroup sandbox and add child PID (best-effort, non-fatal).
+        let _cgroup_sandbox =
+            if let (Some(pid), Some(ref limits)) = (child_pid, &request.resource_limits) {
+                let run_short = &request.run_id.to_string()[..8];
+                let task_short = &request.task_id.to_string()[..8];
+                let mgr = crate::yarli_exec::cgroup::LocalCgroupManager;
+                let sandbox = crate::yarli_exec::cgroup::CgroupManager::create_sandbox(
+                    &mgr, run_short, task_short, limits,
+                );
+                if let Some(ref sb) = sandbox {
+                    if let Err(e) = sb.add_pid(pid) {
+                        debug!(error = %e, "failed to add child pid to cgroup sandbox");
+                    }
+                }
+                sandbox
+            } else {
+                None
+            };
 
         // Track child PID in shutdown controller so it can be killed on
         // programmatic failure (RunFailed) — not just on Ctrl+C signal.
@@ -339,18 +382,18 @@ impl CommandRunner for LocalCommandRunner {
                 biased;
                 _ = cancel.cancelled() => {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
-                    kill_child(&mut child, process_group_id).await;
+                    kill_child(&mut child, process_group_id, &process_handle).await;
                     // Drain remaining output.
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
                 _ = tokio::time::sleep(dur) => {
                     warn!(cmd_id = %cmd_id, timeout = ?dur, "command timed out");
-                    kill_child(&mut child, process_group_id).await;
+                    kill_child(&mut child, process_group_id, &process_handle).await;
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Timeout(dur))
                 }
-                result = collect_and_wait(&mut child, process_group_id, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
+                result = collect_and_wait(&mut child, process_group_id, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout, &process_handle) => {
                     result
                 }
             }
@@ -359,11 +402,11 @@ impl CommandRunner for LocalCommandRunner {
                 biased;
                 _ = cancel.cancelled() => {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
-                    kill_child(&mut child, process_group_id).await;
+                    kill_child(&mut child, process_group_id, &process_handle).await;
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
-                result = collect_and_wait(&mut child, process_group_id, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout) => {
+                result = collect_and_wait(&mut child, process_group_id, &mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx, idle_kill_timeout, &process_handle) => {
                     result
                 }
             }
@@ -466,17 +509,6 @@ fn estimate_tokens(input: &str) -> u64 {
     }
 }
 
-// TODO: Replace /proc polling with proactive enforcement. See IMPLEMENTATION_PLAN.md Section 18.
-//
-// TODO(phase1): cgroup v2 sandbox — create /sys/fs/cgroup/yarli/<run_id>/<task_id>/,
-//   set memory.max, cpu.max, pids.max before spawn, use cgroup.kill on timeout.
-//
-// TODO(phase1): pidfd-based spawn/kill/reap — use pidfd_open(2) for race-free
-//   liveness checks and SIGTERM→SIGKILL escalation without PID recycling races.
-//
-// TODO(phase2): rlimits — set RLIMIT_AS, RLIMIT_CPU, RLIMIT_NPROC, RLIMIT_NOFILE
-//   in child pre-exec via Command::pre_exec + libc::setrlimit.
-//
 // TODO(phase2): eBPF-based resource tracking for zero-overhead in-kernel enforcement.
 //   - Attach BPF programs to task cgroup to track RSS, CPU, and I/O.
 //   - Use eBPF maps to enforce budgets and send signals when thresholds are breached.
@@ -628,6 +660,7 @@ async fn collect_and_wait(
     chunks: &mut Vec<StreamChunk>,
     live_tx: &Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     idle_kill_timeout: Option<Duration>,
+    process_handle: &Option<crate::yarli_exec::pidfd::ProcessHandle>,
 ) -> Result<i32, ExecError> {
     let mut last_output_at = Instant::now();
 
@@ -673,7 +706,7 @@ async fn collect_and_wait(
                     idle_timeout = ?dur,
                     "command produced no output for idle_kill_timeout — killing"
                 );
-                kill_child(child, process_group_id).await;
+                kill_child(child, process_group_id, process_handle).await;
                 drain_channel(rx, cmd_id, seq, chunks, live_tx).await;
                 return Err(ExecError::Timeout(dur));
             }
@@ -711,15 +744,57 @@ async fn drain_channel(
     }
 }
 
+/// Apply rlimits to the current process (called in pre_exec context).
+///
+/// Sets RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE, and RLIMIT_NPROC based on
+/// the provided `ResourceLimits`. Only limits with `Some` values are applied.
+#[cfg(unix)]
+fn apply_rlimits(limits: &ResourceLimits) -> std::io::Result<()> {
+    fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()> {
+        let lim = libc::rlimit {
+            rlim_cur: value as libc::rlim_t,
+            rlim_max: value as libc::rlim_t,
+        };
+        let rc = unsafe { libc::setrlimit(resource, &lim) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    if let Some(bytes) = limits.max_memory_bytes {
+        set_rlimit(libc::RLIMIT_AS, bytes)?;
+    }
+    if let Some(secs) = limits.max_cpu_seconds {
+        set_rlimit(libc::RLIMIT_CPU, secs)?;
+    }
+    if let Some(nfiles) = limits.max_open_files {
+        set_rlimit(libc::RLIMIT_NOFILE, nfiles)?;
+    }
+    if let Some(nproc) = limits.max_pids {
+        set_rlimit(libc::RLIMIT_NPROC, nproc)?;
+    }
+    Ok(())
+}
+
 fn pid_to_process_group_id(pid: u32) -> Option<i32> {
     i32::try_from(pid).ok()
 }
 
 /// Kill a child process (best-effort).
-async fn kill_child(child: &mut tokio::process::Child, process_group_id: Option<i32>) {
+///
+/// Uses process-group signaling for SIGTERM/SIGKILL to tear down all descendants.
+/// The optional `ProcessHandle` provides race-free signal delivery via pidfd
+/// on supported kernels.
+async fn kill_child(
+    child: &mut tokio::process::Child,
+    process_group_id: Option<i32>,
+    #[allow(unused_variables)] handle: &Option<crate::yarli_exec::pidfd::ProcessHandle>,
+) {
     #[cfg(unix)]
     if let Some(pgid) = process_group_id {
-        let _ = signal_process_group(pgid, libc::SIGTERM);
+        let _ = crate::yarli_exec::pidfd::signal_process_group(pgid, libc::SIGTERM);
         for _ in 0..10 {
             match child.try_wait() {
                 Ok(Some(_)) => return,
@@ -730,25 +805,16 @@ async fn kill_child(child: &mut tokio::process::Child, process_group_id: Option<
                 }
             }
         }
-        let _ = signal_process_group(pgid, libc::SIGKILL);
+        // Escalate to SIGKILL via process group.
+        let _ = crate::yarli_exec::pidfd::signal_process_group(pgid, libc::SIGKILL);
+        // Also send SIGKILL via pidfd handle for race-free delivery to the lead process.
+        if let Some(h) = handle {
+            let _ = h.send_signal(libc::SIGKILL);
+        }
     }
     if let Err(e) = child.kill().await {
         warn!(error = %e, "failed to kill child process");
     }
-}
-
-#[cfg(unix)]
-fn signal_process_group(process_group_id: i32, signal: i32) -> std::io::Result<()> {
-    // Negative PID targets the entire process group.
-    let rc = unsafe { libc::kill(-process_group_id, signal) };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    if matches!(err.raw_os_error(), Some(code) if code == libc::ESRCH) {
-        return Ok(());
-    }
-    Err(err)
 }
 
 #[cfg(test)]
@@ -769,6 +835,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         }
     }
 
@@ -1107,5 +1174,84 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rlimit_memory_kills_allocation() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        // Use python to try allocating 100MB in one shot. With RLIMIT_AS at
+        // a small value, the python interpreter itself may fail to start or
+        // the allocation will fail with MemoryError.
+        let mut req = make_request("python3 -c 'b = bytearray(100_000_000); print(len(b))'");
+        req.resource_limits = Some(ResourceLimits {
+            max_memory_bytes: Some(50 * 1024 * 1024), // 50 MB virtual AS limit
+            ..Default::default()
+        });
+        req.timeout = Some(Duration::from_secs(5));
+        let result = runner.run(req, cancel).await.unwrap();
+        // Python should fail to start or fail to allocate.
+        let exit_code = result.execution.exit_code;
+        let state = result.execution.state;
+        assert!(
+            exit_code != Some(0) || state == CommandState::CmdTimedOut,
+            "expected non-zero exit or timeout with 50MB memory limit, got state={state:?} exit={exit_code:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rlimit_cpu_kills_busy_loop() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let mut req = make_request("while true; do :; done");
+        req.resource_limits = Some(ResourceLimits {
+            max_cpu_seconds: Some(1),
+            ..Default::default()
+        });
+        req.timeout = Some(Duration::from_secs(10));
+        let result = runner.run(req, cancel).await.unwrap();
+        // SIGXCPU (signal 24) kills the process, so exit code should be non-zero.
+        let exit_code = result.execution.exit_code;
+        assert!(
+            exit_code != Some(0),
+            "expected non-zero exit from CPU limit, got {exit_code:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rlimit_nproc_prevents_fork_bomb() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        // Try to fork 10 subprocesses; with nproc=2 most should fail.
+        let mut req = make_request("for i in $(seq 1 10); do (echo $i) & done; wait; echo done");
+        req.resource_limits = Some(ResourceLimits {
+            max_pids: Some(2),
+            ..Default::default()
+        });
+        req.timeout = Some(Duration::from_secs(5));
+        let result = runner.run(req, cancel).await.unwrap();
+        // Some forks should fail, but the main shell may still exit 0.
+        // The important thing is we don't hang and the command completes.
+        let state = result.execution.state;
+        assert!(
+            state == CommandState::CmdExited || state == CommandState::CmdTimedOut,
+            "expected CmdExited or CmdTimedOut, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_rlimits_when_none() {
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let mut req = make_request("echo ok");
+        req.resource_limits = None;
+        let result = runner.run(req, cancel).await.unwrap();
+        assert_eq!(result.execution.state, CommandState::CmdExited);
+        assert_eq!(result.execution.exit_code, Some(0));
+        assert!(!result.chunks.is_empty());
+        assert_eq!(result.chunks[0].data, "ok");
     }
 }

@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod config;
 pub mod messages;
 pub mod orchestrator;
+pub mod transport;
 
 /// Mock implementations for testing. Only available with `test-support` feature
 /// or in test builds.
@@ -23,3 +24,4 @@ pub use messages::{
     ImplementationRequest, ImplementationResponse, OrchestrationReport, VerificationFailure,
 };
 pub use orchestrator::{ObjectiveParams, OrchestratorLoop, OrchestratorResult, RouterSender};
+pub use transport::{CorrelationRegistry, GrpcRouterSender, ReportSender};
