@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use yarli_cli::yarli_core::domain::{CommandClass, EntityType, Event, SafeMode};
 use yarli_cli::yarli_core::entities::command_execution::{
-    CommandExecution, CommandResourceUsage, StreamChunk, TokenUsage,
+    CommandExecution, CommandResourceUsage, StreamChunk, StreamType, TokenUsage,
 };
 use yarli_cli::yarli_core::entities::task::Task;
 use yarli_cli::yarli_core::entities::Run;
@@ -26,7 +26,8 @@ use yarli_cli::yarli_core::fsm::command::CommandState;
 use yarli_cli::yarli_core::fsm::run::RunState;
 use yarli_cli::yarli_core::fsm::task::TaskState;
 use yarli_cli::yarli_exec::{
-    CommandRequest, CommandResult, CommandRunner, ExecError, LocalCommandRunner,
+    cgroup::{cgroup_v2_available, CgroupManager, LocalCgroupManager},
+    CommandRequest, CommandResult, CommandRunner, ExecError, LocalCommandRunner, ResourceLimits,
 };
 use yarli_cli::yarli_queue::{
     ConcurrencyConfig, InMemoryTaskQueue, ResourceBudgetConfig, Scheduler, SchedulerConfig,
@@ -78,6 +79,59 @@ fn make_task(run_id: Uuid, key: &str, command: &str, correlation_id: Uuid) -> Ta
 struct FlakyEventStore {
     inner: Arc<InMemoryEventStore>,
     fail_next_task_ready: AtomicBool,
+}
+
+#[derive(Clone, Default)]
+struct CapturingRunner {
+    inner: LocalCommandRunner,
+    observed: Arc<tokio::sync::Mutex<Option<CommandRequest>>>,
+}
+
+impl CommandRunner for CapturingRunner {
+    async fn run(
+        &self,
+        request: CommandRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandResult, ExecError> {
+        *self.observed.lock().await = Some(request.clone());
+        self.inner.run(request, cancel).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct ObservedCommandRun {
+    exit_code: Option<i32>,
+    state: Option<CommandState>,
+    stdout: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct CapturingAndObservingRunner {
+    inner: LocalCommandRunner,
+    observed: Arc<tokio::sync::Mutex<Option<ObservedCommandRun>>>,
+}
+
+impl CommandRunner for CapturingAndObservingRunner {
+    async fn run(
+        &self,
+        request: CommandRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandResult, ExecError> {
+        let result = self.inner.run(request, cancel).await?;
+        let mut stdout = Vec::new();
+        for chunk in &result.chunks {
+            if chunk.stream == StreamType::Stdout {
+                stdout.push(chunk.data.clone());
+            }
+        }
+        let observed = ObservedCommandRun {
+            exit_code: result.execution.exit_code,
+            state: Some(result.execution.state),
+            stdout,
+        };
+        *self.observed.lock().await = Some(observed);
+        Ok(result)
+    }
 }
 
 impl FlakyEventStore {
@@ -242,6 +296,261 @@ async fn resource_exhaustion_disk_full_append_failure_is_recoverable() {
     assert!(
         events.iter().any(|event| event.event_type == "task.ready"),
         "task.ready event should be persisted after recovery"
+    );
+}
+
+#[tokio::test]
+async fn resource_exhaustion_scheduler_passes_budget_limits_to_runner_request() {
+    let queue = Arc::new(InMemoryTaskQueue::new());
+    let store = Arc::new(InMemoryEventStore::new());
+    let observed = Arc::new(tokio::sync::Mutex::new(None));
+    let runner = Arc::new(CapturingRunner {
+        inner: LocalCommandRunner::new(),
+        observed: observed.clone(),
+    });
+    let config = make_scheduler_config(
+        "r13-04-request-limits",
+        1,
+        ResourceBudgetConfig {
+            max_task_rss_bytes: Some(64 * 1024 * 1024),
+            max_task_cpu_user_ticks: Some(100),
+            max_task_cpu_system_ticks: Some(75),
+            max_task_io_read_bytes: Some(4 * 1024 * 1024),
+            max_task_io_write_bytes: Some(2 * 1024 * 1024),
+            ..ResourceBudgetConfig::default()
+        },
+    );
+    let sched = Scheduler::new(queue.clone(), store.clone(), runner, config);
+
+    let run = make_run("resource budget request integration");
+    let run_id = run.id;
+    let corr_id = run.correlation_id;
+    let task = make_task(run_id, "capturing-request", "echo ok", corr_id);
+    let task_id = task.id;
+
+    sched.submit_run(run, vec![task]).await.unwrap();
+
+    for _ in 0..40 {
+        let _ = sched.tick().await.unwrap();
+        let reg = sched.registry().read().await;
+        if let Some(task) = reg.get_task(&task_id) {
+            if matches!(
+                task.state,
+                TaskState::TaskComplete | TaskState::TaskFailed | TaskState::TaskCancelled
+            ) {
+                break;
+            }
+        }
+    }
+
+    let request = observed
+        .lock()
+        .await
+        .clone()
+        .expect("runner should receive request");
+    let limits = request
+        .resource_limits
+        .expect("request should include resource limits when budgets are configured");
+
+    assert_eq!(limits.max_memory_bytes, Some(64 * 1024 * 1024));
+    assert_eq!(limits.max_open_files, None);
+    assert_eq!(limits.max_pids, None);
+    assert!(
+        limits.max_cpu_seconds.is_some(),
+        "cpu ticks should convert to non-zero limit"
+    );
+
+    assert!(
+        queue.pending_count() == 0,
+        "task should be claimed and processed during scheduler run"
+    );
+    let reg = sched.registry().read().await;
+    let task = reg.get_task(&task_id).unwrap();
+    assert_eq!(task.state, TaskState::TaskComplete);
+    let events = store.all().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "task.completed"),
+        "expected task.completed event"
+    );
+    assert_eq!(
+        run_id.to_string(),
+        reg.get_run(&run_id).unwrap().id.to_string(),
+        "run should remain visible after completion"
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn resource_exhaustion_scheduler_applies_real_rlimits_and_reports_failure() {
+    let queue = Arc::new(InMemoryTaskQueue::new());
+    let store = Arc::new(InMemoryEventStore::new());
+    let observed = Arc::new(tokio::sync::Mutex::new(None));
+    let runner = Arc::new(CapturingAndObservingRunner {
+        inner: LocalCommandRunner::new(),
+        observed: observed.clone(),
+    });
+    let config = make_scheduler_config(
+        "r13-04-real-rlimits",
+        1,
+        ResourceBudgetConfig {
+            max_task_rss_bytes: Some(64 * 1024 * 1024),
+            max_task_cpu_user_ticks: Some(200),
+            max_task_cpu_system_ticks: Some(50),
+            ..ResourceBudgetConfig::default()
+        },
+    );
+    let sched = Scheduler::new(queue.clone(), store.clone(), runner, config);
+
+    let run = make_run("real scheduler rlimits + cgroup probe");
+    let run_id = run.id;
+    let corr_id = run.correlation_id;
+    let task = make_task(
+        run_id,
+        "rlimit-cgroup-probe",
+        "cat /proc/self/cgroup; while true; do :; done",
+        corr_id,
+    );
+    let task_id = task.id;
+
+    sched.submit_run(run, vec![task]).await.unwrap();
+
+    for _ in 0..120 {
+        let _ = sched.tick().await.unwrap();
+        let reg = sched.registry().read().await;
+        if let Some(task) = reg.get_task(&task_id) {
+            if matches!(
+                task.state,
+                TaskState::TaskComplete | TaskState::TaskFailed | TaskState::TaskCancelled
+            ) {
+                break;
+            }
+        }
+    }
+
+    let observed_run = observed
+        .lock()
+        .await
+        .clone()
+        .expect("runner should observe command outcome");
+    assert!(
+        observed_run.stdout.iter().any(|line| line.contains("0::/")),
+        "expected output from /proc/self/cgroup to indicate command was executed"
+    );
+    assert!(
+        observed_run.state == Some(CommandState::CmdExited),
+        "expected command process to exit"
+    );
+    assert_ne!(
+        observed_run.exit_code,
+        Some(0),
+        "expected non-zero exit code from enforced CPU limit"
+    );
+
+    let reg = sched.registry().read().await;
+    let task = reg.get_task(&task_id).unwrap();
+    assert_eq!(task.state, TaskState::TaskFailed);
+    let events = store.all().unwrap();
+    let failed = events
+        .iter()
+        .find(|event| event.event_type == "task.failed" && event.entity_id == task_id.to_string());
+    assert!(failed.is_some(), "expected task.failed event");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn resource_exhaustion_scheduler_applies_real_cgroup_sandbox_when_writable() {
+    if !cgroup_v2_available() {
+        return;
+    }
+
+    let probe_limits = ResourceLimits {
+        max_memory_bytes: Some(32 * 1024 * 1024),
+        max_cpu_seconds: Some(10),
+        max_open_files: None,
+        max_pids: None,
+    };
+    if LocalCgroupManager
+        .create_sandbox("yarli-test", "probe", &probe_limits)
+        .is_none()
+    {
+        return;
+    }
+
+    let queue = Arc::new(InMemoryTaskQueue::new());
+    let store = Arc::new(InMemoryEventStore::new());
+    let observed = Arc::new(tokio::sync::Mutex::new(None));
+    let runner = Arc::new(CapturingAndObservingRunner {
+        inner: LocalCommandRunner::new(),
+        observed: observed.clone(),
+    });
+    let config = make_scheduler_config(
+        "r13-04-real-cgroup",
+        1,
+        ResourceBudgetConfig {
+            max_task_rss_bytes: Some(32 * 1024 * 1024),
+            max_task_cpu_user_ticks: Some(500),
+            max_task_cpu_system_ticks: None,
+            ..ResourceBudgetConfig::default()
+        },
+    );
+    let sched = Scheduler::new(queue.clone(), store.clone(), runner, config);
+
+    let run = make_run("real cgroup sandbox probe");
+    let run_id = run.id;
+    let corr_id = run.correlation_id;
+    let task = make_task(
+        run_id,
+        "cgroup-sandbox-probe",
+        "cat /proc/self/cgroup",
+        corr_id,
+    );
+    let task_id = task.id;
+
+    sched.submit_run(run, vec![task]).await.unwrap();
+
+    for _ in 0..40 {
+        let _ = sched.tick().await.unwrap();
+        let reg = sched.registry().read().await;
+        if let Some(task) = reg.get_task(&task_id) {
+            if matches!(
+                task.state,
+                TaskState::TaskComplete | TaskState::TaskFailed | TaskState::TaskCancelled
+            ) {
+                break;
+            }
+        }
+    }
+
+    let observed_run = observed
+        .lock()
+        .await
+        .clone()
+        .expect("runner should observe command outcome");
+
+    assert_eq!(observed_run.state, Some(CommandState::CmdExited));
+    assert!(
+        observed_run
+            .stdout
+            .iter()
+            .any(|line| line.contains("0::/yarli/")),
+        "expected cgroup sandbox marker in /proc/self/cgroup output"
+    );
+
+    let reg = sched.registry().read().await;
+    let task = reg.get_task(&task_id).unwrap();
+    assert_eq!(task.state, TaskState::TaskComplete);
+    let reg_run = reg.get_run(&run_id).unwrap();
+    assert_eq!(reg_run.state, RunState::RunCompleted);
+
+    let events = store.all().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "task.completed"
+                && event.entity_id == task_id.to_string()),
+        "expected task.completed event"
     );
 }
 

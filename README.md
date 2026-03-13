@@ -521,6 +521,15 @@ Key implementation modules and integration tests still live under `crates/yarli-
 - API key rate limiting uses `YARLI_API_RATE_LIMIT_PER_MINUTE` (default 120/min).
 - Durable mode is recommended for write commands; in-memory mode blocks writes unless explicitly allowed.
 
+## Runner Hardening and sw4rm Notes
+
+- `yarli run` now wires per-task scheduler budgets into command execution as `ResourceLimits` and applies Linux `setrlimit(2)` caps for memory, CPU, open files, and process count before spawning workers.
+- `sw4rm` agent runtime transport uses a correlation-aware gRPC sender/receiver (`GrpcRouterSender`) and `CT_IMPLEMENTATION_RESPONSE` now maps back to pending local correlation state.
+- Process lifecycle control prefers pidfd (`pidfd_open(2)` / `pidfd_send_signal(2)`) when available, with automatic fallback for older kernels.
+- A cgroup v2 sandbox is enabled when writable; when unavailable or unwritable, execution continues in fallback mode using rlimits only.
+- `/proc/self/cgroup` is used in integration probes to confirm sandbox attachment under writable cgroup v2 runs.
+- Build `yarli` with `--features sw4rm` when running the sw4rm runtime (`yarli run sw4rm`), plus compatible gRPC endpoints.
+
 ## Examples
 
 ```bash

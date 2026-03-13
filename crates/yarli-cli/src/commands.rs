@@ -1702,6 +1702,7 @@ where
 pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
     use yarli_cli::yarli_sw4rm::{
         orchestrator::{VerificationCommand, VerificationSpec},
+        transport::{CorrelationRegistry, GrpcRouterSender, ReportSender},
         OrchestratorLoop, ShutdownBridge, YarliAgent,
     };
 
@@ -1786,13 +1787,27 @@ pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
         }
     };
 
-    // NOTE: Using MockRouterSender — real RouterClient transport not yet implemented.
-    // The agent will boot and register but LLM dispatch will not function.
-    eprintln!("WARNING: using mock router sender — real sw4rm transport not yet implemented");
-    let router = std::sync::Arc::new(yarli_cli::yarli_sw4rm::mock::MockRouterSender::new());
+    let router_client = sw4rm_sdk::RouterClient::new(&sw4rm_config.router_url)
+        .await
+        .context("failed to initialize sw4rm router client")?;
+    let report_client = sw4rm_sdk::RouterClient::new(&sw4rm_config.router_url)
+        .await
+        .context("failed to initialize sw4rm report router client")?;
+    let correlations = std::sync::Arc::new(CorrelationRegistry::new());
+    let router_sender = std::sync::Arc::new(GrpcRouterSender::new(
+        router_client,
+        correlations.clone(),
+        sw4rm_config.agent_name.clone(),
+        std::time::Duration::from_secs(sw4rm_config.llm_response_timeout_secs),
+    ));
+    let report_sender = std::sync::Arc::new(ReportSender::new(
+        report_client,
+        sw4rm_config.agent_name.clone(),
+    ));
+
     let command_runner = sw4rm_verification_runner(loaded_config)?;
     let orchestrator = std::sync::Arc::new(
-        OrchestratorLoop::new(router, sw4rm_config.clone(), verification)
+        OrchestratorLoop::new(router_sender, sw4rm_config.clone(), verification)
             .with_verification_runner(command_runner),
     );
 
@@ -1816,6 +1831,8 @@ pub(crate) async fn cmd_run_sw4rm(loaded_config: &LoadedConfig) -> Result<()> {
 
     // Create agent
     let agent = YarliAgent::new(agent_config.clone(), sw4rm_config, orchestrator)
+        .with_correlations(correlations)
+        .with_report_sender(report_sender)
         .with_shutdown_bridge(bridge);
 
     println!("Connecting to sw4rm services...");
@@ -7997,8 +8014,8 @@ mod tests {
 
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::set_current_dir(&self.previous_dir)
-                    .expect("restore previous working directory");
+                let _ = std::env::set_current_dir(&self.previous_dir)
+                    .or_else(|_| std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")));
                 match &self.previous_database_url {
                     Some(value) => std::env::set_var("DATABASE_URL", value),
                     None => std::env::remove_var("DATABASE_URL"),
@@ -8009,10 +8026,11 @@ mod tests {
         let _lock = TEST_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("lock isolated runtime env");
+            .unwrap_or_else(|error| error.into_inner());
         let temp_dir = TempDir::new().expect("create isolated temp dir");
         let guard = EnvGuard {
-            previous_dir: std::env::current_dir().expect("read current working directory"),
+            previous_dir: std::env::current_dir()
+                .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()),
             previous_database_url: std::env::var("DATABASE_URL").ok(),
         };
         std::env::set_current_dir(temp_dir.path()).expect("switch to isolated temp dir");
