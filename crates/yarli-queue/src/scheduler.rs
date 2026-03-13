@@ -1096,6 +1096,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             timeout: self.config.command_timeout,
             env: vec![],
             live_output_tx,
+            resource_limits: None,
         };
 
         // Execute via journal

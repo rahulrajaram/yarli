@@ -371,6 +371,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         let result = journal.execute(req, cancel).await.unwrap();
@@ -408,6 +409,7 @@ mod tests {
             timeout: Some(Duration::from_millis(100)),
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -443,6 +445,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -472,6 +475,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -501,6 +505,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -530,6 +535,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -562,6 +568,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         let result = journal.execute(req, cancel).await.unwrap();
@@ -591,6 +598,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -620,6 +628,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -646,6 +655,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -682,6 +692,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -712,6 +723,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -740,6 +752,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         let result = journal.execute(req, cancel).await;
@@ -765,6 +778,7 @@ mod tests {
             timeout: None,
             env: vec![],
             live_output_tx: None,
+            resource_limits: None,
         };
 
         journal.execute(req, cancel).await.unwrap();

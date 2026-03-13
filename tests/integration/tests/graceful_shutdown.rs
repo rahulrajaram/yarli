@@ -199,6 +199,7 @@ async fn terminate_children_kills_tracked_processes() {
         timeout: None,
         env: vec![],
         live_output_tx: Some(live_tx),
+        resource_limits: None,
     };
 
     // Run the command in a background task, cancel it once we capture PIDs.

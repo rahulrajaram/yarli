@@ -7,13 +7,17 @@
 //!   to an [`EventStore`](crate::yarli_store::EventStore).
 //! - Timeout and cancellation support via `tokio_util::CancellationToken`.
 
+pub mod cgroup;
 pub mod error;
 pub mod introspect;
 pub mod journal;
 pub mod overwatch;
+pub mod pidfd;
 pub mod runner;
 
 pub use error::ExecError;
 pub use journal::CommandJournal;
 pub use overwatch::{OverwatchCommandRunner, OverwatchRunnerConfig};
-pub use runner::{CommandRequest, CommandResult, CommandRunner, LocalCommandRunner};
+pub use runner::{
+    CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, ResourceLimits,
+};
