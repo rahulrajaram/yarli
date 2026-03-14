@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Stdio};
@@ -361,13 +362,7 @@ fn prepare_parallel_workspace_layout_copy(
         );
     }
 
-    let run_workspace_root = worktree_root.join(format!("run-{}", Uuid::now_v7()));
-    fs::create_dir_all(&run_workspace_root).with_context(|| {
-        format!(
-            "failed to create run workspace root {}",
-            run_workspace_root.display()
-        )
-    })?;
+    let run_workspace_root = allocate_run_workspace_root(&worktree_root)?;
 
     let mut excluded_roots = Vec::new();
     if worktree_root.starts_with(&source_workdir) {
@@ -525,6 +520,39 @@ fn load_run_workspace_lease(run_workspace_root: &Path) -> Option<RunWorkspaceLea
     let path = run_workspace_root.join(RUN_WORKSPACE_LEASE_FILE);
     let text = fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+const RUN_WORKSPACE_ROOT_CREATE_ATTEMPTS: usize = 32;
+
+fn allocate_run_workspace_root(worktree_root: &Path) -> Result<PathBuf> {
+    allocate_run_workspace_root_with(worktree_root, || format!("run-{}", Uuid::new_v4().simple()))
+}
+
+fn allocate_run_workspace_root_with<F>(worktree_root: &Path, mut next_name: F) -> Result<PathBuf>
+where
+    F: FnMut() -> String,
+{
+    for _ in 0..RUN_WORKSPACE_ROOT_CREATE_ATTEMPTS {
+        let run_workspace_root = worktree_root.join(next_name());
+        match fs::create_dir(&run_workspace_root) {
+            Ok(()) => return Ok(run_workspace_root),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to create run workspace root {}",
+                        run_workspace_root.display()
+                    )
+                });
+            }
+        }
+    }
+
+    bail!(
+        "failed to allocate a unique run workspace root under {} after {} attempts",
+        worktree_root.display(),
+        RUN_WORKSPACE_ROOT_CREATE_ATTEMPTS
+    );
 }
 
 #[cfg(unix)]
@@ -978,14 +1006,12 @@ fn prepare_parallel_workspace_layout_worktree(
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
-    let run_id_short = &Uuid::now_v7().simple().to_string()[..12];
-    let run_workspace_root = worktree_root.join(format!("run-{run_id_short}"));
-    fs::create_dir_all(&run_workspace_root).with_context(|| {
-        format!(
-            "failed to create run workspace root {}",
-            run_workspace_root.display()
-        )
-    })?;
+    let run_workspace_root = allocate_run_workspace_root(&worktree_root)?;
+    let run_id_short = run_workspace_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_prefix("run-"))
+        .unwrap_or("run");
     write_run_workspace_lease(&run_workspace_root, &source_workdir)?;
 
     let mut task_workspace_dirs = Vec::with_capacity(needed);
@@ -6467,6 +6493,38 @@ worktree_root = "{}"
         // Cleanup.
         cleanup_parallel_workspace(&layout);
         assert!(!layout.run_workspace_root.exists());
+    }
+
+    #[test]
+    fn workspace_layout_allocates_distinct_run_roots_under_same_tick_inputs() {
+        let temp = TempDir::new().unwrap();
+        let worktree_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+
+        let mut names = [
+            "run-same-tick".to_string(),
+            "run-same-tick".to_string(),
+            "run-same-tick-retry".to_string(),
+        ]
+        .into_iter();
+
+        let first = allocate_run_workspace_root_with(&worktree_root, || names.next().unwrap())
+            .expect("first run workspace root should be created");
+        assert!(first.is_dir());
+
+        let second = allocate_run_workspace_root_with(&worktree_root, || names.next().unwrap())
+            .expect("second run workspace root should retry to a unique path");
+        assert!(second.is_dir());
+
+        assert_ne!(first, second, "run workspace roots should remain distinct");
+        assert_eq!(
+            first.file_name().and_then(|value| value.to_str()),
+            Some("run-same-tick")
+        );
+        assert_eq!(
+            second.file_name().and_then(|value| value.to_str()),
+            Some("run-same-tick-retry")
+        );
     }
 
     #[test]

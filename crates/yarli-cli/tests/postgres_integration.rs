@@ -338,6 +338,73 @@ async fn serve_command_exposes_health_and_run_status_against_postgres(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn serve_command_default_path_excludes_debug_queue_routes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) =
+        test_database_url_for_test("serve_command_default_path_excludes_debug_queue_routes")
+    else {
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let temp_dir = TempDir::new()?;
+    write_test_config(temp_dir.path(), &database.database_url)?;
+    let binary = yarli_binary_path()?;
+
+    let stdout_path = temp_dir.path().join("yarli-serve-stdout.log");
+    let stderr_path = temp_dir.path().join("yarli-serve-stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
+    let mut child = tokio::process::Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["serve", "--bind", "127.0.0.1", "--port", "0"])
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()?;
+
+    let base_url = wait_for_serve_base_url(
+        &mut child,
+        &stdout_path,
+        &stderr_path,
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
+    )
+    .await?;
+
+    let client = Client::builder().build()?;
+    wait_for_health_endpoint(
+        &client,
+        &base_url,
+        &mut child,
+        &stdout_path,
+        &stderr_path,
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
+    )
+    .await?;
+
+    let health_payload: serde_json::Value = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(health_payload["status"], "ok");
+
+    let debug_response = client
+        .get(format!("{base_url}/debug/queue-depth"))
+        .send()
+        .await?;
+    assert_eq!(debug_response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    terminate_child_process(&mut child).await?;
+    database.drop().await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn run_projection_state_consistency_roundtrip_against_postgres(
