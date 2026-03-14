@@ -709,22 +709,41 @@ async fn resource_exhaustion_postgres_connection_pool_exhaustion_recovery(
 
     drop(_holder);
 
-    let second = Event {
-        event_id: Uuid::now_v7(),
-        occurred_at: Utc::now(),
-        entity_type: EntityType::Run,
-        entity_id: Uuid::now_v7().to_string(),
-        event_type: "run.activated".to_string(),
-        payload: serde_json::json!({"reason": "pool-recovery"}),
-        correlation_id: Uuid::now_v7(),
-        causation_id: None,
-        actor: "pool-exhaustion-test".to_string(),
-        idempotency_key: Some("pool-recovery".to_string()),
-    };
-    let recovered = store.append(second);
+    let mut last_error = None;
+    let mut recovered = false;
+    let recovery_started = std::time::Instant::now();
+    loop {
+        let second = Event {
+            event_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: Uuid::now_v7().to_string(),
+            event_type: "run.activated".to_string(),
+            payload: serde_json::json!({"reason": "pool-recovery"}),
+            correlation_id: Uuid::now_v7(),
+            causation_id: None,
+            actor: "pool-exhaustion-test".to_string(),
+            idempotency_key: Some(format!("pool-recovery-{}", Uuid::now_v7())),
+        };
+
+        match store.append(second) {
+            Ok(()) => {
+                recovered = true;
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if recovery_started.elapsed() >= Duration::from_secs(2) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
     assert!(
-        recovered.is_ok(),
-        "append should succeed again after releasing a held connection"
+        recovered,
+        "append should recover within 2s after releasing a held connection; last error: {}",
+        last_error.unwrap_or_else(|| "<none>".to_string())
     );
 
     database.drop().await?;

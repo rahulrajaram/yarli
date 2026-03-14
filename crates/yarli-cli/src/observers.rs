@@ -617,15 +617,20 @@ impl ToolOutcomeObservation {
 pub(crate) struct TaskHealthArtifactObserver {
     run_id: Uuid,
     correlation_id: Uuid,
+    artifact_root: PathBuf,
     task_keys: BTreeMap<Uuid, String>,
     tail: HashMap<Uuid, ArtifactTailCursor>,
 }
 
 impl TaskHealthArtifactObserver {
     pub(crate) fn new(run_id: Uuid, correlation_id: Uuid, task_names: &[(Uuid, String)]) -> Self {
+        let artifact_root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".yarl/runs");
         Self {
             run_id,
             correlation_id,
+            artifact_root,
             task_keys: task_names.iter().cloned().collect(),
             tail: task_names
                 .iter()
@@ -644,7 +649,7 @@ impl TaskHealthArtifactObserver {
             .collect();
 
         for (task_id, task_key) in tasks {
-            let path = task_output_artifact_path(task_id);
+            let path = self.artifact_root.join(format!("{task_id}.jsonl"));
             let Some(events) = self.read_new_tool_outcomes(task_id, &path) else {
                 continue;
             };
@@ -749,10 +754,6 @@ impl TaskHealthArtifactObserver {
 
         Some(observations)
     }
-}
-
-fn task_output_artifact_path(task_id: Uuid) -> PathBuf {
-    PathBuf::from(".yarl/runs").join(format!("{task_id}.jsonl"))
 }
 
 fn expand_tool_outcome_payload_candidates(value: &serde_json::Value) -> Vec<serde_json::Value> {

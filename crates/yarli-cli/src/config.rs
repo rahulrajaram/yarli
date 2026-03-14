@@ -2259,14 +2259,6 @@ soft_token_cap_ratio = 0.9
 max_auto_advance_tranches = 0
 enable_plan_tranche_grouping = true
 max_grouped_tasks_per_tranche = 3
-[run.tranche_token_advisory]
-warn_tokens = 60000
-max_recommended_tokens = 90000
-
-[run.tranche_token_advisory_by_backend.codex]
-warn_tokens = 50000
-max_recommended_tokens = 80000
-
 enforce_plan_tranche_allowed_paths = true
 default_pace = "batch"
 
@@ -2274,6 +2266,14 @@ default_pace = "batch"
 improving = "continue"
 stable = "checkpoint-now"
 deteriorating = "stop-and-summarize"
+
+[run.tranche_token_advisory]
+warn_tokens = 60000
+max_recommended_tokens = 90000
+
+[run.tranche_token_advisory_by_backend.codex]
+warn_tokens = 50000
+max_recommended_tokens = 80000
 [[run.tasks]]
 key = "lint"
 cmd = "cargo clippy --workspace -- -D warnings"

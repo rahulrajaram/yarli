@@ -337,15 +337,6 @@ continue_wait_timeout_seconds = 0
 allow_stable_auto_advance = false
 # Preferred auto-advance policy: improving-only | stable-ok | always
 auto_advance_policy = "stable-ok"
-# Optional task-health actions by deterioration trend:
-# - continue: proceed with continuation + planned auto-advance evaluation
-# - checkpoint-now: stop planned auto-advance and checkpoint the current context
-# - force-pivot: force the next action to switch task focus (requires operator follow-up)
-# - stop-and-summarize: stop auto-advance and summarize state for manual review
-[run.task_health]
-improving = "continue"
-stable = "continue"
-deteriorating = "continue"
 # Optional soft-token checkpoint trigger ratio for run-level token hard caps.
 # - default: 0.9
 # - 0 disables the soft cap.
@@ -356,6 +347,22 @@ max_auto_advance_tranches = 0
 enable_plan_tranche_grouping = false
 # Cap grouped tasks per tranche (0 = unlimited).
 max_grouped_tasks_per_tranche = 0
+# Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
+enforce_plan_tranche_allowed_paths = false
+# Auto-commit YARLI state files after every N tranches (0 = disabled).
+# auto_commit_interval = 1
+# Template for auto-commit messages (placeholders: {tranche_key}, {run_id}, {tranches_completed}, {tranches_total}).
+# auto_commit_message = "chore(state): checkpoint runtime state"
+# default_pace = "batch"
+# Optional task-health actions by deterioration trend:
+# - continue: proceed with continuation + planned auto-advance evaluation
+# - checkpoint-now: stop planned auto-advance and checkpoint the current context
+# - force-pivot: force the next action to switch task focus (requires operator follow-up)
+# - stop-and-summarize: stop auto-advance and summarize state for manual review
+[run.task_health]
+improving = "continue"
+stable = "continue"
+deteriorating = "continue"
 # Advisory tranche token thresholds (warning vs recommended upper bound; warnings only).
 [run.tranche_token_advisory]
 warn_tokens = 70000
@@ -364,18 +371,12 @@ max_recommended_tokens = 100000
 # [run.tranche_token_advisory_by_backend.codex]
 # warn_tokens = 65000
 # max_recommended_tokens = 95000
-# Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
-enforce_plan_tranche_allowed_paths = false
 # Merge conflict resolution strategy: fail | manual | auto-repair | llm-assisted
 # merge_conflict_resolution = "fail"
 # Shell command for LLM-assisted merge conflict repair (required when llm-assisted).
 # merge_repair_command = "claude --print"
 # Timeout in seconds for the repair command (0 = no timeout).
 # merge_repair_timeout_seconds = 300
-# Auto-commit YARLI state files after every N tranches (0 = disabled).
-# auto_commit_interval = 1
-# Template for auto-commit messages (placeholders: {tranche_key}, {run_id}, {tranches_completed}, {tranches_total}).
-# auto_commit_message = "chore(state): checkpoint runtime state"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"
@@ -1261,5 +1262,39 @@ mod tests {
         assert!(template.contains("one coherent objective per tranche"));
         assert!(template.contains("prefer grouped dispatch over micro-tranches"));
         assert!(template.contains("enable_plan_tranche_grouping = false"));
+    }
+
+    #[test]
+    fn init_config_template_keeps_allowed_paths_flag_in_run_table() {
+        let template = init_config_template(None);
+        let uncommented = template
+            .replace(
+                "# [run.tranche_token_advisory_by_backend.codex]",
+                "[run.tranche_token_advisory_by_backend.codex]",
+            )
+            .replace("# warn_tokens = 65000", "warn_tokens = 65000")
+            .replace(
+                "# max_recommended_tokens = 95000",
+                "max_recommended_tokens = 95000",
+            );
+
+        let loaded: crate::config::YarliConfig = toml::from_str(&uncommented)
+            .expect("template should parse after enabling backend override");
+
+        assert!(!loaded.run.enforce_plan_tranche_allowed_paths);
+        assert_eq!(loaded.run.soft_token_cap_ratio, 0.9);
+        assert_eq!(loaded.run.max_auto_advance_tranches, 0);
+        assert!(!loaded.run.enable_plan_tranche_grouping);
+        assert_eq!(
+            loaded
+                .run
+                .tranche_token_advisory_by_backend
+                .get("codex")
+                .expect("codex override should parse"),
+            &crate::config::AdvisoryTrancheTokenThresholds {
+                warn_tokens: 65_000,
+                max_recommended_tokens: 95_000,
+            }
+        );
     }
 }
