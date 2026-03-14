@@ -62,6 +62,7 @@ test-support = []
 
 [dev-dependencies]
 assert_matches = "1.5"
+proptest = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 axum08 = { package = "axum", version = "0.8" }

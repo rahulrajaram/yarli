@@ -1150,6 +1150,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             env: vec![],
             live_output_tx,
             resource_limits: build_resource_limits(&self.config.budgets),
+            rehydration_tokens: entry.rehydration_tokens,
         };
 
         // Execute via journal
@@ -2723,6 +2724,7 @@ mod tests {
     use crate::yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
     use crate::yarli_queue::InMemoryTaskQueue;
     use crate::yarli_store::InMemoryEventStore;
+    use proptest::prelude::*;
 
     fn test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -2840,6 +2842,38 @@ mod tests {
                 None
             }
         );
+    }
+
+    proptest! {
+        #[test]
+        fn scheduler_budget_cpu_tick_conversion_is_monotonic(a in any::<u64>(), b in any::<u64>()) {
+            let (low, high) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(cpu_ticks_to_seconds(low) <= cpu_ticks_to_seconds(high));
+        }
+
+        #[test]
+        fn scheduler_budget_cpu_tick_conversion_is_overflow_safe(
+            user_ticks in any::<u64>(),
+            system_ticks in any::<u64>(),
+        ) {
+            let budgets = ResourceBudgetConfig {
+                max_task_cpu_user_ticks: Some(user_ticks),
+                max_task_cpu_system_ticks: Some(system_ticks),
+                ..ResourceBudgetConfig::default()
+            };
+
+            let limits = build_resource_limits(&budgets).expect("resource limits should be present");
+            let expected_cpu_seconds = cpu_ticks_to_seconds(user_ticks.saturating_add(system_ticks));
+
+            prop_assert_eq!(
+                limits.max_cpu_seconds,
+                if expected_cpu_seconds > 0 {
+                    Some(expected_cpu_seconds)
+                } else {
+                    None
+                }
+            );
+        }
     }
 
     #[tokio::test]

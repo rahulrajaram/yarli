@@ -782,6 +782,8 @@ mod tests {
                 cancelled: 0,
                 pending: 0,
             },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
             next_tranche: Some(TrancheSpec {
                 suggested_objective: "next".into(),
                 kind: TrancheKind::PlannedNext,
@@ -833,6 +835,8 @@ mod tests {
                 cancelled: 0,
                 pending: 0,
             },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
             next_tranche: Some(TrancheSpec {
                 suggested_objective: "next".into(),
                 kind: TrancheKind::PlannedNext,
@@ -884,6 +888,8 @@ mod tests {
                 cancelled: 0,
                 pending: 0,
             },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
             next_tranche: Some(TrancheSpec {
                 suggested_objective: "next".into(),
                 kind: TrancheKind::PlannedNext,
@@ -936,6 +942,8 @@ mod tests {
                 cancelled: 0,
                 pending: 0,
             },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
             next_tranche: Some(TrancheSpec {
                 suggested_objective: "Re-verify after gate failure".into(),
                 kind: TrancheKind::GateRetry,
@@ -1267,6 +1275,50 @@ mod tests {
         assert_eq!(entries[1].allowed_paths, vec!["src/lib.rs".to_string()]);
         assert!(!entries[0].summary.contains("allowed_paths"));
         assert!(!entries[1].summary.contains("allowed_paths"));
+    }
+
+    #[test]
+    fn discover_plan_entries_extracts_contract_metadata() {
+        let entries = crate::plan::discover_plan_entries(
+            "- [ ] I8A first tranche_group=core verify=\"cargo test -p yarli tranche\" done_when=\"Status output shows tranche totals\" max_tokens=42000\n",
+        );
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.key, "I8A");
+        assert_eq!(entry.tranche_group.as_deref(), Some("core"));
+        assert_eq!(entry.verify.as_deref(), Some("cargo test -p yarli tranche"));
+        assert_eq!(
+            entry.done_when.as_deref(),
+            Some("Status output shows tranche totals")
+        );
+        assert_eq!(entry.max_tokens, Some(42_000));
+        assert!(!entry.summary.contains("verify="));
+        assert!(!entry.summary.contains("done_when="));
+        assert!(!entry.summary.contains("max_tokens="));
+    }
+
+    #[test]
+    fn parse_plan_tranche_header_line_extracts_contract_metadata() {
+        let line = r#"5. NXT-042 `Record tranche tokens`: incomplete. tranche_group=core verify="cargo test -p yarli tranche_tokens" done_when="CLI shows per-tranche totals" max_tokens=70000 allowed_paths=crates/yarli-cli/src/plan.rs,crates/yarli-cli/src/render.rs"#;
+        let entry = crate::plan::parse_plan_tranche_header_line(line).expect("should parse");
+        assert_eq!(entry.key, "NXT-042");
+        assert_eq!(entry.tranche_group.as_deref(), Some("core"));
+        assert_eq!(
+            entry.verify.as_deref(),
+            Some("cargo test -p yarli tranche_tokens")
+        );
+        assert_eq!(
+            entry.done_when.as_deref(),
+            Some("CLI shows per-tranche totals")
+        );
+        assert_eq!(entry.max_tokens, Some(70_000));
+        assert_eq!(
+            entry.allowed_paths,
+            vec![
+                "crates/yarli-cli/src/plan.rs".to_string(),
+                "crates/yarli-cli/src/render.rs".to_string()
+            ]
+        );
     }
 
     #[test]

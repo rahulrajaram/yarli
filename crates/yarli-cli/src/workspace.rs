@@ -3676,6 +3676,7 @@ worktree_root = "{}"
             tranche_group: None,
             depends_on: Vec::new(),
             allowed_paths: Vec::new(),
+            rehydration_tokens: None,
         };
         let plan = RunPlan {
             objective: "test".to_string(),
@@ -3755,6 +3756,7 @@ worktree_root = "{}"
                 tranche_group: None,
                 depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             }],
             task_catalog: Vec::new(),
             workdir: repo.display().to_string(),
@@ -3829,6 +3831,7 @@ worktree_root = "{}"
                 tranche_group: None,
                 depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             }],
             task_catalog: Vec::new(),
             workdir: repo.display().to_string(),
@@ -5508,6 +5511,7 @@ worktree_root = "{}"
                 tranche_group: None,
                 depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             },
             PlannedTask {
                 task_key: "edit-config-bottom".to_string(),
@@ -5517,6 +5521,7 @@ worktree_root = "{}"
                 tranche_group: None,
                 depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             },
             PlannedTask {
                 task_key: "add-new-module".to_string(),
@@ -5526,6 +5531,7 @@ worktree_root = "{}"
                 tranche_group: None,
                 depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             },
         ];
 
@@ -5734,6 +5740,7 @@ worktree_root = "{}"
                 tranche_group: None,
                 depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             },
             PlannedTask {
                 task_key: "task-B".to_string(),
@@ -5744,6 +5751,7 @@ worktree_root = "{}"
                 tranche_group: None,
                 depends_on: Vec::new(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             },
         ];
 
@@ -6369,6 +6377,7 @@ worktree_root = "{}"
             tranche_group: None,
             depends_on: Vec::new(),
             allowed_paths: Vec::new(),
+            rehydration_tokens: None,
         }
     }
 

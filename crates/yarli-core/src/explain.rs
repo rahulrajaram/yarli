@@ -806,6 +806,7 @@ mod tests {
             prompt_tokens: 2500,
             completion_tokens: 2500,
             total_tokens: 5000,
+            rehydration_tokens: None,
             source: "char_count_div4_estimate_v1".to_string(),
         });
 
@@ -856,6 +857,7 @@ mod tests {
             prompt_tokens: 1000,
             completion_tokens: 500,
             total_tokens: 1500,
+            rehydration_tokens: None,
             source: "char_count_div4_estimate_v1".to_string(),
         });
         assert_eq!(task.token_usage.as_ref().unwrap().prompt_tokens, 1000);

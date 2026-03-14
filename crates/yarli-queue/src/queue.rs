@@ -59,6 +59,8 @@ pub struct QueueEntry {
     pub lease_expires_at: Option<DateTime<Utc>>,
     /// Last heartbeat timestamp.
     pub last_heartbeat: Option<DateTime<Utc>>,
+    /// Estimated prompt/context reload cost for this entry, if known.
+    pub rehydration_tokens: Option<u64>,
     /// When this entry was created.
     pub created_at: DateTime<Utc>,
     /// When this entry was last updated.

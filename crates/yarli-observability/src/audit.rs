@@ -225,7 +225,19 @@ impl AuditEntry {
         confidence: f64,
         lesson: Option<&str>,
         run_id: RunId,
+        tranche_token_correlation: Option<serde_json::Value>,
     ) -> Self {
+        let mut details = serde_json::Map::new();
+        details.insert("patterns".to_string(), serde_json::json!(patterns));
+        details.insert(
+            "recommendation".to_string(),
+            serde_json::Value::String(recommendation.into()),
+        );
+        details.insert("confidence".to_string(), serde_json::json!(confidence));
+        details.insert("lesson".to_string(), serde_json::json!(lesson));
+        if let Some(correlation) = tranche_token_correlation {
+            details.insert("tranche_token_correlation".to_string(), correlation);
+        }
         Self {
             audit_id: Uuid::now_v7(),
             timestamp: Utc::now(),
@@ -240,12 +252,7 @@ impl AuditEntry {
             ),
             run_id: Some(run_id),
             task_id: None,
-            details: serde_json::json!({
-                "patterns": patterns,
-                "recommendation": recommendation.into(),
-                "confidence": confidence,
-                "lesson": lesson,
-            }),
+            details: serde_json::Value::Object(details),
         }
     }
 
@@ -771,6 +778,12 @@ mod tests {
             0.7,
             Some("root task failed causing cascade"),
             run_id,
+            Some(serde_json::json!({
+                "summary": {
+                    "high_cost_tranches": 1,
+                    "failed_tranches": 1
+                }
+            })),
         );
         assert_eq!(entry.category, AuditCategory::RunAnalysis);
         assert_eq!(entry.actor, "run_analyzer");
@@ -778,6 +791,10 @@ mod tests {
         assert!(entry.reason.contains("2 pattern(s)"));
         assert_eq!(entry.details["confidence"], 0.7);
         assert_eq!(entry.details["lesson"], "root task failed causing cascade");
+        assert_eq!(
+            entry.details["tranche_token_correlation"]["summary"]["high_cost_tranches"],
+            1
+        );
     }
 
     #[test]

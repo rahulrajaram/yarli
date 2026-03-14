@@ -882,6 +882,7 @@ pub(crate) async fn cmd_run_default(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_run_start_with_backend<Q, S>(
     plan: RunPlan,
     render_mode: RenderMode,
@@ -1202,6 +1203,7 @@ where
                     "tranche_group": planned.tranche_group,
                     "depends_on": planned.depends_on,
                     "allowed_paths": planned.allowed_paths,
+                    "rehydration_tokens": planned.rehydration_tokens,
                     "workspace_dir": task_workspace_by_id.get(&task.id),
                 }))
                 .collect::<Vec<_>>(),
@@ -2905,6 +2907,7 @@ pub(crate) fn build_run_config_snapshot(
                 "tranche_group": &t.tranche_group,
                 "depends_on": &t.depends_on,
                 "allowed_paths": &t.allowed_paths,
+                "rehydration_tokens": &t.rehydration_tokens,
             })).collect::<Vec<_>>(),
             "task_catalog": task_catalog.iter().map(|t| serde_json::json!({
                 "task_key": &t.task_key,
@@ -2914,6 +2917,7 @@ pub(crate) fn build_run_config_snapshot(
                 "tranche_group": &t.tranche_group,
                 "depends_on": &t.depends_on,
                 "allowed_paths": &t.allowed_paths,
+                "rehydration_tokens": &t.rehydration_tokens,
             })).collect::<Vec<_>>(),
             "tranche_plan": tranche_plan.iter().map(|t| serde_json::json!({
                 "key": &t.key,
@@ -3056,6 +3060,53 @@ pub(crate) fn write_continuation_payload_file(
         .context("failed to serialize continuation payload")?;
     fs::write(&cont_path, json).context("failed to write continuation file contents")?;
     Ok(cont_path)
+}
+
+fn enrich_continuation_payload_tranche_tokens(
+    store: &dyn EventStore,
+    payload: &mut yarli_cli::yarli_core::entities::ContinuationPayload,
+) {
+    let Ok(Some(run_projection)) = crate::projection::load_run_projection(store, payload.run_id)
+    else {
+        return;
+    };
+
+    let thresholds = run_projection.tranche_token_thresholds;
+    payload.tranche_token_usage = run_projection
+        .tranche_tokens
+        .into_iter()
+        .map(|tranche| {
+            use yarli_cli::yarli_core::entities::continuation::TrancheTokenAdvisoryLevel;
+            let advisory = if tranche.total_tokens >= thresholds.recommended_max_tokens {
+                Some(TrancheTokenAdvisoryLevel::Exceeded)
+            } else if tranche.total_tokens >= thresholds.warning_tokens {
+                Some(TrancheTokenAdvisoryLevel::Warning)
+            } else {
+                Some(TrancheTokenAdvisoryLevel::Healthy)
+            };
+            yarli_cli::yarli_core::entities::continuation::TrancheTokenUsageSummary {
+                tranche_key: tranche.tranche_key,
+                tranche_group: tranche.tranche_group,
+                task_count: tranche.task_count,
+                completed_tasks: tranche.completed_tasks,
+                failed_tasks: tranche.failed_tasks,
+                retried_tasks: tranche.retried_tasks,
+                prompt_tokens: tranche.prompt_tokens,
+                completion_tokens: tranche.completion_tokens,
+                total_tokens: tranche.total_tokens,
+                rehydration_tokens: Some(tranche.rehydration_tokens),
+                advisory,
+                warning: tranche.warning,
+            }
+        })
+        .collect();
+    payload.tranche_token_thresholds = Some(
+        yarli_cli::yarli_core::entities::continuation::TrancheTokenThresholds {
+            selector: None,
+            target_tokens: thresholds.warning_tokens,
+            max_recommended_tokens: thresholds.recommended_max_tokens,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -3630,7 +3681,7 @@ where
                         Err(_) => warn!("memory observer observe_events timed out after 15s on cancel"),
                     }
                 }
-                let payload = {
+                let mut payload = {
                     let reg = scheduler.registry().read().await;
                     let run = reg.get_run(&run_id).ok_or_else(|| {
                         anyhow::anyhow!("run {run_id} missing from registry after cancellation")
@@ -3655,6 +3706,7 @@ where
                         &gate_failures,
                     )
                 };
+                enrich_continuation_payload_tranche_tokens(store.as_ref(), &mut payload);
                 if let Some(observer) = memory_observer.as_ref() {
                     let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
                     let _ = tokio::time::timeout(
@@ -3849,7 +3901,7 @@ where
                                 Err(_) => warn!("memory observer observe_events timed out after operator cancel"),
                             }
                         }
-                        let payload = {
+                        let mut payload = {
                             let reg = scheduler.registry().read().await;
                             let run = reg.get_run(&run_id).ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -3876,6 +3928,7 @@ where
                                 &gate_failures,
                             )
                         };
+                        enrich_continuation_payload_tranche_tokens(store.as_ref(), &mut payload);
                         scheduler.clear_live_output();
                         if let Some(h) = forwarder_handle.take() {
                             let _ = h.await;
@@ -4104,7 +4157,7 @@ where
                                 observer.observe_store(store.as_ref());
                             }
                             deterioration_observer.observe_store(store.as_ref())?;
-                            let payload = {
+                            let mut payload = {
                                 let reg = scheduler.registry().read().await;
                                 let run = reg.get_run(&run_id).ok_or_else(|| {
                                     anyhow::anyhow!(
@@ -4132,6 +4185,10 @@ where
                                     &gate_failures,
                                 )
                             };
+                            enrich_continuation_payload_tranche_tokens(
+                                store.as_ref(),
+                                &mut payload,
+                            );
                             if let Some(observer) = memory_observer.as_ref() {
                                 let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
                                 let _ = tokio::time::timeout(
@@ -4198,7 +4255,7 @@ where
                                 .collect();
                             let run_total_tokens = collect_run_total_tokens();
                             let gate_failures = extract_gate_failure_names_for_run(store.as_ref(), run_id);
-                            Some(build_continuation_payload_with_gate_failures(
+                            let mut payload = build_continuation_payload_with_gate_failures(
                                 run,
                                 &tasks,
                                 deterioration_observer.latest_report(),
@@ -4209,7 +4266,12 @@ where
                                 soft_token_cap_ratio,
                                 deterioration_observer.has_deterioration_cycle(),
                                 &gate_failures,
-                            ))
+                            );
+                            enrich_continuation_payload_tranche_tokens(
+                                store.as_ref(),
+                                &mut payload,
+                            );
+                            Some(payload)
                         } else {
                             None
                         }
@@ -8210,6 +8272,8 @@ mod tests {
                 && help.contains("PROMPT.md")
                 && help.contains("yarli run")
                 && help.contains("no subcommand")
+                && help.contains("one coherent objective per tranche")
+                && help.contains("same reasoning context")
                 && help_lower.contains("built-in yarli policy gates")
                 && help_lower.contains("verification command chain")
                 && help_lower.contains("observer events are telemetry only")
@@ -8263,8 +8327,27 @@ mod tests {
         assert!(
             help.contains("Default workflow")
                 && help.contains("PROMPT.md")
-                && help.contains("yarli run"),
+                && help.contains("yarli run")
+                && help.contains("Tranche sizing guidance")
+                && help.contains("one coherent objective per tranche"),
             "yarli --help should mention PROMPT.md default execution behavior"
+        );
+    }
+
+    #[test]
+    fn init_help_mentions_tranche_sizing_guidance() {
+        let mut cmd = Cli::command();
+        let init = cmd
+            .find_subcommand_mut("init")
+            .expect("init subcommand should exist");
+        let mut help = Vec::new();
+        init.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains("Tranche sizing guidance for plan-driven runs")
+                && help.contains("run.enable_plan_tranche_grouping")
+                && help.contains("one coherent objective per tranche"),
+            "init --help should mention tranche sizing guidance"
         );
     }
 

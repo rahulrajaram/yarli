@@ -36,6 +36,10 @@ pub struct ContinuationPayload {
     pub quality_gate: Option<ContinuationQualityGate>,
     #[serde(default)]
     pub retry_recommendation: Option<RetryScope>,
+    #[serde(default)]
+    pub tranche_token_usage: Vec<TrancheTokenUsageSummary>,
+    #[serde(default)]
+    pub tranche_token_thresholds: Option<TrancheTokenThresholds>,
 }
 
 mod run_state_pascal_case {
@@ -122,6 +126,42 @@ pub struct ContinuationIntervention {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrancheTokenAdvisoryLevel {
+    Healthy,
+    Warning,
+    Exceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrancheTokenThresholds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    pub target_tokens: u64,
+    pub max_recommended_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrancheTokenUsageSummary {
+    pub tranche_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tranche_group: Option<String>,
+    pub task_count: u32,
+    pub completed_tasks: u32,
+    pub failed_tasks: u32,
+    pub retried_tasks: u32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehydration_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<TrancheTokenAdvisoryLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// Outcome record for a single task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskOutcome {
@@ -141,6 +181,23 @@ pub struct RunSummary {
     pub failed: u32,
     pub cancelled: u32,
     pub pending: u32,
+}
+
+/// Aggregate token usage for a planned tranche.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrancheTokenSummary {
+    pub tranche_key: String,
+    #[serde(default)]
+    pub tranche_group: Option<String>,
+    pub task_count: u32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// Heuristic estimate of repeated prompt/context loading within the tranche.
+    #[serde(default)]
+    pub rehydration_tokens: u64,
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// What to do next — enough info for `yarli run continue`.
@@ -337,6 +394,8 @@ impl ContinuationPayload {
             next_tranche,
             quality_gate: None,
             retry_recommendation: None,
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
         }
     }
 }

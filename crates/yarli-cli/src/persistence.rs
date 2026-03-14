@@ -247,6 +247,8 @@ mod tests {
                 cancelled: 0,
                 pending: 0,
             },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
             next_tranche: Some(TrancheSpec {
                 suggested_objective: "Retry failed tasks: test".into(),
                 kind: yarli_cli::yarli_core::entities::continuation::TrancheKind::RetryUnfinished,

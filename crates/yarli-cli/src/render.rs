@@ -29,6 +29,51 @@ fn write_blocker_lines(out: &mut String, blocker: &str) -> Result<(), std::fmt::
     Ok(())
 }
 
+fn write_tranche_token_lines(
+    out: &mut String,
+    tranches: &[TrancheTokenProjection],
+    thresholds: AdvisoryTrancheTokenThresholds,
+    compact: bool,
+) -> Result<(), std::fmt::Error> {
+    if tranches.is_empty() {
+        return Ok(());
+    }
+
+    if compact {
+        writeln!(out, "Tranche token totals: {}", tranches.len())?;
+    } else {
+        writeln!(out, "Tranche token totals:")?;
+    }
+    writeln!(
+        out,
+        "  advisory_thresholds: warn_tokens={} max_recommended_tokens={}",
+        thresholds.warning_tokens, thresholds.recommended_max_tokens
+    )?;
+
+    for tranche in tranches {
+        let _ = compact;
+        writeln!(
+            out,
+            "  {} group={} tasks={} completed={} failed={} retried={} total_tokens={} prompt_tokens={} completion_tokens={} rehydration_estimate={}",
+            tranche.tranche_key,
+            tranche.tranche_group.as_deref().unwrap_or("-"),
+            tranche.task_count,
+            tranche.completed_tasks,
+            tranche.failed_tasks,
+            tranche.retried_tasks,
+            tranche.total_tokens,
+            tranche.prompt_tokens,
+            tranche.completion_tokens,
+            tranche.rehydration_tokens
+        )?;
+        if let Some(warning) = tranche.warning.as_deref() {
+            writeln!(out, "    advisory_warning: {warning}")?;
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<String> {
     let run = match load_run_projection(store, run_id)? {
         Some(run) => run,
@@ -116,6 +161,16 @@ pub(crate) fn render_run_status(store: &dyn EventStore, run_id: Uuid) -> Result<
                 factor.name, factor.impact, factor.detail
             )?;
         }
+    }
+
+    if !run.tranche_tokens.is_empty() {
+        writeln!(&mut out)?;
+        write_tranche_token_lines(
+            &mut out,
+            &run.tranche_tokens,
+            run.tranche_token_thresholds,
+            false,
+        )?;
     }
 
     if !run.merge_finalization_blockers.is_empty() {
@@ -411,6 +466,16 @@ pub(crate) fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result
                 factor.name, factor.impact, factor.detail
             )?;
         }
+    }
+
+    if !run.tranche_tokens.is_empty() {
+        writeln!(&mut out)?;
+        write_tranche_token_lines(
+            &mut out,
+            &run.tranche_tokens,
+            run.tranche_token_thresholds,
+            true,
+        )?;
     }
 
     if let Some(hints) = run.memory_hints.as_ref() {
@@ -1951,6 +2016,180 @@ mod tests {
         assert!(
             output.contains("budget_exceeded") || output.contains("max_task_total_tokens"),
             "explain output must reference budget breach detail: {output}"
+        );
+    }
+
+    #[test]
+    fn render_run_status_surfaces_tranche_token_totals_and_advisory_warning() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_a = Uuid::now_v7();
+        let task_b = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.config_snapshot",
+                corr,
+                serde_json::json!({
+                    "objective": "token surfacing",
+                    "config_snapshot": {
+                        "config": {
+                            "run": {
+                                "target_tranche_tokens": 7000,
+                                "max_recommended_tranche_tokens": 10000
+                            }
+                        }
+                    }
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.task_catalog",
+                corr,
+                serde_json::json!({
+                    "tasks": [
+                        {
+                            "task_id": task_a.to_string(),
+                            "task_key": "a",
+                            "tranche_key": "NXT-042",
+                            "tranche_group": "next-todos"
+                        },
+                        {
+                            "task_id": task_b.to_string(),
+                            "task_key": "b",
+                            "tranche_key": "NXT-042",
+                            "tranche_group": "next-todos"
+                        }
+                    ]
+                }),
+            ))
+            .unwrap();
+        for (task_id, prompt_tokens, completion_tokens, total_tokens) in [
+            (task_a, 4000_u64, 2500_u64, 6500_u64),
+            (task_b, 4500_u64, 1000_u64, 5500_u64),
+        ] {
+            store
+                .append(make_event(
+                    EntityType::Task,
+                    task_id.to_string(),
+                    "task.completed",
+                    corr,
+                    serde_json::json!({
+                        "from": "TaskVerifying",
+                        "to": "TaskComplete",
+                        "command_token_usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                            "source": "char_count_div4_estimate_v1"
+                        }
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(
+            output.contains("Tranche token totals:"),
+            "status output must include tranche token section: {output}"
+        );
+        assert!(
+            output.contains("NXT-042"),
+            "status output must include tranche key: {output}"
+        );
+        assert!(
+            output.contains("rehydration_estimate=4500"),
+            "status output must include rehydration estimate: {output}"
+        );
+        assert!(
+            output.contains("advisory_warning: above advisory tranche maximum (12000 >= 10000)"),
+            "status output must include advisory warning: {output}"
+        );
+    }
+
+    #[test]
+    fn render_run_explain_surfaces_tranche_token_totals() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.config_snapshot",
+                corr,
+                serde_json::json!({
+                    "objective": "token explain",
+                    "config_snapshot": {
+                        "config": {
+                            "run": {
+                                "target_tranche_tokens": 3000,
+                                "max_recommended_tranche_tokens": 6000
+                            }
+                        }
+                    }
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.task_catalog",
+                corr,
+                serde_json::json!({
+                    "tasks": [
+                        {
+                            "task_id": task_id.to_string(),
+                            "task_key": "a",
+                            "tranche_key": "NXT-043",
+                            "tranche_group": "next-todos"
+                        }
+                    ]
+                }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskExecuting",
+                    "to": "TaskFailed",
+                    "reason": "budget_exceeded",
+                    "detail": "task max_task_total_tokens observed=5000 limit=1",
+                    "command_token_usage": {
+                        "prompt_tokens": 3500,
+                        "completion_tokens": 3200,
+                        "total_tokens": 6700,
+                        "source": "char_count_div4_estimate_v1"
+                    }
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_explain(&store, run_id).unwrap();
+        assert!(
+            output.contains("Tranche token totals: 1"),
+            "explain output must include tranche token summary count: {output}"
+        );
+        assert!(
+            output.contains("NXT-043"),
+            "explain output must include tranche key: {output}"
+        );
+        assert!(
+            output.contains("advisory_warning: above advisory tranche maximum (6700 >= 6000)"),
+            "explain output must include advisory warning: {output}"
         );
     }
 

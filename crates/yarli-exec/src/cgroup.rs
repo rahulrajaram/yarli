@@ -20,6 +20,32 @@ pub fn cgroup_v2_available() -> bool {
     Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
 }
 
+/// Why YARLI fell back from cgroup isolation to rlimits-only mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgroupFallbackMode {
+    Unavailable,
+    PermissionDenied,
+    ReadOnly,
+    SetupFailed,
+}
+
+impl CgroupFallbackMode {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "rlimits_only_unavailable",
+            Self::PermissionDenied => "rlimits_only_permission_denied",
+            Self::ReadOnly => "rlimits_only_read_only",
+            Self::SetupFailed => "rlimits_only_setup_failed",
+        }
+    }
+}
+
+/// Result of attempting to create a cgroup sandbox.
+pub enum CgroupSandboxOutcome {
+    Attached(CgroupSandbox),
+    Fallback(CgroupFallbackMode),
+}
+
 /// A cgroup v2 sandbox created for a single task execution.
 ///
 /// Writes resource limits to the cgroup control files and adds the child PID.
@@ -86,11 +112,43 @@ pub trait CgroupManager: Send + Sync {
         run_id: &str,
         task_id: &str,
         limits: &ResourceLimits,
-    ) -> Option<CgroupSandbox>;
+    ) -> CgroupSandboxOutcome;
 }
 
 /// Production cgroup manager that writes to `/sys/fs/cgroup/`.
-pub struct LocalCgroupManager;
+pub struct LocalCgroupManager {
+    base: PathBuf,
+}
+
+impl LocalCgroupManager {
+    pub fn new() -> Self {
+        Self {
+            base: PathBuf::from("/sys/fs/cgroup"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_base_path(base: PathBuf) -> Self {
+        Self { base }
+    }
+}
+
+impl Default for LocalCgroupManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn classify_fallback(err: &io::Error) -> CgroupFallbackMode {
+    if matches!(err.raw_os_error(), Some(code) if code == libc::EROFS) {
+        CgroupFallbackMode::ReadOnly
+    } else {
+        match err.kind() {
+            io::ErrorKind::PermissionDenied => CgroupFallbackMode::PermissionDenied,
+            _ => CgroupFallbackMode::SetupFailed,
+        }
+    }
+}
 
 impl CgroupManager for LocalCgroupManager {
     fn create_sandbox(
@@ -98,14 +156,18 @@ impl CgroupManager for LocalCgroupManager {
         run_id: &str,
         task_id: &str,
         limits: &ResourceLimits,
-    ) -> Option<CgroupSandbox> {
-        if !cgroup_v2_available() {
-            return None;
+    ) -> CgroupSandboxOutcome {
+        if !self.base.join("cgroup.controllers").exists() {
+            return CgroupSandboxOutcome::Fallback(CgroupFallbackMode::Unavailable);
         }
-        let base = Path::new("/sys/fs/cgroup");
-        let sandbox = CgroupSandbox::create(base, run_id, task_id).ok()?;
-        sandbox.write_limits(limits).ok()?;
-        Some(sandbox)
+        let sandbox = match CgroupSandbox::create(&self.base, run_id, task_id) {
+            Ok(sandbox) => sandbox,
+            Err(err) => return CgroupSandboxOutcome::Fallback(classify_fallback(&err)),
+        };
+        if let Err(err) = sandbox.write_limits(limits) {
+            return CgroupSandboxOutcome::Fallback(classify_fallback(&err));
+        }
+        CgroupSandboxOutcome::Attached(sandbox)
     }
 }
 
@@ -167,5 +229,47 @@ mod tests {
 
         let contents = std::fs::read_to_string(sandbox.path.join("cgroup.procs")).unwrap();
         assert_eq!(contents, "12345");
+    }
+
+    #[test]
+    fn local_cgroup_manager_reports_unavailable_when_controllers_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = LocalCgroupManager::with_base_path(tmp.path().to_path_buf());
+        let limits = ResourceLimits {
+            max_memory_bytes: Some(1024),
+            ..ResourceLimits::default()
+        };
+
+        let outcome = manager.create_sandbox("run-x", "task-y", &limits);
+        assert!(matches!(
+            outcome,
+            CgroupSandboxOutcome::Fallback(CgroupFallbackMode::Unavailable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_cgroup_manager_reports_read_only_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cgroup.controllers"), "cpu memory pids").unwrap();
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+
+        let manager = LocalCgroupManager::with_base_path(tmp.path().to_path_buf());
+        let limits = ResourceLimits {
+            max_memory_bytes: Some(1024),
+            ..ResourceLimits::default()
+        };
+
+        let outcome = manager.create_sandbox("run-ro", "task-ro", &limits);
+        assert!(matches!(
+            outcome,
+            CgroupSandboxOutcome::Fallback(
+                CgroupFallbackMode::PermissionDenied | CgroupFallbackMode::ReadOnly
+            )
+        ));
     }
 }

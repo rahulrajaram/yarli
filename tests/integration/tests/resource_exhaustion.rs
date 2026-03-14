@@ -471,10 +471,10 @@ async fn resource_exhaustion_scheduler_applies_real_cgroup_sandbox_when_writable
         max_open_files: None,
         max_pids: None,
     };
-    if LocalCgroupManager
-        .create_sandbox("yarli-test", "probe", &probe_limits)
-        .is_none()
-    {
+    if !matches!(
+        LocalCgroupManager::new().create_sandbox("yarli-test", "probe", &probe_limits),
+        yarli_cli::yarli_exec::cgroup::CgroupSandboxOutcome::Attached(_)
+    ) {
         return;
     }
 

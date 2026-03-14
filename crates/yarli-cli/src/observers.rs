@@ -242,12 +242,14 @@ impl MemoryObserver {
 
         if let Some(lesson) = &analysis.run_lesson {
             if let Some(sink) = &self.audit_sink {
+                let tranche_token_correlation = build_tranche_token_correlation_details(payload);
                 let audit_entry = yarli_cli::yarli_observability::AuditEntry::run_analysis(
                     &pattern_names,
                     recommendation_str.as_str(),
                     analysis.confidence,
                     Some(lesson),
                     self.run_id,
+                    tranche_token_correlation,
                 );
                 if let Err(err) =
                     yarli_cli::yarli_observability::AuditSink::append(sink, &audit_entry)
@@ -1785,6 +1787,87 @@ pub(crate) fn build_task_health_observer(
     ))
 }
 
+fn build_tranche_token_correlation_details(
+    payload: &yarli_cli::yarli_core::entities::ContinuationPayload,
+) -> Option<serde_json::Value> {
+    use yarli_cli::yarli_core::entities::continuation::TrancheTokenAdvisoryLevel;
+
+    if payload.tranche_token_usage.is_empty() {
+        return None;
+    }
+
+    let high_cost_tranches = payload
+        .tranche_token_usage
+        .iter()
+        .filter(|tranche| {
+            matches!(
+                tranche.advisory,
+                Some(TrancheTokenAdvisoryLevel::Warning | TrancheTokenAdvisoryLevel::Exceeded)
+            )
+        })
+        .count();
+    let failed_tranches = payload
+        .tranche_token_usage
+        .iter()
+        .filter(|tranche| tranche.failed_tasks > 0)
+        .count();
+    let retried_tranches = payload
+        .tranche_token_usage
+        .iter()
+        .filter(|tranche| tranche.retried_tasks > 0)
+        .count();
+    let high_cost_failed_tranches = payload
+        .tranche_token_usage
+        .iter()
+        .filter(|tranche| {
+            tranche.failed_tasks > 0
+                && matches!(
+                    tranche.advisory,
+                    Some(TrancheTokenAdvisoryLevel::Warning | TrancheTokenAdvisoryLevel::Exceeded)
+                )
+        })
+        .count();
+    let high_cost_retried_tranches = payload
+        .tranche_token_usage
+        .iter()
+        .filter(|tranche| {
+            tranche.retried_tasks > 0
+                && matches!(
+                    tranche.advisory,
+                    Some(TrancheTokenAdvisoryLevel::Warning | TrancheTokenAdvisoryLevel::Exceeded)
+                )
+        })
+        .count();
+
+    Some(serde_json::json!({
+        "summary": {
+            "high_cost_tranches": high_cost_tranches,
+            "failed_tranches": failed_tranches,
+            "retried_tranches": retried_tranches,
+            "high_cost_failed_tranches": high_cost_failed_tranches,
+            "high_cost_retried_tranches": high_cost_retried_tranches,
+            "continuation_suggested": payload.next_tranche.is_some(),
+        },
+        "thresholds": payload.tranche_token_thresholds,
+        "retry_recommendation": payload.retry_recommendation,
+        "next_tranche_kind": payload.next_tranche.as_ref().map(|tranche| format!("{:?}", tranche.kind)),
+        "tranches": payload.tranche_token_usage.iter().map(|tranche| serde_json::json!({
+            "tranche_key": tranche.tranche_key,
+            "tranche_group": tranche.tranche_group,
+            "task_count": tranche.task_count,
+            "completed_tasks": tranche.completed_tasks,
+            "failed_tasks": tranche.failed_tasks,
+            "retried_tasks": tranche.retried_tasks,
+            "prompt_tokens": tranche.prompt_tokens,
+            "completion_tokens": tranche.completion_tokens,
+            "total_tokens": tranche.total_tokens,
+            "rehydration_tokens": tranche.rehydration_tokens,
+            "advisory": tranche.advisory,
+            "warning": tranche.warning,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2352,7 +2435,10 @@ mod tests {
 
     // --- observe_run_end integration (run_analyzer path) ---
 
-    use yarli_cli::yarli_core::entities::continuation::{ContinuationPayload, RunSummary};
+    use yarli_cli::yarli_core::entities::continuation::{
+        ContinuationPayload, RetryScope, RunSummary, TrancheKind, TrancheSpec,
+        TrancheTokenAdvisoryLevel, TrancheTokenThresholds, TrancheTokenUsageSummary,
+    };
     use yarli_cli::yarli_core::fsm::run::RunState;
     use yarli_cli::yarli_core::fsm::task::TaskState;
     use yarli_cli::yarli_observability::run_analyzer;
@@ -2387,6 +2473,8 @@ mod tests {
                 cancelled: 0,
                 pending: 0,
             },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
             next_tranche: None,
             quality_gate: None,
             retry_recommendation: None,
@@ -2551,6 +2639,85 @@ mod tests {
         assert!(
             lesson.contains("lint_clean"),
             "lesson should mention all gate failures"
+        );
+    }
+
+    #[test]
+    fn build_tranche_token_correlation_details_summarizes_high_cost_failures_and_retries() {
+        let mut payload = make_continuation_payload(
+            RunState::RunFailed,
+            Some(yarli_cli::yarli_core::domain::ExitReason::BlockedOpenTasks),
+            vec![
+                make_task_outcome("build", TaskState::TaskComplete),
+                make_task_outcome("test", TaskState::TaskFailed),
+            ],
+        );
+        payload.retry_recommendation = Some(RetryScope::Subset {
+            keys: vec!["test".to_string()],
+        });
+        payload.tranche_token_thresholds = Some(TrancheTokenThresholds {
+            selector: Some("codex".to_string()),
+            target_tokens: 70_000,
+            max_recommended_tokens: 100_000,
+        });
+        payload.tranche_token_usage = vec![
+            TrancheTokenUsageSummary {
+                tranche_key: "NXT-042".to_string(),
+                tranche_group: Some("next-todos".to_string()),
+                task_count: 2,
+                completed_tasks: 1,
+                failed_tasks: 1,
+                retried_tasks: 1,
+                prompt_tokens: 52_000,
+                completion_tokens: 28_000,
+                total_tokens: 80_000,
+                rehydration_tokens: Some(12_000),
+                advisory: Some(TrancheTokenAdvisoryLevel::Warning),
+                warning: Some("above advisory tranche warning".to_string()),
+            },
+            TrancheTokenUsageSummary {
+                tranche_key: "NXT-043".to_string(),
+                tranche_group: Some("next-todos".to_string()),
+                task_count: 1,
+                completed_tasks: 1,
+                failed_tasks: 0,
+                retried_tasks: 0,
+                prompt_tokens: 10_000,
+                completion_tokens: 8_000,
+                total_tokens: 18_000,
+                rehydration_tokens: Some(0),
+                advisory: Some(TrancheTokenAdvisoryLevel::Healthy),
+                warning: None,
+            },
+        ];
+        payload.next_tranche = Some(TrancheSpec {
+            suggested_objective: "Retry failed tasks: test".to_string(),
+            kind: TrancheKind::RetryUnfinished,
+            retry_task_keys: vec!["test".to_string()],
+            unfinished_task_keys: Vec::new(),
+            planned_task_keys: Vec::new(),
+            planned_tranche_key: None,
+            cursor: None,
+            config_snapshot: serde_json::json!({}),
+            interventions: Vec::new(),
+        });
+
+        let details = build_tranche_token_correlation_details(&payload)
+            .expect("tranche token correlation details should exist");
+
+        assert_eq!(details["summary"]["high_cost_tranches"], 1);
+        assert_eq!(details["summary"]["failed_tranches"], 1);
+        assert_eq!(details["summary"]["retried_tranches"], 1);
+        assert_eq!(details["summary"]["high_cost_failed_tranches"], 1);
+        assert_eq!(details["summary"]["high_cost_retried_tranches"], 1);
+        assert_eq!(details["summary"]["continuation_suggested"], true);
+        assert_eq!(details["retry_recommendation"]["scope"], "subset");
+        assert_eq!(details["retry_recommendation"]["keys"][0], "test");
+        assert_eq!(details["next_tranche_kind"], "RetryUnfinished");
+        assert_eq!(details["tranches"][0]["tranche_key"], "NXT-042");
+        assert_eq!(
+            details["tranches"][0]["warning"],
+            "above advisory tranche warning"
         );
     }
 }

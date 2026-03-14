@@ -216,4 +216,14 @@ mod tests {
             .send_signal(0)
             .expect("signal probe via handle should succeed");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_handle_raw_pid_variant_send_signal_zero() {
+        let handle = ProcessHandle::RawPid(std::process::id());
+        assert!(!handle.is_pidfd());
+        handle
+            .send_signal(0)
+            .expect("signal probe via raw pid should succeed");
+    }
 }

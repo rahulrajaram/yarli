@@ -524,9 +524,13 @@ Key implementation modules and integration tests still live under `crates/yarli-
 ## Runner Hardening and sw4rm Notes
 
 - `yarli run` now wires per-task scheduler budgets into command execution as `ResourceLimits` and applies Linux `setrlimit(2)` caps for memory, CPU, open files, and process count before spawning workers.
+- Prometheus now exposes `yarli_enforcement_outcomes_total{mechanism,outcome,reason}` for runner hardening paths, including `rlimit`, `cgroup`, `pidfd`, and `pid_termination` outcomes plus `rlimits_only_*` fallback reasons.
 - `sw4rm` agent runtime transport uses a correlation-aware gRPC sender/receiver (`GrpcRouterSender`) and `CT_IMPLEMENTATION_RESPONSE` now maps back to pending local correlation state.
+- `yarli run sw4rm` fails fast when router/report clients or runtime registration cannot connect; it does not silently degrade into a partial local mode.
+- Invalid sw4rm verification run-spec configuration falls back to minimal verification defaults, while correlation drops from shutdown/stream cancellation surface as `Cancelled` and request expiry surfaces as `LlmTimeout`.
 - Process lifecycle control prefers pidfd (`pidfd_open(2)` / `pidfd_send_signal(2)`) when available, with automatic fallback for older kernels.
 - A cgroup v2 sandbox is enabled when writable; when unavailable or unwritable, execution continues in fallback mode using rlimits only.
+- Containerized cgroup enforcement requires a writable delegated cgroup subtree for the YARLI process. Read-only or non-delegated hierarchies are supported, but they stay in rlimits-only fallback mode.
 - `/proc/self/cgroup` is used in integration probes to confirm sandbox attachment under writable cgroup v2 runs.
 - Build `yarli` with `--features sw4rm` when running the sw4rm runtime (`yarli run sw4rm`), plus compatible gRPC endpoints.
 

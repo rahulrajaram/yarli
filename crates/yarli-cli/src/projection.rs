@@ -26,6 +26,9 @@ use crate::observers::MemoryHintsReport;
 use crate::plan::{PlannedTranche, RunTokenTotals};
 use crate::GateType;
 
+const DEFAULT_ADVISORY_TRANCHE_WARNING_TOKENS: u64 = 70_000;
+const DEFAULT_ADVISORY_TRANCHE_RECOMMENDED_MAX_TOKENS: u64 = 100_000;
+
 #[derive(Debug, Clone)]
 pub(crate) struct TaskProjection {
     pub(crate) task_id: Uuid,
@@ -40,6 +43,7 @@ pub(crate) struct TaskProjection {
     pub(crate) failed_gates: Vec<(GateType, String)>,
     pub(crate) resource_usage: Option<CommandResourceUsage>,
     pub(crate) token_usage: Option<TokenUsage>,
+    pub(crate) rehydration_tokens: Option<u64>,
     pub(crate) budget_breach_reason: Option<String>,
     pub(crate) memory_hints: Option<MemoryHintsReport>,
     pub(crate) last_error: Option<String>,
@@ -71,6 +75,39 @@ pub(crate) struct RunProjection {
     pub(crate) deterioration: Option<DeteriorationReport>,
     pub(crate) memory_hints: Option<MemoryHintsReport>,
     pub(crate) tranche_plan: Vec<PlannedTranche>,
+    pub(crate) tranche_token_thresholds: AdvisoryTrancheTokenThresholds,
+    pub(crate) tranche_tokens: Vec<TrancheTokenProjection>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdvisoryTrancheTokenThresholds {
+    pub(crate) warning_tokens: u64,
+    pub(crate) recommended_max_tokens: u64,
+}
+
+impl Default for AdvisoryTrancheTokenThresholds {
+    fn default() -> Self {
+        Self {
+            warning_tokens: DEFAULT_ADVISORY_TRANCHE_WARNING_TOKENS,
+            recommended_max_tokens: DEFAULT_ADVISORY_TRANCHE_RECOMMENDED_MAX_TOKENS,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrancheTokenProjection {
+    pub(crate) tranche_key: String,
+    pub(crate) tranche_group: Option<String>,
+    pub(crate) task_count: u32,
+    pub(crate) completed_tasks: u32,
+    pub(crate) failed_tasks: u32,
+    pub(crate) retried_tasks: u32,
+    pub(crate) unfinished_tasks: u32,
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) rehydration_tokens: u64,
+    pub(crate) warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +252,145 @@ pub(crate) fn collect_run_resource_totals(
 
     totals.total_tokens = collect_run_token_totals(store, correlation_id)?.total_tokens;
     Ok(totals)
+}
+
+fn advisory_thresholds_from_snapshot(config_snapshot: &Value) -> AdvisoryTrancheTokenThresholds {
+    let config = config_snapshot.get("config").unwrap_or(config_snapshot);
+    let run = config.get("run");
+    let Some(run) = run else {
+        return AdvisoryTrancheTokenThresholds::default();
+    };
+
+    let backend = config
+        .get("cli")
+        .and_then(|value| value.get("backend"))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let advisory = backend
+        .as_ref()
+        .and_then(|backend_name| {
+            run.get("tranche_token_advisory_by_backend")
+                .and_then(|value| value.get(backend_name))
+        })
+        .or_else(|| run.get("tranche_token_advisory"))
+        .unwrap_or(run);
+
+    let warning_tokens = advisory
+        .get("warn_tokens")
+        .or_else(|| advisory.get("target_tranche_tokens"))
+        .or_else(|| advisory.get("tranche_warning_threshold_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ADVISORY_TRANCHE_WARNING_TOKENS);
+    let recommended_max_tokens = advisory
+        .get("max_recommended_tokens")
+        .or_else(|| advisory.get("max_recommended_tranche_tokens"))
+        .or_else(|| advisory.get("tranche_recommended_max_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ADVISORY_TRANCHE_RECOMMENDED_MAX_TOKENS);
+
+    AdvisoryTrancheTokenThresholds {
+        warning_tokens,
+        recommended_max_tokens: recommended_max_tokens.max(warning_tokens),
+    }
+}
+
+fn tranche_warning_for_total(
+    total_tokens: u64,
+    thresholds: AdvisoryTrancheTokenThresholds,
+) -> Option<String> {
+    if total_tokens >= thresholds.recommended_max_tokens {
+        return Some(format!(
+            "above advisory tranche maximum ({} >= {})",
+            total_tokens, thresholds.recommended_max_tokens
+        ));
+    }
+    if total_tokens >= thresholds.warning_tokens {
+        return Some(format!(
+            "above advisory tranche warning threshold ({} >= {})",
+            total_tokens, thresholds.warning_tokens
+        ));
+    }
+    None
+}
+
+fn collect_tranche_token_projections(
+    tasks: &[TaskProjection],
+    thresholds: AdvisoryTrancheTokenThresholds,
+) -> Vec<TrancheTokenProjection> {
+    let mut by_tranche: BTreeMap<String, TrancheTokenProjection> = BTreeMap::new();
+
+    for task in tasks {
+        let Some(tranche_key) = task.tranche_key.as_ref() else {
+            continue;
+        };
+        let entry =
+            by_tranche
+                .entry(tranche_key.clone())
+                .or_insert_with(|| TrancheTokenProjection {
+                    tranche_key: tranche_key.clone(),
+                    tranche_group: task.tranche_group.clone(),
+                    task_count: 0,
+                    completed_tasks: 0,
+                    failed_tasks: 0,
+                    retried_tasks: 0,
+                    unfinished_tasks: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    rehydration_tokens: 0,
+                    warning: None,
+                });
+
+        if entry.tranche_group.is_none() {
+            entry.tranche_group = task.tranche_group.clone();
+        }
+        entry.task_count = entry.task_count.saturating_add(1);
+        if task.attempt_no.unwrap_or(1) > 1 {
+            entry.retried_tasks = entry.retried_tasks.saturating_add(1);
+        }
+        match task.state {
+            TaskState::TaskComplete => {
+                entry.completed_tasks = entry.completed_tasks.saturating_add(1);
+            }
+            TaskState::TaskFailed => {
+                entry.failed_tasks = entry.failed_tasks.saturating_add(1);
+            }
+            TaskState::TaskCancelled => {}
+            _ => {
+                entry.unfinished_tasks = entry.unfinished_tasks.saturating_add(1);
+            }
+        }
+
+        if let Some(usage) = task.token_usage.as_ref() {
+            entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt_tokens);
+            entry.completion_tokens = entry
+                .completion_tokens
+                .saturating_add(usage.completion_tokens);
+            entry.total_tokens = entry.total_tokens.saturating_add(usage.total_tokens);
+            let derived_rehydration = usage.rehydration_tokens.unwrap_or_else(|| {
+                task.rehydration_tokens.unwrap_or({
+                    if entry.task_count > 1 {
+                        usage.prompt_tokens
+                    } else {
+                        0
+                    }
+                })
+            });
+            entry.rehydration_tokens = entry.rehydration_tokens.saturating_add(derived_rehydration);
+        } else if let Some(rehydration_tokens) = task.rehydration_tokens {
+            entry.rehydration_tokens = entry.rehydration_tokens.saturating_add(rehydration_tokens);
+        }
+    }
+
+    let mut values: Vec<_> = by_tranche.into_values().collect();
+    for value in &mut values {
+        value.warning = tranche_warning_for_total(value.total_tokens, thresholds);
+    }
+    values
 }
 
 pub(crate) fn run_state_from_event(event: &Event) -> Option<RunState> {
@@ -458,6 +634,7 @@ pub(crate) struct TaskCatalogProjection {
     pub(crate) workspace_dir: Option<String>,
     pub(crate) tranche_key: Option<String>,
     pub(crate) tranche_group: Option<String>,
+    pub(crate) rehydration_tokens: Option<u64>,
     pub(crate) allowed_paths: Vec<String>,
     pub(crate) depends_on: Vec<String>,
 }
@@ -500,6 +677,9 @@ pub(crate) fn task_catalog_entries_from_event(
                         .and_then(|value| value.as_str())
                         .map(ToString::to_string)
                         .filter(|value| !value.trim().is_empty());
+                    let rehydration_tokens = task
+                        .get("rehydration_tokens")
+                        .and_then(|value| value.as_u64());
                     let allowed_paths = task
                         .get("allowed_paths")
                         .and_then(|value| value.as_array())
@@ -527,6 +707,7 @@ pub(crate) fn task_catalog_entries_from_event(
                             workspace_dir,
                             tranche_key,
                             tranche_group,
+                            rehydration_tokens,
                             allowed_paths,
                             depends_on,
                         },
@@ -559,6 +740,7 @@ pub(crate) fn collect_task_projections(events: &[Event]) -> Vec<TaskProjection> 
             failed_gates: Vec::new(),
             resource_usage: None,
             token_usage: None,
+            rehydration_tokens: None,
             budget_breach_reason: None,
             memory_hints: None,
             last_error: None,
@@ -730,6 +912,7 @@ pub(crate) fn load_run_projection(
     let mut deterioration = None;
     let mut memory_hints = None;
     let mut tranche_plan = Vec::new();
+    let mut tranche_token_thresholds = AdvisoryTrancheTokenThresholds::default();
     let mut task_catalog_by_id: HashMap<Uuid, TaskCatalogProjection> = HashMap::new();
 
     for event in &run_events {
@@ -767,6 +950,7 @@ pub(crate) fn load_run_projection(
                 .map(|s| s.to_string());
             if let Some(config_snapshot) = event.payload.get("config_snapshot") {
                 tranche_plan = crate::plan::parse_tranche_plan_from_snapshot(config_snapshot);
+                tranche_token_thresholds = advisory_thresholds_from_snapshot(config_snapshot);
             }
         }
 
@@ -886,6 +1070,9 @@ pub(crate) fn load_run_projection(
             if task.tranche_group.is_none() {
                 task.tranche_group = metadata.tranche_group.clone();
             }
+            if task.rehydration_tokens.is_none() {
+                task.rehydration_tokens = metadata.rehydration_tokens;
+            }
             if task.allowed_paths.is_empty() {
                 task.allowed_paths = metadata.allowed_paths.clone();
             }
@@ -903,6 +1090,8 @@ pub(crate) fn load_run_projection(
             last_event_type = latest_task.last_event_type.clone();
         }
     }
+
+    let tranche_tokens = collect_tranche_token_projections(&tasks, tranche_token_thresholds);
 
     Ok(Some(RunProjection {
         run_id,
@@ -922,6 +1111,8 @@ pub(crate) fn load_run_projection(
         deterioration,
         memory_hints,
         tranche_plan,
+        tranche_token_thresholds,
+        tranche_tokens,
     }))
 }
 

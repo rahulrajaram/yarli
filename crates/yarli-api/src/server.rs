@@ -125,6 +125,7 @@ impl ApiState {
     }
 
     #[cfg(feature = "debug-api")]
+    #[allow(dead_code)]
     pub(crate) fn new_with_queue_and_security(
         store: Arc<dyn EventStore>,
         queue: Arc<dyn TaskQueue>,

@@ -372,6 +372,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         let result = journal.execute(req, cancel).await.unwrap();
@@ -410,6 +411,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -446,6 +448,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -476,6 +479,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -506,6 +510,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -536,6 +541,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -569,6 +575,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         let result = journal.execute(req, cancel).await.unwrap();
@@ -599,6 +606,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -629,6 +637,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -656,6 +665,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -693,6 +703,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -724,6 +735,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();
@@ -753,6 +765,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         let result = journal.execute(req, cancel).await;
@@ -779,6 +792,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         };
 
         journal.execute(req, cancel).await.unwrap();

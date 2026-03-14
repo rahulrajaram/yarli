@@ -11,6 +11,7 @@
 //! - Supports configurable timeouts.
 
 use std::fs;
+use std::io;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -84,6 +85,8 @@ pub struct CommandRequest {
     pub live_output_tx: Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     /// Optional resource limits (rlimits/cgroup) applied to the child process.
     pub resource_limits: Option<ResourceLimits>,
+    /// Estimated prompt/context reload cost for this command, if available.
+    pub rehydration_tokens: Option<u64>,
 }
 
 /// Result of a completed command execution.
@@ -178,13 +181,14 @@ impl LocalCommandRunner {
 
     fn record_overhead(&self, class: CommandClass, phase: &str, duration: Duration) {
         if let Some(metrics) = &self.metrics {
-            let label = match class {
-                CommandClass::Io => "io",
-                CommandClass::Cpu => "cpu",
-                CommandClass::Git => "git",
-                CommandClass::Tool => "tool",
-            };
+            let label = command_class_metric_label(class);
             metrics.record_command_overhead_duration(label, phase, duration.as_secs_f64());
+        }
+    }
+
+    fn record_enforcement(&self, mechanism: &str, outcome: &str, reason: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_enforcement_outcome(mechanism, outcome, reason);
         }
     }
 }
@@ -273,6 +277,9 @@ impl CommandRunner for LocalCommandRunner {
             }
         }
         let mut child = command.spawn().map_err(ExecError::SpawnFailed)?;
+        if request.resource_limits.is_some() {
+            self.record_enforcement("rlimit", "applied", "pre_exec");
+        }
         self.record_overhead(request.command_class, "spawn", spawn_start.elapsed());
         let child_pid = child.id();
         let process_group_id = child_pid.and_then(pid_to_process_group_id);
@@ -282,22 +289,43 @@ impl CommandRunner for LocalCommandRunner {
         let process_handle = child_pid.map(crate::yarli_exec::pidfd::ProcessHandle::acquire);
         #[cfg(not(unix))]
         let process_handle: Option<crate::yarli_exec::pidfd::ProcessHandle> = None;
+        #[cfg(unix)]
+        if let Some(handle) = process_handle.as_ref() {
+            if handle.is_pidfd() {
+                self.record_enforcement("pidfd", "applied", "pidfd");
+            } else {
+                self.record_enforcement("pidfd", "fallback", "raw_pid");
+            }
+        }
 
         // Create cgroup sandbox and add child PID (best-effort, non-fatal).
         let _cgroup_sandbox =
             if let (Some(pid), Some(ref limits)) = (child_pid, &request.resource_limits) {
                 let run_short = &request.run_id.to_string()[..8];
                 let task_short = &request.task_id.to_string()[..8];
-                let mgr = crate::yarli_exec::cgroup::LocalCgroupManager;
-                let sandbox = crate::yarli_exec::cgroup::CgroupManager::create_sandbox(
+                let mgr = crate::yarli_exec::cgroup::LocalCgroupManager::new();
+                match crate::yarli_exec::cgroup::CgroupManager::create_sandbox(
                     &mgr, run_short, task_short, limits,
-                );
-                if let Some(ref sb) = sandbox {
-                    if let Err(e) = sb.add_pid(pid) {
-                        debug!(error = %e, "failed to add child pid to cgroup sandbox");
+                ) {
+                    crate::yarli_exec::cgroup::CgroupSandboxOutcome::Attached(sb) => {
+                        if let Err(e) = sb.add_pid(pid) {
+                            self.record_enforcement(
+                                "cgroup",
+                                "failed",
+                                &format!("add_pid_{}", io_error_reason(&e)),
+                            );
+                            debug!(error = %e, "failed to add child pid to cgroup sandbox");
+                            None
+                        } else {
+                            self.record_enforcement("cgroup", "applied", "attached");
+                            Some(sb)
+                        }
+                    }
+                    crate::yarli_exec::cgroup::CgroupSandboxOutcome::Fallback(mode) => {
+                        self.record_enforcement("cgroup", "fallback", mode.as_label());
+                        None
                     }
                 }
-                sandbox
             } else {
                 None
             };
@@ -382,14 +410,26 @@ impl CommandRunner for LocalCommandRunner {
                 biased;
                 _ = cancel.cancelled() => {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
-                    kill_child(&mut child, process_group_id, &process_handle).await;
+                    kill_child(
+                        &mut child,
+                        process_group_id,
+                        &process_handle,
+                        self.metrics.clone(),
+                    )
+                    .await;
                     // Drain remaining output.
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
                 _ = tokio::time::sleep(dur) => {
                     warn!(cmd_id = %cmd_id, timeout = ?dur, "command timed out");
-                    kill_child(&mut child, process_group_id, &process_handle).await;
+                    kill_child(
+                        &mut child,
+                        process_group_id,
+                        &process_handle,
+                        self.metrics.clone(),
+                    )
+                    .await;
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Timeout(dur))
                 }
@@ -402,7 +442,13 @@ impl CommandRunner for LocalCommandRunner {
                 biased;
                 _ = cancel.cancelled() => {
                     warn!(cmd_id = %cmd_id, "command cancelled by shutdown");
-                    kill_child(&mut child, process_group_id, &process_handle).await;
+                    kill_child(
+                        &mut child,
+                        process_group_id,
+                        &process_handle,
+                        self.metrics.clone(),
+                    )
+                    .await;
                     drain_channel(&mut stdout_rx, cmd_id, &mut seq, &mut chunks, &live_tx).await;
                     Err(ExecError::Killed { reason: "shutdown".into() })
                 }
@@ -421,7 +467,11 @@ impl CommandRunner for LocalCommandRunner {
             None
         };
         execution.resource_usage = resource_usage;
-        execution.token_usage = Some(estimate_token_usage(&execution.command, &chunks));
+        execution.token_usage = Some(estimate_token_usage(
+            &execution.command,
+            &chunks,
+            request.rehydration_tokens,
+        ));
 
         // Untrack child PID — process has exited (normally, timed out, or killed).
         #[cfg(unix)]
@@ -483,7 +533,11 @@ impl CommandRunner for LocalCommandRunner {
     }
 }
 
-pub(crate) fn estimate_token_usage(command: &str, chunks: &[StreamChunk]) -> TokenUsage {
+pub(crate) fn estimate_token_usage(
+    command: &str,
+    chunks: &[StreamChunk],
+    rehydration_tokens: Option<u64>,
+) -> TokenUsage {
     let prompt_tokens = estimate_tokens(command);
     let completion_chars: u64 = chunks.iter().map(|c| c.data.chars().count() as u64).sum();
     let completion_tokens = if completion_chars == 0 {
@@ -496,11 +550,12 @@ pub(crate) fn estimate_token_usage(command: &str, chunks: &[StreamChunk]) -> Tok
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        rehydration_tokens,
         source: "char_count_div4_estimate_v1".to_string(),
     }
 }
 
-fn estimate_tokens(input: &str) -> u64 {
+pub(crate) fn estimate_tokens(input: &str) -> u64 {
     let chars = input.chars().count() as u64;
     if chars == 0 {
         0
@@ -706,7 +761,7 @@ async fn collect_and_wait(
                     idle_timeout = ?dur,
                     "command produced no output for idle_kill_timeout — killing"
                 );
-                kill_child(child, process_group_id, process_handle).await;
+                kill_child(child, process_group_id, process_handle, None).await;
                 drain_channel(rx, cmd_id, seq, chunks, live_tx).await;
                 return Err(ExecError::Timeout(dur));
             }
@@ -782,6 +837,34 @@ fn pid_to_process_group_id(pid: u32) -> Option<i32> {
     i32::try_from(pid).ok()
 }
 
+fn command_class_metric_label(class: CommandClass) -> &'static str {
+    match class {
+        CommandClass::Io => "io",
+        CommandClass::Cpu => "cpu",
+        CommandClass::Git => "git",
+        CommandClass::Tool => "tool",
+    }
+}
+
+fn io_error_reason(err: &io::Error) -> &'static str {
+    if matches!(err.raw_os_error(), Some(code) if code == libc::EROFS) {
+        "read_only"
+    } else {
+        match err.kind() {
+            io::ErrorKind::PermissionDenied => "permission_denied",
+            io::ErrorKind::NotFound => "not_found",
+            io::ErrorKind::AlreadyExists => "already_exists",
+            io::ErrorKind::TimedOut => "timed_out",
+            io::ErrorKind::Interrupted => "interrupted",
+            io::ErrorKind::Unsupported => "unsupported",
+            io::ErrorKind::InvalidInput => "invalid_input",
+            io::ErrorKind::BrokenPipe => "broken_pipe",
+            io::ErrorKind::UnexpectedEof => "unexpected_eof",
+            _ => "other",
+        }
+    }
+}
+
 /// Kill a child process (best-effort).
 ///
 /// Uses process-group signaling for SIGTERM/SIGKILL to tear down all descendants.
@@ -791,28 +874,44 @@ async fn kill_child(
     child: &mut tokio::process::Child,
     process_group_id: Option<i32>,
     #[allow(unused_variables)] handle: &Option<crate::yarli_exec::pidfd::ProcessHandle>,
+    metrics: Option<std::sync::Arc<YarliMetrics>>,
 ) {
+    let record_failure = |reason: String| {
+        if let Some(metrics) = metrics.as_ref() {
+            metrics.record_enforcement_outcome("pid_termination", "failed", &reason);
+        }
+    };
+
     #[cfg(unix)]
     if let Some(pgid) = process_group_id {
-        let _ = crate::yarli_exec::pidfd::signal_process_group(pgid, libc::SIGTERM);
+        if let Err(err) = crate::yarli_exec::pidfd::signal_process_group(pgid, libc::SIGTERM) {
+            record_failure(format!("sigterm_process_group_{}", io_error_reason(&err)));
+        }
         for _ in 0..10 {
             match child.try_wait() {
                 Ok(Some(_)) => return,
                 Ok(None) => tokio::time::sleep(Duration::from_millis(25)).await,
                 Err(err) => {
+                    record_failure(format!("try_wait_{}", io_error_reason(&err)));
                     warn!(error = %err, "failed to poll child process status during cancellation");
                     break;
                 }
             }
         }
         // Escalate to SIGKILL via process group.
-        let _ = crate::yarli_exec::pidfd::signal_process_group(pgid, libc::SIGKILL);
+        if let Err(err) = crate::yarli_exec::pidfd::signal_process_group(pgid, libc::SIGKILL) {
+            record_failure(format!("sigkill_process_group_{}", io_error_reason(&err)));
+        }
         // Also send SIGKILL via pidfd handle for race-free delivery to the lead process.
         if let Some(h) = handle {
-            let _ = h.send_signal(libc::SIGKILL);
+            if let Err(err) = h.send_signal(libc::SIGKILL) {
+                let mechanism = if h.is_pidfd() { "pidfd" } else { "raw_pid" };
+                record_failure(format!("sigkill_{mechanism}_{}", io_error_reason(&err)));
+            }
         }
     }
     if let Err(e) = child.kill().await {
+        record_failure(format!("child_kill_{}", io_error_reason(&e)));
         warn!(error = %e, "failed to kill child process");
     }
 }
@@ -836,6 +935,7 @@ mod tests {
             env: vec![],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         }
     }
 
