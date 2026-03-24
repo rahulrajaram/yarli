@@ -363,6 +363,7 @@ fn default_cli_command_for_backend(backend: &str) -> Option<String> {
         "codex" => Some("codex".to_string()),
         "claude" => Some("claude".to_string()),
         "gemini" => Some("gemini".to_string()),
+        "kiro-cli" => Some("kiro-cli".to_string()),
         _ => None,
     }
 }
@@ -467,7 +468,7 @@ fn fallback_preflight_invocation(invocation: &CliInvocationConfig) -> Option<Cli
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if command_file != "claude" {
+    if !matches!(command_file, "claude" | "kiro-cli") {
         return None;
     }
     if !has_claude_model_flag(&invocation.args) {
@@ -799,13 +800,13 @@ fn validate_postgres_database_url(source: &str, database_url: &str) -> Result<St
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CliConfig {
-    /// Named backend for operator readability (codex|claude|gemini|custom).
+    /// Named backend for operator readability (codex|claude|gemini|kiro-cli|custom).
     #[serde(default)]
     pub backend: Option<String>,
     /// How the prompt is passed to the CLI: arg or stdin.
     #[serde(default)]
     pub prompt_mode: PromptMode,
-    /// Executable to invoke (e.g. "codex", "claude", "gemini").
+    /// Executable to invoke (e.g. "codex", "claude", "gemini", "kiro-cli").
     #[serde(default)]
     pub command: Option<String>,
     /// Arguments to pass to the command.
@@ -1946,6 +1947,87 @@ parallel = false
             fallback.args,
             vec!["--print", "--dangerously-skip-permissions"]
         );
+    }
+
+    #[test]
+    fn fallback_preflight_invocation_removes_kiro_cli_model() {
+        let invocation = CliInvocationConfig {
+            command: "kiro-cli".to_string(),
+            args: vec![
+                "chat".to_string(),
+                "--no-interactive".to_string(),
+                "--model".to_string(),
+                "some-model".to_string(),
+                "--trust-all-tools".to_string(),
+            ],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        let fallback = fallback_preflight_invocation(&invocation).unwrap();
+        assert_eq!(
+            fallback.args,
+            vec!["chat", "--no-interactive", "--trust-all-tools"]
+        );
+    }
+
+    #[test]
+    fn fallback_preflight_invocation_returns_none_for_kiro_cli_without_model() {
+        let invocation = CliInvocationConfig {
+            command: "kiro-cli".to_string(),
+            args: vec![
+                "chat".to_string(),
+                "--no-interactive".to_string(),
+                "--trust-all-tools".to_string(),
+            ],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        assert!(fallback_preflight_invocation(&invocation).is_none());
+    }
+
+    #[test]
+    fn default_cli_command_for_kiro_cli_backend() {
+        assert_eq!(
+            default_cli_command_for_backend("kiro-cli"),
+            Some("kiro-cli".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cli_invocation_config_resolves_kiro_cli_backend() {
+        let loaded = write_test_config(
+            r#"
+[cli]
+backend = "kiro-cli"
+args = ["chat", "--no-interactive", "--trust-all-tools"]
+"#,
+        );
+        let invocation = resolve_cli_invocation_config(&loaded).unwrap();
+        assert_eq!(invocation.command, "kiro-cli");
+        assert_eq!(
+            invocation.args,
+            vec!["chat", "--no-interactive", "--trust-all-tools"]
+        );
+        assert!(matches!(invocation.prompt_mode, PromptMode::Arg));
+    }
+
+    #[test]
+    fn init_config_template_kiro_cli_produces_valid_toml() {
+        let template = crate::cli::init_config_template(Some(crate::cli::InitBackend::KiroCli));
+        let parsed: toml::Value =
+            toml::from_str(&template).expect("kiro-cli init template should be valid TOML");
+        let cli = parsed.get("cli").expect("template should have [cli]");
+        assert_eq!(cli.get("backend").unwrap().as_str().unwrap(), "kiro-cli");
+        assert_eq!(cli.get("command").unwrap().as_str().unwrap(), "kiro-cli");
+        let args: Vec<&str> = cli
+            .get("args")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(args, vec!["chat", "--no-interactive", "--trust-all-tools"]);
     }
 
     #[test]

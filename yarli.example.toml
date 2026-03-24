@@ -10,7 +10,7 @@ safe_mode = "execute"
 database_url = "postgres://postgres:postgres@localhost:5432/yarli"
 
 [cli]
-# Optional backend alias (codex | claude | gemini | custom).
+# Optional backend alias (codex | claude | gemini | kiro-cli | custom).
 # backend = "codex"
 # arg | stdin
 prompt_mode = "arg"

@@ -65,7 +65,7 @@ Recommended for consumers: use Postgres (`core.backend = "postgres"`) for durabl
 commands unless `core.allow_in_memory_writes = true`.
 
 [cli]
-- cli.backend (optional; codex|claude|gemini|custom)
+- cli.backend (optional; codex|claude|gemini|kiro-cli|custom)
 - cli.prompt_mode (default: "arg"; values: arg|stdin)
 - cli.command (optional; executable to invoke)
 - cli.args (default: []; argv list)
@@ -207,6 +207,7 @@ Examples:
 - yarli init --backend codex
 - yarli init --backend claude --print
 - yarli init --backend gemini --path ./yarli.toml --force
+- yarli init --backend kiro-cli
 "#;
 
 const INIT_CONFIG_TEMPLATE: &str = r#"# YARLI runtime configuration
@@ -240,7 +241,7 @@ safe_mode = "execute"
 # --- CLI_BACKEND_BEGIN ---
 [cli]
 # LLM CLI backend configuration (used by default `yarli run` plan-driven dispatch).
-# backend = "codex" | "claude" | "gemini" | "custom"
+# backend = "codex" | "claude" | "gemini" | "kiro-cli" | "custom"
 # prompt_mode = "arg" | "stdin"
 # command = "codex"
 # args = ["exec", "--json"]
@@ -449,7 +450,7 @@ pub(crate) fn init_config_template(backend: Option<InitBackend>) -> String {
         None => {
             r#"[cli]
 # LLM CLI backend configuration (used by default `yarli run` plan-driven dispatch).
-# backend = "codex" | "claude" | "gemini" | "custom"
+# backend = "codex" | "claude" | "gemini" | "kiro-cli" | "custom"
 # prompt_mode = "arg" | "stdin"
 # command = "codex"
 # args = ["exec", "--json"]
@@ -507,6 +508,23 @@ backend = "gemini"
 prompt_mode = "arg"
 command = "gemini"
 args = ["--model", "gemini-2.0-flash"]
+
+[event_loop]
+max_iterations = 5
+max_runtime_seconds = 14400
+idle_timeout_secs = 1800
+checkpoint_interval = 5
+
+[features]
+parallel = true
+"#
+        }
+        Some(InitBackend::KiroCli) => {
+            r#"[cli]
+backend = "kiro-cli"
+prompt_mode = "arg"
+command = "kiro-cli"
+args = ["chat", "--no-interactive", "--trust-all-tools"]
 
 [event_loop]
 max_iterations = 5
@@ -690,6 +708,7 @@ pub(crate) enum InitBackend {
     Codex,
     Claude,
     Gemini,
+    KiroCli,
 }
 
 #[derive(Subcommand)]

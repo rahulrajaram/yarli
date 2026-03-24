@@ -157,6 +157,7 @@ yarli init --force                            # Overwrite existing file
 yarli init --backend codex                    # Codex-flavored template
 yarli init --backend claude --print           # Claude-flavored template (preview)
 yarli init --backend gemini --path ./yarli.toml --force
+yarli init --backend kiro-cli                 # Kiro CLI-flavored template
 ```
 
 ### `yarli run`
@@ -344,7 +345,7 @@ yarli info
 
 ## AI Agent Integration
 
-YARLI integrates with agent CLIs through `[cli]` configuration (for example `codex`, `claude`, `gemini`, or custom command wiring).
+YARLI integrates with agent CLIs through `[cli]` configuration (for example `codex`, `claude`, `gemini`, `kiro-cli`, or custom command wiring).
 
 ```toml
 [cli]
@@ -352,6 +353,16 @@ backend = "codex"
 prompt_mode = "arg"
 command = "codex"
 args = ["exec"]
+```
+
+Kiro CLI example (`kiro-cli` is Claude under the hood):
+
+```toml
+[cli]
+backend = "kiro-cli"
+prompt_mode = "arg"
+command = "kiro-cli"
+args = ["chat", "--no-interactive", "--trust-all-tools"]
 ```
 
 YARLI is not currently an MCP server. Agent integration is command-dispatch based.
@@ -415,7 +426,7 @@ Key sections:
 |---------|---------|
 | `[core]` | Backend (`in-memory`/`postgres`), safe mode, worker identity |
 | `[postgres]` | Database URL, URL file (Kubernetes secret pattern) |
-| `[cli]` | LLM CLI backend (`codex`/`claude`/`gemini`/custom), prompt mode, command, args |
+| `[cli]` | LLM CLI backend (`codex`/`claude`/`gemini`/`kiro-cli`/custom), prompt mode, command, args |
 | `[features]` | Parallel execution, git worktree mode |
 | `[queue]` | Claim batch size, lease TTL, per-class caps |
 | `[execution]` | Runner (`native`/`overwatch`), working dir, worktree root, timeouts |
