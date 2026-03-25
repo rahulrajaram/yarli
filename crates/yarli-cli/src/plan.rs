@@ -2763,7 +2763,7 @@ mod tests {
         build_continuation_payload, build_run_config_snapshot, compute_quality_gate,
     };
     use crate::config::RunTaskHealthConfig;
-    use crate::test_helpers::{write_test_config, write_test_config_at};
+    use crate::test_helpers::{with_current_dir, write_test_config, write_test_config_at};
     use chrono::Utc;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -3299,12 +3299,10 @@ prompt_mode = "arg"
         let loaded_prompt =
             prompt::load_prompt_and_run_spec(&repo.path().join("PROMPT.md")).unwrap();
 
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(decoy_cwd.path()).unwrap();
-        let (tasks, tranches) =
+        let (tasks, tranches) = with_current_dir(decoy_cwd.path(), || {
             build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
-                .unwrap();
-        let _ = std::env::set_current_dir(&original_dir);
+                .unwrap()
+        });
 
         assert_eq!(tasks.len(), 2);
         assert_eq!(tranches.len(), 2);

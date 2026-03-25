@@ -8040,7 +8040,6 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::mpsc;
@@ -8088,8 +8087,6 @@ mod tests {
     }
 
     fn with_isolated_runtime_env<T>(operation: impl FnOnce() -> T) -> T {
-        static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
         struct EnvGuard {
             previous_dir: std::path::PathBuf,
             previous_database_url: Option<String>,
@@ -8106,22 +8103,20 @@ mod tests {
             }
         }
 
-        let _lock = TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let temp_dir = TempDir::new().expect("create isolated temp dir");
-        let guard = EnvGuard {
-            previous_dir: std::env::current_dir()
-                .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()),
-            previous_database_url: std::env::var("DATABASE_URL").ok(),
-        };
-        std::env::set_current_dir(temp_dir.path()).expect("switch to isolated temp dir");
-        std::env::remove_var("DATABASE_URL");
+        with_process_env_lock(|| {
+            let temp_dir = TempDir::new().expect("create isolated temp dir");
+            let guard = EnvGuard {
+                previous_dir: std::env::current_dir()
+                    .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()),
+                previous_database_url: std::env::var("DATABASE_URL").ok(),
+            };
+            std::env::set_current_dir(temp_dir.path()).expect("switch to isolated temp dir");
+            std::env::remove_var("DATABASE_URL");
 
-        let result = operation();
-        drop(guard);
-        result
+            let result = operation();
+            drop(guard);
+            result
+        })
     }
 
     fn seed_worktree_event_payload(

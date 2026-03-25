@@ -806,6 +806,7 @@ mod tests {
             plan_target_completion_state, run_spec_plan_guard_preflight_with_override,
             should_auto_advance_planned_tranche, validate_tranche_keys, PlannedTranche,
         },
+        test_helpers::with_current_dir,
     };
     use chrono::Utc;
     use tempfile::TempDir;
@@ -1771,35 +1772,33 @@ mode = "implement"
     #[test]
     fn cmd_plan_tranche_add_idempotent_noops_on_matching_fields() {
         let repo = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(repo.path()).unwrap();
+        let parsed = with_current_dir(repo.path(), || {
+            let allowed_paths = vec!["crates/yarli-cli/src".to_string()];
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &allowed_paths,
+                Some("cargo test -p yarli-cli"),
+                Some("config loader handles overrides"),
+                Some(55_000),
+                false,
+            )
+            .unwrap();
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &allowed_paths,
+                Some("cargo test -p yarli-cli"),
+                Some("config loader handles overrides"),
+                Some(55_000),
+                true,
+            )
+            .unwrap();
 
-        let allowed_paths = vec!["crates/yarli-cli/src".to_string()];
-        cmd_plan_tranche_add(
-            "TP-05",
-            "Implement config loader hardening",
-            Some("core"),
-            &allowed_paths,
-            Some("cargo test -p yarli-cli"),
-            Some("config loader handles overrides"),
-            Some(55_000),
-            false,
-        )
-        .unwrap();
-        cmd_plan_tranche_add(
-            "TP-05",
-            "Implement config loader hardening",
-            Some("core"),
-            &allowed_paths,
-            Some("cargo test -p yarli-cli"),
-            Some("config loader handles overrides"),
-            Some(55_000),
-            true,
-        )
-        .unwrap();
-
-        let parsed = read_tranches_file().unwrap().unwrap();
-        let _ = std::env::set_current_dir(&original_dir);
+            read_tranches_file().unwrap().unwrap()
+        });
 
         assert_eq!(parsed.tranches.len(), 1);
         assert_eq!(parsed.tranches[0].key, "TP-05");
@@ -1808,32 +1807,30 @@ mode = "implement"
     #[test]
     fn cmd_plan_tranche_add_idempotent_rejects_mismatched_fields() {
         let repo = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(repo.path()).unwrap();
-
-        cmd_plan_tranche_add(
-            "TP-05",
-            "Implement config loader hardening",
-            Some("core"),
-            &[],
-            None,
-            None,
-            Some(55_000),
-            false,
-        )
-        .unwrap();
-        let err = cmd_plan_tranche_add(
-            "TP-05",
-            "Implement config loader drift guard",
-            Some("core"),
-            &[],
-            None,
-            None,
-            Some(55_000),
-            true,
-        )
-        .unwrap_err();
-        let _ = std::env::set_current_dir(&original_dir);
+        let err = with_current_dir(repo.path(), || {
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &[],
+                None,
+                None,
+                Some(55_000),
+                false,
+            )
+            .unwrap();
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader drift guard",
+                Some("core"),
+                &[],
+                None,
+                None,
+                Some(55_000),
+                true,
+            )
+            .unwrap_err()
+        });
 
         let err_text = format!("{err:#}");
         assert!(err_text.contains("different fields"));
@@ -1928,11 +1925,7 @@ status = "incomplete"
         .unwrap();
 
         // chdir into the temp directory so read_tranches_file() finds the file
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(temp.path()).unwrap();
-
-        let result = read_tranches_file();
-        let _ = std::env::set_current_dir(&original_dir);
+        let result = with_current_dir(temp.path(), read_tranches_file);
 
         let tf_read = result.unwrap().expect("should find tranches file");
         let entries: Vec<ImplementationPlanEntry> = tf_read
@@ -1951,11 +1944,7 @@ status = "incomplete"
         // When no tranches file exists, read_tranches_file() returns None and
         // discover_plan_dispatch_entries should still work independently.
         let temp = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(temp.path()).unwrap();
-
-        let result = read_tranches_file();
-        let _ = std::env::set_current_dir(&original_dir);
+        let result = with_current_dir(temp.path(), read_tranches_file);
 
         assert!(
             result.unwrap().is_none(),
@@ -2097,12 +2086,9 @@ status = "incomplete"
             current_tranche_index: Some(0),
         };
 
-        // Use a stable path for restore — current_dir() may be invalidated by
-        // concurrent tests that drop TempDirs, so fall back to a known-stable path.
-        let restore_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(decoy_cwd.path()).unwrap();
-        let updated = maybe_mark_current_structured_tranche_complete(&plan).unwrap();
-        let _ = std::env::set_current_dir(&restore_dir);
+        let updated = with_current_dir(decoy_cwd.path(), || {
+            maybe_mark_current_structured_tranche_complete(&plan).unwrap()
+        });
 
         assert!(updated, "structured tranche should be marked complete");
 

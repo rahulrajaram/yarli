@@ -1027,7 +1027,7 @@ mod tests {
     use super::*;
     use crate::commands::{execute_task_annotate, list_runs_by_latest_state, resolve_run_id_input};
     use crate::events::*;
-    use crate::test_helpers::make_event;
+    use crate::test_helpers::{make_event, with_current_dir};
     use chrono::Utc;
     use std::fs::{self, File};
     use std::io::Write;
@@ -1515,10 +1515,7 @@ mod tests {
         .unwrap();
         drop(artifact);
 
-        let restore_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let output = render_task_output(&store, task_id).unwrap();
-        let _ = std::env::set_current_dir(&restore_dir);
+        let output = with_current_dir(tmp.path(), || render_task_output(&store, task_id).unwrap());
 
         assert!(output.contains("from artifact"));
     }
