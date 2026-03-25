@@ -116,6 +116,45 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     )
 }
 
+fn tranche_effective_fields_match(
+    existing: &TrancheDefinition,
+    requested: &TrancheDefinition,
+) -> bool {
+    existing.key == requested.key
+        && existing.summary == requested.summary
+        && existing.group == requested.group
+        && existing.allowed_paths == requested.allowed_paths
+        && existing.verify == requested.verify
+        && existing.done_when == requested.done_when
+        && existing.max_tokens == requested.max_tokens
+}
+
+fn tranche_effective_field_mismatches(
+    existing: &TrancheDefinition,
+    requested: &TrancheDefinition,
+) -> Vec<&'static str> {
+    let mut mismatches = Vec::new();
+    if existing.summary != requested.summary {
+        mismatches.push("summary");
+    }
+    if existing.group != requested.group {
+        mismatches.push("group");
+    }
+    if existing.allowed_paths != requested.allowed_paths {
+        mismatches.push("allowed_paths");
+    }
+    if existing.verify != requested.verify {
+        mismatches.push("verify");
+    }
+    if existing.done_when != requested.done_when {
+        mismatches.push("done_when");
+    }
+    if existing.max_tokens != requested.max_tokens {
+        mismatches.push("max_tokens");
+    }
+    mismatches
+}
+
 pub(crate) fn validate_structured_tranches_preflight_for_prompt(
     entry_prompt_path: &Path,
 ) -> Result<Option<PathBuf>> {
@@ -472,6 +511,7 @@ const PLACEHOLDER_PHRASES: &[&str] = &[
 // `yarli plan` command handlers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_plan_tranche_add(
     key: &str,
     summary: &str,
@@ -480,6 +520,7 @@ pub(crate) fn cmd_plan_tranche_add(
     verify: Option<&str>,
     done_when: Option<&str>,
     max_tokens: Option<u64>,
+    idempotent: bool,
 ) -> Result<()> {
     let def = TrancheDefinition {
         key: key.to_string(),
@@ -498,8 +539,20 @@ pub(crate) fn cmd_plan_tranche_add(
         tranches: Vec::new(),
     });
 
-    if tf.tranches.iter().any(|t| t.key == key) {
-        bail!("tranche with key '{}' already exists", key);
+    if let Some(existing) = tf.tranches.iter().find(|t| t.key == key) {
+        if !idempotent {
+            bail!("tranche with key '{}' already exists", key);
+        }
+        if tranche_effective_fields_match(existing, &def) {
+            println!("Tranche '{key}' already exists with matching fields; no changes made");
+            return Ok(());
+        }
+        let mismatches = tranche_effective_field_mismatches(existing, &def).join(", ");
+        bail!(
+            "tranche with key '{}' already exists with different fields: {}",
+            key,
+            mismatches
+        );
     }
 
     tf.tranches.push(def);
@@ -1713,6 +1766,78 @@ mode = "implement"
                 "summary='{summary}' should be valid"
             );
         }
+    }
+
+    #[test]
+    fn cmd_plan_tranche_add_idempotent_noops_on_matching_fields() {
+        let repo = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        std::env::set_current_dir(repo.path()).unwrap();
+
+        let allowed_paths = vec!["crates/yarli-cli/src".to_string()];
+        cmd_plan_tranche_add(
+            "TP-05",
+            "Implement config loader hardening",
+            Some("core"),
+            &allowed_paths,
+            Some("cargo test -p yarli-cli"),
+            Some("config loader handles overrides"),
+            Some(55_000),
+            false,
+        )
+        .unwrap();
+        cmd_plan_tranche_add(
+            "TP-05",
+            "Implement config loader hardening",
+            Some("core"),
+            &allowed_paths,
+            Some("cargo test -p yarli-cli"),
+            Some("config loader handles overrides"),
+            Some(55_000),
+            true,
+        )
+        .unwrap();
+
+        let parsed = read_tranches_file().unwrap().unwrap();
+        let _ = std::env::set_current_dir(&original_dir);
+
+        assert_eq!(parsed.tranches.len(), 1);
+        assert_eq!(parsed.tranches[0].key, "TP-05");
+    }
+
+    #[test]
+    fn cmd_plan_tranche_add_idempotent_rejects_mismatched_fields() {
+        let repo = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        std::env::set_current_dir(repo.path()).unwrap();
+
+        cmd_plan_tranche_add(
+            "TP-05",
+            "Implement config loader hardening",
+            Some("core"),
+            &[],
+            None,
+            None,
+            Some(55_000),
+            false,
+        )
+        .unwrap();
+        let err = cmd_plan_tranche_add(
+            "TP-05",
+            "Implement config loader drift guard",
+            Some("core"),
+            &[],
+            None,
+            None,
+            Some(55_000),
+            true,
+        )
+        .unwrap_err();
+        let _ = std::env::set_current_dir(&original_dir);
+
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("different fields"));
+        assert!(err_text.contains("summary"));
     }
 
     #[test]

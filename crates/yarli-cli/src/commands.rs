@@ -605,6 +605,15 @@ pub(crate) async fn cmd_run_continue(
         }
     };
 
+    if let Some(drift) = detect_continuation_tranche_drift(&payload)? {
+        bail!(
+            "continuation snapshot for run {} does not include newer open tranches from {}: {}. `yarli run continue` only replays the prior snapshot. Use `yarli run --fresh-from-tranches` to rebuild from the current plan/tranches state.",
+            payload.run_id,
+            drift.tranches_path.display(),
+            drift.missing_from_snapshot.join(", ")
+        );
+    }
+
     let auto_advance = config::AutoAdvanceConfig::from_loaded(loaded_config);
     let mut plan = build_plan_from_continuation_tranche(&tranche, loaded_config)?;
     let mut iteration = 1usize;
@@ -674,8 +683,14 @@ pub(crate) async fn cmd_run_default(
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
     prompt_file_override: Option<PathBuf>,
+    fresh_from_tranches: bool,
     allow_recursive_run_override: bool,
 ) -> Result<()> {
+    if fresh_from_tranches {
+        info!(
+            "explicit fresh-from-tranches mode requested; rebuilding from current prompt/plan/tranches state"
+        );
+    }
     let resolved_prompt =
         resolve_prompt_entry_path(loaded_config, prompt_file_override.as_deref())?;
     info!(

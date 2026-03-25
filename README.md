@@ -178,11 +178,16 @@ Start, monitor, and explain orchestration runs. `yarli run` (no subcommand) is t
 - Auto-advance policy: `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"` (default: `stable-ok`).
 - Task health trends (`[run.task_health.improving|stable|deteriorating]`) can trigger `continue`, `checkpoint-now`, `force-pivot`, or `stop-and-summarize`.
 - `[run].soft_token_cap_ratio` triggers checkpoint-now when total token usage reaches `ratio * max_run_total_tokens` (default: `0.9`).
+- `yarli run continue` replays the prior continuation snapshot. If current `.yarli/tranches.toml` has newer open tranche keys, it refuses and tells you to use `yarli run --fresh-from-tranches`.
+- `yarli run --fresh-from-tranches` explicitly rebuilds from current prompt/plan/tranches state and ignores continuation as an execution source.
 - Use `yarli run --allow-recursive-run ...` when a task command intentionally needs to invoke nested `yarli run` execution for that invocation.
 
 ```bash
 # Run the workspace's default prompt-defined loop.
 yarli run --stream
+
+# Make the live plan/tranches rebuild explicit.
+yarli run --fresh-from-tranches --stream
 
 # Override the prompt file for this invocation.
 yarli run --prompt-file prompts/I8C.md --stream
@@ -215,6 +220,9 @@ yarli run cancel --all-active --reason "operator stop"
 # Continue from the latest persisted continuation payload.
 yarli run continue
 yarli run continue --file .yarli/continuation.json
+
+# Rebuild from the current prompt/plan/tranches state instead of replaying continuation.
+yarli run --fresh-from-tranches
 
 # Legacy pace-based execution.
 yarli run batch --pace ci
@@ -337,12 +345,13 @@ Manage the structured tranches file (`.yarli/tranches.toml`) used by plan-driven
 yarli plan validate
 yarli plan tranche list
 yarli plan tranche add --key TP-05 --summary "Config loader hardening"
+yarli plan tranche add --key TP-05 --summary "Config loader hardening" --idempotent
 yarli plan tranche add --key TP-06 --summary "Guard runner" --group runtime --allowed-paths crates/yarli-exec,crates/yarli-cli --verify "cargo test -p yarli" --done-when "guard diagnostics render in run status" --max-tokens 60000
 yarli plan tranche complete --key TP-05
 yarli plan tranche remove --key TP-05
 ```
 
-`yarli plan tranche add` also supports tranche metadata fields used by plan-driven dispatch: `--group`, `--allowed-paths`, `--verify`, `--done-when`, and `--max-tokens`.
+`yarli plan tranche add` also supports tranche metadata fields used by plan-driven dispatch: `--group`, `--allowed-paths`, `--verify`, `--done-when`, and `--max-tokens`. Add `--idempotent` when an agent or script may enqueue the same tranche key repeatedly and you want matching definitions to no-op instead of failing.
 
 ### `yarli debug`
 
@@ -610,7 +619,7 @@ When guard-related telemetry indicates a stop or pivot condition:
 2. `yarli run explain-exit <run-id>` — inspect guard breach reasons and trend summary.
 3. `yarli task explain <task-id>` — inspect task-level budget, usage, and failure provenance.
 4. `yarli run pause|resume|cancel|drain <run-id>` — hold, stop, or finish-current-then-exit while adjusting scope.
-5. `yarli run continue` — continue only after guard intent has been reviewed.
+5. `yarli run continue` only when the continuation snapshot still matches current open tranches; otherwise use `yarli run --fresh-from-tranches`.
 
 ### Merge Conflict Recovery
 
@@ -620,7 +629,7 @@ When `run.status` or `run.explain-exit` show unresolved merge state:
 2. Open `PARALLEL_MERGE_RECOVERY.txt` in the preserved workspace root.
 3. Follow the printed recovery steps (inspect, review patch, retry apply, resolve markers).
 4. Pick action based on `[run].merge_conflict_resolution` policy (`fail`, `manual`, `auto-repair`).
-5. `yarli run continue` after remediation.
+5. Use `yarli run continue` if the snapshot still owns the remaining work, or `yarli run --fresh-from-tranches` if you queued new tranches during remediation.
 
 ## Troubleshooting
 
