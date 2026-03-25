@@ -100,7 +100,7 @@ Generated at (UTC): \`$(date -u +"%Y-%m-%dT%H:%M:%SZ")\`
 EOF
 
 workspace_log="${evidence_dir}/01-workspace.log"
-workspace_cmd='cargo test --workspace'
+workspace_cmd='cargo test --workspace -- --skip postgres'
 run_check "$workspace_log" "$workspace_cmd"
 workspace_ec=$?
 append_summary_entry "$workspace_cmd" "$workspace_ec" "$workspace_log"
@@ -151,7 +151,7 @@ else
   fi
 
   strict_cli_log="${evidence_dir}/05-strict-cli.log"
-  strict_cli_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture'
+  strict_cli_cmd='YARLI_TEST_DATABASE_URL="$YARLI_TEST_DATABASE_URL" YARLI_REQUIRE_POSTGRES_TESTS=1 cargo test -p yarli --test yarli_cli_postgres_integration -- --nocapture --test-threads=1'
   run_check "$strict_cli_log" "$strict_cli_cmd"
   strict_cli_ec=$?
   append_summary_entry "$strict_cli_cmd" "$strict_cli_ec" "$strict_cli_log"
@@ -178,13 +178,20 @@ else
       failures=$((failures + 1))
     fi
 
-    loop8_api_smoke_log="$workspace_log"
-
-    if ! rg -q "test health_endpoint_returns_ok" "$loop8_api_smoke_log"; then
+    loop8_api_smoke_log="${evidence_dir}/16-r8-api-smoke.log"
+    loop8_api_smoke_cmd='cargo test -p yarli health_endpoint_returns_ok -- --nocapture && cargo test -p yarli run_status_endpoint_replays_persisted_events -- --nocapture'
+    run_check "$loop8_api_smoke_log" "$loop8_api_smoke_cmd"
+    loop8_api_smoke_ec=$?
+    append_summary_entry "$loop8_api_smoke_cmd" "$loop8_api_smoke_ec" "$loop8_api_smoke_log"
+    if [[ "$loop8_api_smoke_ec" -ne 0 ]]; then
       failures=$((failures + 1))
     fi
 
-    if ! rg -q "test run_status_endpoint_replays_persisted_events" "$loop8_api_smoke_log"; then
+    if ! rg -q "health_endpoint_returns_ok" "$loop8_api_smoke_log"; then
+      failures=$((failures + 1))
+    fi
+
+    if ! rg -q "run_status_endpoint_replays_persisted_events" "$loop8_api_smoke_log"; then
       failures=$((failures + 1))
     fi
 

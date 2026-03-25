@@ -83,6 +83,14 @@ pub struct StoreOpLabel {
     pub operation: String,
 }
 
+/// Labels for runner hardening and enforcement outcomes.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EnforcementLabel {
+    pub mechanism: String,
+    pub outcome: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RunMetricLabel {
     pub run_id: String,
@@ -145,6 +153,8 @@ pub struct YarliMetrics {
     pub store_duration_seconds: Family<StoreOpLabel, Histogram>,
     /// Total slow queries observed (labelled by operation).
     pub store_slow_queries_total: Family<StoreOpLabel, Counter>,
+    /// Total runner hardening outcomes (rlimits, cgroup, pidfd, termination).
+    pub enforcement_outcomes_total: Family<EnforcementLabel, Counter>,
 
     // -- Git: Worktree --
     /// Total worktree state transitions (labelled by target state).
@@ -268,6 +278,13 @@ impl YarliMetrics {
             store_slow_queries_total.clone(),
         );
 
+        let enforcement_outcomes_total = Family::<EnforcementLabel, Counter>::default();
+        registry.register(
+            "yarli_enforcement_outcomes",
+            "Total runner hardening outcomes by mechanism, outcome, and reason",
+            enforcement_outcomes_total.clone(),
+        );
+
         // -- Git: Worktree --
         let worktree_state_total = Family::<StateLabel, Counter>::default();
         registry.register(
@@ -317,6 +334,7 @@ impl YarliMetrics {
             command_overhead_duration_seconds,
             store_duration_seconds,
             store_slow_queries_total,
+            enforcement_outcomes_total,
             worktree_state_total,
             merge_attempts_total,
             merge_conflicts_total,
@@ -467,6 +485,17 @@ impl YarliMetrics {
             })
             .inc();
     }
+
+    /// Record a runner hardening or enforcement outcome.
+    pub fn record_enforcement_outcome(&self, mechanism: &str, outcome: &str, reason: &str) {
+        self.enforcement_outcomes_total
+            .get_or_create(&EnforcementLabel {
+                mechanism: mechanism.to_string(),
+                outcome: outcome.to_string(),
+                reason: reason.to_string(),
+            })
+            .inc();
+    }
 }
 
 /// Encode the registry contents in Prometheus text exposition format.
@@ -533,6 +562,18 @@ mod tests {
         metrics.queue_lease_timeouts_total.inc();
         let output = encode_metrics(&registry);
         assert!(output.contains("yarli_queue_lease_timeouts_total 2"));
+    }
+
+    #[test]
+    fn enforcement_outcomes_counter() {
+        let (registry, metrics) = setup();
+        metrics.record_enforcement_outcome("pidfd", "fallback", "raw_pid");
+        metrics.record_enforcement_outcome("cgroup", "fallback", "rlimits_only_read_only");
+        let output = encode_metrics(&registry);
+        assert!(output.contains("yarli_enforcement_outcomes_total"));
+        assert!(output.contains("mechanism=\"pidfd\""));
+        assert!(output.contains("reason=\"raw_pid\""));
+        assert!(output.contains("reason=\"rlimits_only_read_only\""));
     }
 
     // -- Run metrics --

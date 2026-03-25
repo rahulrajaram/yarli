@@ -16,6 +16,11 @@ use crate::YARLI_VERSION;
 /// 2. `yarli.toml` `[run].prompt_file`
 /// 3. Legacy fallback lookup for `PROMPT.md`
 ///
+/// Tranche sizing guidance:
+/// - Prefer one coherent objective per tranche with one meaningful verification point.
+/// - Group tiny adjacent edits when they touch the same files or share the same reasoning context.
+/// - Split when verification or operator review creates a natural checkpoint.
+///
 /// Recommended durability: use Postgres (`core.backend = "postgres"`); in-memory mode blocks writes
 /// unless explicitly opted in via `core.allow_in_memory_writes = true`.
 ///
@@ -120,6 +125,10 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.max_auto_advance_tranches (default: 0; 0 = unlimited auto-advance per invocation)
 - run.enable_plan_tranche_grouping (default: false; group adjacent plan entries by shared tranche_group metadata)
 - run.max_grouped_tasks_per_tranche (default: 0; 0 = unlimited tasks per grouped tranche)
+- run.tranche_token_advisory.warn_tokens (default: 70000; advisory warning threshold per tranche; warnings only)
+- run.tranche_token_advisory.max_recommended_tokens (default: 100000; advisory upper bound per tranche; warnings only)
+- run.tranche_token_advisory_by_backend.<name>.warn_tokens (optional backend/model override)
+- run.tranche_token_advisory_by_backend.<name>.max_recommended_tokens (optional backend/model override)
 - run.enforce_plan_tranche_allowed_paths (default: false; surface `allowed_paths=` plan metadata as scope constraints)
 - run.merge_conflict_resolution (default: "fail"; values: fail|manual|auto-repair|llm-assisted)
 - run.merge_repair_command (optional; shell command for llm-assisted conflict repair)
@@ -134,6 +143,14 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.paces.<name>.cmds (legacy; list of commands for the named pace)
 - run.paces.<name>.working_dir (legacy; per-pace working dir override)
 - run.paces.<name>.command_timeout_seconds (legacy; per-pace timeout override)
+
+Tranche sizing guidance for plan-driven runs:
+- Prefer one coherent objective per tranche with one meaningful verification point.
+- Group adjacent tiny edits when they touch the same files or require the same reasoning context.
+- Use `run.enable_plan_tranche_grouping` plus `tranche_group=<name>` metadata to reduce rehydration cost for small plan items.
+- Split only when verification, risk, or operator review creates a natural checkpoint.
+- Treat tranche token usage as an advisory quality signal only: warning near 70k, default upper bound near 100k.
+- Prefer backend-specific overrides when different models show different quality cliffs.
 
 [budgets] (all optional; unset => unlimited)
 - budgets.max_task_rss_bytes
@@ -307,6 +324,11 @@ service_url = "http://127.0.0.1:8089"
 # Optional default prompt file for `yarli run`.
 # Resolution precedence: --prompt-file > run.prompt_file > PROMPT.md fallback.
 # prompt_file = "PROMPT.md"
+# Tranche sizing guidance for plan-driven runs:
+# - Prefer one coherent objective per tranche with one meaningful verification point.
+# - Group adjacent tiny edits when they touch the same files or require the same reasoning context.
+# - Split only when verification, risk, or operator review creates a natural checkpoint.
+# - If setup/rehydration cost dominates the actual edit, prefer grouped dispatch over micro-tranches.
 # Optional default objective when no prompt override is present.
 # objective = "verify workspace"
 # Seconds to wait for continuation payload availability (`yarli run continue`).
@@ -315,15 +337,6 @@ continue_wait_timeout_seconds = 0
 allow_stable_auto_advance = false
 # Preferred auto-advance policy: improving-only | stable-ok | always
 auto_advance_policy = "stable-ok"
-# Optional task-health actions by deterioration trend:
-# - continue: proceed with continuation + planned auto-advance evaluation
-# - checkpoint-now: stop planned auto-advance and checkpoint the current context
-# - force-pivot: force the next action to switch task focus (requires operator follow-up)
-# - stop-and-summarize: stop auto-advance and summarize state for manual review
-[run.task_health]
-improving = "continue"
-stable = "continue"
-deteriorating = "continue"
 # Optional soft-token checkpoint trigger ratio for run-level token hard caps.
 # - default: 0.9
 # - 0 disables the soft cap.
@@ -336,16 +349,34 @@ enable_plan_tranche_grouping = false
 max_grouped_tasks_per_tranche = 0
 # Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
 enforce_plan_tranche_allowed_paths = false
+# Auto-commit YARLI state files after every N tranches (0 = disabled).
+# auto_commit_interval = 1
+# Template for auto-commit messages (placeholders: {tranche_key}, {run_id}, {tranches_completed}, {tranches_total}).
+# auto_commit_message = "chore(state): checkpoint runtime state"
+# default_pace = "batch"
+# Optional task-health actions by deterioration trend:
+# - continue: proceed with continuation + planned auto-advance evaluation
+# - checkpoint-now: stop planned auto-advance and checkpoint the current context
+# - force-pivot: force the next action to switch task focus (requires operator follow-up)
+# - stop-and-summarize: stop auto-advance and summarize state for manual review
+[run.task_health]
+improving = "continue"
+stable = "continue"
+deteriorating = "continue"
+# Advisory tranche token thresholds (warning vs recommended upper bound; warnings only).
+[run.tranche_token_advisory]
+warn_tokens = 70000
+max_recommended_tokens = 100000
+# Optional backend/model-specific overrides keyed by `[cli].backend` (or `[cli].command`).
+# [run.tranche_token_advisory_by_backend.codex]
+# warn_tokens = 65000
+# max_recommended_tokens = 95000
 # Merge conflict resolution strategy: fail | manual | auto-repair | llm-assisted
 # merge_conflict_resolution = "fail"
 # Shell command for LLM-assisted merge conflict repair (required when llm-assisted).
 # merge_repair_command = "claude --print"
 # Timeout in seconds for the repair command (0 = no timeout).
 # merge_repair_timeout_seconds = 300
-# Auto-commit YARLI state files after every N tranches (0 = disabled).
-# auto_commit_interval = 1
-# Template for auto-commit messages (placeholders: {tranche_key}, {run_id}, {tranches_completed}, {tranches_total}).
-# auto_commit_message = "chore(state): checkpoint runtime state"
 # Optional run-spec task catalog (project-level verification/work commands).
 # [[run.tasks]]
 # key = "lint"
@@ -566,7 +597,7 @@ pub(crate) fn replace_between(haystack: &str, begin: &str, end: &str, replacemen
 pub(crate) enum Commands {
     #[command(
         about = "Manage orchestration runs (default: config-first plan-driven execution)",
-        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel|drain`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable adapter-backed hints/storage via `yarli.toml` (`[memory] provider = \"default\"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel|drain ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
+        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nTranche sizing guidance:\n- Prefer one coherent objective per tranche with one meaningful verification point.\n- Group tiny adjacent edits when they touch the same files or require the same reasoning context.\n- Split when verification, risk, or operator review creates a natural checkpoint.\n- If setup/rehydration cost dominates the actual edit, use grouped dispatch instead of micro-tranches.\n- Use advisory tranche token thresholds to catch oversized slices before quality degrades; backend-specific overrides are supported.\n- Thresholds surface warnings only and do not hard-block execution.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel|drain`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable adapter-backed hints/storage via `yarli.toml` (`[memory] provider = \"default\"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel|drain ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
     )]
     Run {
         /// Override the prompt file used by default `yarli run` (no subcommand).
@@ -753,7 +784,7 @@ pub(crate) enum RunAction {
     },
     #[command(
         about = "Show the current status of a run",
-        long_about = "Show the current status of a run.\n\nDisplays the run state, objective, task summary, and gate evaluation results.\nIf Memory backend is enabled, includes relevant memory hints.\n\n`run-id` may be a full UUID or a unique prefix from `yarli run list`.\n\nExamples:\n  yarli run status 019577a2-...\n  yarli run status <run-id>"
+        long_about = "Show the current status of a run.\n\nDisplays the run state, objective, task summary, gate evaluation results, and tranche token advisories.\nIf Memory backend is enabled, includes relevant memory hints.\n\n`run-id` may be a full UUID or a unique prefix from `yarli run list`.\n\nExamples:\n  yarli run status 019577a2-...\n  yarli run status <run-id>"
     )]
     Status {
         /// Run ID to query (UUID).
@@ -761,7 +792,7 @@ pub(crate) enum RunAction {
     },
     #[command(
         about = "Explain why a run is not done (Why Not Done? engine)",
-        long_about = "Explain why a run is not done (Why Not Done? engine).\n\nRuns the explain engine to diagnose why a run hasn't completed. Reports:\n- Open/blocked tasks and their blockers\n- Failed gate evaluations\n- Policy denials\n- Deterioration trends (repeated failures)\n\n`run-id` may be a full UUID or a unique prefix from `yarli run list`.\n\nExamples:\n  yarli run explain-exit 019577a2-...\n  yarli run explain-exit <run-id>"
+        long_about = "Explain why a run is not done (Why Not Done? engine).\n\nRuns the explain engine to diagnose why a run hasn't completed. Reports:\n- Open/blocked tasks and their blockers\n- Failed gate evaluations\n- Policy denials\n- Deterioration trends (repeated failures)\n- Tranche token advisories and high-cost tranche summaries\n\n`run-id` may be a full UUID or a unique prefix from `yarli run list`.\n\nExamples:\n  yarli run explain-exit 019577a2-...\n  yarli run explain-exit <run-id>"
     )]
     ExplainExit {
         /// Run ID to explain (UUID).
@@ -1218,4 +1249,52 @@ Examples:
         /// Snapshot label to restore from.
         label: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_config_template_mentions_tranche_sizing_guidance() {
+        let template = init_config_template(None);
+        assert!(template.contains("Tranche sizing guidance for plan-driven runs:"));
+        assert!(template.contains("one coherent objective per tranche"));
+        assert!(template.contains("prefer grouped dispatch over micro-tranches"));
+        assert!(template.contains("enable_plan_tranche_grouping = false"));
+    }
+
+    #[test]
+    fn init_config_template_keeps_allowed_paths_flag_in_run_table() {
+        let template = init_config_template(None);
+        let uncommented = template
+            .replace(
+                "# [run.tranche_token_advisory_by_backend.codex]",
+                "[run.tranche_token_advisory_by_backend.codex]",
+            )
+            .replace("# warn_tokens = 65000", "warn_tokens = 65000")
+            .replace(
+                "# max_recommended_tokens = 95000",
+                "max_recommended_tokens = 95000",
+            );
+
+        let loaded: crate::config::YarliConfig = toml::from_str(&uncommented)
+            .expect("template should parse after enabling backend override");
+
+        assert!(!loaded.run.enforce_plan_tranche_allowed_paths);
+        assert_eq!(loaded.run.soft_token_cap_ratio, 0.9);
+        assert_eq!(loaded.run.max_auto_advance_tranches, 0);
+        assert!(!loaded.run.enable_plan_tranche_grouping);
+        assert_eq!(
+            loaded
+                .run
+                .tranche_token_advisory_by_backend
+                .get("codex")
+                .expect("codex override should parse"),
+            &crate::config::AdvisoryTrancheTokenThresholds {
+                warn_tokens: 65_000,
+                max_recommended_tokens: 95_000,
+            }
+        );
+    }
 }

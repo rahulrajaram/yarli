@@ -617,6 +617,7 @@ impl LoadedConfig {
         if self.config.core.backend == BackendKind::Postgres {
             self.resolve_postgres_database_url()?;
         }
+        self.config.run.validate_merge_repair_config()?;
         Ok(())
     }
 
@@ -1023,6 +1024,31 @@ fn default_soft_token_cap_ratio() -> f64 {
     0.9
 }
 
+fn default_advisory_tranche_warn_tokens() -> u64 {
+    70_000
+}
+
+fn default_advisory_tranche_max_tokens() -> u64 {
+    100_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdvisoryTrancheTokenThresholds {
+    #[serde(default = "default_advisory_tranche_warn_tokens")]
+    pub warn_tokens: u64,
+    #[serde(default = "default_advisory_tranche_max_tokens")]
+    pub max_recommended_tokens: u64,
+}
+
+impl Default for AdvisoryTrancheTokenThresholds {
+    fn default() -> Self {
+        Self {
+            warn_tokens: default_advisory_tranche_warn_tokens(),
+            max_recommended_tokens: default_advisory_tranche_max_tokens(),
+        }
+    }
+}
+
 fn default_worktree_exclude_paths() -> Vec<String> {
     vec![
         ".yarl/workspaces".to_string(),
@@ -1124,6 +1150,19 @@ pub struct RunConfig {
     /// `0` means unlimited.
     #[serde(default)]
     pub max_grouped_tasks_per_tranche: u32,
+    /// Advisory tranche-token thresholds used for operator guidance and warnings only.
+    ///
+    /// These thresholds do not hard-stop execution; they surface quality signals so
+    /// operators and planners can regroup oversized tranches before quality drifts.
+    #[serde(default)]
+    pub tranche_token_advisory: AdvisoryTrancheTokenThresholds,
+    /// Optional backend/model-specific advisory tranche-token overrides.
+    ///
+    /// Keys are matched case-insensitively against `[cli].backend` first, then
+    /// `[cli].command` when backend is unset.
+    #[serde(default)]
+    pub tranche_token_advisory_by_backend:
+        std::collections::BTreeMap<String, AdvisoryTrancheTokenThresholds>,
     /// Enforce per-tranche allowed path hints from `IMPLEMENTATION_PLAN.md`.
     ///
     /// When enabled, `allowed_paths=` metadata is surfaced as explicit scope instructions
@@ -1217,6 +1256,16 @@ impl RunConfig {
                 _ => {}
             }
         }
+        validate_advisory_tranche_token_thresholds(
+            "run.tranche_token_advisory",
+            &self.tranche_token_advisory,
+        )?;
+        for (backend, thresholds) in &self.tranche_token_advisory_by_backend {
+            validate_advisory_tranche_token_thresholds(
+                &format!("run.tranche_token_advisory_by_backend.{backend}"),
+                thresholds,
+            )?;
+        }
         Ok(())
     }
 
@@ -1229,6 +1278,22 @@ impl RunConfig {
         } else {
             AutoAdvancePolicy::ImprovingOnly
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn advisory_tranche_token_thresholds_for_backend(
+        &self,
+        backend: Option<&str>,
+    ) -> AdvisoryTrancheTokenThresholds {
+        let Some(backend) = backend.map(str::trim).filter(|value| !value.is_empty()) else {
+            return self.tranche_token_advisory.clone();
+        };
+        let normalized = backend.to_ascii_lowercase();
+        self.tranche_token_advisory_by_backend
+            .iter()
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(&normalized))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| self.tranche_token_advisory.clone())
     }
 }
 
@@ -1245,6 +1310,8 @@ impl Default for RunConfig {
             max_auto_advance_tranches: 0,
             enable_plan_tranche_grouping: false,
             max_grouped_tasks_per_tranche: 0,
+            tranche_token_advisory: AdvisoryTrancheTokenThresholds::default(),
+            tranche_token_advisory_by_backend: std::collections::BTreeMap::new(),
             enforce_plan_tranche_allowed_paths: false,
             allow_recursive_run: false,
             merge_conflict_resolution: MergeConflictResolution::Fail,
@@ -1259,6 +1326,26 @@ impl Default for RunConfig {
             paces: std::collections::BTreeMap::new(),
         }
     }
+}
+
+fn validate_advisory_tranche_token_thresholds(
+    label: &str,
+    thresholds: &AdvisoryTrancheTokenThresholds,
+) -> Result<()> {
+    if thresholds.warn_tokens == 0 {
+        bail!("{label}.warn_tokens must be greater than zero");
+    }
+    if thresholds.max_recommended_tokens == 0 {
+        bail!("{label}.max_recommended_tokens must be greater than zero");
+    }
+    if thresholds.warn_tokens > thresholds.max_recommended_tokens {
+        bail!(
+            "{label}.warn_tokens ({}) must be <= {label}.max_recommended_tokens ({})",
+            thresholds.warn_tokens,
+            thresholds.max_recommended_tokens
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1801,6 +1888,10 @@ mod tests {
             "run.max_auto_advance_tranches",
             "run.enable_plan_tranche_grouping",
             "run.max_grouped_tasks_per_tranche",
+            "run.tranche_token_advisory.warn_tokens",
+            "run.tranche_token_advisory.max_recommended_tokens",
+            "run.tranche_token_advisory_by_backend.<name>.warn_tokens",
+            "run.tranche_token_advisory_by_backend.<name>.max_recommended_tokens",
             "run.enforce_plan_tranche_allowed_paths",
             "run.merge_conflict_resolution",
             "run.merge_repair_command",
@@ -2094,6 +2185,15 @@ env_unset = ["BAD-NAME"]
         assert_eq!(loaded.config().run.max_auto_advance_tranches, 0);
         assert!(!loaded.config().run.enable_plan_tranche_grouping);
         assert_eq!(loaded.config().run.max_grouped_tasks_per_tranche, 0);
+        assert_eq!(
+            loaded.config().run.tranche_token_advisory,
+            AdvisoryTrancheTokenThresholds::default()
+        );
+        assert!(loaded
+            .config()
+            .run
+            .tranche_token_advisory_by_backend
+            .is_empty());
         assert!(!loaded.config().run.enforce_plan_tranche_allowed_paths);
         assert!(loaded.config().run.tasks.is_empty());
         assert!(loaded.config().run.tranches.is_empty());
@@ -2166,6 +2266,14 @@ default_pace = "batch"
 improving = "continue"
 stable = "checkpoint-now"
 deteriorating = "stop-and-summarize"
+
+[run.tranche_token_advisory]
+warn_tokens = 60000
+max_recommended_tokens = 90000
+
+[run.tranche_token_advisory_by_backend.codex]
+warn_tokens = 50000
+max_recommended_tokens = 80000
 [[run.tasks]]
 key = "lint"
 cmd = "cargo clippy --workspace -- -D warnings"
@@ -2289,6 +2397,23 @@ mode = "stream"
         assert_eq!(loaded.config().run.max_auto_advance_tranches, 0);
         assert!(loaded.config().run.enable_plan_tranche_grouping);
         assert_eq!(loaded.config().run.max_grouped_tasks_per_tranche, 3);
+        assert_eq!(
+            loaded.config().run.tranche_token_advisory,
+            AdvisoryTrancheTokenThresholds {
+                warn_tokens: 60_000,
+                max_recommended_tokens: 90_000,
+            }
+        );
+        assert_eq!(
+            loaded
+                .config()
+                .run
+                .advisory_tranche_token_thresholds_for_backend(Some("codex")),
+            AdvisoryTrancheTokenThresholds {
+                warn_tokens: 50_000,
+                max_recommended_tokens: 80_000,
+            }
+        );
         assert!(loaded.config().run.enforce_plan_tranche_allowed_paths);
         assert_eq!(loaded.config().run.tasks.len(), 2);
         assert_eq!(loaded.config().run.tasks[0].key, "lint");
@@ -2393,6 +2518,24 @@ inject_on_failure = true
         assert_eq!(resolved.kind, MemoryProviderKind::Cli);
         assert_eq!(resolved.command, "memory-backend");
         assert_eq!(resolved.query_limit, 5);
+    }
+
+    #[test]
+    fn advisory_tranche_thresholds_validate_warn_not_above_max() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("yarli.toml");
+        std::fs::write(
+            &path,
+            r#"
+[run.tranche_token_advisory]
+warn_tokens = 120000
+max_recommended_tokens = 100000
+"#,
+        )
+        .unwrap();
+
+        let err = LoadedConfig::load(&path).unwrap_err();
+        assert!(err.to_string().contains("warn_tokens"));
     }
 
     #[test]

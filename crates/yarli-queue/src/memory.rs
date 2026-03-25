@@ -85,6 +85,7 @@ impl TaskQueue for InMemoryTaskQueue {
             lease_owner: None,
             lease_expires_at: None,
             last_heartbeat: None,
+            rehydration_tokens: None,
             created_at: now,
             updated_at: now,
         };

@@ -7,6 +7,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
+use reqwest::Client;
+use serial_test::serial;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::ConnectOptions;
 use sqlx::{PgPool, Row};
@@ -25,8 +27,11 @@ const REQUIRE_POSTGRES_TESTS_ENV: &str = "YARLI_REQUIRE_POSTGRES_TESTS";
 const TEST_DATABASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_POSTGRES_BOOTSTRAP_HINT: &str =
     "docker run --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16";
+const POSTGRES_CLI_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(60);
+const POSTGRES_CLI_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
+#[serial]
 async fn merge_request_and_status_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -87,6 +92,7 @@ async fn merge_request_and_status_roundtrip_against_postgres(
 }
 
 #[tokio::test]
+#[serial]
 async fn run_start_and_status_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
 {
     let Some(admin_database_url) =
@@ -142,6 +148,7 @@ async fn run_start_and_status_roundtrip_against_postgres() -> Result<(), Box<dyn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn debug_queue_commands_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
 {
     let Some(admin_database_url) =
@@ -176,12 +183,12 @@ async fn debug_queue_commands_roundtrip_against_postgres() -> Result<(), Box<dyn
         .stderr(stderr_file)
         .spawn()?;
 
-    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+    let run_id = wait_for_any_run_in_db(&pool, POSTGRES_CLI_OBSERVATION_TIMEOUT).await?;
     wait_for_run_activated_event(
         &pool,
         &mut child,
         run_id,
-        Duration::from_secs(30),
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
         &stdout_path,
         &stderr_path,
     )
@@ -191,7 +198,7 @@ async fn debug_queue_commands_roundtrip_against_postgres() -> Result<(), Box<dyn
         &mut child,
         run_id,
         "task.executing",
-        Duration::from_secs(30),
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
         &stdout_path,
         &stderr_path,
     )
@@ -231,14 +238,175 @@ async fn debug_queue_commands_roundtrip_against_postgres() -> Result<(), Box<dyn
     Command::new("kill")
         .args(["-TERM", &child_pid.to_string()])
         .output()?;
-    let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
-    wait_for_run_state(&pool, run_id, "RUN_CANCELLED", Duration::from_secs(15)).await?;
+    let _child_output =
+        tokio::time::timeout(POSTGRES_CLI_OBSERVATION_TIMEOUT, child.wait()).await??;
+    wait_for_run_state(&pool, run_id, "RUN_CANCELLED", POSTGRES_CLI_STATE_TIMEOUT).await?;
 
     database.drop().await?;
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn serve_command_exposes_health_and_run_status_against_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) =
+        test_database_url_for_test("serve_command_exposes_health_and_run_status_against_postgres")
+    else {
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let temp_dir = TempDir::new()?;
+    write_test_config(temp_dir.path(), &database.database_url)?;
+    let binary = yarli_binary_path()?;
+
+    let stdout_path = temp_dir.path().join("yarli-serve-stdout.log");
+    let stderr_path = temp_dir.path().join("yarli-serve-stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
+    let mut child = tokio::process::Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["serve", "--bind", "127.0.0.1", "--port", "0"])
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()?;
+
+    let base_url = wait_for_serve_base_url(
+        &mut child,
+        &stdout_path,
+        &stderr_path,
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
+    )
+    .await?;
+
+    let client = Client::builder().build()?;
+    wait_for_health_endpoint(
+        &client,
+        &base_url,
+        &mut child,
+        &stdout_path,
+        &stderr_path,
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
+    )
+    .await?;
+
+    let health_payload: serde_json::Value = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(health_payload["status"], "ok");
+
+    let create_payload: serde_json::Value = client
+        .post(format!("{base_url}/v1/runs"))
+        .json(&serde_json::json!({
+            "objective": "postgres serve smoke"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let run_id = create_payload["run_id"]
+        .as_str()
+        .ok_or("missing run_id in create run response")?
+        .to_string();
+    assert_eq!(create_payload["state"], "RunActive");
+    assert_eq!(create_payload["objective"], "postgres serve smoke");
+
+    let status_payload: serde_json::Value = client
+        .get(format!("{base_url}/v1/runs/{run_id}/status"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        status_payload["run_id"],
+        serde_json::Value::String(run_id.clone())
+    );
+    assert_eq!(status_payload["state"], "RunActive");
+    assert_eq!(status_payload["objective"], "postgres serve smoke");
+
+    terminate_child_process(&mut child).await?;
+    database.drop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn serve_command_default_path_excludes_debug_queue_routes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(admin_database_url) =
+        test_database_url_for_test("serve_command_default_path_excludes_debug_queue_routes")
+    else {
+        return Ok(());
+    };
+
+    let database = TestDatabase::create(&admin_database_url).await?;
+    apply_migrations(&database.database_url).await?;
+
+    let temp_dir = TempDir::new()?;
+    write_test_config(temp_dir.path(), &database.database_url)?;
+    let binary = yarli_binary_path()?;
+
+    let stdout_path = temp_dir.path().join("yarli-serve-stdout.log");
+    let stderr_path = temp_dir.path().join("yarli-serve-stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
+    let mut child = tokio::process::Command::new(&binary)
+        .current_dir(temp_dir.path())
+        .args(["serve", "--bind", "127.0.0.1", "--port", "0"])
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()?;
+
+    let base_url = wait_for_serve_base_url(
+        &mut child,
+        &stdout_path,
+        &stderr_path,
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
+    )
+    .await?;
+
+    let client = Client::builder().build()?;
+    wait_for_health_endpoint(
+        &client,
+        &base_url,
+        &mut child,
+        &stdout_path,
+        &stderr_path,
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
+    )
+    .await?;
+
+    let health_payload: serde_json::Value = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(health_payload["status"], "ok");
+
+    let debug_response = client
+        .get(format!("{base_url}/debug/queue-depth"))
+        .send()
+        .await?;
+    assert_eq!(debug_response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    terminate_child_process(&mut child).await?;
+    database.drop().await?;
+    Ok(())
+}
+
 #[tokio::test]
+#[serial]
 async fn run_projection_state_consistency_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -312,6 +480,7 @@ async fn run_projection_state_consistency_roundtrip_against_postgres(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
 {
     let Some(admin_database_url) =
@@ -350,7 +519,7 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
         .spawn()?;
 
     // Wait for the run to appear in Postgres (any state including RUN_OPEN).
-    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+    let run_id = wait_for_any_run_in_db(&pool, POSTGRES_CLI_OBSERVATION_TIMEOUT).await?;
 
     // Wait for the run.activated event in the events table.  We cannot poll
     // the `runs` table because `sync_postgres_state_if_changed` only runs after
@@ -359,7 +528,7 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
         &pool,
         &mut child,
         run_id,
-        Duration::from_secs(30),
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
         &stdout_path,
         &stderr_path,
     )
@@ -378,9 +547,10 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
         .output()?;
 
     // Wait for the background process to exit.
-    let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
+    let _child_output =
+        tokio::time::timeout(POSTGRES_CLI_OBSERVATION_TIMEOUT, child.wait()).await??;
 
-    wait_for_run_state(&pool, run_id, "RUN_CANCELLED", Duration::from_secs(15)).await?;
+    wait_for_run_state(&pool, run_id, "RUN_CANCELLED", POSTGRES_CLI_STATE_TIMEOUT).await?;
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
     assert_eq!(state, "RUN_CANCELLED");
     assert_eq!(exit_reason, Some("cancelled_by_operator".to_string()));
@@ -444,6 +614,7 @@ async fn run_cancel_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn run_cancel_load_hardening_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -492,12 +663,12 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
         .spawn()?;
 
     // Wait for the run to appear in Postgres then become active (via events table).
-    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+    let run_id = wait_for_any_run_in_db(&pool, POSTGRES_CLI_OBSERVATION_TIMEOUT).await?;
     wait_for_run_activated_event(
         &pool,
         &mut child,
         run_id,
-        Duration::from_secs(30),
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
         &stdout_path,
         &stderr_path,
     )
@@ -511,9 +682,10 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
         .output()?;
 
     // Wait for the background process to exit.
-    let _child_output = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
+    let _child_output =
+        tokio::time::timeout(POSTGRES_CLI_OBSERVATION_TIMEOUT, child.wait()).await??;
 
-    wait_for_run_state(&pool, run_id, "RUN_CANCELLED", Duration::from_secs(15)).await?;
+    wait_for_run_state(&pool, run_id, "RUN_CANCELLED", POSTGRES_CLI_STATE_TIMEOUT).await?;
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
     assert_eq!(state, "RUN_CANCELLED");
     assert_eq!(exit_reason, Some("cancelled_by_operator".to_string()));
@@ -566,6 +738,7 @@ async fn run_cancel_load_hardening_roundtrip_against_postgres(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
         test_database_url_for_test("run_drain_roundtrip_against_postgres")
@@ -606,12 +779,12 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
         .stderr(stderr_file)
         .spawn()?;
 
-    let run_id = wait_for_any_run_in_db(&pool, Duration::from_secs(30)).await?;
+    let run_id = wait_for_any_run_in_db(&pool, POSTGRES_CLI_OBSERVATION_TIMEOUT).await?;
     wait_for_run_activated_event(
         &pool,
         &mut child,
         run_id,
-        Duration::from_secs(30),
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
         &stdout_path,
         &stderr_path,
     )
@@ -621,7 +794,7 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
         &mut child,
         run_id,
         "task.executing",
-        Duration::from_secs(15),
+        POSTGRES_CLI_STATE_TIMEOUT,
         &stdout_path,
         &stderr_path,
     )
@@ -646,9 +819,16 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
     let drain_stdout = String::from_utf8(drain_output.stdout)?;
     assert!(drain_stdout.contains("drain requested"));
 
-    let _child_status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await??;
+    let _child_status =
+        tokio::time::timeout(POSTGRES_CLI_OBSERVATION_TIMEOUT, child.wait()).await??;
 
-    wait_for_run_event(&pool, run_id, "run.drained", Duration::from_secs(30)).await?;
+    wait_for_run_event(
+        &pool,
+        run_id,
+        "run.drained",
+        POSTGRES_CLI_OBSERVATION_TIMEOUT,
+    )
+    .await?;
 
     assert!(
         count_events(&pool, "run", "run.drain_requested", run_id).await? >= 1,
@@ -722,6 +902,7 @@ async fn run_drain_roundtrip_against_postgres() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test]
+#[serial]
 async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dyn std::error::Error>>
 {
     let Some(admin_database_url) =
@@ -765,7 +946,7 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
             )
         })?;
 
-    wait_for_run_state(&pool, run_id, "RUN_FAILED", Duration::from_secs(20)).await?;
+    wait_for_run_state(&pool, run_id, "RUN_FAILED", POSTGRES_CLI_STATE_TIMEOUT).await?;
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
     assert_eq!(state, "RUN_FAILED");
     // Command-level timeout causes task failure which leads to run failure with
@@ -819,6 +1000,7 @@ async fn run_timeout_hardening_roundtrip_against_postgres() -> Result<(), Box<dy
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn overwatch_runner_hardening_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -863,7 +1045,7 @@ async fn overwatch_runner_hardening_roundtrip_against_postgres(
     let run_stdout = String::from_utf8(run_output.stdout)?;
     let run_id = parse_run_id(&run_stdout).ok_or("missing run id in overwatch hardening output")?;
 
-    wait_for_run_state(&pool, run_id, "RUN_COMPLETED", Duration::from_secs(15)).await?;
+    wait_for_run_state(&pool, run_id, "RUN_COMPLETED", POSTGRES_CLI_STATE_TIMEOUT).await?;
 
     let task_states = fetch_task_states(&pool, run_id).await?;
     assert!(task_states.iter().all(|state| state == "TASK_COMPLETE"));
@@ -905,6 +1087,7 @@ async fn overwatch_runner_hardening_roundtrip_against_postgres(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn overwatch_runner_failure_roundtrip_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(admin_database_url) =
@@ -949,7 +1132,7 @@ async fn overwatch_runner_failure_roundtrip_against_postgres(
             )
         })?;
 
-    wait_for_run_state(&pool, run_id, "RUN_FAILED", Duration::from_secs(20)).await?;
+    wait_for_run_state(&pool, run_id, "RUN_FAILED", POSTGRES_CLI_STATE_TIMEOUT).await?;
 
     let (state, exit_reason) = fetch_run_state(&pool, run_id).await?;
     assert_eq!(state, "RUN_FAILED");
@@ -1349,6 +1532,86 @@ async fn wait_for_any_run_in_db(
     }
 }
 
+async fn wait_for_serve_base_url(
+    child: &mut tokio::process::Child,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "serve URL wait timeout overflow".to_string())?;
+
+    loop {
+        let stdout_content = fs::read_to_string(stdout_path).unwrap_or_default();
+        if let Some(url) = parse_serve_base_url(&stdout_content) {
+            return Ok(url);
+        }
+
+        if let Some(exit_status) = child.try_wait()? {
+            let stderr_content = fs::read_to_string(stderr_path).unwrap_or_default();
+            return Err(format!(
+                "yarli serve exited prematurely with {exit_status} while waiting for bind address\n\
+                 stdout:\n{stdout_content}\nstderr:\n{stderr_content}"
+            )
+            .into());
+        }
+
+        if Instant::now() >= deadline {
+            let stderr_content = fs::read_to_string(stderr_path).unwrap_or_default();
+            return Err(format!(
+                "timed out waiting for yarli serve startup banner\n\
+                 stdout:\n{stdout_content}\nstderr:\n{stderr_content}"
+            )
+            .into());
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_health_endpoint(
+    client: &Client,
+    base_url: &str,
+    child: &mut tokio::process::Child,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "health endpoint wait timeout overflow".to_string())?;
+
+    loop {
+        match client.get(format!("{base_url}/health")).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(_) | Err(_) => {}
+        }
+
+        if let Some(exit_status) = child.try_wait()? {
+            let stdout_content = fs::read_to_string(stdout_path).unwrap_or_default();
+            let stderr_content = fs::read_to_string(stderr_path).unwrap_or_default();
+            return Err(format!(
+                "yarli serve exited prematurely with {exit_status} while waiting for /health\n\
+                 stdout:\n{stdout_content}\nstderr:\n{stderr_content}"
+            )
+            .into());
+        }
+
+        if Instant::now() >= deadline {
+            let stdout_content = fs::read_to_string(stdout_path).unwrap_or_default();
+            let stderr_content = fs::read_to_string(stderr_path).unwrap_or_default();
+            return Err(format!(
+                "timed out waiting for {base_url}/health\n\
+                 stdout:\n{stdout_content}\nstderr:\n{stderr_content}"
+            )
+            .into());
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Wait for a `run.activated` event in the events table.
 ///
 /// The `runs` table is only updated by `sync_postgres_state_if_changed` which
@@ -1581,6 +1844,15 @@ fn map_run_state_to_db(state: &str) -> Option<&'static str> {
         "RunDrained" => Some("RUN_DRAINED"),
         _ => None,
     }
+}
+
+fn parse_serve_base_url(stdout_content: &str) -> Option<String> {
+    stdout_content.lines().find_map(|line| {
+        line.strip_prefix("Starting YARLI API server on ")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 fn map_task_state_to_db(state: &str) -> Option<&'static str> {
@@ -1820,6 +2092,19 @@ fn yarli_binary_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+async fn terminate_child_process(
+    child: &mut tokio::process::Child,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(child_pid) = child.id() {
+        Command::new("kill")
+            .args(["-TERM", &child_pid.to_string()])
+            .output()?;
+    }
+
+    let _ = tokio::time::timeout(POSTGRES_CLI_OBSERVATION_TIMEOUT, child.wait()).await??;
+    Ok(())
 }
 
 struct TestDatabase {

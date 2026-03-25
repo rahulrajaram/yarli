@@ -37,6 +37,7 @@ pub(crate) struct PlannedTask {
     pub(crate) tranche_group: Option<String>,
     pub(crate) depends_on: Vec<String>,
     pub(crate) allowed_paths: Vec<String>,
+    pub(crate) rehydration_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +77,11 @@ pub(crate) struct RunTokenTotals {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) total_tokens: u64,
+}
+
+pub(crate) fn estimate_rehydration_tokens(input: &str) -> u64 {
+    let chars = input.chars().count() as u64;
+    (chars / 4).max(1)
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +273,7 @@ pub(crate) fn resolve_run_plan(
             tranche_group: None,
             depends_on: Vec::new(),
             allowed_paths: Vec::new(),
+            rehydration_tokens: None,
         })
         .collect::<Vec<_>>();
 
@@ -437,25 +444,28 @@ pub(crate) fn build_grouped_plan_tranches(
         max_grouped_tasks_per_tranche as usize
     };
     let mut tranches: Vec<PlannedTranche> = Vec::new();
+    let mut previous_entry: Option<&ImplementationPlanEntry> = None;
 
     for (idx, (entry, task_key)) in entry_task_pairs.iter().enumerate() {
+        if enable_grouping
+            && should_group_plan_entry(previous_entry, entry, tranches.last(), grouped_task_cap)
+        {
+            if let Some(last) = tranches.last_mut() {
+                last.task_keys.push(task_key.clone());
+                previous_entry = Some(entry);
+                continue;
+            }
+        }
+
         if enable_grouping {
             if let Some(group) = entry.tranche_group.as_deref() {
-                if let Some(last) = tranches.last_mut() {
-                    if last.tranche_group.as_deref() == Some(group)
-                        && last.task_keys.len() < grouped_task_cap
-                    {
-                        last.task_keys.push(task_key.clone());
-                        continue;
-                    }
-                }
-
                 tranches.push(PlannedTranche {
                     key: format!("group-{:03}-{}", idx + 1, group),
                     objective: format!("{objective} [group:{group}]"),
                     task_keys: vec![task_key.clone()],
                     tranche_group: Some(group.to_string()),
                 });
+                previous_entry = Some(entry);
                 continue;
             }
         }
@@ -466,6 +476,7 @@ pub(crate) fn build_grouped_plan_tranches(
             task_keys: vec![task_key.clone()],
             tranche_group: entry.tranche_group.clone(),
         });
+        previous_entry = Some(entry);
     }
 
     tranches
@@ -559,6 +570,7 @@ pub(crate) fn build_plan_driven_run_sequence(
             tranche_group: tranche.tranche_group.clone(),
             depends_on: Vec::new(),
             allowed_paths: tranche.allowed_paths.clone(),
+            rehydration_tokens: Some(estimate_rehydration_tokens(&prompt_text)),
         });
         entry_task_pairs.push((tranche.clone(), task_key));
     }
@@ -582,6 +594,7 @@ pub(crate) fn build_plan_driven_run_sequence(
         tranche_group: None,
         depends_on: Vec::new(),
         allowed_paths: Vec::new(),
+        rehydration_tokens: Some(estimate_rehydration_tokens(&verification_prompt)),
     });
     tranche_plan.push(PlannedTranche {
         key: "verification".to_string(),
@@ -651,6 +664,7 @@ pub(crate) fn build_plain_prompt_run_sequence(
         tranche_group: None,
         depends_on: Vec::new(),
         allowed_paths: Vec::new(),
+        rehydration_tokens: Some(estimate_rehydration_tokens(&loaded_prompt.expanded_text)),
     }];
     let tranche_plan = vec![PlannedTranche {
         key: "prompt".to_string(),
@@ -803,6 +817,7 @@ pub(crate) fn build_task_catalog_from_run_spec(
                 tranche_group: None,
                 depends_on: t.depends_on.clone(),
                 allowed_paths: Vec::new(),
+                rehydration_tokens: None,
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -974,6 +989,9 @@ pub(crate) fn parse_task_catalog_from_snapshot(
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default(),
+                    rehydration_tokens: task
+                        .get("rehydration_tokens")
+                        .and_then(|value| value.as_u64()),
                 })
             })
             .collect::<Vec<_>>()
@@ -1437,6 +1455,7 @@ pub(crate) fn build_plan_from_continuation_tranche(
                     tranche_group: None,
                     depends_on: Vec::new(),
                     allowed_paths: Vec::new(),
+                    rehydration_tokens: None,
                 }
             }
         })
@@ -1794,6 +1813,7 @@ pub(crate) fn parse_plan_status_keywords(text: &str) -> Option<bool> {
     None
 }
 
+#[allow(dead_code)]
 pub(crate) fn parse_tranche_group_token(token: &str) -> Option<String> {
     let trimmed = token.trim_matches(|ch: char| {
         matches!(
@@ -1838,17 +1858,152 @@ pub(crate) fn normalize_allowed_path(raw: &str) -> Option<String> {
     Some(normalized.to_string())
 }
 
-pub(crate) fn parse_allowed_paths_token(token: &str) -> Option<Vec<String>> {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '[' | ']' | '(' | ')' | '{' | '}' | ',' | ';' | '"' | '\''
-        )
-    });
-    let (key, value) = trimmed.split_once('=')?;
-    if !key.eq_ignore_ascii_case("allowed_paths") {
+#[derive(Debug, Clone)]
+struct PlanMetadataMatch {
+    key: &'static str,
+    value: String,
+    start: usize,
+    end: usize,
+}
+
+fn is_plan_metadata_boundary(ch: Option<char>) -> bool {
+    match ch {
+        None => true,
+        Some(ch) => ch.is_ascii_whitespace() || matches!(ch, '[' | '(' | '{' | ',' | ';'),
+    }
+}
+
+fn skip_ascii_whitespace(text: &str, mut idx: usize) -> usize {
+    while let Some(ch) = text[idx..].chars().next() {
+        if !ch.is_ascii_whitespace() {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    idx
+}
+
+fn match_plan_metadata_assignment(
+    text: &str,
+    key: &'static str,
+    start: usize,
+) -> Option<PlanMetadataMatch> {
+    let head = text.get(start..start.saturating_add(key.len()))?;
+    if !head.eq_ignore_ascii_case(key) {
         return None;
     }
+    if !is_plan_metadata_boundary(text[..start].chars().next_back()) {
+        return None;
+    }
+
+    let mut idx = skip_ascii_whitespace(text, start + key.len());
+    if text[idx..].chars().next()? != '=' {
+        return None;
+    }
+    idx += '='.len_utf8();
+    idx = skip_ascii_whitespace(text, idx);
+
+    let mut remove_start = start;
+    if let Some(prev) = text[..start].chars().next_back() {
+        if matches!(prev, '[' | '(' | '{') {
+            remove_start -= prev.len_utf8();
+        }
+    }
+
+    let first = text[idx..].chars().next()?;
+    let (value, mut end) = if matches!(first, '"' | '\'') {
+        let quote = first;
+        let value_start = idx + quote.len_utf8();
+        let rel_end = text[value_start..].find(quote)?;
+        let value_end = value_start + rel_end;
+        (
+            text[value_start..value_end].to_string(),
+            value_end + quote.len_utf8(),
+        )
+    } else {
+        let value_start = idx;
+        let mut value_end = value_start;
+        for (offset, ch) in text[value_start..].char_indices() {
+            if ch.is_ascii_whitespace() || matches!(ch, ']' | ')' | '}' | ';') {
+                break;
+            }
+            value_end = value_start + offset + ch.len_utf8();
+        }
+        if value_end == value_start {
+            return None;
+        }
+        (
+            text[value_start..value_end]
+                .trim_end_matches(',')
+                .to_string(),
+            value_end,
+        )
+    };
+
+    while let Some(ch) = text[end..].chars().next() {
+        if matches!(ch, ']' | ')' | '}' | ',' | ';') {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+
+    Some(PlanMetadataMatch {
+        key,
+        value,
+        start: remove_start,
+        end,
+    })
+}
+
+fn collect_plan_metadata_matches(text: &str) -> Vec<PlanMetadataMatch> {
+    const PLAN_METADATA_KEYS: [&str; 5] = [
+        "tranche_group",
+        "allowed_paths",
+        "verify",
+        "done_when",
+        "max_tokens",
+    ];
+
+    let mut matches = Vec::new();
+    let mut idx = 0usize;
+    while idx < text.len() {
+        let mut matched = None;
+        for key in PLAN_METADATA_KEYS {
+            if let Some(found) = match_plan_metadata_assignment(text, key, idx) {
+                matched = Some(found);
+                break;
+            }
+        }
+
+        if let Some(found) = matched {
+            idx = found.end;
+            matches.push(found);
+        } else if let Some(ch) = text[idx..].chars().next() {
+            idx += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    matches
+}
+
+fn parse_plan_metadata_value(text: &str, key: &'static str) -> Option<String> {
+    collect_plan_metadata_matches(text)
+        .into_iter()
+        .find(|item| item.key == key)
+        .map(|item| item.value)
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_allowed_paths_token(token: &str) -> Option<Vec<String>> {
+    let value = parse_plan_metadata_value(token, "allowed_paths")?;
     Some(
         value
             .split(',')
@@ -1858,50 +2013,99 @@ pub(crate) fn parse_allowed_paths_token(token: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn parse_plan_tranche_group(text: &str) -> Option<String> {
-    text.split_whitespace().find_map(parse_tranche_group_token)
+    let value = parse_plan_metadata_value(text, "tranche_group")?;
+    let normalized = sanitize_task_key_component(value.trim());
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 pub(crate) fn parse_plan_allowed_paths(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
-    text.split_whitespace()
-        .filter_map(parse_allowed_paths_token)
-        .flat_map(|items| items.into_iter())
+    collect_plan_metadata_matches(text)
+        .into_iter()
+        .filter(|item| item.key == "allowed_paths")
+        .map(|item| item.value)
+        .flat_map(|value| {
+            value
+                .split(',')
+                .filter_map(normalize_allowed_path)
+                .collect::<Vec<_>>()
+        })
         .filter(|path| seen.insert(path.to_ascii_lowercase()))
         .collect()
 }
 
+pub(crate) fn parse_plan_verify(text: &str) -> Option<String> {
+    parse_plan_metadata_value(text, "verify").filter(|value| !value.trim().is_empty())
+}
+
+pub(crate) fn parse_plan_done_when(text: &str) -> Option<String> {
+    parse_plan_metadata_value(text, "done_when").filter(|value| !value.trim().is_empty())
+}
+
+pub(crate) fn parse_plan_max_tokens(text: &str) -> Option<u64> {
+    parse_plan_metadata_value(text, "max_tokens").and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 pub(crate) fn strip_plan_metadata_tokens(text: &str) -> String {
-    let filtered = text
+    let matches = collect_plan_metadata_matches(text);
+    if matches.is_empty() {
+        return text.trim().to_string();
+    }
+
+    let mut stripped = text.to_string();
+    for item in matches.iter().rev() {
+        stripped.replace_range(item.start..item.end, "");
+    }
+
+    let filtered = stripped
         .split_whitespace()
-        .filter(|token| {
-            parse_tranche_group_token(token).is_none() && parse_allowed_paths_token(token).is_none()
-        })
         .collect::<Vec<_>>()
-        .join(" ");
-    if filtered.trim().is_empty() {
+        .join(" ")
+        .trim()
+        .to_string();
+    if filtered.is_empty() {
         text.trim().to_string()
     } else {
-        filtered.trim().to_string()
+        filtered
     }
 }
 
-pub(crate) fn extract_plan_target_key(text: &str) -> Option<String> {
-    for raw in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')) {
-        let token = raw.trim();
-        if token.is_empty() {
-            continue;
-        }
-        if token_has_alpha_and_digit(token) {
-            return Some(token.to_string());
-        }
-    }
-    None
+fn plan_entries_share_grouping_contract(
+    previous: &ImplementationPlanEntry,
+    current: &ImplementationPlanEntry,
+) -> bool {
+    previous.tranche_group == current.tranche_group
+        && previous.verify == current.verify
+        && previous.done_when == current.done_when
+        && previous.max_tokens == current.max_tokens
+        && previous.allowed_paths == current.allowed_paths
 }
 
-pub(crate) fn token_has_alpha_and_digit(token: &str) -> bool {
-    let has_alpha = token.chars().any(|ch| ch.is_ascii_alphabetic());
-    let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
-    has_alpha && has_digit
+fn should_group_plan_entry(
+    previous_entry: Option<&ImplementationPlanEntry>,
+    current_entry: &ImplementationPlanEntry,
+    last_tranche: Option<&PlannedTranche>,
+    grouped_task_cap: usize,
+) -> bool {
+    let Some(group) = current_entry.tranche_group.as_deref() else {
+        return false;
+    };
+    let Some(last_tranche) = last_tranche else {
+        return false;
+    };
+    if last_tranche.tranche_group.as_deref() != Some(group)
+        || last_tranche.task_keys.len() >= grouped_task_cap
+    {
+        return false;
+    }
+
+    previous_entry
+        .map(|entry| plan_entries_share_grouping_contract(entry, current_entry))
+        .unwrap_or(false)
 }
 
 pub(crate) fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntry> {
@@ -1914,9 +2118,9 @@ pub(crate) fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntr
             is_complete,
             tranche_group: parse_plan_tranche_group(entry),
             allowed_paths: parse_plan_allowed_paths(entry),
-            verify: None,
-            done_when: None,
-            max_tokens: None,
+            verify: parse_plan_verify(entry),
+            done_when: parse_plan_done_when(entry),
+            max_tokens: parse_plan_max_tokens(entry),
         });
     }
 
@@ -1943,10 +2147,29 @@ pub(crate) fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntr
         is_complete,
         tranche_group: parse_plan_tranche_group(candidate),
         allowed_paths: parse_plan_allowed_paths(candidate),
-        verify: None,
-        done_when: None,
-        max_tokens: None,
+        verify: parse_plan_verify(candidate),
+        done_when: parse_plan_done_when(candidate),
+        max_tokens: parse_plan_max_tokens(candidate),
     })
+}
+
+pub(crate) fn extract_plan_target_key(text: &str) -> Option<String> {
+    for raw in text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')) {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token_has_alpha_and_digit(token) {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+pub(crate) fn token_has_alpha_and_digit(token: &str) -> bool {
+    let has_alpha = token.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
+    has_alpha && has_digit
 }
 
 pub(crate) fn discover_plan_entries(plan_text: &str) -> Vec<ImplementationPlanEntry> {
@@ -2035,9 +2258,9 @@ pub(crate) fn parse_plan_tranche_header_line(line: &str) -> Option<Implementatio
         is_complete,
         tranche_group: parse_plan_tranche_group(candidate),
         allowed_paths: parse_plan_allowed_paths(candidate),
-        verify: None,
-        done_when: None,
-        max_tokens: None,
+        verify: parse_plan_verify(candidate),
+        done_when: parse_plan_done_when(candidate),
+        max_tokens: parse_plan_max_tokens(candidate),
     })
 }
 
@@ -3345,6 +3568,109 @@ max_grouped_tasks_per_tranche = 2
     }
 
     #[test]
+    fn plan_driven_sequence_grouping_keeps_verify_boundaries_separate() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement grouped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A first tranche_group=core verify=\"cargo test core-a\"\n- [ ] I8B second tranche_group=core verify=\"cargo test core-b\"\n- [ ] I8C third tranche_group=core verify=\"cargo test core-b\"\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enable_plan_tranche_grouping = true
+max_grouped_tasks_per_tranche = 0
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (_tasks, tranches) = build_plan_driven_run_sequence(
+            &loaded_config,
+            &loaded_prompt,
+            "implement grouped plan",
+        )
+        .unwrap();
+
+        assert_eq!(tranches.len(), 3);
+        assert_eq!(tranches[0].key, "group-001-core");
+        assert_eq!(tranches[0].task_keys.len(), 1);
+        assert!(tranches[0].task_keys[0].starts_with("tranche-001"));
+        assert_eq!(tranches[1].key, "group-002-core");
+        assert_eq!(tranches[1].task_keys.len(), 2);
+        assert!(tranches[1].task_keys[0].starts_with("tranche-002"));
+        assert!(tranches[1].task_keys[1].starts_with("tranche-003"));
+        assert_eq!(tranches[2].key, "verification");
+    }
+
+    #[test]
+    fn plan_driven_sequence_grouping_keeps_allowed_path_boundaries_separate() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("PROMPT.md"),
+            r#"
+```yarli-run
+version = 1
+objective = "implement grouped plan"
+```
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("IMPLEMENTATION_PLAN.md"),
+            "- [ ] I8A first tranche_group=core allowed_paths=src/a.rs\n- [ ] I8B second tranche_group=core allowed_paths=src/b.rs\n",
+        )
+        .unwrap();
+
+        let loaded_config = write_test_config_at(
+            &temp.path().join("yarli.toml"),
+            r#"
+[cli]
+command = "codex"
+args = ["exec", "--json"]
+prompt_mode = "arg"
+
+[run]
+enable_plan_tranche_grouping = true
+max_grouped_tasks_per_tranche = 0
+"#,
+        );
+        let loaded_prompt =
+            prompt::load_prompt_and_run_spec(&temp.path().join("PROMPT.md")).unwrap();
+        let (_tasks, tranches) = build_plan_driven_run_sequence(
+            &loaded_config,
+            &loaded_prompt,
+            "implement grouped plan",
+        )
+        .unwrap();
+
+        assert_eq!(tranches.len(), 3);
+        assert_eq!(tranches[0].key, "group-001-core");
+        assert_eq!(tranches[0].task_keys.len(), 1);
+        assert!(tranches[0].task_keys[0].starts_with("tranche-001"));
+        assert_eq!(tranches[1].key, "group-002-core");
+        assert_eq!(tranches[1].task_keys.len(), 1);
+        assert!(tranches[1].task_keys[0].starts_with("tranche-002"));
+        assert_eq!(tranches[2].key, "verification");
+    }
+
+    #[test]
     fn plan_driven_sequence_surfaces_allowed_paths_scope_when_enforced() {
         let temp = TempDir::new().unwrap();
         std::fs::write(
@@ -4072,6 +4398,8 @@ cmds = ["echo ok"]
                 cancelled: 0,
                 pending: 0,
             },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
             next_tranche: Some(TrancheSpec {
                 suggested_objective: "next".into(),
                 kind: TrancheKind::PlannedNext,

@@ -22,6 +22,8 @@ path = "crates/yarli-cli/src/main.rs"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = { version = "0.3", features = ["sink"] }
 sw4rm-sdk = "0.4"
+tokio-stream = { version = "0.1", optional = true }
+tonic = { version = "0.12", optional = true }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -53,13 +55,15 @@ libc = "0.2"
 
 [features]
 default = []
-sw4rm = []
+sw4rm = ["dep:tokio-stream", "dep:tonic"]
 chaos = []
 debug-api = []
 test-support = []
 
 [dev-dependencies]
 assert_matches = "1.5"
+proptest = "1"
+serial_test = "3"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 axum08 = { package = "axum", version = "0.8" }

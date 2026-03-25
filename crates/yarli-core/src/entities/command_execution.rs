@@ -38,6 +38,9 @@ pub struct TokenUsage {
     pub completion_tokens: u64,
     /// Total tokens consumed.
     pub total_tokens: u64,
+    /// Estimated prompt/context reload cost for this command, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehydration_tokens: Option<u64>,
     /// How token counts were produced.
     pub source: String,
 }

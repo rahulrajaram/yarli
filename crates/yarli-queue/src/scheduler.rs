@@ -29,7 +29,9 @@ use crate::yarli_core::explain::GateType;
 use crate::yarli_core::fsm::command::CommandState;
 use crate::yarli_core::fsm::run::RunState;
 use crate::yarli_core::fsm::task::TaskState;
-use crate::yarli_exec::{CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError};
+use crate::yarli_exec::{
+    CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError, ResourceLimits,
+};
 use crate::yarli_gates::{all_passed, collect_failures, evaluate_all, GateContext};
 use crate::yarli_observability::{AuditEntry, AuditSink};
 use crate::yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
@@ -151,6 +153,57 @@ impl Default for SchedulerConfig {
             max_runtime: None,
             idle_timeout: None,
         }
+    }
+}
+
+#[cfg(unix)]
+fn cpu_ticks_to_seconds(ticks: u64) -> u64 {
+    if ticks == 0 {
+        return 0;
+    }
+
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_sec <= 0 {
+        return ticks;
+    }
+
+    let ticks_per_sec = ticks_per_sec as u64;
+    ticks.saturating_add(ticks_per_sec.saturating_sub(1)) / ticks_per_sec
+}
+
+#[cfg(not(unix))]
+fn cpu_ticks_to_seconds(ticks: u64) -> u64 {
+    ticks
+}
+
+fn build_resource_limits(budgets: &ResourceBudgetConfig) -> Option<ResourceLimits> {
+    let mut limits = ResourceLimits::default();
+    let mut has_limits = false;
+
+    if let Some(bytes) = budgets.max_task_rss_bytes {
+        limits.max_memory_bytes = Some(bytes);
+        has_limits = true;
+    }
+
+    let cpu_ticks_total = budgets
+        .max_task_cpu_user_ticks
+        .zip(budgets.max_task_cpu_system_ticks)
+        .map(|(user_ticks, system_ticks)| user_ticks.saturating_add(system_ticks))
+        .or(budgets.max_task_cpu_user_ticks)
+        .or(budgets.max_task_cpu_system_ticks);
+
+    if let Some(cpu_ticks) = cpu_ticks_total {
+        let cpu_secs = cpu_ticks_to_seconds(cpu_ticks);
+        if cpu_secs > 0 {
+            limits.max_cpu_seconds = Some(cpu_secs);
+            has_limits = true;
+        }
+    }
+
+    if has_limits {
+        Some(limits)
+    } else {
+        None
     }
 }
 
@@ -1096,7 +1149,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             timeout: self.config.command_timeout,
             env: vec![],
             live_output_tx,
-            resource_limits: None,
+            resource_limits: build_resource_limits(&self.config.budgets),
+            rehydration_tokens: entry.rehydration_tokens,
         };
 
         // Execute via journal
@@ -2670,6 +2724,7 @@ mod tests {
     use crate::yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
     use crate::yarli_queue::InMemoryTaskQueue;
     use crate::yarli_store::InMemoryEventStore;
+    use proptest::prelude::*;
 
     fn test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -2712,6 +2767,113 @@ mod tests {
 
     fn make_task(run_id: RunId, key: &str, command: &str, correlation_id: Uuid) -> Task {
         Task::new(run_id, key, command, CommandClass::Io, correlation_id)
+    }
+
+    #[test]
+    fn test_build_resource_limits_with_no_limits_returns_none() {
+        let budgets = ResourceBudgetConfig::default();
+
+        let limits = build_resource_limits(&budgets);
+
+        assert!(limits.is_none());
+    }
+
+    #[test]
+    fn test_build_resource_limits_maps_memory_and_cpu_ticks() {
+        let budgets = ResourceBudgetConfig {
+            max_task_rss_bytes: Some(1024),
+            max_task_cpu_user_ticks: Some(500),
+            max_task_cpu_system_ticks: None,
+            ..ResourceBudgetConfig::default()
+        };
+
+        let limits = build_resource_limits(&budgets).expect("resource limits should be present");
+
+        let expected_cpu_seconds = cpu_ticks_to_seconds(500);
+        assert_eq!(limits.max_memory_bytes, Some(1024));
+        assert_eq!(
+            limits.max_cpu_seconds,
+            if expected_cpu_seconds > 0 {
+                Some(expected_cpu_seconds)
+            } else {
+                None
+            },
+            "cpu tick values should be translated using cpu_ticks_to_seconds"
+        );
+    }
+
+    #[test]
+    fn test_build_resource_limits_prefers_sum_of_cpu_user_and_system_ticks() {
+        let budgets = ResourceBudgetConfig {
+            max_task_cpu_user_ticks: Some(10),
+            max_task_cpu_system_ticks: Some(1),
+            ..ResourceBudgetConfig::default()
+        };
+
+        let limits = build_resource_limits(&budgets).expect("resource limits should be present");
+
+        let expected_cpu_seconds = cpu_ticks_to_seconds(11);
+        assert_eq!(
+            limits.max_cpu_seconds,
+            if expected_cpu_seconds > 0 {
+                Some(expected_cpu_seconds)
+            } else {
+                None
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_resource_limits_falls_back_to_single_cpu_tick_field() {
+        let budgets = ResourceBudgetConfig {
+            max_task_cpu_user_ticks: None,
+            max_task_cpu_system_ticks: Some(10),
+            ..ResourceBudgetConfig::default()
+        };
+
+        let limits = build_resource_limits(&budgets).expect("resource limits should be present");
+
+        let expected_cpu_seconds = cpu_ticks_to_seconds(10);
+        assert_eq!(
+            limits.max_cpu_seconds,
+            if expected_cpu_seconds > 0 {
+                Some(expected_cpu_seconds)
+            } else {
+                None
+            }
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn scheduler_budget_cpu_tick_conversion_is_monotonic(a in any::<u64>(), b in any::<u64>()) {
+            let (low, high) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(cpu_ticks_to_seconds(low) <= cpu_ticks_to_seconds(high));
+        }
+
+        #[test]
+        fn scheduler_budget_cpu_tick_conversion_is_overflow_safe(
+            user_ticks in any::<u64>(),
+            system_ticks in any::<u64>(),
+        ) {
+            let budgets = ResourceBudgetConfig {
+                max_task_cpu_user_ticks: Some(user_ticks),
+                max_task_cpu_system_ticks: Some(system_ticks),
+                ..ResourceBudgetConfig::default()
+            };
+
+            let limits = build_resource_limits(&budgets).expect("resource limits should be present");
+            let expected_cpu_seconds = cpu_ticks_to_seconds(user_ticks.saturating_add(system_ticks));
+
+            prop_assert_eq!(
+                limits.max_cpu_seconds,
+                if expected_cpu_seconds > 0 {
+                    Some(expected_cpu_seconds)
+                } else {
+                    None
+                }
+            );
+        }
     }
 
     #[tokio::test]

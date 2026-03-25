@@ -980,6 +980,7 @@ fn row_to_queue_entry(row: PgRow) -> Result<QueueEntry, QueueError> {
         last_heartbeat: row
             .try_get("last_heartbeat")
             .map_err(|error| QueueError::Database(error.to_string()))?,
+        rehydration_tokens: None,
         created_at: row
             .try_get("created_at")
             .map_err(|error| QueueError::Database(error.to_string()))?,

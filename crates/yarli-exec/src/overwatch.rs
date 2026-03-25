@@ -198,7 +198,11 @@ impl CommandRunner for OverwatchCommandRunner {
                         warn!(task_id = %task_id, error = %err, "overwatch cancel call failed");
                     }
                     execution.chunk_count = 0;
-                    execution.token_usage = Some(estimate_token_usage(&execution.command, &[]));
+                    execution.token_usage = Some(estimate_token_usage(
+                        &execution.command,
+                        &[],
+                        request.rehydration_tokens,
+                    ));
                     execution
                         .transition(
                             CommandState::CmdKilled,
@@ -240,7 +244,11 @@ impl CommandRunner for OverwatchCommandRunner {
         );
 
         execution.resource_usage = status.resource_usage.clone();
-        execution.token_usage = Some(estimate_token_usage(&execution.command, &chunks));
+        execution.token_usage = Some(estimate_token_usage(
+            &execution.command,
+            &chunks,
+            request.rehydration_tokens,
+        ));
         execution.chunk_count = chunks.len() as u64;
 
         match map_terminal_outcome(&status) {
@@ -612,6 +620,7 @@ mod tests {
             env: vec![("A".to_string(), "B".to_string())],
             live_output_tx: None,
             resource_limits: None,
+            rehydration_tokens: None,
         }
     }
 

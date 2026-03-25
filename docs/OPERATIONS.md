@@ -274,6 +274,50 @@ Behavior notes:
 - `ui.verbose_output` affects stream verbosity only. Provenance capture is independent; enable `ui.cancellation_diagnostics = true` to append extra diagnostic context in provenance `actor_detail`.
 - Durable provenance history requires Postgres backend. In-memory backend keeps provenance only for the lifetime of the current process (plus any existing `.yarli/continuation.json` artifact).
 
+## Runner Hardening Telemetry and cgroup Delegation
+
+Use these signals when validating the runner hardening path in production-like environments:
+
+- `yarli_enforcement_outcomes_total{mechanism,outcome,reason}`
+  - `mechanism="rlimit"` confirms pre-exec `setrlimit(2)` application.
+  - `mechanism="pidfd"` distinguishes race-free pidfd control from `raw_pid` fallback.
+  - `mechanism="cgroup"` reports `attached` success or `rlimits_only_*` fallback reasons.
+  - `mechanism="pid_termination"` records bounded failure reasons during cancellation escalation.
+- `yarli_command_overhead_duration_seconds`
+  - Useful for spotting expensive spawn/resource-capture phases during runner rollout.
+- `/proc/self/cgroup`
+  - Confirms whether the YARLI process is operating inside the expected delegated subtree.
+
+Delegation requirements for cgroup v2:
+
+- YARLI needs a writable delegated cgroup subtree, not blanket write access to the root hierarchy.
+- In systemd environments, run the service in a delegated unit/slice so it can create leaf cgroups below its assigned boundary.
+- In container/Kubernetes environments, verify the container runtime exposes a writable subtree for the service user before expecting cgroup enforcement.
+- Non-root execution is supported; if the subtree is read-only or not delegated, YARLI falls back to rlimits-only mode and emits `rlimits_only_*` telemetry.
+
+Operator checklist before enabling cgroup enforcement:
+
+1. Confirm the service user is non-root and can create/remove a test directory under its delegated cgroup subtree.
+2. Start YARLI and hit `/metrics`, then verify `yarli_enforcement_outcomes_total` emits either `attached` or an explicit `rlimits_only_*` fallback.
+3. Run a bounded verification command and confirm `yarli debug resource-usage <run-id>` and `/proc/self/cgroup` match expectations.
+4. If metrics show repeated `permission_denied` or `read_only` fallback, keep the deployment in rlimits-only mode until delegation is fixed.
+
+## sw4rm Fallback Behavior
+
+`yarli run sw4rm` is intentionally fail-closed around transport setup and stream loss:
+
+- Invalid merged sw4rm run-spec configuration falls back to a minimal verification suite (`cargo build`) so the agent still has a bounded verification path.
+- Router/report client initialization, runtime init, or registry registration failures stop startup immediately and return a non-zero error to the operator.
+- If the response correlation is dropped because shutdown/preemption cancels the in-flight stream, the orchestrator surfaces `Cancelled` rather than fabricating a result.
+- If the correlation stays pending past `sw4rm.llm_response_timeout_secs`, the orchestrator cleans up the pending entry and returns `LlmTimeout`.
+
+Recommended operator response:
+
+1. Treat startup failures as connectivity/configuration issues, not partial success.
+2. Retry only after router/registry reachability and credentials are confirmed.
+3. Treat `Cancelled` as an interrupted orchestration and resume or requeue explicitly.
+4. Treat `LlmTimeout` as an execution-budget or transport-latency issue and inspect router/runtime health before retrying.
+
 ## Runtime Resource and Token Budgets
 
 YARLI can enforce explicit per-task and per-run budgets from `yarli.toml`:
