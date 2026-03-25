@@ -66,16 +66,36 @@ docker run --rm yarli:local --help
 
 ## Quick Start
 
-```bash
-# 1) Generate config template
-yarli init
+Use a backend-specific template so `[cli]` is populated. Replace `codex` with
+`claude`, `gemini`, or `kiro-cli` if that is the agent CLI you want YARLI to
+drive.
 
-# 2) For local ephemeral writes, set in yarli.toml:
+```bash
+# 1) Generate a backend-specific config template.
+yarli init --backend codex
+
+# 2) In yarli.toml, set a workspace root for parallel task execution.
+# For local ephemeral writes, also opt into in-memory writes:
 # [core]
 # backend = "in-memory"
 # allow_in_memory_writes = true
+#
+# [execution]
+# worktree_root = ".yarl/workspaces"
 
-# 3) Ensure PROMPT.md exists, then run
+# 3) Run inside a git repo that already has a valid HEAD, then create:
+#    - PROMPT.md
+#    - IMPLEMENTATION_PLAN.md (for plan-driven dispatch)
+#
+#    Minimum PROMPT.md:
+#    # Project Prompt
+#
+#    @include IMPLEMENTATION_PLAN.md
+#
+#    Minimum IMPLEMENTATION_PLAN.md:
+#    - [ ] T1 describe the first tranche
+
+# 4) Run the default plan-driven loop.
 yarli run --stream
 ```
 
@@ -155,6 +175,9 @@ If `--stream` is requested but the current environment is not a TTY, YARLI falls
 
 Creates a documented `yarli.toml` template to bootstrap a workspace. This is where you initialize durability (Postgres vs ephemeral), execution backend (native vs Overwatch), budgets, policy mode, and UI mode.
 
+`yarli init` writes a fully annotated skeleton. Use `yarli init --backend <name>`
+when you want a runnable `[cli]` section for first-run setup.
+
 ```bash
 yarli init                                    # Create yarli.toml
 yarli init --print                            # Print template without writing
@@ -170,6 +193,7 @@ yarli init --backend kiro-cli                 # Kiro CLI-flavored template
 
 Start, monitor, and explain orchestration runs. `yarli run` (no subcommand) is the primary config-first, plan-driven workflow.
 
+- For config-first `yarli run`, configure `[cli]` first (for example via `yarli init --backend codex`) and run inside a git repo with a valid `HEAD`.
 - Parallel mode defaults to enabled (`[features].parallel = true`); requires `[execution].worktree_root`.
 - In parallel mode, YARLI prepares one workspace per task under `execution.worktree_root`.
 - Before creating new git-worktree task slots, YARLI sweeps `execution.worktree_root` for abandoned `run-*` roots, salvages dirty worktrees onto durable branches, and reclaims empty stale roots.
@@ -229,12 +253,12 @@ yarli run batch --pace ci
 yarli run batch --objective "nightly check" -w /repo --timeout 900
 ```
 
-Feature-gated sw4rm agent mode:
+Feature-gated sw4rm agent mode (build or install YARLI with `--features sw4rm` first):
 
 ```bash
 cargo run --features sw4rm -- run sw4rm --help
-yarli run sw4rm
-YARLI_LOG=debug yarli run sw4rm
+cargo run --features sw4rm -- run sw4rm
+YARLI_LOG=debug cargo run --features sw4rm -- run sw4rm
 ```
 
 `yarli run sw4rm` requires a build with `--features sw4rm` and reads its runtime configuration from `[sw4rm]` in `yarli.toml`.
