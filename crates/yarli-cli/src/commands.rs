@@ -724,12 +724,18 @@ pub(crate) async fn cmd_run_default(
         run_spec: run_spec.clone(),
     };
     let plan_guard_context = run_spec_plan_guard_preflight(&loaded)?;
-    if let Some(validated_tranches_path) =
-        validate_structured_tranches_preflight_for_prompt(&loaded.entry_path)?
-    {
+    let validated_tranches_path =
+        validate_structured_tranches_preflight_for_prompt(&loaded.entry_path)?;
+    if let Some(ref path) = validated_tranches_path {
         info!(
-            tranches_file = %validated_tranches_path.display(),
+            tranches_file = %path.display(),
             "validated structured tranches file preflight"
+        );
+    }
+    if fresh_from_tranches && validated_tranches_path.is_none() {
+        warn!(
+            "fresh-from-tranches requested but no structured tranches file found; \
+             falling back to plan-text dispatch"
         );
     }
 

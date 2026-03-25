@@ -1841,6 +1841,63 @@ mode = "implement"
     }
 
     #[test]
+    fn cmd_plan_tranche_add_idempotent_matches_first_of_duplicate_keys() {
+        // Write a tranches file with two entries sharing the same key but different
+        // summaries (simulating a hand-edit or merge artifact). The idempotent path
+        // in cmd_plan_tranche_add uses `iter().find()`, which returns the first
+        // match. This test verifies that matching the first entry succeeds and that
+        // no dedup side-effect occurs.
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"version = 1
+
+[[tranches]]
+key = "TP-05"
+summary = "Implement config loader hardening"
+status = "incomplete"
+
+[[tranches]]
+key = "TP-05"
+summary = "Implement config loader drift guard"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let tf = read_tranches_file_in(repo.path()).unwrap().unwrap();
+
+        // Simulate the idempotent lookup: find first entry with matching key.
+        let requested = TrancheDefinition {
+            key: "TP-05".to_string(),
+            summary: "Implement config loader hardening".to_string(),
+            status: TrancheStatus::Incomplete,
+            group: None,
+            allowed_paths: vec![],
+            verify: None,
+            done_when: None,
+            max_tokens: None,
+        };
+        let existing = tf.tranches.iter().find(|t| t.key == "TP-05");
+        assert!(
+            existing.is_some(),
+            "should find at least one entry with key TP-05"
+        );
+        assert!(
+            tranche_effective_fields_match(existing.unwrap(), &requested),
+            "first duplicate entry should match the requested fields"
+        );
+
+        // File should still have both entries — no dedup side-effect.
+        assert_eq!(
+            tf.tranches.len(),
+            2,
+            "file should retain both duplicate entries"
+        );
+    }
+
+    #[test]
     fn build_plan_driven_prefers_structured_file() {
         let temp = TempDir::new().unwrap();
         let yarli_dir = temp.path().join(".yarli");

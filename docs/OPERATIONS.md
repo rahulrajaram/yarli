@@ -467,6 +467,24 @@ The external `yarli-execution-loop` skill is expected to treat Yarli as the dura
 - Choose `yarli run --fresh-from-tranches` after new tranche enqueue or other live-plan changes.
 - End each agent cycle with a `YARLI_DECISION_V1` block containing `status`, `reason`, `enqueued_tranches`, and `next_command`.
 
+### Idempotent Tranche Enqueue
+
+`yarli plan tranche add --idempotent` is designed for safe repeated invocation in
+agent loops. The semantics are:
+
+- **Matching fields → no-op.** If a tranche with the given key already exists and
+  all effective fields (summary, group, allowed_paths, verify, done_when, max_tokens)
+  match the request, the command prints a confirmation message and returns success
+  without modifying the file.
+- **Mismatched fields → error.** If the key exists but any effective field differs,
+  the command fails with a message listing which fields differ. This prevents
+  accidental overwrites while making the conflict visible to the caller.
+- **New key → normal add.** If no tranche with the key exists, the tranche is
+  appended exactly as with a non-idempotent `add`.
+- **Safe for repeated invocation.** Because identical calls are no-ops and
+  conflicting calls are errors, agents can call `--idempotent` unconditionally at the
+  start of every cycle without side effects or silent data loss.
+
 ## Reproducing Budget Stress Checks Locally
 
 Run these commands to verify budget governance under parallel workload:
