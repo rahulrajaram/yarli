@@ -402,11 +402,17 @@ Quick diagnosis cheat sheet:
 - Deterioration-cycle response:
   1. Inspect current state with `yarli run status <run-id>` and `yarli run explain-exit <run-id>`
   2. If guidance is `force-pivot` or `stop-and-summarize`, pause/stop before continuing
-  3. Re-run with narrower scope, then continue via `yarli run continue` after intent is updated
+  3. Re-run with narrower scope, then continue via `yarli run continue` only if the continuation snapshot still matches current open tranches
 - Soft-cap continuation guidance (`checkpoint-now`):
   1. Treat as a review checkpoint and avoid blind continuation
   2. Evaluate remaining objective and current usage headroom
   3. If safe, continue; otherwise cancel and restart with adjusted `[run]` strategy
+
+Continuation semantics:
+
+- `yarli run continue` replays the prior continuation snapshot and is the right tool for retry/unfinished/planned-next work that already belongs to that snapshot.
+- `yarli run --fresh-from-tranches` rebuilds from the current prompt/plan/tranches state and is the right tool after you enqueue new tranches or otherwise change `.yarli/tranches.toml`.
+- When current `.yarli/tranches.toml` contains open tranche keys not represented in the continuation snapshot, `yarli run continue` now refuses with an actionable drift message instead of silently replaying stale scope.
 
 ## Merge Conflict Policy and Incident Response
 
@@ -435,7 +441,7 @@ Incident response workflow:
 - Open `PARALLEL_MERGE_RECOVERY.txt` in the preserved workspace root reported by `run.parallel_merge_failed`.
 - Run recovery commands from the note in order (status, patch diff stats, manual `git apply` retry).
 - Resolve conflicts and re-run with your normal operator decision path:
-  - `yarli run continue` when continuation is available, or
+  - `yarli run continue` when continuation is available and still matches current open tranches, or
   - rerun the target tranche after scope and policy review.
 - If recovery requires policy change, update `run.merge_conflict_resolution` (`fail`, `manual`, or `auto-repair`) and resume according to post-incident policy.
 
@@ -450,6 +456,34 @@ Policy defaults:
 - Keep guard-related telemetry in evidence (`evidence/<loop-id>/`) to preserve trend history.
 - Avoid runtime-guard bypass shortcuts; use continuation/replan actions and explicit operator commands.
 - Treat `yarli audit tail` as a local JSONL view by default; in durable deployments it complements, but does not replace, the persisted event-store record.
+
+## External Agent Skill Contract
+
+The external `yarli-execution-loop` skill is expected to treat Yarli as the durable control plane:
+
+- Inspect Yarli state first (`.yarli/continuation.json`, `.yarli/tranches.toml`, `yarli run status`, `yarli run explain-exit`).
+- Enqueue newly discovered work durably through `yarli plan tranche add --idempotent`.
+- Choose `yarli run continue` only for snapshot-owned work with no drift.
+- Choose `yarli run --fresh-from-tranches` after new tranche enqueue or other live-plan changes.
+- End each agent cycle with a `YARLI_DECISION_V1` block containing `status`, `reason`, `enqueued_tranches`, and `next_command`.
+
+### Idempotent Tranche Enqueue
+
+`yarli plan tranche add --idempotent` is designed for safe repeated invocation in
+agent loops. The semantics are:
+
+- **Matching fields → no-op.** If a tranche with the given key already exists and
+  all effective fields (summary, group, allowed_paths, verify, done_when, max_tokens)
+  match the request, the command prints a confirmation message and returns success
+  without modifying the file.
+- **Mismatched fields → error.** If the key exists but any effective field differs,
+  the command fails with a message listing which fields differ. This prevents
+  accidental overwrites while making the conflict visible to the caller.
+- **New key → normal add.** If no tranche with the key exists, the tranche is
+  appended exactly as with a non-idempotent `add`.
+- **Safe for repeated invocation.** Because identical calls are no-ops and
+  conflicting calls are errors, agents can call `--idempotent` unconditionally at the
+  start of every cycle without side effects or silent data loss.
 
 ## Reproducing Budget Stress Checks Locally
 

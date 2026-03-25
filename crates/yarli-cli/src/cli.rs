@@ -597,12 +597,15 @@ pub(crate) fn replace_between(haystack: &str, begin: &str, end: &str, replacemen
 pub(crate) enum Commands {
     #[command(
         about = "Manage orchestration runs (default: config-first plan-driven execution)",
-        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nTranche sizing guidance:\n- Prefer one coherent objective per tranche with one meaningful verification point.\n- Group tiny adjacent edits when they touch the same files or require the same reasoning context.\n- Split when verification, risk, or operator review creates a natural checkpoint.\n- If setup/rehydration cost dominates the actual edit, use grouped dispatch instead of micro-tranches.\n- Use advisory tranche token thresholds to catch oversized slices before quality degrades; backend-specific overrides are supported.\n- Thresholds surface warnings only and do not hard-block execution.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel|drain`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable adapter-backed hints/storage via `yarli.toml` (`[memory] provider = \"default\"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel|drain ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
+        long_about = "Manage orchestration runs.\n\nDefault behavior:\n- `yarli run` (no subcommand) resolves prompt context in this order:\n  1. `--prompt-file <path>`\n  2. `[run].prompt_file` in `yarli.toml`\n  3. fallback lookup of `PROMPT.md`\n- Run-spec baseline configuration can be defined in `yarli.toml` under `[run]` + `[[run.tasks]]` + `[[run.tranches]]` + `[run.plan_guard]`.\n- `PROMPT.md` may optionally include a `yarli-run` fenced block as a per-prompt override layer.\n- `yarli run` discovers incomplete tranches from `IMPLEMENTATION_PLAN.md` and dispatches them via `[cli]` command settings, followed by a verification task.\n- `yarli run --fresh-from-tranches` makes that live rebuild behavior explicit when you are choosing between a fresh rebuild and `yarli run continue`.\n- Optional grouped dispatch is available with `[run].enable_plan_tranche_grouping = true` and `tranche_group=<name>` plan metadata.\n- If no incomplete tranches are found and no run-spec configuration is present, `yarli run` dispatches the full prompt text as a single task.\n- Legacy run-spec task/tranche orchestration is used only as fallback when config-first dispatch cannot be materialized.\n\nTranche sizing guidance:\n- Prefer one coherent objective per tranche with one meaningful verification point.\n- Group tiny adjacent edits when they touch the same files or require the same reasoning context.\n- Split when verification, risk, or operator review creates a natural checkpoint.\n- If setup/rehydration cost dominates the actual edit, use grouped dispatch instead of micro-tranches.\n- Use advisory tranche token thresholds to catch oversized slices before quality degrades; backend-specific overrides are supported.\n- Thresholds surface warnings only and do not hard-block execution.\n\nControl model:\n- Built-in Yarli policy gates are code-defined checks (`yarli gate ...`) that evaluate run/task state.\n- Verification command chain is plan/config/script-defined execution work (tranches + verification commands).\n- Observer events are telemetry only and do not gate or mutate active run execution.\n- Operator controls (`yarli run pause|resume|cancel|drain`) are explicit control-plane actions.\n\nOptional integrations:\n- Memories: enable adapter-backed hints/storage via `yarli.toml` (`[memory] provider = \"default\"` + `[memory.providers.default] ...`, or legacy `[memory.backend]`). Memory hints are surfaced in `yarli run status` and `yarli run explain-exit`.\n\nExamples:\n- `yarli run`\n- `yarli run --fresh-from-tranches --stream`\n- `yarli run --prompt-file prompts/I8B.md --stream`\n\nOther subcommands:\n- `yarli run start ...` for ad-hoc runs with explicit `--cmd`.\n- `yarli run status ...` / `yarli run explain-exit ...` for inspection.\n- `yarli run pause|resume|cancel|drain ...` for explicit operator control.\n- `yarli run batch ...` is legacy/back-compat pace-based execution."
     )]
     Run {
         /// Override the prompt file used by default `yarli run` (no subcommand).
         #[arg(long)]
         prompt_file: Option<PathBuf>,
+        /// Explicitly rebuild from current prompt/plan/tranches state instead of replaying continuation.
+        #[arg(long, default_value_t = false)]
+        fresh_from_tranches: bool,
         /// Allow recursive `yarli run` from task commands for this invocation.
         #[arg(long, default_value_t = false)]
         allow_recursive_run: bool,
@@ -659,7 +662,7 @@ pub(crate) enum Commands {
     },
     #[command(
         about = "Manage the structured plan (tranches file)",
-        long_about = "Manage the structured plan in .yarli/tranches.toml.\n\nExamples:\n  yarli plan tranche add --key TP-05 --summary \"Config loader\"\n  yarli plan tranche complete --key TP-05\n  yarli plan tranche list\n  yarli plan tranche remove --key TP-05\n  yarli plan validate"
+        long_about = "Manage the structured plan in .yarli/tranches.toml.\n\nExamples:\n  yarli plan tranche add --key TP-05 --summary \"Config loader\"\n  yarli plan tranche add --key TP-05 --summary \"Config loader\" --idempotent\n  yarli plan tranche complete --key TP-05\n  yarli plan tranche list\n  yarli plan tranche remove --key TP-05\n  yarli plan validate"
     )]
     Plan {
         #[command(subcommand)]
@@ -805,7 +808,7 @@ pub(crate) enum RunAction {
     List,
     #[command(
         about = "Continue from a previous run's unfinished/failed tasks",
-        long_about = "Continue from a previous run using the auto-tranche continuation spec.\n\nBy default, yarli first loads the latest persisted continuation payload from\nthe event store (`run.continuation`), then falls back to `.yarli/continuation.json`\n(written automatically on run exit). It then creates a new run from the suggested\nnext tranche (retry/unfinished or planned-next).\nWhen continuation is not yet available, wait behavior is configured via\n`[run] continue_wait_timeout_seconds` in yarli.toml.\nAfter each successful run, yarli auto-advances through planned tranches when\nquality gate criteria allow it.\n\nExamples:\n  yarli run continue\n  yarli run continue --file .yarli/continuation.json"
+        long_about = "Continue from a previous run using the auto-tranche continuation spec.\n\nBy default, yarli first loads the latest persisted continuation payload from\nthe event store (`run.continuation`), then falls back to `.yarli/continuation.json`\n(written automatically on run exit). It then creates a new run from the suggested\nnext tranche (retry/unfinished or planned-next).\nIf current `.yarli/tranches.toml` contains newer open tranches that are not\nrepresented in the continuation snapshot, `yarli run continue` refuses and asks\nyou to use `yarli run --fresh-from-tranches` instead.\nWhen continuation is not yet available, wait behavior is configured via\n`[run] continue_wait_timeout_seconds` in yarli.toml.\nAfter each successful run, yarli auto-advances through planned tranches when\nquality gate criteria allow it.\n\nExamples:\n  yarli run continue\n  yarli run continue --file .yarli/continuation.json"
     )]
     Continue {
         /// Path to the continuation file (defaults to `.yarli/continuation.json`).
@@ -1102,7 +1105,7 @@ pub(crate) enum EvidenceAction {
 pub(crate) enum PlanAction {
     #[command(
         about = "Manage structured tranches",
-        long_about = "Manage structured tranches in .yarli/tranches.toml.\n\nExamples:\n  yarli plan tranche add --key TP-05 --summary \"Config loader\"\n  yarli plan tranche complete --key TP-05\n  yarli plan tranche list\n  yarli plan tranche remove --key TP-05"
+        long_about = "Manage structured tranches in .yarli/tranches.toml.\n\nExamples:\n  yarli plan tranche add --key TP-05 --summary \"Config loader\"\n  yarli plan tranche add --key TP-05 --summary \"Config loader\" --idempotent\n  yarli plan tranche complete --key TP-05\n  yarli plan tranche list\n  yarli plan tranche remove --key TP-05"
     )]
     Tranche {
         #[command(subcommand)]
@@ -1140,6 +1143,9 @@ pub(crate) enum TrancheAction {
         /// Per-tranche token budget override.
         #[arg(short, long)]
         max_tokens: Option<u64>,
+        /// No-op when the tranche already exists with matching effective fields.
+        #[arg(long, default_value_t = false)]
+        idempotent: bool,
     },
     #[command(about = "Mark a tranche as complete")]
     Complete {
@@ -1254,6 +1260,7 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn init_config_template_mentions_tranche_sizing_guidance() {
@@ -1296,5 +1303,55 @@ mod tests {
                 max_recommended_tokens: 95_000,
             }
         );
+    }
+
+    #[test]
+    fn cli_parses_run_fresh_from_tranches_flag() {
+        let cli = Cli::parse_from(["yarli", "run", "--fresh-from-tranches"]);
+        match cli.command {
+            Commands::Run {
+                fresh_from_tranches,
+                action,
+                ..
+            } => {
+                assert!(fresh_from_tranches);
+                assert!(action.is_none());
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_idempotent_tranche_add_flag() {
+        let cli = Cli::parse_from([
+            "yarli",
+            "plan",
+            "tranche",
+            "add",
+            "--key",
+            "TP-05",
+            "--summary",
+            "Implement config loader hardening",
+            "--idempotent",
+        ]);
+        match cli.command {
+            Commands::Plan {
+                action:
+                    PlanAction::Tranche {
+                        action:
+                            TrancheAction::Add {
+                                idempotent,
+                                key,
+                                summary,
+                                ..
+                            },
+                    },
+            } => {
+                assert!(idempotent);
+                assert_eq!(key, "TP-05");
+                assert_eq!(summary, "Implement config loader hardening");
+            }
+            _ => panic!("expected plan tranche add command"),
+        }
     }
 }

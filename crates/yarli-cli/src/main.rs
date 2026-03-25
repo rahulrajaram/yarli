@@ -149,6 +149,7 @@ async fn run() -> Result<()> {
     match cli.command {
         Commands::Run {
             prompt_file,
+            fresh_from_tranches,
             allow_recursive_run,
             action,
         } => match action {
@@ -158,6 +159,7 @@ async fn run() -> Result<()> {
                     render_mode,
                     &loaded_config,
                     prompt_file,
+                    fresh_from_tranches,
                     allow_recursive_run,
                 )
                 .await
@@ -172,6 +174,11 @@ async fn run() -> Result<()> {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                }
                 let plan =
                     resolve_run_plan(&loaded_config, objective, cmd, pace, workdir, timeout, None)?;
                 let render_mode = select_render_mode()?;
@@ -185,6 +192,11 @@ async fn run() -> Result<()> {
             }) => {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
                 }
                 let plan = resolve_run_plan(
                     &loaded_config,
@@ -202,11 +214,21 @@ async fn run() -> Result<()> {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                }
                 cmd_run_status(&run_id)
             }
             Some(RunAction::ExplainExit { run_id }) => {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
                 }
                 cmd_run_explain(&run_id)
             }
@@ -214,11 +236,21 @@ async fn run() -> Result<()> {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                }
                 cmd_run_list()
             }
             Some(RunAction::Continue { file }) => {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
                 }
                 let render_mode = select_render_mode()?;
                 cmd_run_continue(file, render_mode, &loaded_config, allow_recursive_run).await
@@ -231,6 +263,11 @@ async fn run() -> Result<()> {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                }
                 cmd_run_pause(run_id.as_deref(), all_active, &reason)
             }
             Some(RunAction::Resume {
@@ -240,6 +277,11 @@ async fn run() -> Result<()> {
             }) => {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
                 }
                 cmd_run_resume(run_id.as_deref(), all_paused, &reason)
             }
@@ -251,6 +293,11 @@ async fn run() -> Result<()> {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                }
                 cmd_run_drain(run_id.as_deref(), all_active, &reason)
             }
             Some(RunAction::Cancel {
@@ -261,12 +308,22 @@ async fn run() -> Result<()> {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
                 }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                }
                 cmd_run_cancel(run_id.as_deref(), all_active, &reason)
             }
             #[cfg(feature = "sw4rm")]
             Some(RunAction::Sw4rm) => {
                 if prompt_file.is_some() {
                     bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+                }
+                if fresh_from_tranches {
+                    bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
                 }
                 cmd_run_sw4rm(&loaded_config).await
             }
@@ -345,6 +402,7 @@ async fn run() -> Result<()> {
                     verify,
                     done_when,
                     max_tokens,
+                    idempotent,
                 } => cmd_plan_tranche_add(
                     &key,
                     &summary,
@@ -353,6 +411,7 @@ async fn run() -> Result<()> {
                     verify.as_deref(),
                     done_when.as_deref(),
                     max_tokens,
+                    idempotent,
                 ),
                 TrancheAction::Complete { key } => cmd_plan_tranche_complete(&key),
                 TrancheAction::List => cmd_plan_tranche_list(),

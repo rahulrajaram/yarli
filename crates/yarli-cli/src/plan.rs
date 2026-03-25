@@ -1078,6 +1078,76 @@ pub(crate) fn parse_prompt_snapshot_from_snapshot(
     serde_json::from_value(prompt_value.clone()).ok()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContinuationTrancheDrift {
+    pub(crate) tranches_path: PathBuf,
+    pub(crate) current_open_keys: Vec<String>,
+    pub(crate) snapshot_open_keys: Vec<String>,
+    pub(crate) missing_from_snapshot: Vec<String>,
+}
+
+pub(crate) fn detect_continuation_tranche_drift(
+    payload: &yarli_cli::yarli_core::entities::ContinuationPayload,
+) -> Result<Option<ContinuationTrancheDrift>> {
+    let Some(tranche) = payload.next_tranche.as_ref() else {
+        return Ok(None);
+    };
+
+    let Some(prompt_snapshot) = parse_prompt_snapshot_from_snapshot(&tranche.config_snapshot)
+    else {
+        return Ok(None);
+    };
+    let plan_path = match plan_path_for_prompt_entry(Path::new(&prompt_snapshot.entry_path)) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let Some(tranches_base_dir) = plan_path.parent() else {
+        return Ok(None);
+    };
+    let tranches_path = tranches_file_path(tranches_base_dir);
+    let Some(tf) = read_tranches_file_in(tranches_base_dir)? else {
+        return Ok(None);
+    };
+
+    let current_open_keys = tf
+        .to_entries()
+        .into_iter()
+        .filter(|entry| !entry.is_complete)
+        .map(|entry| entry.key)
+        .collect::<Vec<_>>();
+    if current_open_keys.is_empty() {
+        return Ok(None);
+    }
+
+    let snapshot_open_keys = parse_tranche_plan_from_snapshot(&tranche.config_snapshot)
+        .into_iter()
+        .map(|planned| planned.key)
+        .filter(|key| {
+            let trimmed = key.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("prompt")
+                && !trimmed.eq_ignore_ascii_case("verification")
+        })
+        .collect::<Vec<_>>();
+    let snapshot_key_set: HashSet<&str> = snapshot_open_keys.iter().map(String::as_str).collect();
+    let missing_from_snapshot = current_open_keys
+        .iter()
+        .filter(|key| !snapshot_key_set.contains(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if missing_from_snapshot.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ContinuationTrancheDrift {
+        tranches_path,
+        current_open_keys,
+        snapshot_open_keys,
+        missing_from_snapshot,
+    }))
+}
+
 pub(crate) async fn cmd_run_start(
     plan: RunPlan,
     render_mode: RenderMode,
@@ -2693,7 +2763,7 @@ mod tests {
         build_continuation_payload, build_run_config_snapshot, compute_quality_gate,
     };
     use crate::config::RunTaskHealthConfig;
-    use crate::test_helpers::{write_test_config, write_test_config_at};
+    use crate::test_helpers::{with_current_dir, write_test_config, write_test_config_at};
     use chrono::Utc;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -3229,12 +3299,10 @@ prompt_mode = "arg"
         let loaded_prompt =
             prompt::load_prompt_and_run_spec(&repo.path().join("PROMPT.md")).unwrap();
 
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(decoy_cwd.path()).unwrap();
-        let (tasks, tranches) =
+        let (tasks, tranches) = with_current_dir(decoy_cwd.path(), || {
             build_plan_driven_run_sequence(&loaded_config, &loaded_prompt, "implement active plan")
-                .unwrap();
-        let _ = std::env::set_current_dir(&original_dir);
+                .unwrap()
+        });
 
         assert_eq!(tasks.len(), 2);
         assert_eq!(tranches.len(), 2);
@@ -4134,6 +4202,180 @@ cmds = ["echo ok"]
         let plan = build_plan_from_continuation_tranche(&tranche, &loaded).unwrap();
         assert_eq!(plan.tasks.len(), 1);
         assert!(plan.tasks[0].command.contains("Strategy-pivot checkpoint:"));
+    }
+
+    #[test]
+    fn detect_continuation_tranche_drift_reports_new_open_structured_tranches() {
+        use yarli_cli::yarli_core::entities::continuation::{
+            TrancheCursor, TrancheKind, TrancheSpec,
+        };
+
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. TP-05 `Loader`: incomplete.\n2. TP-06 `Guard`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "TP-05"
+summary = "Implement config loader hardening"
+status = "incomplete"
+
+[[tranches]]
+key = "TP-06"
+summary = "Add continuation drift guard"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let payload = yarli_cli::yarli_core::entities::ContinuationPayload {
+            run_id: Uuid::new_v4(),
+            objective: "continue".into(),
+            exit_state: RunState::RunCompleted,
+            exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
+            completed_at: Utc::now(),
+            tasks: Vec::new(),
+            summary: yarli_cli::yarli_core::entities::continuation::RunSummary {
+                total: 1,
+                completed: 1,
+                failed: 0,
+                cancelled: 0,
+                pending: 0,
+            },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
+            next_tranche: Some(TrancheSpec {
+                suggested_objective: "continue".into(),
+                kind: TrancheKind::PlannedNext,
+                retry_task_keys: vec![],
+                unfinished_task_keys: vec![],
+                planned_task_keys: vec!["tp05_task".into()],
+                planned_tranche_key: Some("TP-05".into()),
+                cursor: Some(TrancheCursor {
+                    current_tranche_index: Some(0),
+                    next_tranche_index: Some(0),
+                }),
+                config_snapshot: serde_json::json!({
+                    "runtime": {
+                        "working_dir": repo.path(),
+                        "timeout_secs": 300,
+                        "task_catalog": [
+                            {"task_key": "tp05_task", "command": "echo tp05", "command_class": "Io"}
+                        ],
+                        "tranche_plan": [
+                            {"key": "TP-05", "objective": "Loader", "task_keys": ["tp05_task"]}
+                        ],
+                        "current_tranche_index": 0,
+                        "prompt": {
+                            "entry_path": repo.path().join("PROMPT.md"),
+                            "expanded_sha256": "abc123",
+                            "included_files": []
+                        }
+                    }
+                }),
+                interventions: Vec::new(),
+            }),
+            quality_gate: None,
+            retry_recommendation: None,
+        };
+
+        let drift = detect_continuation_tranche_drift(&payload)
+            .unwrap()
+            .expect("expected drift");
+        assert_eq!(
+            drift.tranches_path,
+            repo.path().join(".yarli/tranches.toml")
+        );
+        assert_eq!(drift.current_open_keys, vec!["TP-05", "TP-06"]);
+        assert_eq!(drift.snapshot_open_keys, vec!["TP-05"]);
+        assert_eq!(drift.missing_from_snapshot, vec!["TP-06"]);
+    }
+
+    #[test]
+    fn detect_continuation_tranche_drift_ignores_matching_structured_state() {
+        use yarli_cli::yarli_core::entities::continuation::{TrancheKind, TrancheSpec};
+
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. TP-05 `Loader`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "TP-05"
+summary = "Implement config loader hardening"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let payload = yarli_cli::yarli_core::entities::ContinuationPayload {
+            run_id: Uuid::new_v4(),
+            objective: "continue".into(),
+            exit_state: RunState::RunCompleted,
+            exit_reason: None,
+            cancellation_source: None,
+            cancellation_provenance: None,
+            completed_at: Utc::now(),
+            tasks: Vec::new(),
+            summary: yarli_cli::yarli_core::entities::continuation::RunSummary {
+                total: 1,
+                completed: 1,
+                failed: 0,
+                cancelled: 0,
+                pending: 0,
+            },
+            tranche_token_usage: Vec::new(),
+            tranche_token_thresholds: None,
+            next_tranche: Some(TrancheSpec {
+                suggested_objective: "continue".into(),
+                kind: TrancheKind::PlannedNext,
+                retry_task_keys: vec![],
+                unfinished_task_keys: vec![],
+                planned_task_keys: vec!["tp05_task".into()],
+                planned_tranche_key: Some("TP-05".into()),
+                cursor: None,
+                config_snapshot: serde_json::json!({
+                    "runtime": {
+                        "task_catalog": [
+                            {"task_key": "tp05_task", "command": "echo tp05", "command_class": "Io"}
+                        ],
+                        "tranche_plan": [
+                            {"key": "TP-05", "objective": "Loader", "task_keys": ["tp05_task"]}
+                        ],
+                        "prompt": {
+                            "entry_path": repo.path().join("PROMPT.md"),
+                            "expanded_sha256": "abc123",
+                            "included_files": []
+                        }
+                    }
+                }),
+                interventions: Vec::new(),
+            }),
+            quality_gate: None,
+            retry_recommendation: None,
+        };
+
+        assert!(detect_continuation_tranche_drift(&payload)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

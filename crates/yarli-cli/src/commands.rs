@@ -605,6 +605,15 @@ pub(crate) async fn cmd_run_continue(
         }
     };
 
+    if let Some(drift) = detect_continuation_tranche_drift(&payload)? {
+        bail!(
+            "continuation snapshot for run {} does not include newer open tranches from {}: {}. `yarli run continue` only replays the prior snapshot. Use `yarli run --fresh-from-tranches` to rebuild from the current plan/tranches state.",
+            payload.run_id,
+            drift.tranches_path.display(),
+            drift.missing_from_snapshot.join(", ")
+        );
+    }
+
     let auto_advance = config::AutoAdvanceConfig::from_loaded(loaded_config);
     let mut plan = build_plan_from_continuation_tranche(&tranche, loaded_config)?;
     let mut iteration = 1usize;
@@ -674,8 +683,14 @@ pub(crate) async fn cmd_run_default(
     render_mode: RenderMode,
     loaded_config: &LoadedConfig,
     prompt_file_override: Option<PathBuf>,
+    fresh_from_tranches: bool,
     allow_recursive_run_override: bool,
 ) -> Result<()> {
+    if fresh_from_tranches {
+        info!(
+            "explicit fresh-from-tranches mode requested; rebuilding from current prompt/plan/tranches state"
+        );
+    }
     let resolved_prompt =
         resolve_prompt_entry_path(loaded_config, prompt_file_override.as_deref())?;
     info!(
@@ -709,12 +724,18 @@ pub(crate) async fn cmd_run_default(
         run_spec: run_spec.clone(),
     };
     let plan_guard_context = run_spec_plan_guard_preflight(&loaded)?;
-    if let Some(validated_tranches_path) =
-        validate_structured_tranches_preflight_for_prompt(&loaded.entry_path)?
-    {
+    let validated_tranches_path =
+        validate_structured_tranches_preflight_for_prompt(&loaded.entry_path)?;
+    if let Some(ref path) = validated_tranches_path {
         info!(
-            tranches_file = %validated_tranches_path.display(),
+            tranches_file = %path.display(),
             "validated structured tranches file preflight"
+        );
+    }
+    if fresh_from_tranches && validated_tranches_path.is_none() {
+        warn!(
+            "fresh-from-tranches requested but no structured tranches file found; \
+             falling back to plan-text dispatch"
         );
     }
 
@@ -8019,7 +8040,6 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::mpsc;
@@ -8067,8 +8087,6 @@ mod tests {
     }
 
     fn with_isolated_runtime_env<T>(operation: impl FnOnce() -> T) -> T {
-        static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
         struct EnvGuard {
             previous_dir: std::path::PathBuf,
             previous_database_url: Option<String>,
@@ -8085,22 +8103,20 @@ mod tests {
             }
         }
 
-        let _lock = TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let temp_dir = TempDir::new().expect("create isolated temp dir");
-        let guard = EnvGuard {
-            previous_dir: std::env::current_dir()
-                .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()),
-            previous_database_url: std::env::var("DATABASE_URL").ok(),
-        };
-        std::env::set_current_dir(temp_dir.path()).expect("switch to isolated temp dir");
-        std::env::remove_var("DATABASE_URL");
+        with_process_env_lock(|| {
+            let temp_dir = TempDir::new().expect("create isolated temp dir");
+            let guard = EnvGuard {
+                previous_dir: std::env::current_dir()
+                    .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()),
+                previous_database_url: std::env::var("DATABASE_URL").ok(),
+            };
+            std::env::set_current_dir(temp_dir.path()).expect("switch to isolated temp dir");
+            std::env::remove_var("DATABASE_URL");
 
-        let result = operation();
-        drop(guard);
-        result
+            let result = operation();
+            drop(guard);
+            result
+        })
     }
 
     fn seed_worktree_event_payload(

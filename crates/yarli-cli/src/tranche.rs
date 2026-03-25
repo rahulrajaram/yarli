@@ -116,6 +116,45 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     )
 }
 
+fn tranche_effective_fields_match(
+    existing: &TrancheDefinition,
+    requested: &TrancheDefinition,
+) -> bool {
+    existing.key == requested.key
+        && existing.summary == requested.summary
+        && existing.group == requested.group
+        && existing.allowed_paths == requested.allowed_paths
+        && existing.verify == requested.verify
+        && existing.done_when == requested.done_when
+        && existing.max_tokens == requested.max_tokens
+}
+
+fn tranche_effective_field_mismatches(
+    existing: &TrancheDefinition,
+    requested: &TrancheDefinition,
+) -> Vec<&'static str> {
+    let mut mismatches = Vec::new();
+    if existing.summary != requested.summary {
+        mismatches.push("summary");
+    }
+    if existing.group != requested.group {
+        mismatches.push("group");
+    }
+    if existing.allowed_paths != requested.allowed_paths {
+        mismatches.push("allowed_paths");
+    }
+    if existing.verify != requested.verify {
+        mismatches.push("verify");
+    }
+    if existing.done_when != requested.done_when {
+        mismatches.push("done_when");
+    }
+    if existing.max_tokens != requested.max_tokens {
+        mismatches.push("max_tokens");
+    }
+    mismatches
+}
+
 pub(crate) fn validate_structured_tranches_preflight_for_prompt(
     entry_prompt_path: &Path,
 ) -> Result<Option<PathBuf>> {
@@ -472,6 +511,7 @@ const PLACEHOLDER_PHRASES: &[&str] = &[
 // `yarli plan` command handlers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_plan_tranche_add(
     key: &str,
     summary: &str,
@@ -480,6 +520,7 @@ pub(crate) fn cmd_plan_tranche_add(
     verify: Option<&str>,
     done_when: Option<&str>,
     max_tokens: Option<u64>,
+    idempotent: bool,
 ) -> Result<()> {
     let def = TrancheDefinition {
         key: key.to_string(),
@@ -498,8 +539,20 @@ pub(crate) fn cmd_plan_tranche_add(
         tranches: Vec::new(),
     });
 
-    if tf.tranches.iter().any(|t| t.key == key) {
-        bail!("tranche with key '{}' already exists", key);
+    if let Some(existing) = tf.tranches.iter().find(|t| t.key == key) {
+        if !idempotent {
+            bail!("tranche with key '{}' already exists", key);
+        }
+        if tranche_effective_fields_match(existing, &def) {
+            println!("Tranche '{key}' already exists with matching fields; no changes made");
+            return Ok(());
+        }
+        let mismatches = tranche_effective_field_mismatches(existing, &def).join(", ");
+        bail!(
+            "tranche with key '{}' already exists with different fields: {}",
+            key,
+            mismatches
+        );
     }
 
     tf.tranches.push(def);
@@ -753,6 +806,7 @@ mod tests {
             plan_target_completion_state, run_spec_plan_guard_preflight_with_override,
             should_auto_advance_planned_tranche, validate_tranche_keys, PlannedTranche,
         },
+        test_helpers::with_current_dir,
     };
     use chrono::Utc;
     use tempfile::TempDir;
@@ -1716,6 +1770,131 @@ mode = "implement"
     }
 
     #[test]
+    fn cmd_plan_tranche_add_idempotent_noops_on_matching_fields() {
+        let repo = TempDir::new().unwrap();
+        let parsed = with_current_dir(repo.path(), || {
+            let allowed_paths = vec!["crates/yarli-cli/src".to_string()];
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &allowed_paths,
+                Some("cargo test -p yarli-cli"),
+                Some("config loader handles overrides"),
+                Some(55_000),
+                false,
+            )
+            .unwrap();
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &allowed_paths,
+                Some("cargo test -p yarli-cli"),
+                Some("config loader handles overrides"),
+                Some(55_000),
+                true,
+            )
+            .unwrap();
+
+            read_tranches_file().unwrap().unwrap()
+        });
+
+        assert_eq!(parsed.tranches.len(), 1);
+        assert_eq!(parsed.tranches[0].key, "TP-05");
+    }
+
+    #[test]
+    fn cmd_plan_tranche_add_idempotent_rejects_mismatched_fields() {
+        let repo = TempDir::new().unwrap();
+        let err = with_current_dir(repo.path(), || {
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &[],
+                None,
+                None,
+                Some(55_000),
+                false,
+            )
+            .unwrap();
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader drift guard",
+                Some("core"),
+                &[],
+                None,
+                None,
+                Some(55_000),
+                true,
+            )
+            .unwrap_err()
+        });
+
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("different fields"));
+        assert!(err_text.contains("summary"));
+    }
+
+    #[test]
+    fn cmd_plan_tranche_add_idempotent_matches_first_of_duplicate_keys() {
+        // Write a tranches file with two entries sharing the same key but different
+        // summaries (simulating a hand-edit or merge artifact). The idempotent path
+        // in cmd_plan_tranche_add uses `iter().find()`, which returns the first
+        // match. This test verifies that matching the first entry succeeds and that
+        // no dedup side-effect occurs.
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"version = 1
+
+[[tranches]]
+key = "TP-05"
+summary = "Implement config loader hardening"
+status = "incomplete"
+
+[[tranches]]
+key = "TP-05"
+summary = "Implement config loader drift guard"
+status = "incomplete"
+"#,
+        )
+        .unwrap();
+
+        let tf = read_tranches_file_in(repo.path()).unwrap().unwrap();
+
+        // Simulate the idempotent lookup: find first entry with matching key.
+        let requested = TrancheDefinition {
+            key: "TP-05".to_string(),
+            summary: "Implement config loader hardening".to_string(),
+            status: TrancheStatus::Incomplete,
+            group: None,
+            allowed_paths: vec![],
+            verify: None,
+            done_when: None,
+            max_tokens: None,
+        };
+        let existing = tf.tranches.iter().find(|t| t.key == "TP-05");
+        assert!(
+            existing.is_some(),
+            "should find at least one entry with key TP-05"
+        );
+        assert!(
+            tranche_effective_fields_match(existing.unwrap(), &requested),
+            "first duplicate entry should match the requested fields"
+        );
+
+        // File should still have both entries — no dedup side-effect.
+        assert_eq!(
+            tf.tranches.len(),
+            2,
+            "file should retain both duplicate entries"
+        );
+    }
+
+    #[test]
     fn build_plan_driven_prefers_structured_file() {
         let temp = TempDir::new().unwrap();
         let yarli_dir = temp.path().join(".yarli");
@@ -1746,11 +1925,7 @@ mode = "implement"
         .unwrap();
 
         // chdir into the temp directory so read_tranches_file() finds the file
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(temp.path()).unwrap();
-
-        let result = read_tranches_file();
-        let _ = std::env::set_current_dir(&original_dir);
+        let result = with_current_dir(temp.path(), read_tranches_file);
 
         let tf_read = result.unwrap().expect("should find tranches file");
         let entries: Vec<ImplementationPlanEntry> = tf_read
@@ -1769,11 +1944,7 @@ mode = "implement"
         // When no tranches file exists, read_tranches_file() returns None and
         // discover_plan_dispatch_entries should still work independently.
         let temp = TempDir::new().unwrap();
-        let original_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(temp.path()).unwrap();
-
-        let result = read_tranches_file();
-        let _ = std::env::set_current_dir(&original_dir);
+        let result = with_current_dir(temp.path(), read_tranches_file);
 
         assert!(
             result.unwrap().is_none(),
@@ -1915,12 +2086,9 @@ status = "incomplete"
             current_tranche_index: Some(0),
         };
 
-        // Use a stable path for restore — current_dir() may be invalidated by
-        // concurrent tests that drop TempDirs, so fall back to a known-stable path.
-        let restore_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        std::env::set_current_dir(decoy_cwd.path()).unwrap();
-        let updated = maybe_mark_current_structured_tranche_complete(&plan).unwrap();
-        let _ = std::env::set_current_dir(&restore_dir);
+        let updated = with_current_dir(decoy_cwd.path(), || {
+            maybe_mark_current_structured_tranche_complete(&plan).unwrap()
+        });
 
         assert!(updated, "structured tranche should be marked complete");
 

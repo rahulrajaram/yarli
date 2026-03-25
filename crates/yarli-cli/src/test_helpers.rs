@@ -1,7 +1,8 @@
 //! Shared test helpers used across multiple test modules.
 
 use chrono::Utc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 use yarli_cli::yarli_core::domain::{EntityType, Event};
@@ -11,6 +12,38 @@ use yarli_cli::yarli_core::fsm::run::RunState;
 use crate::config::LoadedConfig;
 
 pub(crate) const VALID_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+static PROCESS_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn with_process_env_lock<T>(operation: impl FnOnce() -> T) -> T {
+    let _lock = PROCESS_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    operation()
+}
+
+pub(crate) fn with_current_dir<T>(dir: &Path, operation: impl FnOnce() -> T) -> T {
+    struct CurrentDirGuard {
+        previous_dir: PathBuf,
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous_dir)
+                .or_else(|_| std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")));
+        }
+    }
+
+    with_process_env_lock(|| {
+        let _guard = CurrentDirGuard {
+            previous_dir: std::env::current_dir()
+                .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()),
+        };
+        std::env::set_current_dir(dir).expect("switch to isolated test dir");
+        operation()
+    })
+}
 
 pub(crate) fn write_test_config(contents: &str) -> LoadedConfig {
     let temp_dir = tempfile::TempDir::new().unwrap();
