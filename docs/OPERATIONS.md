@@ -341,6 +341,12 @@ Operator-visible command surfaces for resource_usage and token_usage:
 - `yarli run status <run-id>`: shows per-task `budget_exceeded`, `token_usage` (prompt_tokens, completion_tokens, total_tokens), and `resource_usage` (max_rss_bytes).
 - `yarli run explain-exit <run-id>`: shows `Budget breaches:` section with task name and breach detail, plus per-task token and resource usage.
 - `yarli task explain <task-id>`: shows `budget_exceeded` reason, token usage, and resource usage for individual tasks.
+- `yarli task output <task-id>`: prints the raw captured stdout/stderr for a task when durable output events are available.
+
+Durability note:
+
+- `core.backend = "in-memory"` is ephemeral; captured task output and local audit history are lost when the process exits.
+- `core.backend = "postgres"` preserves run/task state and captured output for later diagnosis.
 
 ## Sequence Deterioration Observer
 
@@ -382,9 +388,16 @@ Telemetry to monitor:
 
 Operator playbook:
 
+Quick diagnosis cheat sheet:
+
+- Why did the run stop? -> `yarli run explain-exit <run-id>`
+- What did the task actually print? -> `yarli task output <task-id>`
+- Why is a task blocked or failing? -> `yarli task explain <task-id>`
+- What policy or gate decided this? -> `yarli audit query --task-id <task-id> --category gate_evaluation`
+
 - Budget breach (`budget_exceeded`) response:
   1. Pause if active: `yarli run pause <run-id>`
-  2. Inspect: `yarli run status <run-id>`, `yarli run explain-exit <run-id>`, `yarli task explain <task-id>`
+  2. Inspect: `yarli run status <run-id>`, `yarli run explain-exit <run-id>`, `yarli task explain <task-id>`, `yarli task output <task-id>`
   3. Decide: lower scope, raise limits, or cancel and rerun (`yarli run cancel <run-id>`)
 - Deterioration-cycle response:
   1. Inspect current state with `yarli run status <run-id>` and `yarli run explain-exit <run-id>`
@@ -417,7 +430,8 @@ Incident response workflow:
 - Pull latest failure context:
   1. `yarli run status <run-id>`
   2. `yarli run explain-exit <run-id>`
-  3. `yarli audit tail` or your standard event consumer for merge telemetry and task-level context.
+  3. `yarli task output <task-id>` for raw command stdout/stderr from the failing task.
+  4. `yarli audit tail` or `yarli audit query` for merge telemetry, policy decisions, and task-level context.
 - Open `PARALLEL_MERGE_RECOVERY.txt` in the preserved workspace root reported by `run.parallel_merge_failed`.
 - Run recovery commands from the note in order (status, patch diff stats, manual `git apply` retry).
 - Resolve conflicts and re-run with your normal operator decision path:
@@ -435,6 +449,7 @@ Policy defaults:
 
 - Keep guard-related telemetry in evidence (`evidence/<loop-id>/`) to preserve trend history.
 - Avoid runtime-guard bypass shortcuts; use continuation/replan actions and explicit operator commands.
+- Treat `yarli audit tail` as a local JSONL view by default; in durable deployments it complements, but does not replace, the persisted event-store record.
 
 ## Reproducing Budget Stress Checks Locally
 

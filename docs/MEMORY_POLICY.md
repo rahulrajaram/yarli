@@ -64,4 +64,5 @@ Hints are *observer outputs* and should be surfaced in:
 
 - Redaction: if content matches secret patterns, do not store. Emit an explicit `*.memory_store_failed` observer event noting redaction required.
 - Size: do not store raw command logs; store a summary and stable identifiers only.
+- Raw logs belong in durable artifacts and event storage for later diagnosis; memory should keep only summaries plus references back to that evidence.
 - Best-effort: memory backend failures must never change scheduler semantics or budget fail-fast behavior.
