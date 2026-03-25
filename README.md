@@ -95,6 +95,12 @@ Then apply migrations:
 yarli migrate up
 ```
 
+`in-memory` mode is ephemeral: once the process exits, captured task output and
+audit history do not survive. In durable Postgres mode, YARLI persists run/task
+state plus captured command output so operators and agents can inspect failures
+later with `yarli run explain-exit`, `yarli task explain`, `yarli task output`,
+and `yarli audit`.
+
 ## Core Concepts
 
 ### Prompt Resolution
@@ -172,6 +178,7 @@ Start, monitor, and explain orchestration runs. `yarli run` (no subcommand) is t
 - Auto-advance policy: `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"` (default: `stable-ok`).
 - Task health trends (`[run.task_health.improving|stable|deteriorating]`) can trigger `continue`, `checkpoint-now`, `force-pivot`, or `stop-and-summarize`.
 - `[run].soft_token_cap_ratio` triggers checkpoint-now when total token usage reaches `ratio * max_run_total_tokens` (default: `0.9`).
+- Use `yarli run --allow-recursive-run ...` when a task command intentionally needs to invoke nested `yarli run` execution for that invocation.
 
 ```bash
 # Run the workspace's default prompt-defined loop.
@@ -214,6 +221,16 @@ yarli run batch --pace ci
 yarli run batch --objective "nightly check" -w /repo --timeout 900
 ```
 
+Feature-gated sw4rm agent mode:
+
+```bash
+cargo run --features sw4rm -- run sw4rm --help
+yarli run sw4rm
+YARLI_LOG=debug yarli run sw4rm
+```
+
+`yarli run sw4rm` requires a build with `--features sw4rm` and reads its runtime configuration from `[sw4rm]` in `yarli.toml`.
+
 Plan guard (recommended for tranche/card workflows):
 
 ```toml
@@ -225,6 +242,10 @@ mode = "implement"   # "implement" (default) or "verify-only"
 ### `yarli task`
 
 Inspect tasks and clear blockers.
+
+Use `yarli task output <task-id>` to retrieve the raw stdout/stderr captured for
+that task's command execution. This retrieval path depends on durable persisted
+output events, so it is most useful in Postgres mode.
 
 ```bash
 yarli task list <run-id>
@@ -271,6 +292,11 @@ yarli merge status <merge-id>
 
 Tail and query the JSONL audit log emitted by policy decisions, governance accounting, and command execution events.
 
+Use audit history alongside `yarli task output`: task output shows what the
+command printed, while audit entries show the surrounding policy, gate, and
+operator-decision trail. By default `yarli audit tail` reads the local
+`.yarl/audit.jsonl` file.
+
 ```bash
 yarli audit tail
 yarli audit tail --file .yarl/audit.jsonl --lines 200
@@ -279,6 +305,19 @@ yarli audit tail --category policy_decision
 yarli audit query --run-id <run-id> --task-id <task-id>
 yarli audit query --category gate_evaluation --since 2026-02-20T00:00:00Z --before 2026-02-22T23:59:59Z
 yarli audit query --category policy_decision --format csv --limit 50
+```
+
+Quick diagnosis workflow for a failed durable run:
+
+```bash
+# 1) Get the summary of why the run exited or stopped.
+yarli run explain-exit <run-id>
+
+# 2) Inspect the failing task's raw captured stdout/stderr.
+yarli task output <task-id>
+
+# 3) Query the event and policy trail around that task.
+yarli audit query --task-id <task-id> --category gate_evaluation
 ```
 
 ### `yarli evidence`
@@ -298,9 +337,12 @@ Manage the structured tranches file (`.yarli/tranches.toml`) used by plan-driven
 yarli plan validate
 yarli plan tranche list
 yarli plan tranche add --key TP-05 --summary "Config loader hardening"
+yarli plan tranche add --key TP-06 --summary "Guard runner" --group runtime --allowed-paths crates/yarli-exec,crates/yarli-cli --verify "cargo test -p yarli" --done-when "guard diagnostics render in run status" --max-tokens 60000
 yarli plan tranche complete --key TP-05
 yarli plan tranche remove --key TP-05
 ```
+
+`yarli plan tranche add` also supports tranche metadata fields used by plan-driven dispatch: `--group`, `--allowed-paths`, `--verify`, `--done-when`, and `--max-tokens`.
 
 ### `yarli debug`
 
@@ -409,8 +451,13 @@ Debug-only routes (feature-gated: `debug-api`):
 Authentication is enabled when `YARLI_API_KEYS` is set. Public endpoints (`/health`, `/metrics`) bypass auth.
 
 ```bash
+# Public endpoint
 curl -sS http://127.0.0.1:3000/health
+
+# Non-public endpoint when auth is disabled
 curl -sS http://127.0.0.1:3000/v1/runs
+
+# Non-public endpoint when auth is enabled
 curl -sS -H "Authorization: Bearer <key>" http://127.0.0.1:3000/v1/runs/<run-id>/status
 ```
 
