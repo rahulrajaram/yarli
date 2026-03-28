@@ -130,6 +130,10 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.tranche_token_advisory_by_backend.<name>.warn_tokens (optional backend/model override)
 - run.tranche_token_advisory_by_backend.<name>.max_recommended_tokens (optional backend/model override)
 - run.enforce_plan_tranche_allowed_paths (default: false; surface `allowed_paths=` plan metadata as scope constraints)
+- run.tranche_contract.strict (default: false; umbrella for strict verify/done_when/path-merge checks)
+- run.tranche_contract.require_verify (default: false; require `verify` on open tranches)
+- run.tranche_contract.require_done_when (default: false; require `done_when` on open tranches)
+- run.tranche_contract.enforce_allowed_paths_on_merge (default: false; fail merge finalization on out-of-scope edits)
 - run.merge_conflict_resolution (default: "fail"; values: fail|manual|auto-repair|llm-assisted)
 - run.merge_repair_command (optional; shell command for llm-assisted conflict repair)
 - run.merge_repair_timeout_seconds (default: 300; 0 = no timeout)
@@ -349,6 +353,17 @@ enable_plan_tranche_grouping = false
 max_grouped_tasks_per_tranche = 0
 # Surface per-tranche `allowed_paths=...` metadata as explicit scope instructions.
 enforce_plan_tranche_allowed_paths = false
+# Optional tranche contract hardening.
+# - strict = true turns on all checks below.
+# - require_verify rejects open tranches with no `verify`.
+# - require_done_when rejects open tranches with no `done_when`.
+# - enforce_allowed_paths_on_merge fail-closes merge finalization when a tranche edits
+#   paths outside its declared `allowed_paths` (control-plane files remain exempt).
+# [run.tranche_contract]
+# strict = false
+# require_verify = false
+# require_done_when = false
+# enforce_allowed_paths_on_merge = false
 # Auto-commit YARLI state files after every N tranches (0 = disabled).
 # auto_commit_interval = 1
 # Template for auto-commit messages (placeholders: {tranche_key}, {run_id}, {tranches_completed}, {tranches_total}).
@@ -1113,7 +1128,7 @@ pub(crate) enum PlanAction {
     },
     #[command(
         about = "Validate the structured tranches file",
-        long_about = "Validate the structured tranches file (.yarli/tranches.toml).\n\nChecks all tranche keys for validity, detects duplicates, and reports errors.\n\nExamples:\n  yarli plan validate"
+        long_about = "Validate the structured tranches file (.yarli/tranches.toml).\n\nChecks all tranche keys for validity, detects duplicates, and reports errors. When `[run.tranche_contract]` is enabled in `yarli.toml`, validation also enforces the active tranche contract checks for open tranches.\n\nExamples:\n  yarli plan validate"
     )]
     Validate,
 }

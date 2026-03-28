@@ -153,6 +153,15 @@ Optional metadata on `IMPLEMENTATION_PLAN.md` tranche lines:
 - `done_when="criteria"` — explicit completion contract
 - `max_tokens=N` — per-tranche token-budget hint
 
+Optional hardening lives under `[run.tranche_contract]` in `yarli.toml`:
+
+- `strict = true` — convenience umbrella for strict tranche contract checks
+- `require_verify = true` — fail runs and `yarli plan validate` when open tranches omit `verify`
+- `require_done_when = true` — fail runs and `yarli plan validate` when open tranches omit `done_when`
+- `enforce_allowed_paths_on_merge = true` — fail merge finalization when a tranche edits paths outside `allowed_paths`
+
+`enforce_allowed_paths_on_merge` is backward-compatible and opt-in. When enabled, YARLI also surfaces `allowed_paths` in tranche prompts automatically, and control-plane files like `IMPLEMENTATION_PLAN.md` remain exempt so normal tranche bookkeeping still works.
+
 ### Control Terminology
 
 - **Policy gates**: code-defined checks evaluated by YARLI (`yarli gate ...`).
@@ -375,7 +384,7 @@ yarli plan tranche complete --key TP-05
 yarli plan tranche remove --key TP-05
 ```
 
-`yarli plan tranche add` also supports tranche metadata fields used by plan-driven dispatch: `--group`, `--allowed-paths`, `--verify`, `--done-when`, and `--max-tokens`. Add `--idempotent` when an agent or script may enqueue the same tranche key repeatedly and you want matching definitions to no-op instead of failing.
+`yarli plan tranche add` also supports tranche metadata fields used by plan-driven dispatch: `--group`, `--allowed-paths`, `--verify`, `--done-when`, and `--max-tokens`. Add `--idempotent` when an agent or script may enqueue the same tranche key repeatedly and you want matching definitions to no-op instead of failing. When `[run.tranche_contract]` is enabled, `yarli plan validate` and `yarli plan tranche add` enforce those stricter contract checks for open tranches without changing the default legacy behavior.
 
 ### `yarli debug`
 

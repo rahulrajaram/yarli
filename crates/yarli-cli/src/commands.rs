@@ -18,7 +18,7 @@ use crate::workspace::{
     cleanup_parallel_workspace, merge_parallel_workspace_results_with_resolution_with_events,
     merge_worktree_workspace_results, prepare_parallel_workspace_layout, MergeApplyTelemetryEvent,
     MergeResolutionConfig, ParallelWorkspaceMergeApplyError, ParallelWorkspaceMergeFailureKind,
-    ParallelWorkspaceMergeReport, ParallelWorkspaceMode,
+    ParallelWorkspaceMergeReport, ParallelWorkspaceMode, TaskWorkspaceBinding,
 };
 use yarli_cli::yarli_core::domain::ExitReason;
 use yarli_cli::yarli_core::entities::continuation::{
@@ -1326,7 +1326,13 @@ where
                 .tasks
                 .iter()
                 .zip(layout.task_workspace_dirs.iter())
-                .map(|(task, workspace_dir)| (task.task_key.clone(), workspace_dir.clone()))
+                .map(|(task, workspace_dir)| {
+                    TaskWorkspaceBinding::new(
+                        task.task_key.clone(),
+                        workspace_dir.clone(),
+                        task.allowed_paths.clone(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let merge_result = if layout.mode == ParallelWorkspaceMode::GitWorktree {
                 merge_worktree_workspace_results(

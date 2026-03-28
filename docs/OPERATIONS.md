@@ -226,6 +226,7 @@ Execution behavior:
 - Dispatch each tranche as its own Yarli task via `[cli]` command settings.
 - Optional grouping: set `[run].enable_plan_tranche_grouping = true` and annotate related plan lines with `tranche_group=<name>` to dispatch shared tranches.
 - Optional per-tranche file-scope policy: annotate plan lines with `allowed_paths=path/a,path/b` and set `[run].enforce_plan_tranche_allowed_paths = true` to inject explicit scope constraints into tranche prompts.
+- Optional tranche hardening: configure `[run.tranche_contract]` to require `verify`, require `done_when`, and fail merge finalization on out-of-scope edits. These checks are opt-in and preserve legacy behavior when unset.
 - Optional run-spec defaults can live in `yarli.toml` (`[run]`, `[[run.tasks]]`, `[[run.tranches]]`, `[run.plan_guard]`), with `PROMPT.md` `yarli-run` blocks used only for per-prompt overrides/backward compatibility.
 - Parallel mode defaults to enabled (`[features].parallel = true`) and requires `[execution].worktree_root`.
 - In parallel mode, YARLI prepares one workspace copy per task under `execution.worktree_root` before execution.
@@ -484,6 +485,21 @@ agent loops. The semantics are:
 - **Safe for repeated invocation.** Because identical calls are no-ops and
   conflicting calls are errors, agents can call `--idempotent` unconditionally at the
   start of every cycle without side effects or silent data loss.
+
+### Strict Tranche Contract
+
+Use `[run.tranche_contract]` when agent consumers need stronger execution guarantees without breaking legacy repositories:
+
+- `strict = true` turns on all checks below.
+- `require_verify = true` rejects open tranches that omit `verify`.
+- `require_done_when = true` rejects open tranches that omit `done_when`.
+- `enforce_allowed_paths_on_merge = true` fail-closes merge finalization when a tranche edits paths outside its declared `allowed_paths`.
+
+Behavior notes:
+
+- These checks apply to open tranches only; completed legacy tranches are left alone.
+- When merge-time path enforcement is enabled, YARLI automatically surfaces `allowed_paths` in tranche prompts even if `[run].enforce_plan_tranche_allowed_paths` is otherwise false.
+- Control-plane files such as `IMPLEMENTATION_PLAN.md` and `.yarli/*` remain exempt so normal plan/evidence bookkeeping does not trip the scope gate.
 
 ## Reproducing Budget Stress Checks Locally
 

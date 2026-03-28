@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 use yarli_cli::prompt;
 
+use crate::config::RunConfig;
 use crate::plan::{
     discover_plan_entries, looks_like_uuid, parse_plan_tranche_header_line,
     token_has_alpha_and_digit, verify_only_override_enabled, ImplementationPlanEntry, RunPlan,
@@ -494,6 +495,65 @@ pub(crate) fn validate_tranche_definition(def: &TrancheDefinition) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn validate_tranche_definition_with_run_config(
+    def: &TrancheDefinition,
+    run_config: &RunConfig,
+) -> Result<()> {
+    validate_tranche_definition(def)?;
+    validate_tranche_contract_fields(
+        &def.key,
+        def.verify.as_deref(),
+        def.done_when.as_deref(),
+        run_config,
+    )
+}
+
+fn validate_tranche_contract_fields(
+    key: &str,
+    verify: Option<&str>,
+    done_when: Option<&str>,
+    run_config: &RunConfig,
+) -> Result<()> {
+    let contract = &run_config.tranche_contract;
+    if contract.effective_require_verify() && verify.map(str::trim).unwrap_or("").is_empty() {
+        bail!(
+            "open tranche '{}' is missing `verify` but [run.tranche_contract] requires it",
+            key
+        );
+    }
+    if contract.effective_require_done_when() && done_when.map(str::trim).unwrap_or("").is_empty() {
+        bail!(
+            "open tranche '{}' is missing `done_when` but [run.tranche_contract] requires it",
+            key
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_plan_dispatch_entries_with_run_config(
+    entries: &[ImplementationPlanEntry],
+    run_config: &RunConfig,
+) -> Result<()> {
+    if !run_config.tranche_contract.any_contract_checks_enabled() {
+        return Ok(());
+    }
+
+    for entry in entries {
+        if entry.is_complete {
+            continue;
+        }
+        validate_tranche_contract_fields(
+            &entry.key,
+            entry.verify.as_deref(),
+            entry.done_when.as_deref(),
+            run_config,
+        )
+        .with_context(|| format!("tranche contract validation failed for {}", entry.key))?;
+    }
+
+    Ok(())
+}
+
 /// Phrases that indicate a placeholder/vague tranche summary.
 const PLACEHOLDER_PHRASES: &[&str] = &[
     "details pending",
@@ -512,7 +572,8 @@ const PLACEHOLDER_PHRASES: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn cmd_plan_tranche_add(
+pub(crate) fn cmd_plan_tranche_add_with_run_config(
+    run_config: &RunConfig,
     key: &str,
     summary: &str,
     group: Option<&str>,
@@ -532,7 +593,7 @@ pub(crate) fn cmd_plan_tranche_add(
         done_when: done_when.map(|s| s.to_string()),
         max_tokens,
     };
-    validate_tranche_definition(&def)?;
+    validate_tranche_definition_with_run_config(&def, run_config)?;
 
     let mut tf = read_tranches_file()?.unwrap_or(TranchesFile {
         version: 1,
@@ -559,6 +620,31 @@ pub(crate) fn cmd_plan_tranche_add(
     write_tranches_file(&tf)?;
     println!("Added tranche '{key}'");
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_plan_tranche_add(
+    key: &str,
+    summary: &str,
+    group: Option<&str>,
+    allowed_paths: &[String],
+    verify: Option<&str>,
+    done_when: Option<&str>,
+    max_tokens: Option<u64>,
+    idempotent: bool,
+) -> Result<()> {
+    cmd_plan_tranche_add_with_run_config(
+        &RunConfig::default(),
+        key,
+        summary,
+        group,
+        allowed_paths,
+        verify,
+        done_when,
+        max_tokens,
+        idempotent,
+    )
 }
 
 pub(crate) fn cmd_plan_tranche_complete(key: &str) -> Result<()> {
@@ -617,7 +703,7 @@ pub(crate) fn cmd_plan_tranche_remove(key: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_plan_validate() -> Result<()> {
+pub(crate) fn cmd_plan_validate_with_run_config(run_config: &RunConfig) -> Result<()> {
     let tf = read_tranches_file()?
         .ok_or_else(|| anyhow::anyhow!("no tranches file found at {TRANCHES_FILE}"))?;
 
@@ -627,6 +713,11 @@ pub(crate) fn cmd_plan_validate() -> Result<()> {
     for (i, def) in tf.tranches.iter().enumerate() {
         if let Err(e) = validate_tranche_definition(def) {
             errors.push(format!("tranches[{}] (key='{}'): {}", i, def.key, e));
+        }
+        if def.status != TrancheStatus::Complete {
+            if let Err(e) = validate_tranche_definition_with_run_config(def, run_config) {
+                errors.push(format!("tranches[{}] (key='{}'): {}", i, def.key, e));
+            }
         }
         if !seen_keys.insert(&def.key) {
             errors.push(format!("tranches[{}]: duplicate key '{}'", i, def.key));
@@ -645,6 +736,11 @@ pub(crate) fn cmd_plan_validate() -> Result<()> {
         }
         bail!("{TRANCHES_FILE} has {} validation error(s)", errors.len());
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn cmd_plan_validate() -> Result<()> {
+    cmd_plan_validate_with_run_config(&RunConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,6 +1773,46 @@ mode = "implement"
                 "key={key} should be valid"
             );
         }
+    }
+
+    #[test]
+    fn validate_tranche_definition_with_run_config_rejects_missing_contract_fields() {
+        let mut run_config = config::RunConfig::default();
+        run_config.tranche_contract.strict = true;
+
+        let def = TrancheDefinition {
+            key: "TP-09".to_string(),
+            summary: "Harden tranche execution contract".to_string(),
+            status: TrancheStatus::Incomplete,
+            group: None,
+            allowed_paths: vec!["src/".to_string()],
+            verify: None,
+            done_when: None,
+            max_tokens: None,
+        };
+
+        let err = validate_tranche_definition_with_run_config(&def, &run_config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing `verify`"), "error: {msg}");
+    }
+
+    #[test]
+    fn validate_plan_dispatch_entries_with_run_config_ignores_completed_entries() {
+        let mut run_config = config::RunConfig::default();
+        run_config.tranche_contract.strict = true;
+
+        let entries = vec![ImplementationPlanEntry {
+            key: "TP-10".to_string(),
+            summary: "Legacy tranche that predates strict contract".to_string(),
+            is_complete: true,
+            tranche_group: None,
+            allowed_paths: Vec::new(),
+            verify: None,
+            done_when: None,
+            max_tokens: None,
+        }];
+
+        validate_plan_dispatch_entries_with_run_config(&entries, &run_config).unwrap();
     }
 
     #[test]
