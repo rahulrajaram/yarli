@@ -403,7 +403,8 @@ async fn run() -> Result<()> {
                     done_when,
                     max_tokens,
                     idempotent,
-                } => cmd_plan_tranche_add(
+                } => cmd_plan_tranche_add_with_run_config(
+                    &loaded_config.config().run,
                     &key,
                     &summary,
                     group.as_deref(),
@@ -417,7 +418,7 @@ async fn run() -> Result<()> {
                 TrancheAction::List => cmd_plan_tranche_list(),
                 TrancheAction::Remove { key } => cmd_plan_tranche_remove(&key),
             },
-            PlanAction::Validate => cmd_plan_validate(),
+            PlanAction::Validate => cmd_plan_validate_with_run_config(&loaded_config.config().run),
         },
         Commands::Debug { action } => match action {
             DebugAction::QueueDepth => cmd_debug_queue_depth(),

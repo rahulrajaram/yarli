@@ -16,8 +16,8 @@ use yarli_cli::yarli_git::{generate_commit_message, render_commit_message, DiffS
 
 use crate::config;
 use crate::config::LoadedConfig;
-use crate::plan::sanitize_task_key_component;
 use crate::plan::RunPlan;
+use crate::plan::{normalize_allowed_path, sanitize_task_key_component};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParallelWorkspaceMode {
@@ -39,6 +39,61 @@ pub(crate) struct ParallelWorkspaceLayout {
     pub(crate) worktree_branches: Vec<String>,
     /// Source working directory (needed for worktree cleanup).
     pub(crate) source_workdir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskWorkspaceBinding {
+    pub(crate) task_key: String,
+    pub(crate) workspace_dir: PathBuf,
+    pub(crate) allowed_paths: Vec<String>,
+}
+
+impl TaskWorkspaceBinding {
+    pub(crate) fn new(
+        task_key: impl Into<String>,
+        workspace_dir: PathBuf,
+        allowed_paths: Vec<String>,
+    ) -> Self {
+        Self {
+            task_key: task_key.into(),
+            workspace_dir,
+            allowed_paths,
+        }
+    }
+}
+
+pub(crate) trait WorkspaceBindingLike {
+    fn task_key(&self) -> &str;
+    fn workspace_dir(&self) -> &Path;
+    fn allowed_paths(&self) -> &[String];
+}
+
+impl WorkspaceBindingLike for TaskWorkspaceBinding {
+    fn task_key(&self) -> &str {
+        &self.task_key
+    }
+
+    fn workspace_dir(&self) -> &Path {
+        &self.workspace_dir
+    }
+
+    fn allowed_paths(&self) -> &[String] {
+        &self.allowed_paths
+    }
+}
+
+impl WorkspaceBindingLike for (String, PathBuf) {
+    fn task_key(&self) -> &str {
+        &self.0
+    }
+
+    fn workspace_dir(&self) -> &Path {
+        &self.1
+    }
+
+    fn allowed_paths(&self) -> &[String] {
+        &[]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2276,6 +2331,75 @@ fn should_skip_parallel_merge_path(source_workdir: &Path, relative: &Path) -> bo
     !source_workdir.join(relative).exists()
 }
 
+fn is_tranche_contract_exempt_path(relative: &Path) -> bool {
+    if is_parallel_merge_internal_path(relative) {
+        return true;
+    }
+    relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("IMPLEMENTATION_PLAN.md"))
+        .unwrap_or(false)
+}
+
+fn task_path_within_allowed_scope(relative: &Path, allowed_paths: &[String]) -> bool {
+    if is_tranche_contract_exempt_path(relative) {
+        return true;
+    }
+    allowed_paths.iter().any(|allowed| {
+        let Some(normalized) = normalize_allowed_path(allowed) else {
+            return false;
+        };
+        let trimmed = normalized.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return false;
+        }
+        let root = Path::new(trimmed);
+        relative == root || relative.starts_with(root)
+    })
+}
+
+fn collect_out_of_scope_task_paths(
+    changed_paths: &[PathBuf],
+    allowed_paths: &[String],
+) -> Vec<String> {
+    if allowed_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let mut paths = changed_paths
+        .iter()
+        .filter(|relative| !task_path_within_allowed_scope(relative, allowed_paths))
+        .map(|relative| relative.display().to_string())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+fn enforce_allowed_paths_for_task(
+    task_key: &str,
+    changed_paths: &[PathBuf],
+    allowed_paths: &[String],
+) -> Result<()> {
+    let out_of_scope = collect_out_of_scope_task_paths(changed_paths, allowed_paths);
+    if out_of_scope.is_empty() {
+        return Ok(());
+    }
+
+    let allowed = allowed_paths.join(", ");
+    Err(ParallelWorkspaceMergeApplyError::new(
+        ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+        false,
+        format!(
+            "task {task_key} modified paths outside allowed_paths during merge finalization: {} (allowed_paths: {})",
+            out_of_scope.join(", "),
+            allowed
+        ),
+    )
+    .into())
+}
+
 pub(crate) fn workspace_candidate_paths(
     source_workdir: &Path,
     workspace_dir: &Path,
@@ -2446,6 +2570,35 @@ pub(crate) fn export_staged_workspace_patch(workspace_dir: &Path) -> Result<Stri
     )
 }
 
+fn worktree_branch_changed_paths(
+    source_workdir: &Path,
+    source_head: &str,
+    branch: &str,
+) -> Result<Vec<PathBuf>> {
+    let range = format!("{source_head}..{branch}");
+    let diff_args = ["diff", "--name-only", "-z", range.as_str()];
+    let diff_output = run_git_capture(source_workdir, &diff_args)?;
+    let stdout = ensure_git_success(
+        diff_output,
+        source_workdir,
+        &diff_args,
+        "worktree branch changed-path discovery",
+    )?;
+
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for token in stdout.split('\0') {
+        if token.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(token);
+        if seen.insert(relative.clone()) {
+            paths.push(relative);
+        }
+    }
+    Ok(paths)
+}
+
 pub(crate) fn persist_workspace_patch_for_recovery(
     run_workspace_root: &Path,
     task_key: &str,
@@ -2584,11 +2737,11 @@ Operator recovery steps:\n\
 }
 
 #[cfg(test)]
-pub(crate) fn merge_parallel_workspace_results(
+pub(crate) fn merge_parallel_workspace_results<T: WorkspaceBindingLike>(
     source_workdir: &Path,
     run_id: Uuid,
     run_workspace_root: &Path,
-    task_workspaces: &[(String, PathBuf)],
+    task_workspaces: &[T],
 ) -> Result<ParallelWorkspaceMergeReport> {
     let resolution_config = MergeResolutionConfig {
         strategy: config::MergeConflictResolution::Fail,
@@ -2609,10 +2762,10 @@ pub(crate) fn merge_parallel_workspace_results(
 ///
 /// For each task worktree: commit any changes, then merge the branch into the
 /// current branch in source_workdir.
-pub(crate) fn merge_worktree_workspace_results(
+pub(crate) fn merge_worktree_workspace_results<T: WorkspaceBindingLike>(
     source_workdir: &Path,
     run_id: Uuid,
-    task_workspaces: &[(String, PathBuf)],
+    task_workspaces: &[T],
     worktree_branches: &[String],
     resolution_config: &MergeResolutionConfig,
     apply_telemetry: &mut Vec<MergeApplyTelemetryEvent>,
@@ -2663,11 +2816,13 @@ pub(crate) fn merge_worktree_workspace_results(
             let mut skipped_task_keys = Vec::new();
             let mut task_outcomes = Vec::new();
 
-            for (task_index, ((task_key, workspace_dir), branch)) in task_workspaces
+            for (task_index, (task_workspace, branch)) in task_workspaces
                 .iter()
                 .zip(worktree_branches.iter())
                 .enumerate()
             {
+                let task_key = task_workspace.task_key();
+                let workspace_dir = task_workspace.workspace_dir();
                 // Check if worktree has any changes.
                 let status_output = run_git_capture(workspace_dir, &["status", "--porcelain"])?;
                 let status_text = String::from_utf8_lossy(&status_output.stdout);
@@ -2698,9 +2853,9 @@ pub(crate) fn merge_worktree_workspace_results(
                                 )
                             },
                         )?;
-                        skipped_task_keys.push(task_key.clone());
+                        skipped_task_keys.push(task_key.to_string());
                         task_outcomes.push(ParallelTaskMergeOutcome {
-                            task_key: task_key.clone(),
+                            task_key: task_key.to_string(),
                             disposition: ParallelTaskMergeDisposition::Skipped,
                             skip_reason: Some(ParallelTaskSkipReason::NoScopedPaths),
                             workspace_head: Some(ws_head),
@@ -2720,7 +2875,7 @@ pub(crate) fn merge_worktree_workspace_results(
                         DiffSpec::Staged,
                         vec![
                             ("yarli-run".to_string(), run_id.to_string()),
-                            ("yarli-task".to_string(), task_key.clone()),
+                            ("yarli-task".to_string(), task_key.to_string()),
                             ("yarli-branch".to_string(), branch.clone()),
                         ],
                         "chore(workspace): update staged changes",
@@ -2741,6 +2896,35 @@ pub(crate) fn merge_worktree_workspace_results(
                     }
                 }
 
+                let source_head_output = run_git_capture(source_workdir, &["rev-parse", "HEAD"])?;
+                let source_head = String::from_utf8_lossy(&source_head_output.stdout)
+                    .trim()
+                    .to_string();
+                let changed_paths =
+                    worktree_branch_changed_paths(source_workdir, &source_head, branch)?;
+                if let Err(err) = enforce_allowed_paths_for_task(
+                    task_key,
+                    &changed_paths,
+                    task_workspace.allowed_paths(),
+                ) {
+                    merge_apply_telemetry_event(
+                        apply_telemetry,
+                        "merge.apply.scope_violation",
+                        Some(task_key),
+                        Some(task_index),
+                        serde_json::json!({
+                            "run_id": run_id.to_string(),
+                            "task_key": task_key,
+                            "branch": branch,
+                            "mode": "git_worktree",
+                            "allowed_paths": task_workspace.allowed_paths(),
+                            "changed_paths": changed_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                            "out_of_scope_paths": collect_out_of_scope_task_paths(&changed_paths, task_workspace.allowed_paths()),
+                        }),
+                    );
+                    return Err(err);
+                }
+
                 // Merge the worktree branch into the main working directory.
                 let merge_msg = generated_commit_message(
                     source_workdir,
@@ -2750,7 +2934,7 @@ pub(crate) fn merge_worktree_workspace_results(
                     },
                     vec![
                         ("yarli-run".to_string(), run_id.to_string()),
-                        ("yarli-task".to_string(), task_key.clone()),
+                        ("yarli-task".to_string(), task_key.to_string()),
                         ("yarli-source-branch".to_string(), branch.clone()),
                     ],
                     "chore(integration): integrate workspace changes",
@@ -2787,9 +2971,9 @@ pub(crate) fn merge_worktree_workspace_results(
                                 )
                             },
                         )?;
-                        merged_task_keys.push(task_key.clone());
+                        merged_task_keys.push(task_key.to_string());
                         task_outcomes.push(ParallelTaskMergeOutcome {
-                            task_key: task_key.clone(),
+                            task_key: task_key.to_string(),
                             disposition: ParallelTaskMergeDisposition::Merged,
                             skip_reason: None,
                             workspace_head: Some(ws_head),
@@ -2860,7 +3044,7 @@ pub(crate) fn merge_worktree_workspace_results(
                                     DiffSpec::Staged,
                                     vec![
                                         ("yarli-run".to_string(), run_id.to_string()),
-                                        ("yarli-task".to_string(), task_key.clone()),
+                                        ("yarli-task".to_string(), task_key.to_string()),
                                         ("yarli-resolution".to_string(), "auto-repair".to_string()),
                                     ],
                                     "fix(integration): update repaired merge changes",
@@ -2870,9 +3054,9 @@ pub(crate) fn merge_worktree_workspace_results(
                                     source_workdir,
                                     &["commit", "--no-verify", "--allow-empty", "-m", &repair_msg],
                                 );
-                                merged_task_keys.push(task_key.clone());
+                                merged_task_keys.push(task_key.to_string());
                                 task_outcomes.push(ParallelTaskMergeOutcome {
-                                    task_key: task_key.clone(),
+                                    task_key: task_key.to_string(),
                                     disposition: ParallelTaskMergeDisposition::Merged,
                                     skip_reason: None,
                                     workspace_head: None,
@@ -3014,11 +3198,11 @@ fn merge_apply_telemetry_event(
 }
 
 #[allow(dead_code)]
-pub(crate) fn merge_parallel_workspace_results_with_resolution(
+pub(crate) fn merge_parallel_workspace_results_with_resolution<T: WorkspaceBindingLike>(
     source_workdir: &Path,
     run_id: Uuid,
     run_workspace_root: &Path,
-    task_workspaces: &[(String, PathBuf)],
+    task_workspaces: &[T],
     resolution_config: &MergeResolutionConfig,
     source_head_at_creation: Option<&str>,
 ) -> Result<ParallelWorkspaceMergeReport> {
@@ -3035,11 +3219,13 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution(
     Ok(report)
 }
 
-pub(crate) fn merge_parallel_workspace_results_with_resolution_with_events(
+pub(crate) fn merge_parallel_workspace_results_with_resolution_with_events<
+    T: WorkspaceBindingLike,
+>(
     source_workdir: &Path,
     run_id: Uuid,
     run_workspace_root: &Path,
-    task_workspaces: &[(String, PathBuf)],
+    task_workspaces: &[T],
     resolution_config: &MergeResolutionConfig,
     source_head_at_creation: Option<&str>,
     apply_telemetry: &mut Vec<MergeApplyTelemetryEvent>,
@@ -3112,7 +3298,9 @@ pub(crate) fn merge_parallel_workspace_results_with_resolution_with_events(
     let mut repair_succeeded_count = 0usize;
     let mut repair_failed_count = 0usize;
     let mut conflict_count = 0usize;
-    for (task_index, (task_key, workspace_dir)) in task_workspaces.iter().enumerate() {
+    for (task_index, task_workspace) in task_workspaces.iter().enumerate() {
+        let task_key = task_workspace.task_key();
+        let workspace_dir = task_workspace.workspace_dir();
         ensure_git_repository(workspace_dir)?;
         let mut original_workspace_head_for_restore: Option<String> = None;
         let mut soft_reset_applied = false;
@@ -3268,10 +3456,34 @@ Operator recovery steps:\n\
                 )));
             }
         };
+        if let Err(err) =
+            enforce_allowed_paths_for_task(task_key, &scoped_paths, task_workspace.allowed_paths())
+        {
+            merge_apply_telemetry_event(
+                apply_telemetry,
+                "merge.apply.scope_violation",
+                Some(task_key),
+                Some(task_index),
+                serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "task_key": task_key,
+                    "mode": "file_copy",
+                    "allowed_paths": task_workspace.allowed_paths(),
+                    "changed_paths": scoped_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                    "out_of_scope_paths": collect_out_of_scope_task_paths(&scoped_paths, task_workspace.allowed_paths()),
+                }),
+            );
+            let restore_note =
+                restore_workspace_head_on_error("workspace scope enforcement failed")
+                    .unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "parallel workspace merge failed while enforcing allowed_paths for task {task_key}{restore_note}: {err}"
+            ));
+        }
         if scoped_paths.is_empty() {
-            skipped_task_keys.push(task_key.clone());
+            skipped_task_keys.push(task_key.to_string());
             task_outcomes.push(ParallelTaskMergeOutcome {
-                task_key: task_key.clone(),
+                task_key: task_key.to_string(),
                 disposition: ParallelTaskMergeDisposition::Skipped,
                 skip_reason: Some(ParallelTaskSkipReason::NoScopedPaths),
                 workspace_head: Some(ws_head.clone()),
@@ -3300,9 +3512,9 @@ Operator recovery steps:\n\
             }
         };
         if patch.trim().is_empty() {
-            skipped_task_keys.push(task_key.clone());
+            skipped_task_keys.push(task_key.to_string());
             task_outcomes.push(ParallelTaskMergeOutcome {
-                task_key: task_key.clone(),
+                task_key: task_key.to_string(),
                 disposition: ParallelTaskMergeDisposition::Skipped,
                 skip_reason: Some(ParallelTaskSkipReason::EmptyPatch),
                 workspace_head: Some(ws_head.clone()),
@@ -3467,9 +3679,9 @@ Operator recovery steps:\n\
                 ));
             }
         }
-        merged_task_keys.push(task_key.clone());
+        merged_task_keys.push(task_key.to_string());
         task_outcomes.push(ParallelTaskMergeOutcome {
-            task_key: task_key.clone(),
+            task_key: task_key.to_string(),
             disposition: ParallelTaskMergeDisposition::Merged,
             skip_reason: None,
             workspace_head: Some(ws_head.clone()),
@@ -3489,7 +3701,7 @@ Operator recovery steps:\n\
             DiffSpec::Staged,
             vec![
                 ("yarli-run".to_string(), run_id.to_string()),
-                ("yarli-task".to_string(), task_key.clone()),
+                ("yarli-task".to_string(), task_key.to_string()),
                 ("yarli-workspace-head".to_string(), ws_head.clone()),
                 ("yarli-source-head".to_string(), source_head.clone()),
                 ("yarli-patch".to_string(), patch_path.display().to_string()),
@@ -5633,11 +5845,17 @@ worktree_root = "{}"
         );
 
         // Build task_workspaces for merge
-        let task_workspaces: Vec<(String, PathBuf)> = plan
+        let task_workspaces: Vec<TaskWorkspaceBinding> = plan
             .tasks
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.task_key.clone(), layout.task_workspace_dirs[i].clone()))
+            .map(|(i, t)| {
+                TaskWorkspaceBinding::new(
+                    t.task_key.clone(),
+                    layout.task_workspace_dirs[i].clone(),
+                    t.allowed_paths.clone(),
+                )
+            })
             .collect();
 
         let run_id = Uuid::now_v7();
@@ -5818,11 +6036,17 @@ worktree_root = "{}"
         assert!(ws1.contains("edited by task B"));
 
         // Merge should fail with conflict
-        let task_workspaces: Vec<(String, PathBuf)> = plan
+        let task_workspaces: Vec<TaskWorkspaceBinding> = plan
             .tasks
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.task_key.clone(), layout.task_workspace_dirs[i].clone()))
+            .map(|(i, t)| {
+                TaskWorkspaceBinding::new(
+                    t.task_key.clone(),
+                    layout.task_workspace_dirs[i].clone(),
+                    t.allowed_paths.clone(),
+                )
+            })
             .collect();
 
         let run_id = Uuid::now_v7();
@@ -6711,7 +6935,11 @@ worktree_root = "{}"
             repair_command: None,
             repair_timeout_seconds: 300,
         };
-        let task_workspaces = vec![("alpha".to_string(), wt1.clone())];
+        let task_workspaces = vec![TaskWorkspaceBinding::new(
+            "alpha".to_string(),
+            wt1.clone(),
+            Vec::new(),
+        )];
         let branches = vec!["yarli/merge/001-alpha".to_string()];
         let mut telemetry = Vec::new();
 
@@ -6795,7 +7023,11 @@ worktree_root = "{}"
             repair_command: None,
             repair_timeout_seconds: 300,
         };
-        let task_workspaces = vec![("task".to_string(), wt1.clone())];
+        let task_workspaces = vec![TaskWorkspaceBinding::new(
+            "task".to_string(),
+            wt1.clone(),
+            Vec::new(),
+        )];
         let branches = vec!["yarli/skip/001-task".to_string()];
         let mut telemetry = Vec::new();
 
@@ -6909,7 +7141,11 @@ worktree_root = "{}"
             repair_command: None,
             repair_timeout_seconds: 300,
         };
-        let task_workspaces = vec![("task".to_string(), wt1.clone())];
+        let task_workspaces = vec![TaskWorkspaceBinding::new(
+            "task".to_string(),
+            wt1.clone(),
+            Vec::new(),
+        )];
         let branches = vec!["yarli/stash/001-task".to_string()];
         let mut telemetry = Vec::new();
 
@@ -7002,7 +7238,11 @@ worktree_root = "{}"
             repair_command: None,
             repair_timeout_seconds: 300,
         };
-        let task_workspaces = vec![("conflict".to_string(), wt1.clone())];
+        let task_workspaces = vec![TaskWorkspaceBinding::new(
+            "conflict".to_string(),
+            wt1.clone(),
+            Vec::new(),
+        )];
         let branches = vec!["yarli/fail/001-conflict".to_string()];
         let mut telemetry = Vec::new();
 
@@ -7030,5 +7270,184 @@ worktree_root = "{}"
             repo.join("dirty_local.txt").exists(),
             "dirty local file should be restored from stash"
         );
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_rejects_out_of_scope_paths_when_allowed_paths_present() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(source_repo.join("src")).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
+        std::fs::write(source_repo.join("README.md"), "base readme\n").unwrap();
+        std::fs::write(
+            source_repo.join("IMPLEMENTATION_PLAN.md"),
+            "1. TP-01 `Plan`: incomplete.\n",
+        )
+        .unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace");
+        run_git_expect_ok(
+            temp_dir.path(),
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+        );
+
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn hi() { println!(\"ok\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("README.md"),
+            "unexpected out of scope change\n",
+        )
+        .unwrap();
+
+        let err = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[TaskWorkspaceBinding::new(
+                "task-scope".to_string(),
+                workspace.clone(),
+                vec!["src".to_string()],
+            )],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("outside allowed_paths"), "error: {msg}");
+        assert!(msg.contains("README.md"), "error: {msg}");
+    }
+
+    #[test]
+    fn merge_parallel_workspace_results_allows_plan_updates_as_control_plane_exemptions() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_repo = temp_dir.path().join("source");
+        std::fs::create_dir_all(source_repo.join("src")).unwrap();
+        let run_workspace_root = temp_dir.path().join("parallel-run");
+        std::fs::create_dir_all(&run_workspace_root).unwrap();
+
+        run_git_expect_ok(&source_repo, &["init"]);
+        run_git_expect_ok(&source_repo, &["checkout", "-b", "main"]);
+        run_git_expect_ok(&source_repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&source_repo, &["config", "user.name", "Yarli Test"]);
+
+        std::fs::write(source_repo.join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
+        std::fs::write(
+            source_repo.join("IMPLEMENTATION_PLAN.md"),
+            "1. TP-01 `Plan`: incomplete.\n",
+        )
+        .unwrap();
+        run_git_expect_ok(&source_repo, &["add", "."]);
+        run_git_expect_ok(&source_repo, &["commit", "-m", "initial"]);
+
+        let workspace = temp_dir.path().join("workspace");
+        run_git_expect_ok(
+            temp_dir.path(),
+            &[
+                "clone",
+                source_repo.to_str().unwrap(),
+                workspace.to_str().unwrap(),
+            ],
+        );
+
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn hi() { println!(\"ok\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("IMPLEMENTATION_PLAN.md"),
+            "1. TP-01 `Plan`: complete.\n",
+        )
+        .unwrap();
+
+        let report = merge_parallel_workspace_results(
+            &source_repo,
+            Uuid::now_v7(),
+            &run_workspace_root,
+            &[TaskWorkspaceBinding::new(
+                "task-scope".to_string(),
+                workspace.clone(),
+                vec!["src".to_string()],
+            )],
+        )
+        .unwrap();
+        assert_eq!(report.merged_task_keys, vec!["task-scope".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(source_repo.join("src/lib.rs")).unwrap(),
+            "pub fn hi() { println!(\"ok\"); }\n"
+        );
+    }
+
+    #[test]
+    fn merge_worktree_workspace_results_rejects_out_of_scope_paths_when_allowed_paths_present() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let wt_root = temp.path().join("workspaces");
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let run_root = wt_root.join("run-scope-test");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let wt1 = run_root.join("001-task");
+        let wt1_str = wt1.display().to_string();
+        run_git_expect_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "yarli/scope/001-task",
+                &wt1_str,
+                "HEAD",
+            ],
+        );
+
+        std::fs::write(wt1.join("README.md"), "out of scope change\n").unwrap();
+
+        let resolution_config = MergeResolutionConfig {
+            strategy: crate::config::MergeConflictResolution::Fail,
+            repair_command: None,
+            repair_timeout_seconds: 300,
+        };
+        let task_workspaces = vec![TaskWorkspaceBinding::new(
+            "task".to_string(),
+            wt1.clone(),
+            vec!["src".to_string()],
+        )];
+        let branches = vec!["yarli/scope/001-task".to_string()];
+        let mut telemetry = Vec::new();
+
+        let err = merge_worktree_workspace_results(
+            &repo,
+            Uuid::now_v7(),
+            &task_workspaces,
+            &branches,
+            &resolution_config,
+            &mut telemetry,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("outside allowed_paths"), "error: {msg}");
+        assert!(msg.contains("README.md"), "error: {msg}");
     }
 }

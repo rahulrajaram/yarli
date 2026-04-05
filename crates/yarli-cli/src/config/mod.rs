@@ -2,6 +2,8 @@
 //!
 //! Loop-2 requires explicit backend selection and typed config sections.
 
+mod migrate;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -601,8 +603,21 @@ impl LoadedConfig {
 
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let config: YarliConfig = toml::from_str(&raw)
+
+        // Pass 1: parse into untyped TOML tree.
+        let mut value: toml::Value = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
+
+        // Apply migrations for deprecated keys.
+        let report = migrate::apply_migrations(&mut value);
+        for m in &report.applied {
+            tracing::warn!(rule = m.rule_id, "{}", m.warning);
+        }
+
+        // Pass 2: deserialize patched tree into typed config.
+        let config: YarliConfig = value
+            .try_into()
+            .with_context(|| format!("failed to deserialize config from {}", path.display()))?;
 
         let loaded = Self {
             path,
@@ -1169,6 +1184,11 @@ pub struct RunConfig {
     /// in tranche task prompts.
     #[serde(default)]
     pub enforce_plan_tranche_allowed_paths: bool,
+    /// Optional hardening policy for tranche execution contracts.
+    ///
+    /// This is opt-in and preserves legacy behavior by default.
+    #[serde(default)]
+    pub tranche_contract: TrancheContractConfig,
     /// Allow recursive `yarli run` invocation from task commands.
     ///
     /// Defaults to false; recursive runs require explicit per-invocation opt-in.
@@ -1269,6 +1289,13 @@ impl RunConfig {
         Ok(())
     }
 
+    pub fn should_surface_allowed_paths_in_prompts(&self) -> bool {
+        self.enforce_plan_tranche_allowed_paths
+            || self
+                .tranche_contract
+                .effective_enforce_allowed_paths_on_merge()
+    }
+
     pub fn effective_auto_advance_policy(&self) -> AutoAdvancePolicy {
         if self.auto_advance_policy != AutoAdvancePolicy::ImprovingOnly {
             return self.auto_advance_policy;
@@ -1313,6 +1340,7 @@ impl Default for RunConfig {
             tranche_token_advisory: AdvisoryTrancheTokenThresholds::default(),
             tranche_token_advisory_by_backend: std::collections::BTreeMap::new(),
             enforce_plan_tranche_allowed_paths: false,
+            tranche_contract: TrancheContractConfig::default(),
             allow_recursive_run: false,
             merge_conflict_resolution: MergeConflictResolution::Fail,
             merge_repair_command: None,
@@ -1325,6 +1353,47 @@ impl Default for RunConfig {
             default_pace: None,
             paces: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TrancheContractConfig {
+    /// Convenience umbrella for the strict tranche contract checks below.
+    ///
+    /// When enabled, Yarli requires `verify`, requires `done_when`, and
+    /// hard-enforces `allowed_paths` during merge finalization when
+    /// `allowed_paths` are present on a tranche.
+    #[serde(default)]
+    pub strict: bool,
+    /// Require open tranches to declare a verification command.
+    #[serde(default)]
+    pub require_verify: bool,
+    /// Require open tranches to declare explicit done criteria.
+    #[serde(default)]
+    pub require_done_when: bool,
+    /// Fail merge finalization if a tranche edits paths outside its
+    /// declared `allowed_paths`.
+    #[serde(default)]
+    pub enforce_allowed_paths_on_merge: bool,
+}
+
+impl TrancheContractConfig {
+    pub fn effective_require_verify(&self) -> bool {
+        self.strict || self.require_verify
+    }
+
+    pub fn effective_require_done_when(&self) -> bool {
+        self.strict || self.require_done_when
+    }
+
+    pub fn effective_enforce_allowed_paths_on_merge(&self) -> bool {
+        self.strict || self.enforce_allowed_paths_on_merge
+    }
+
+    pub fn any_contract_checks_enabled(&self) -> bool {
+        self.effective_require_verify()
+            || self.effective_require_done_when()
+            || self.effective_enforce_allowed_paths_on_merge()
     }
 }
 
@@ -1893,6 +1962,10 @@ mod tests {
             "run.tranche_token_advisory_by_backend.<name>.warn_tokens",
             "run.tranche_token_advisory_by_backend.<name>.max_recommended_tokens",
             "run.enforce_plan_tranche_allowed_paths",
+            "run.tranche_contract.strict",
+            "run.tranche_contract.require_verify",
+            "run.tranche_contract.require_done_when",
+            "run.tranche_contract.enforce_allowed_paths_on_merge",
             "run.merge_conflict_resolution",
             "run.merge_repair_command",
             "run.merge_repair_timeout_seconds",
@@ -2261,6 +2334,12 @@ enable_plan_tranche_grouping = true
 max_grouped_tasks_per_tranche = 3
 enforce_plan_tranche_allowed_paths = true
 default_pace = "batch"
+
+[run.tranche_contract]
+strict = true
+require_verify = true
+require_done_when = true
+enforce_allowed_paths_on_merge = true
 
 [run.task_health]
 improving = "continue"
@@ -2843,6 +2922,50 @@ merge_conflict_resolution = "manual"
     }
 
     #[test]
+    fn tranche_contract_config_parses_and_applies_strict_defaults() {
+        let loaded = write_test_config(
+            r#"
+[run.tranche_contract]
+strict = true
+"#,
+        );
+        let contract = &loaded.config().run.tranche_contract;
+        assert!(contract.strict);
+        assert!(contract.effective_require_verify());
+        assert!(contract.effective_require_done_when());
+        assert!(contract.effective_enforce_allowed_paths_on_merge());
+        assert!(loaded
+            .config()
+            .run
+            .should_surface_allowed_paths_in_prompts());
+    }
+
+    #[test]
+    fn tranche_contract_config_supports_granular_flags_without_strict_mode() {
+        let loaded = write_test_config(
+            r#"
+[run]
+enforce_plan_tranche_allowed_paths = false
+
+[run.tranche_contract]
+strict = false
+require_verify = true
+require_done_when = false
+enforce_allowed_paths_on_merge = true
+"#,
+        );
+        let contract = &loaded.config().run.tranche_contract;
+        assert!(!contract.strict);
+        assert!(contract.effective_require_verify());
+        assert!(!contract.effective_require_done_when());
+        assert!(contract.effective_enforce_allowed_paths_on_merge());
+        assert!(loaded
+            .config()
+            .run
+            .should_surface_allowed_paths_in_prompts());
+    }
+
+    #[test]
     fn merge_conflict_resolution_rejects_unknown_values_with_clear_error() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("yarli.toml");
@@ -2859,7 +2982,8 @@ merge_conflict_resolution = "agentic"
         let msg = err.to_string();
         let root_msg = err.root_cause().to_string();
         assert!(
-            msg.contains("failed to parse config file"),
+            msg.contains("failed to deserialize config from")
+                || msg.contains("failed to parse config file"),
             "unexpected error: {msg}"
         );
         assert!(
@@ -2997,5 +3121,37 @@ auto_commit_message = "checkpoint: {tranche_key}"
             loaded.config().run.auto_commit_message.as_deref(),
             Some("checkpoint: {tranche_key}")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip migration integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn migration_allow_stable_auto_advance_round_trips_to_stable_ok() {
+        let loaded = write_test_config(
+            r#"
+[run]
+allow_stable_auto_advance = true
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.effective_auto_advance_policy(),
+            AutoAdvancePolicy::StableOk,
+        );
+    }
+
+    #[test]
+    fn migration_enforce_plan_tranche_allowed_paths_round_trips() {
+        let loaded = write_test_config(
+            r#"
+[run]
+enforce_plan_tranche_allowed_paths = true
+"#,
+        );
+        assert!(loaded
+            .config()
+            .run
+            .should_surface_allowed_paths_in_prompts());
     }
 }

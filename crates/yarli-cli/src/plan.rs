@@ -93,11 +93,11 @@ pub(crate) struct IterationMetrics {
 }
 
 pub(crate) use crate::tranche::{
-    cmd_plan_tranche_add, cmd_plan_tranche_complete, cmd_plan_tranche_list,
-    cmd_plan_tranche_remove, cmd_plan_validate, discover_plan_dispatch_entries,
+    cmd_plan_tranche_add_with_run_config, cmd_plan_tranche_complete, cmd_plan_tranche_list,
+    cmd_plan_tranche_remove, cmd_plan_validate_with_run_config, discover_plan_dispatch_entries,
     enforce_plan_guard_post_run, maybe_mark_current_structured_tranche_complete,
     plan_path_for_prompt_entry, read_tranches_file_in, run_spec_plan_guard_preflight,
-    run_tranche_verify_command, tranches_file_path,
+    run_tranche_verify_command, tranches_file_path, validate_plan_dispatch_entries_with_run_config,
     validate_structured_tranches_preflight_for_prompt,
 };
 #[cfg(test)]
@@ -527,6 +527,7 @@ pub(crate) fn build_plan_driven_run_sequence(
         &all_tranches,
         &loaded_prompt.run_spec,
     )?;
+    validate_plan_dispatch_entries_with_run_config(&open_tranches, &loaded_config.config().run)?;
 
     if open_tranches.is_empty() && plan_text.len() > 50 {
         let total_parsed = discover_plan_dispatch_entries(&plan_text).len();
@@ -559,7 +560,7 @@ pub(crate) fn build_plan_driven_run_sequence(
             loaded_config
                 .config()
                 .run
-                .enforce_plan_tranche_allowed_paths,
+                .should_surface_allowed_paths_in_prompts(),
         );
         let command = config::build_cli_command(&cli_invocation, &prompt_text);
         task_catalog.push(PlannedTask {
