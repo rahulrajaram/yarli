@@ -605,6 +605,16 @@ pub(crate) fn cmd_plan_tranche_add_with_run_config(
             bail!("tranche with key '{}' already exists", key);
         }
         if tranche_effective_fields_match(existing, &def) {
+            if existing.status != TrancheStatus::Incomplete {
+                bail!(
+                    "tranche '{}' already exists with matching fields but is {:?}; \
+                     `--idempotent` only no-ops for incomplete tranches. \
+                     Use `yarli plan tranche remove --key {0}` then re-add, \
+                     or omit `--idempotent` after confirming the tranche state.",
+                    key,
+                    existing.status,
+                );
+            }
             println!("Tranche '{key}' already exists with matching fields; no changes made");
             return Ok(());
         }
@@ -1938,6 +1948,95 @@ mode = "implement"
 
         assert_eq!(parsed.tranches.len(), 1);
         assert_eq!(parsed.tranches[0].key, "TP-05");
+    }
+
+    #[test]
+    fn cmd_plan_tranche_add_idempotent_rejects_completed_tranche() {
+        let repo = TempDir::new().unwrap();
+        let err = with_current_dir(repo.path(), || {
+            let allowed_paths = vec!["crates/yarli-cli/src".to_string()];
+            // First add the tranche normally.
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &allowed_paths,
+                Some("cargo test -p yarli-cli"),
+                Some("config loader handles overrides"),
+                Some(55_000),
+                false,
+            )
+            .unwrap();
+            // Mark it complete.
+            cmd_plan_tranche_complete("TP-05").unwrap();
+            // Idempotent add with identical effective fields should fail because
+            // the tranche is no longer incomplete.
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &allowed_paths,
+                Some("cargo test -p yarli-cli"),
+                Some("config loader handles overrides"),
+                Some(55_000),
+                true,
+            )
+            .unwrap_err()
+        });
+
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("Complete"),
+            "error should mention the Complete status: {err_text}"
+        );
+        assert!(
+            err_text.contains("--idempotent"),
+            "error should reference the --idempotent flag: {err_text}"
+        );
+    }
+
+    #[test]
+    fn cmd_plan_tranche_add_idempotent_rejects_blocked_tranche() {
+        let repo = TempDir::new().unwrap();
+        let err = with_current_dir(repo.path(), || {
+            // Write a tranches file with a blocked tranche directly.
+            std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+            std::fs::write(
+                repo.path().join(".yarli/tranches.toml"),
+                r#"version = 1
+
+[[tranches]]
+key = "TP-05"
+summary = "Implement config loader hardening"
+status = "blocked"
+group = "core"
+allowed_paths = ["crates/yarli-cli/src"]
+verify = "cargo test -p yarli-cli"
+done_when = "config loader handles overrides"
+max_tokens = 55000
+"#,
+            )
+            .unwrap();
+            // Idempotent add with matching fields should fail because the tranche
+            // is blocked, not incomplete.
+            cmd_plan_tranche_add(
+                "TP-05",
+                "Implement config loader hardening",
+                Some("core"),
+                &["crates/yarli-cli/src".to_string()],
+                Some("cargo test -p yarli-cli"),
+                Some("config loader handles overrides"),
+                Some(55_000),
+                true,
+            )
+            .unwrap_err()
+        });
+
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("Blocked"),
+            "error should mention the Blocked status: {err_text}"
+        );
     }
 
     #[test]
