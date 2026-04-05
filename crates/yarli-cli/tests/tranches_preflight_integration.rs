@@ -274,3 +274,170 @@ prompt_mode = "arg"
         "expected drift refusal message in output:\n{combined_output}"
     );
 }
+
+/// Binary-level roundtrip: add → list → complete → validate proves the full
+/// `yarli plan tranche` CLI path works end-to-end through clap dispatch,
+/// `tranches.toml` I/O, and plan validation.
+#[test]
+fn plan_tranche_add_complete_list_validate_roundtrip() {
+    let temp_dir = TempDir::new().expect("create temp workspace");
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+    // Minimal yarli.toml — plan commands only need [core].
+    std::fs::write(
+        repo_dir.join("yarli.toml"),
+        r#"[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+"#,
+    )
+    .expect("write yarli.toml");
+
+    let binary = run_output_path();
+
+    // Helper to run yarli and return (success, stdout+stderr).
+    let yarli = |args: &[&str]| -> (bool, String) {
+        let output = Command::new(&binary)
+            .current_dir(&repo_dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run yarli {args:?}: {err}"));
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        (output.status.success(), combined)
+    };
+
+    // 1. Add two tranches.
+    let (ok, out) = yarli(&[
+        "plan",
+        "tranche",
+        "add",
+        "--key",
+        "RT-01",
+        "--summary",
+        "First roundtrip tranche",
+        "--group",
+        "roundtrip",
+    ]);
+    assert!(ok, "tranche add RT-01 should succeed:\n{out}");
+    assert!(
+        out.contains("Added tranche 'RT-01'"),
+        "expected confirmation for RT-01:\n{out}",
+    );
+
+    let (ok, out) = yarli(&[
+        "plan",
+        "tranche",
+        "add",
+        "--key",
+        "RT-02",
+        "--summary",
+        "Second roundtrip tranche",
+        "--group",
+        "roundtrip",
+        "--verify",
+        "cargo test --offline roundtrip",
+    ]);
+    assert!(ok, "tranche add RT-02 should succeed:\n{out}");
+    assert!(
+        out.contains("Added tranche 'RT-02'"),
+        "expected confirmation for RT-02:\n{out}",
+    );
+
+    // 2. List — both should appear as incomplete.
+    let (ok, out) = yarli(&["plan", "tranche", "list"]);
+    assert!(ok, "tranche list should succeed:\n{out}");
+    assert!(
+        out.contains("RT-01") && out.contains("RT-02"),
+        "list should show both tranches:\n{out}",
+    );
+    assert!(
+        out.contains("[ ]") || out.contains("incomplete"),
+        "tranches should be incomplete:\n{out}",
+    );
+
+    // 3. Validate — should pass with 2 tranches.
+    let (ok, out) = yarli(&["plan", "validate"]);
+    assert!(ok, "validate should pass with 2 valid tranches:\n{out}");
+    assert!(
+        out.contains("2 tranches defined"),
+        "expected '2 tranches defined' in validate output:\n{out}",
+    );
+
+    // 4. Complete RT-01.
+    let (ok, out) = yarli(&["plan", "tranche", "complete", "--key", "RT-01"]);
+    assert!(ok, "tranche complete RT-01 should succeed:\n{out}");
+    assert!(
+        out.contains("Marked tranche 'RT-01' as complete"),
+        "expected completion confirmation:\n{out}",
+    );
+
+    // 5. List again — RT-01 should be [x], RT-02 still [ ].
+    let (ok, out) = yarli(&["plan", "tranche", "list"]);
+    assert!(ok, "tranche list after complete should succeed:\n{out}");
+    assert!(
+        out.contains("[x] RT-01"),
+        "RT-01 should be marked complete:\n{out}",
+    );
+    assert!(
+        out.contains("[ ] RT-02"),
+        "RT-02 should still be incomplete:\n{out}",
+    );
+
+    // 6. Validate again — still 2 tranches, still valid.
+    let (ok, out) = yarli(&["plan", "validate"]);
+    assert!(
+        ok,
+        "validate should still pass after completing one:\n{out}"
+    );
+
+    // 7. Idempotent add of RT-01 should fail (it's Complete now).
+    let (ok, out) = yarli(&[
+        "plan",
+        "tranche",
+        "add",
+        "--key",
+        "RT-01",
+        "--summary",
+        "First roundtrip tranche",
+        "--group",
+        "roundtrip",
+        "--idempotent",
+    ]);
+    assert!(
+        !ok,
+        "idempotent add of completed tranche should fail:\n{out}",
+    );
+    assert!(
+        out.contains("Complete"),
+        "error should mention Complete status:\n{out}",
+    );
+
+    // 8. Idempotent add of RT-02 should no-op (it's still Incomplete).
+    let (ok, out) = yarli(&[
+        "plan",
+        "tranche",
+        "add",
+        "--key",
+        "RT-02",
+        "--summary",
+        "Second roundtrip tranche",
+        "--group",
+        "roundtrip",
+        "--verify",
+        "cargo test --offline roundtrip",
+        "--idempotent",
+    ]);
+    assert!(
+        ok,
+        "idempotent add of matching incomplete tranche should no-op:\n{out}"
+    );
+    assert!(
+        out.contains("no changes made"),
+        "expected no-op message:\n{out}",
+    );
+}
