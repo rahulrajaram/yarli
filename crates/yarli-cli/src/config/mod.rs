@@ -2,6 +2,8 @@
 //!
 //! Loop-2 requires explicit backend selection and typed config sections.
 
+mod migrate;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -601,8 +603,21 @@ impl LoadedConfig {
 
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let config: YarliConfig = toml::from_str(&raw)
+
+        // Pass 1: parse into untyped TOML tree.
+        let mut value: toml::Value = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
+
+        // Apply migrations for deprecated keys.
+        let report = migrate::apply_migrations(&mut value);
+        for m in &report.applied {
+            tracing::warn!(rule = m.rule_id, "{}", m.warning);
+        }
+
+        // Pass 2: deserialize patched tree into typed config.
+        let config: YarliConfig = value
+            .try_into()
+            .with_context(|| format!("failed to deserialize config from {}", path.display()))?;
 
         let loaded = Self {
             path,
@@ -2967,7 +2982,8 @@ merge_conflict_resolution = "agentic"
         let msg = err.to_string();
         let root_msg = err.root_cause().to_string();
         assert!(
-            msg.contains("failed to parse config file"),
+            msg.contains("failed to deserialize config from")
+                || msg.contains("failed to parse config file"),
             "unexpected error: {msg}"
         );
         assert!(
@@ -3105,5 +3121,37 @@ auto_commit_message = "checkpoint: {tranche_key}"
             loaded.config().run.auto_commit_message.as_deref(),
             Some("checkpoint: {tranche_key}")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip migration integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn migration_allow_stable_auto_advance_round_trips_to_stable_ok() {
+        let loaded = write_test_config(
+            r#"
+[run]
+allow_stable_auto_advance = true
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.effective_auto_advance_policy(),
+            AutoAdvancePolicy::StableOk,
+        );
+    }
+
+    #[test]
+    fn migration_enforce_plan_tranche_allowed_paths_round_trips() {
+        let loaded = write_test_config(
+            r#"
+[run]
+enforce_plan_tranche_allowed_paths = true
+"#,
+        );
+        assert!(loaded
+            .config()
+            .run
+            .should_surface_allowed_paths_in_prompts());
     }
 }
