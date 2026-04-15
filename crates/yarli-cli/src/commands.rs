@@ -606,12 +606,31 @@ pub(crate) async fn cmd_run_continue(
     };
 
     if let Some(drift) = detect_continuation_tranche_drift(&payload)? {
-        bail!(
-            "continuation snapshot for run {} does not include newer open tranches from {}: {}. `yarli run continue` only replays the prior snapshot. Use `yarli run --fresh-from-tranches` to rebuild from the current plan/tranches state.",
-            payload.run_id,
-            drift.tranches_path.display(),
-            drift.missing_from_snapshot.join(", ")
-        );
+        match loaded_config.config().run.continuation_drift_policy {
+            config::ContinuationDriftPolicy::Refuse => {
+                bail!(
+                    "continuation snapshot for run {} does not include newer open tranches from {}: {}. `yarli run continue` only replays the prior snapshot. Use `yarli run --fresh-from-tranches` to rebuild from the current plan/tranches state.",
+                    payload.run_id,
+                    drift.tranches_path.display(),
+                    drift.missing_from_snapshot.join(", ")
+                );
+            }
+            config::ContinuationDriftPolicy::FallbackFresh => {
+                warn!(
+                    run_id = %payload.run_id,
+                    drifted_keys = %drift.missing_from_snapshot.join(", "),
+                    "continuation drift detected; falling back to fresh-from-tranches rebuild"
+                );
+                return cmd_run_default(
+                    render_mode,
+                    loaded_config,
+                    None,
+                    true,
+                    allow_recursive_run_override,
+                )
+                .await;
+            }
+        }
     }
 
     let auto_advance = config::AutoAdvanceConfig::from_loaded(loaded_config);

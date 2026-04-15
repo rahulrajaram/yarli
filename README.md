@@ -211,7 +211,7 @@ Start, monitor, and explain orchestration runs. `yarli run` (no subcommand) is t
 - Auto-advance policy: `[run] auto_advance_policy = "improving-only" | "stable-ok" | "always"` (default: `stable-ok`).
 - Task health trends (`[run.task_health.improving|stable|deteriorating]`) can trigger `continue`, `checkpoint-now`, `force-pivot`, or `stop-and-summarize`.
 - `[run].soft_token_cap_ratio` triggers checkpoint-now when total token usage reaches `ratio * max_run_total_tokens` (default: `0.9`).
-- `yarli run continue` replays the prior continuation snapshot. If current `.yarli/tranches.toml` has newer open tranche keys, it refuses and tells you to use `yarli run --fresh-from-tranches`.
+- `yarli run continue` replays the prior continuation snapshot. If current `.yarli/tranches.toml` has newer open tranche keys, the behavior depends on `[run].continuation_drift_policy`: `refuse` (default) hard-fails and tells you to use `yarli run --fresh-from-tranches`; `fallback-fresh` logs a warning and automatically rebuilds from current state.
 - `yarli run --fresh-from-tranches` explicitly rebuilds from current prompt/plan/tranches state and ignores continuation as an execution source.
 - Use `yarli run --allow-recursive-run ...` when a task command intentionally needs to invoke nested `yarli run` execution for that invocation.
 
