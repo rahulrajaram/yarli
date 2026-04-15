@@ -115,6 +115,7 @@ commands unless `core.allow_in_memory_writes = true`.
 - run.prompt_file (optional; default prompt file for `yarli run`, relative to repo root)
 - run.objective (optional; default objective when no prompt override is provided)
 - run.continue_wait_timeout_seconds (default: 0; seconds to wait for continuation availability before failing)
+- run.continuation_drift_policy (default: "refuse"; values: refuse|fallback-fresh)
 - run.allow_stable_auto_advance (legacy compatibility toggle; prefer run.auto_advance_policy)
 - run.auto_advance_policy (default: stable-ok; values: improving-only|stable-ok|always)
 - run.task_health (config block: improving/stable/deteriorating actions)
@@ -337,6 +338,10 @@ service_url = "http://127.0.0.1:8089"
 # objective = "verify workspace"
 # Seconds to wait for continuation payload availability (`yarli run continue`).
 continue_wait_timeout_seconds = 0
+# Policy when `yarli run continue` detects tranche drift:
+#   refuse (default) — hard-fail; operator must use --fresh-from-tranches
+#   fallback-fresh   — log a warning and automatically rebuild from current state
+continuation_drift_policy = "refuse"
 # Legacy compatibility toggle for stable-trend auto-advance.
 allow_stable_auto_advance = false
 # Preferred auto-advance policy: improving-only | stable-ok | always

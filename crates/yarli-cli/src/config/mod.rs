@@ -1129,6 +1129,14 @@ pub struct RunConfig {
     /// Value is seconds. `0` disables waiting (fail-fast behavior).
     #[serde(default)]
     pub continue_wait_timeout_seconds: u64,
+    /// Policy when `yarli run continue` detects tranche drift (newer open
+    /// tranches not present in the continuation snapshot).
+    ///
+    /// `refuse` (default): hard-fail and tell the operator to use `--fresh-from-tranches`.
+    /// `fallback-fresh`: log a warning and automatically rebuild from the current
+    /// prompt/plan/tranches state instead of refusing.
+    #[serde(default)]
+    pub continuation_drift_policy: ContinuationDriftPolicy,
     /// Allow planned-tranche auto-advance when deterioration trend is `stable`.
     ///
     /// Legacy compatibility toggle; prefer `auto_advance_policy`.
@@ -1330,6 +1338,7 @@ impl Default for RunConfig {
             prompt_file: None,
             objective: None,
             continue_wait_timeout_seconds: 0,
+            continuation_drift_policy: ContinuationDriftPolicy::Refuse,
             allow_stable_auto_advance: false,
             task_health: RunTaskHealthConfig::default(),
             soft_token_cap_ratio: default_soft_token_cap_ratio(),
@@ -1464,6 +1473,17 @@ pub enum AutoAdvancePolicy {
     #[default]
     StableOk,
     Always,
+}
+
+/// Policy for handling tranche drift during `yarli run continue`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContinuationDriftPolicy {
+    /// Hard-fail when newer open tranches are detected (current default).
+    #[default]
+    Refuse,
+    /// Log a warning and rebuild from current prompt/plan/tranches state.
+    FallbackFresh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -3153,5 +3173,42 @@ enforce_plan_tranche_allowed_paths = true
             .config()
             .run
             .should_surface_allowed_paths_in_prompts());
+    }
+
+    #[test]
+    fn continuation_drift_policy_defaults_to_refuse() {
+        let loaded = write_test_config("[run]\n");
+        assert_eq!(
+            loaded.config().run.continuation_drift_policy,
+            ContinuationDriftPolicy::Refuse,
+        );
+    }
+
+    #[test]
+    fn continuation_drift_policy_parses_fallback_fresh() {
+        let loaded = write_test_config(
+            r#"
+[run]
+continuation_drift_policy = "fallback-fresh"
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.continuation_drift_policy,
+            ContinuationDriftPolicy::FallbackFresh,
+        );
+    }
+
+    #[test]
+    fn continuation_drift_policy_parses_refuse_explicitly() {
+        let loaded = write_test_config(
+            r#"
+[run]
+continuation_drift_policy = "refuse"
+"#,
+        );
+        assert_eq!(
+            loaded.config().run.continuation_drift_policy,
+            ContinuationDriftPolicy::Refuse,
+        );
     }
 }
