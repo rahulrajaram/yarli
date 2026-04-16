@@ -1047,6 +1047,157 @@ worktree_root = "{}"
 }
 
 #[test]
+fn run_plan_parallel_scope_violation_surfaces_allowed_paths_recovery_guidance() {
+    let temp_dir = TempDir::new().expect("create temp workspace");
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("src")).expect("create src dir");
+    let worktree_root = repo_dir.join(".yarl/workspaces");
+    std::fs::create_dir_all(&worktree_root).expect("create worktree root dir");
+
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["checkout", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
+    run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
+
+    std::fs::write(repo_dir.join("src/lib.rs"), "pub fn hi() {}\n").expect("write src/lib.rs");
+    std::fs::write(repo_dir.join("README.md"), "baseline\n").expect("write README.md");
+    std::fs::write(
+        repo_dir.join("mock-agent.sh"),
+        r#"#!/bin/sh
+set -eu
+prompt="${1:-}"
+case "$prompt" in
+  *YARLI_PREFLIGHT_OK*)
+    printf 'YARLI_PREFLIGHT_OK\n'
+    ;;
+  *)
+    printf 'scope leak\n' > README.md
+    printf 'task finished\n'
+    ;;
+esac
+"#,
+    )
+    .expect("write mock agent");
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "initial"]);
+
+    std::fs::write(
+        repo_dir.join("PROMPT.md"),
+        r#"
+```yarli-run
+version = 1
+objective = "implement scoped plan"
+```
+"#,
+    )
+    .expect("write prompt file");
+    std::fs::write(
+        repo_dir.join("IMPLEMENTATION_PLAN.md"),
+        "- [ ] AP-01 tighten merge recovery guidance allowed_paths=src/lib.rs\n",
+    )
+    .expect("write implementation plan");
+
+    let config = format!(
+        r#"[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+
+[features]
+parallel = true
+parallel_worktree = false
+
+[run]
+enforce_plan_tranche_allowed_paths = true
+
+[run.tranche_contract]
+enforce_allowed_paths_on_merge = true
+
+[execution]
+working_dir = "."
+worktree_root = "{}"
+
+[cli]
+command = "sh"
+args = ["./mock-agent.sh"]
+prompt_mode = "arg"
+"#,
+        worktree_root.display()
+    );
+    std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
+
+    let binary = run_output_path();
+    let run_output = Command::new(&binary)
+        .current_dir(&repo_dir)
+        .args(["run", "--stream"])
+        .output()
+        .expect("run command invocation failed");
+
+    assert!(
+        !run_output.status.success(),
+        "run should fail on allowed_paths scope violation during merge finalization\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr),
+    );
+
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    let combined_output = format!(
+        "{}{}",
+        run_stdout,
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    assert!(
+        combined_output.contains("Exit state:  RunFailed"),
+        "scope violation run should report RunFailed in summary\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Suggested allowed_paths additions: README.md"),
+        "scope violation run should surface allowed_paths recovery guidance\n{combined_output}"
+    );
+
+    let continuation = read_continuation_payload(&repo_dir);
+    assert_eq!(
+        continuation.get("exit_state").and_then(Value::as_str),
+        Some("RunFailed"),
+        "expected continuation exit_state to be RunFailed after scope violation"
+    );
+    assert_eq!(
+        continuation.get("exit_reason").and_then(Value::as_str),
+        Some("failed_runtime_error"),
+        "expected continuation exit_reason to be failed_runtime_error after scope violation"
+    );
+    let next_tranche = continuation
+        .get("next_tranche")
+        .and_then(Value::as_object)
+        .expect("expected scope violation continuation to include recovery tranche");
+    assert_eq!(
+        next_tranche.get("kind").and_then(Value::as_str),
+        Some("retry_unfinished"),
+        "expected recovery tranche kind to be retry_unfinished"
+    );
+    let retry_task_keys = next_tranche
+        .get("retry_task_keys")
+        .and_then(Value::as_array)
+        .expect("expected retry_task_keys array");
+    assert!(
+        !retry_task_keys.is_empty(),
+        "expected at least one retry task key for scope violation recovery"
+    );
+    let suggested_objective = next_tranche
+        .get("suggested_objective")
+        .and_then(Value::as_str)
+        .expect("expected suggested_objective");
+    assert!(
+        suggested_objective.contains("allowed_paths scope mismatch"),
+        "expected scope mismatch wording in continuation objective: {suggested_objective}"
+    );
+    assert!(
+        suggested_objective.contains("README.md"),
+        "expected suggested allowed path in continuation objective: {suggested_objective}"
+    );
+    assert_output_state_matches_continuation(&run_stdout, &continuation);
+}
+
+#[test]
 fn run_start_parallel_merge_lineage_failure_preserves_workspace_and_escalates() {
     let temp_dir = TempDir::new().expect("create temp workspace");
     let repo_dir = temp_dir.path().join("repo");

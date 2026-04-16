@@ -2556,6 +2556,52 @@ mod tests {
     }
 
     #[test]
+    fn run_status_surfaces_scope_violation_merge_finalization_details() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.parallel_merge_failed",
+                corr,
+                serde_json::json!({
+                    "reason": "task task-scope modified paths outside allowed_paths during merge finalization: tests/new_scope.rs",
+                    "failure_kind": "allowed_paths_scope_violation",
+                    "task_key": "task-scope",
+                    "allowed_paths": ["src/lib.rs"],
+                    "changed_paths": ["src/lib.rs", "tests/new_scope.rs"],
+                    "out_of_scope_paths": ["tests/new_scope.rs"],
+                    "suggested_allowed_paths": ["tests/new_scope.rs"],
+                    "recovery_hints": [
+                        "Minimal allowed_paths additions to consider: tests/new_scope.rs"
+                    ],
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_status(&store, run_id).unwrap();
+        assert!(
+            output.contains("failure_kind=allowed_paths_scope_violation"),
+            "run status must include scope violation kind: {output}"
+        );
+        assert!(
+            output.contains("out_of_scope_paths:"),
+            "run status must include out-of-scope section: {output}"
+        );
+        assert!(
+            output.contains("suggested_allowed_paths:"),
+            "run status must include suggested allowed_paths section: {output}"
+        );
+        assert!(
+            output.contains("Minimal allowed_paths additions to consider: tests/new_scope.rs"),
+            "run status must include scope repair hint: {output}"
+        );
+    }
+
+    #[test]
     fn task_explain_displays_last_error() {
         let store = InMemoryEventStore::new();
         let task_id = Uuid::now_v7();
@@ -2686,6 +2732,47 @@ mod tests {
         assert!(
             output.contains("recovery_hints:"),
             "run explain must include recovery hints block"
+        );
+    }
+
+    #[test]
+    fn render_run_explain_surfaces_scope_violation_merge_finalization_details() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.parallel_merge_failed",
+                corr,
+                serde_json::json!({
+                    "reason": "task task-scope modified paths outside allowed_paths during merge finalization: tests/new_scope.rs",
+                    "failure_kind": "allowed_paths_scope_violation",
+                    "task_key": "task-scope",
+                    "allowed_paths": ["src/lib.rs"],
+                    "out_of_scope_paths": ["tests/new_scope.rs"],
+                    "suggested_allowed_paths": ["tests/new_scope.rs"],
+                    "recovery_hints": [
+                        "Minimal allowed_paths additions to consider: tests/new_scope.rs"
+                    ],
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_explain(&store, run_id).unwrap();
+        assert!(
+            output.contains("failure_kind=allowed_paths_scope_violation"),
+            "run explain must include scope violation kind: {output}"
+        );
+        assert!(
+            output.contains("suggested_allowed_paths:"),
+            "run explain must include suggested allowed_paths section: {output}"
+        );
+        assert!(
+            output.contains("  - tests/new_scope.rs"),
+            "run explain must include the suggested allowed path: {output}"
         );
     }
 

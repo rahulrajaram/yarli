@@ -1614,9 +1614,11 @@ pub(crate) fn warn_on_new_file_content_divergence(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ParallelWorkspaceMergeFailureKind {
     MergeConflict,
+    AllowedPathsScopeViolation,
     RuntimeFailure,
 }
 
@@ -2389,7 +2391,7 @@ fn enforce_allowed_paths_for_task(
 
     let allowed = allowed_paths.join(", ");
     Err(ParallelWorkspaceMergeApplyError::new(
-        ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+        ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation,
         false,
         format!(
             "task {task_key} modified paths outside allowed_paths during merge finalization: {} (allowed_paths: {})",
@@ -3476,9 +3478,9 @@ Operator recovery steps:\n\
             let restore_note =
                 restore_workspace_head_on_error("workspace scope enforcement failed")
                     .unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "parallel workspace merge failed while enforcing allowed_paths for task {task_key}{restore_note}: {err}"
-            ));
+            return Err(err.context(format!(
+                "parallel workspace merge failed while enforcing allowed_paths for task {task_key}{restore_note}"
+            )));
         }
         if scoped_paths.is_empty() {
             skipped_task_keys.push(task_key.to_string());
@@ -7327,7 +7329,15 @@ worktree_root = "{}"
             )],
         )
         .unwrap_err();
-        let msg = err.to_string();
+        let scoped_err = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ParallelWorkspaceMergeApplyError>())
+            .expect("expected typed scope violation error");
+        assert_eq!(
+            scoped_err.kind,
+            ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation
+        );
+        let msg = format!("{err:#}");
         assert!(msg.contains("outside allowed_paths"), "error: {msg}");
         assert!(msg.contains("README.md"), "error: {msg}");
     }
@@ -7446,7 +7456,15 @@ worktree_root = "{}"
             &mut telemetry,
         )
         .unwrap_err();
-        let msg = err.to_string();
+        let scoped_err = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ParallelWorkspaceMergeApplyError>())
+            .expect("expected typed scope violation error");
+        assert_eq!(
+            scoped_err.kind,
+            ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation
+        );
+        let msg = format!("{err:#}");
         assert!(msg.contains("outside allowed_paths"), "error: {msg}");
         assert!(msg.contains("README.md"), "error: {msg}");
     }

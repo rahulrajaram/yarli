@@ -449,6 +449,105 @@ fn merge_apply_conflict_metadata(
         )
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MergeApplyScopeViolationMetadata {
+    task_key: Option<String>,
+    allowed_paths: Vec<String>,
+    changed_paths: Vec<String>,
+    out_of_scope_paths: Vec<String>,
+    suggested_allowed_paths: Vec<String>,
+    recovery_hints: Vec<String>,
+}
+
+fn allowed_paths_scope_recovery_hints(
+    allowed_paths: &[String],
+    out_of_scope_paths: &[String],
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    if !out_of_scope_paths.is_empty() {
+        hints.push(format!(
+            "Review the verified worker diff for out-of-scope paths: {}",
+            out_of_scope_paths.join(", ")
+        ));
+        hints.push(format!(
+            "Minimal allowed_paths additions to consider: {}",
+            out_of_scope_paths.join(", ")
+        ));
+    }
+    if !allowed_paths.is_empty() {
+        hints.push(format!(
+            "Current allowed_paths: {}",
+            allowed_paths.join(", ")
+        ));
+    }
+    hints.push(
+        "If the worker already passed verification, prefer reconciling allowed_paths and applying the verified diff over blindly re-running the tranche.".to_string(),
+    );
+    hints
+}
+
+fn merge_apply_scope_violation_metadata(
+    telemetry: &[MergeApplyTelemetryEvent],
+) -> MergeApplyScopeViolationMetadata {
+    telemetry
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "merge.apply.scope_violation")
+        .map_or_else(MergeApplyScopeViolationMetadata::default, |event| {
+            let task_key = event
+                .metadata
+                .get("task_key")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string);
+            let allowed_paths =
+                collect_telemetry_string_values(event.metadata.get("allowed_paths"));
+            let changed_paths =
+                collect_telemetry_string_values(event.metadata.get("changed_paths"));
+            let out_of_scope_paths =
+                collect_telemetry_string_values(event.metadata.get("out_of_scope_paths"));
+            let suggested_allowed_paths = if out_of_scope_paths.is_empty() {
+                Vec::new()
+            } else {
+                out_of_scope_paths.clone()
+            };
+            let recovery_hints =
+                allowed_paths_scope_recovery_hints(&allowed_paths, &out_of_scope_paths);
+            MergeApplyScopeViolationMetadata {
+                task_key,
+                allowed_paths,
+                changed_paths,
+                out_of_scope_paths,
+                suggested_allowed_paths,
+                recovery_hints,
+            }
+        })
+}
+
+fn parallel_merge_recovery_objective(
+    failure_kind: ParallelWorkspaceMergeFailureKind,
+    retry_task_keys: &[String],
+    suggested_allowed_paths: &[String],
+) -> String {
+    let task_summary = if retry_task_keys.is_empty() {
+        "unknown tasks".to_string()
+    } else {
+        retry_task_keys.join(", ")
+    };
+    match failure_kind {
+        ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation => {
+            if suggested_allowed_paths.is_empty() {
+                format!("Recover verified allowed_paths scope mismatch for tasks: {task_summary}")
+            } else {
+                format!(
+                    "Recover verified allowed_paths scope mismatch for tasks: {task_summary}. Reconcile allowed_paths with: {}",
+                    suggested_allowed_paths.join(", ")
+                )
+            }
+        }
+        _ => format!("Recover merge finalization by re-running tasks: {task_summary}"),
+    }
+}
+
 #[derive(Clone)]
 enum SelectedCommandRunner {
     Native(LocalCommandRunner),
@@ -1327,6 +1426,7 @@ where
     let mut parallel_merge_error_reason: Option<ParallelWorkspaceMergeFailureKind> = None;
     let mut parallel_merge_report: Option<ParallelWorkspaceMergeReport> = None;
     let mut parallel_merge_retry_task_keys: Vec<String> = Vec::new();
+    let mut parallel_merge_scope_suggested_allowed_paths: Vec<String> = Vec::new();
     if continuation_payload.exit_state == RunState::RunCompleted {
         if let Some(layout) = parallel_workspace_layout.as_ref() {
             let source_workdir =
@@ -1447,6 +1547,8 @@ where
                     }
                 }
                 Err(err) => {
+                    let scope_violation =
+                        merge_apply_scope_violation_metadata(&merge_apply_telemetry);
                     let merge_failure_kind = err
                         .root_cause()
                         .downcast_ref::<ParallelWorkspaceMergeApplyError>()
@@ -1455,14 +1557,56 @@ where
                             |merge_error| merge_error.kind,
                         );
                     let (
-                        conflict_task_key,
+                        failure_task_key,
                         conflict_patch_path,
                         conflict_workspace_path,
                         conflict_files,
                         recovery_hints,
                         conflict_repo_status,
-                    ) = merge_apply_conflict_metadata(&merge_apply_telemetry);
-                    if let Some(task_key) = conflict_task_key.as_ref() {
+                        allowed_paths,
+                        changed_paths,
+                        out_of_scope_paths,
+                        suggested_allowed_paths,
+                    ) = if merge_failure_kind
+                        == ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation
+                    {
+                        parallel_merge_scope_suggested_allowed_paths =
+                            scope_violation.suggested_allowed_paths.clone();
+                        (
+                            scope_violation.task_key.clone(),
+                            None,
+                            None,
+                            Vec::new(),
+                            scope_violation.recovery_hints.clone(),
+                            None,
+                            scope_violation.allowed_paths.clone(),
+                            scope_violation.changed_paths.clone(),
+                            scope_violation.out_of_scope_paths.clone(),
+                            scope_violation.suggested_allowed_paths.clone(),
+                        )
+                    } else {
+                        let (
+                            conflict_task_key,
+                            conflict_patch_path,
+                            conflict_workspace_path,
+                            conflict_files,
+                            recovery_hints,
+                            conflict_repo_status,
+                        ) = merge_apply_conflict_metadata(&merge_apply_telemetry);
+                        (
+                            conflict_task_key,
+                            conflict_patch_path,
+                            conflict_workspace_path,
+                            conflict_files,
+                            recovery_hints,
+                            conflict_repo_status,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    };
+                    if let Some(task_key) = failure_task_key.as_ref() {
                         parallel_merge_retry_task_keys.push(task_key.clone());
                     } else if let Some(task_key) = merge_apply_telemetry
                         .iter()
@@ -1480,13 +1624,18 @@ where
                         event_type: "run.parallel_merge_failed".to_string(),
                         payload: serde_json::json!({
                             "reason": err.to_string(),
+                            "failure_kind": merge_failure_kind,
                             "source_workdir": source_workdir.display().to_string(),
                             "workspace_root": layout.run_workspace_root.display().to_string(),
-                            "task_key": conflict_task_key,
+                            "task_key": failure_task_key,
                             "patch_path": conflict_patch_path,
                             "workspace_path": conflict_workspace_path,
                             "repo_status": conflict_repo_status,
                             "conflicted_files": conflict_files,
+                            "allowed_paths": allowed_paths,
+                            "changed_paths": changed_paths,
+                            "out_of_scope_paths": out_of_scope_paths,
+                            "suggested_allowed_paths": suggested_allowed_paths,
                             "recovery_hints": recovery_hints,
                         }),
                         correlation_id,
@@ -1596,10 +1745,13 @@ where
             parallel_merge_retry_task_keys.dedup();
             continuation_payload.next_tranche =
                 (!parallel_merge_retry_task_keys.is_empty()).then(|| {
+                    let merge_failure_kind = parallel_merge_error_reason
+                        .unwrap_or(ParallelWorkspaceMergeFailureKind::RuntimeFailure);
                     yarli_cli::yarli_core::entities::continuation::TrancheSpec {
-                    suggested_objective: format!(
-                        "Recover merge finalization by re-running tasks: {}",
-                        parallel_merge_retry_task_keys.join(", ")
+                    suggested_objective: parallel_merge_recovery_objective(
+                        merge_failure_kind,
+                        &parallel_merge_retry_task_keys,
+                        &parallel_merge_scope_suggested_allowed_paths,
                     ),
                     kind:
                         yarli_cli::yarli_core::entities::continuation::TrancheKind::RetryUnfinished,
@@ -1615,6 +1767,15 @@ where
             eprintln!("Run {run_id} completed core tasks, but parallel merge did not finalize;");
             if continuation_payload.next_tranche.is_some() {
                 eprintln!("Continuation prepared a recovery tranche for explicit operator retry.");
+                if parallel_merge_error_reason
+                    == Some(ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation)
+                    && !parallel_merge_scope_suggested_allowed_paths.is_empty()
+                {
+                    eprintln!(
+                        "Suggested allowed_paths additions: {}",
+                        parallel_merge_scope_suggested_allowed_paths.join(", ")
+                    );
+                }
             } else {
                 eprintln!(
                     "Continuation state set to RunFailed with no recovery tranche available."
@@ -10498,5 +10659,63 @@ mod tests {
         assert_eq!(conflicted_files, vec!["shared.txt".to_string()]);
         assert!(recovery_hints.is_empty());
         assert!(repo_status.is_none());
+    }
+
+    #[test]
+    fn merge_apply_scope_violation_metadata_extracts_recovery_details() {
+        let telemetry = vec![MergeApplyTelemetryEvent {
+            event_type: "merge.apply.scope_violation".to_string(),
+            task_key: Some("task-scope".to_string()),
+            task_index: Some(1),
+            metadata: serde_json::json!({
+                "task_key": "task-scope",
+                "allowed_paths": ["src/lib.rs", "tests/allowed.rs"],
+                "changed_paths": ["src/lib.rs", "tests/new_scope.rs"],
+                "out_of_scope_paths": ["tests/new_scope.rs"],
+            }),
+        }];
+
+        let metadata = merge_apply_scope_violation_metadata(&telemetry);
+        assert_eq!(metadata.task_key.as_deref(), Some("task-scope"));
+        assert_eq!(
+            metadata.allowed_paths,
+            vec!["src/lib.rs".to_string(), "tests/allowed.rs".to_string()]
+        );
+        assert_eq!(
+            metadata.changed_paths,
+            vec!["src/lib.rs".to_string(), "tests/new_scope.rs".to_string()]
+        );
+        assert_eq!(
+            metadata.out_of_scope_paths,
+            vec!["tests/new_scope.rs".to_string()]
+        );
+        assert_eq!(
+            metadata.suggested_allowed_paths,
+            vec!["tests/new_scope.rs".to_string()]
+        );
+        assert!(
+            metadata
+                .recovery_hints
+                .iter()
+                .any(|hint| hint.contains("Minimal allowed_paths additions to consider")),
+            "expected recovery hints to mention the minimal allowed_paths repair"
+        );
+    }
+
+    #[test]
+    fn parallel_merge_recovery_objective_calls_out_scope_reconciliation() {
+        let objective = parallel_merge_recovery_objective(
+            ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation,
+            &["task-scope".to_string()],
+            &["tests/new_scope.rs".to_string()],
+        );
+        assert!(
+            objective.contains("allowed_paths scope mismatch"),
+            "expected scope mismatch wording: {objective}"
+        );
+        assert!(
+            objective.contains("tests/new_scope.rs"),
+            "expected suggested path in objective: {objective}"
+        );
     }
 }
