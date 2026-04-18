@@ -1394,7 +1394,19 @@ pub(crate) fn auto_commit_state_files(
     for file in &state_files {
         let full = source_workdir.join(file);
         if full.exists() {
-            let output = run_git_capture(source_workdir, &["add", "-f", "--", file])?;
+            // Respect gitignore: do NOT pass `-f` here. If a project has
+            // `.yarli/` in `.gitignore` and these files are untracked, the
+            // add is a silent no-op and nothing downstream stages them.
+            // If a project deliberately tracks the files (no gitignore, or
+            // already tracked before the ignore landed), the add works
+            // normally and existing behavior is preserved.
+            //
+            // The historic `-f` forced tracking past gitignore and produced
+            // the "19 of 59 unpushed commits are pure yarli state" pattern
+            // that operators had no clean way to opt out of — removing it
+            // lets standard git hygiene (gitignore + `git rm --cached`)
+            // express operator intent.
+            let output = run_git_capture(source_workdir, &["add", "--", file])?;
             if output.status.success() {
                 any_staged = true;
             }
@@ -7053,6 +7065,54 @@ worktree_root = "{}"
         // Skipped task worktree should also be removed immediately.
         assert_eq!(count_existing_worktrees(&repo).unwrap(), 0);
         assert!(!wt1.exists(), "worktree path should be removed after skip");
+    }
+
+    #[test]
+    fn auto_commit_respects_gitignore_for_untracked_state_files() {
+        // Regression test: historically yarli used `git add -f` and
+        // force-tracked `.yarli/continuation.json` / `.yarli/tranches.toml`
+        // past `.gitignore`. Operators who put `.yarli/` in `.gitignore`
+        // expecting those files to stay untracked ended up with dozens of
+        // unavoidable `chore(state): checkpoint runtime state` commits.
+        // Dropping `-f` means the add respects gitignore — when the files
+        // are untracked AND gitignored, nothing stages, nothing commits.
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".yarli")).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        std::fs::write(repo.join(".gitignore"), ".yarli/\n").unwrap();
+        run_git_expect_ok(&repo, &["add", "README.md", ".gitignore"]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        // State files are present on disk but not tracked and `.yarli/` is
+        // gitignored, so the auto-commit must be a no-op.
+        std::fs::write(repo.join(".yarli/continuation.json"), "{}").unwrap();
+        std::fs::write(repo.join(".yarli/tranches.toml"), "version = 1\n").unwrap();
+
+        let committed =
+            auto_commit_state_files(&repo, "tranche-001", "run-123", 1, 3, None).unwrap();
+        assert!(
+            !committed,
+            "gitignored untracked state files must not trigger an auto-commit"
+        );
+
+        // Confirm HEAD is still the init commit — no checkpoint commit was made.
+        let (ok, log, _) = run_git(&repo, &["log", "--oneline"]);
+        assert!(ok);
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "no new commits should have landed; got: {log}"
+        );
+
+        // And the files themselves remain untracked.
+        let (ok, ls, _) = run_git(&repo, &["ls-files", ".yarli/"]);
+        assert!(ok);
+        assert!(
+            ls.trim().is_empty(),
+            "no .yarli/* paths should be tracked; got: {ls:?}"
+        );
     }
 
     #[test]
