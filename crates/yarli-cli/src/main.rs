@@ -417,6 +417,9 @@ async fn run() -> Result<()> {
                 TrancheAction::Complete { key } => cmd_plan_tranche_complete(&key),
                 TrancheAction::List => cmd_plan_tranche_list(),
                 TrancheAction::Remove { key } => cmd_plan_tranche_remove(&key),
+                TrancheAction::ReconcileFromEvidence { dry_run } => {
+                    cmd_plan_tranche_reconcile_from_evidence(dry_run)
+                }
             },
             PlanAction::Validate => cmd_plan_validate_with_run_config(&loaded_config.config().run),
         },

@@ -94,10 +94,11 @@ pub(crate) struct IterationMetrics {
 
 pub(crate) use crate::tranche::{
     cmd_plan_tranche_add_with_run_config, cmd_plan_tranche_complete, cmd_plan_tranche_list,
-    cmd_plan_tranche_remove, cmd_plan_validate_with_run_config, discover_plan_dispatch_entries,
-    enforce_plan_guard_post_run, maybe_mark_current_structured_tranche_complete,
-    plan_path_for_prompt_entry, read_tranches_file_in, run_spec_plan_guard_preflight,
-    run_tranche_verify_command, tranches_file_path, validate_plan_dispatch_entries_with_run_config,
+    cmd_plan_tranche_reconcile_from_evidence, cmd_plan_tranche_remove,
+    cmd_plan_validate_with_run_config, discover_plan_dispatch_entries, enforce_plan_guard_post_run,
+    maybe_mark_current_structured_tranche_complete, plan_path_for_prompt_entry,
+    read_tranches_file_in, run_spec_plan_guard_preflight, run_tranche_verify_command,
+    tranches_file_path, validate_plan_dispatch_entries_with_run_config,
     validate_structured_tranches_preflight_for_prompt,
 };
 #[cfg(test)]

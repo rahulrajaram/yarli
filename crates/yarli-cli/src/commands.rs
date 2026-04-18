@@ -1,6 +1,6 @@
 //! Command handlers extracted from `main.rs`.
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use yarli_cli::yarli_exec::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
     OverwatchRunnerConfig,
@@ -14,6 +14,7 @@ use crate::cli::AuditOutputFormat;
 use crate::events::*;
 use crate::persistence::RUN_CONTINUATION_EVENT_TYPE;
 use crate::render::*;
+use crate::tranche::reconcile_tranche_status_from_evidence_in;
 use crate::workspace::{
     cleanup_parallel_workspace, merge_parallel_workspace_results_with_resolution_with_events,
     merge_worktree_workspace_results, prepare_parallel_workspace_layout, MergeApplyTelemetryEvent,
@@ -809,6 +810,34 @@ pub(crate) async fn cmd_run_default(
             "explicit fresh-from-tranches mode requested; rebuilding from current prompt/plan/tranches state"
         );
     }
+
+    // Auto-reconcile tranches.toml against on-disk `.yarli/evidence/I<KEY>.md`
+    // files BEFORE any planning reads the tranches file. This prevents runs
+    // from re-dispatching tranches whose work is already landed (evidence file
+    // exists with `status = "pass"`) but whose `tranches.toml` status was
+    // never flipped — a drift mode that otherwise burns hundreds of
+    // thousands of tokens per stranded tranche.
+    match reconcile_tranche_status_from_evidence_in(
+        &std::env::current_dir().context("failed to read current working directory")?,
+        /* dry_run */ false,
+    ) {
+        Ok(report) if !report.flipped.is_empty() => {
+            info!(
+                flipped = report.flipped.len(),
+                keys = %report.flipped.join(","),
+                "auto-reconciled tranches.toml status from evidence before run"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!(
+                error = %err,
+                error_chain = %format!("{err:#}"),
+                "evidence-to-tranches reconciliation failed; continuing without auto-flip"
+            );
+        }
+    }
+
     let resolved_prompt =
         resolve_prompt_entry_path(loaded_config, prompt_file_override.as_deref())?;
     info!(

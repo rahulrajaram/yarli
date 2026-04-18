@@ -1181,6 +1181,15 @@ pub(crate) enum TrancheAction {
         #[arg(short, long)]
         key: String,
     },
+    #[command(
+        about = "Reconcile tranches.toml status against on-disk evidence files",
+        long_about = "Reconcile `.yarli/tranches.toml` against `.yarli/evidence/I<KEY>.md` files.\n\nFor every schema-valid evidence file whose frontmatter declares `status = \"pass\"`, the matching tranche is flipped from `incomplete` to `complete` in `tranches.toml`. Already-complete tranches are left alone; `blocked` tranches are skipped because they represent operator-controlled state; evidence for unknown keys is reported but does not mutate the file.\n\nThis is also invoked automatically at the start of `yarli run` and `yarli run --fresh-from-tranches` so that runs do not re-dispatch tranches whose work is already landed.\n\nUse `--dry-run` to print the report without mutating the tranches file.\n\nExamples:\n  yarli plan tranche reconcile-from-evidence\n  yarli plan tranche reconcile-from-evidence --dry-run"
+    )]
+    ReconcileFromEvidence {
+        /// Print what would change without writing tranches.toml.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -673,6 +673,178 @@ pub(crate) fn cmd_plan_tranche_complete(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of a tranches-file reconciliation against on-disk evidence files.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct EvidenceReconcileReport {
+    /// Keys that were flipped `incomplete → complete` by this pass.
+    pub(crate) flipped: Vec<String>,
+    /// Keys whose evidence says pass but tranche was already `complete`.
+    pub(crate) already_complete: Vec<String>,
+    /// Keys whose evidence says pass but no matching tranche exists in the file.
+    pub(crate) unknown_keys: Vec<String>,
+    /// Keys whose evidence says pass but tranche is currently `blocked`;
+    /// these are NOT auto-flipped because a blocked tranche represents an
+    /// operator-controlled state.
+    pub(crate) skipped_blocked: Vec<String>,
+}
+
+impl EvidenceReconcileReport {
+    pub(crate) fn is_noop(&self) -> bool {
+        self.flipped.is_empty()
+            && self.already_complete.is_empty()
+            && self.unknown_keys.is_empty()
+            && self.skipped_blocked.is_empty()
+    }
+
+    pub(crate) fn summary_line(&self) -> String {
+        format!(
+            "reconcile-from-evidence: flipped={} already_complete={} unknown={} skipped_blocked={}",
+            self.flipped.len(),
+            self.already_complete.len(),
+            self.unknown_keys.len(),
+            self.skipped_blocked.len()
+        )
+    }
+}
+
+/// Reconcile `tranches.toml` status against on-disk `.yarli/evidence/I<KEY>.md`
+/// files.
+///
+/// For every evidence file whose frontmatter is schema-valid AND declares
+/// `status = "pass"`:
+///  - if the matching tranche is `incomplete`, flip it to `complete`
+///  - if the matching tranche is already `complete`, record as already-complete
+///  - if the matching tranche is `blocked`, leave it alone (operator state)
+///  - if no matching tranche exists in the file, record as unknown
+///
+/// This is the durable fix for the "evidence exists but tranches.toml still
+/// says incomplete" drift that causes `yarli run --fresh-from-tranches` to
+/// burn tokens re-targeting already-landed work.
+///
+/// When `dry_run` is true, no writes occur. The report still describes what
+/// *would* have been flipped.
+pub(crate) fn reconcile_tranche_status_from_evidence_in(
+    base_dir: &Path,
+    dry_run: bool,
+) -> Result<EvidenceReconcileReport> {
+    let evidence_dir = base_dir.join(".yarli").join("evidence");
+    let passing_keys = crate::evidence::collect_passing_tranche_keys(&evidence_dir)?;
+    if passing_keys.is_empty() {
+        return Ok(EvidenceReconcileReport::default());
+    }
+
+    let Some(mut tf) = read_tranches_file_in(base_dir)? else {
+        // No tranches file to reconcile against; nothing to do.
+        return Ok(EvidenceReconcileReport {
+            unknown_keys: passing_keys,
+            ..Default::default()
+        });
+    };
+
+    let mut report = EvidenceReconcileReport::default();
+    let mut mutated = false;
+    for key in passing_keys {
+        let Some(def) = tf
+            .tranches
+            .iter_mut()
+            .find(|d| d.key.eq_ignore_ascii_case(&key))
+        else {
+            report.unknown_keys.push(key);
+            continue;
+        };
+        match def.status {
+            TrancheStatus::Complete => {
+                report.already_complete.push(def.key.clone());
+            }
+            TrancheStatus::Blocked => {
+                report.skipped_blocked.push(def.key.clone());
+            }
+            TrancheStatus::Incomplete => {
+                let canonical_key = def.key.clone();
+                def.status = TrancheStatus::Complete;
+                report.flipped.push(canonical_key);
+                mutated = true;
+            }
+        }
+    }
+
+    if mutated && !dry_run {
+        write_tranches_file_in(base_dir, &tf)?;
+        info!(
+            flipped = report.flipped.len(),
+            already_complete = report.already_complete.len(),
+            unknown = report.unknown_keys.len(),
+            skipped_blocked = report.skipped_blocked.len(),
+            "reconciled tranches.toml status against on-disk evidence"
+        );
+    }
+
+    Ok(report)
+}
+
+/// cwd-relative convenience wrapper.
+pub(crate) fn reconcile_tranche_status_from_evidence(
+    dry_run: bool,
+) -> Result<EvidenceReconcileReport> {
+    let cwd = std::env::current_dir().context("failed to read current working directory")?;
+    reconcile_tranche_status_from_evidence_in(&cwd, dry_run)
+}
+
+pub(crate) fn cmd_plan_tranche_reconcile_from_evidence(dry_run: bool) -> Result<()> {
+    let report = reconcile_tranche_status_from_evidence(dry_run)?;
+
+    if report.is_noop() {
+        println!("Nothing to reconcile: no passing evidence files found.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("[dry-run] {}", report.summary_line());
+    } else {
+        println!("{}", report.summary_line());
+    }
+
+    if !report.flipped.is_empty() {
+        let action = if dry_run { "would flip" } else { "flipped" };
+        println!(
+            "{action} incomplete -> complete ({} key(s)):",
+            report.flipped.len()
+        );
+        for key in &report.flipped {
+            println!("  - {key}");
+        }
+    }
+    if !report.already_complete.is_empty() {
+        println!(
+            "already complete (evidence matches existing status, {} key(s)):",
+            report.already_complete.len()
+        );
+        for key in &report.already_complete {
+            println!("  - {key}");
+        }
+    }
+    if !report.skipped_blocked.is_empty() {
+        println!(
+            "skipped blocked tranches (operator-controlled, {} key(s)):",
+            report.skipped_blocked.len()
+        );
+        for key in &report.skipped_blocked {
+            println!("  - {key}");
+        }
+    }
+    if !report.unknown_keys.is_empty() {
+        println!(
+            "evidence for unknown tranche keys ({} key(s) — consider `yarli plan tranche add` or cleaning stale evidence):",
+            report.unknown_keys.len()
+        );
+        for key in &report.unknown_keys {
+            println!("  - {key}");
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn cmd_plan_tranche_list() -> Result<()> {
     let tf = read_tranches_file()?
         .ok_or_else(|| anyhow::anyhow!("no tranches file found at {TRANCHES_FILE}"))?;
@@ -2677,5 +2849,157 @@ verify = "false"
 
         let passed = run_tranche_verify_command(&plan, repo.path(), 10).unwrap();
         assert!(passed, "missing tranches file should default to pass");
+    }
+
+    fn write_tranches_fixture(base: &Path, body: &str) {
+        let dir = base.join(".yarli");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tranches.toml"), body).unwrap();
+    }
+
+    fn write_evidence_fixture(base: &Path, key: &str, status: &str) {
+        let dir = base.join(".yarli").join("evidence");
+        fs::create_dir_all(&dir).unwrap();
+        let body = format!(
+            "+++\n\
+schema_version = 1\n\
+tranche = \"{key}\"\n\
+task_type = \"implementation\"\n\
+status = \"{status}\"\n\
+summary = \"fixture evidence for {key}\"\n\
+generated_at = \"2026-04-18\"\n\
+prompt_file = \"PROMPT.md\"\n\
+plan_file = \"IMPLEMENTATION_PLAN.md\"\n\
+scope = []\n\
+verification_commands = [\"cargo test\"]\n\
++++\n\
+# Evidence: {key}\n\
+## Summary\n\
+- fixture\n\
+## Changes\n\
+- fixture\n\
+## Verification\n\
+- `cargo test`: PASS - fixture.\n"
+        );
+        fs::write(dir.join(format!("I{key}.md")), body).unwrap();
+    }
+
+    const RECONCILE_FIXTURE: &str = r#"version = 1
+
+[[tranches]]
+key = "NXT-100"
+summary = "Already complete; evidence should be a no-op."
+status = "complete"
+
+[[tranches]]
+key = "NXT-101"
+summary = "Passing evidence should flip this to complete."
+status = "incomplete"
+
+[[tranches]]
+key = "NXT-102"
+summary = "No evidence present; status stays incomplete."
+status = "incomplete"
+
+[[tranches]]
+key = "NXT-103"
+summary = "Blocked tranches must not be auto-flipped even when evidence passes."
+status = "blocked"
+
+[[tranches]]
+key = "NXT-104"
+summary = "Partial evidence must not flip status."
+status = "incomplete"
+"#;
+
+    #[test]
+    fn reconcile_flips_only_matching_incomplete_with_passing_evidence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        write_tranches_fixture(base, RECONCILE_FIXTURE);
+        write_evidence_fixture(base, "NXT-100", "pass"); // already complete
+        write_evidence_fixture(base, "NXT-101", "pass"); // should flip
+        write_evidence_fixture(base, "NXT-103", "pass"); // blocked — must skip
+        write_evidence_fixture(base, "NXT-104", "partial"); // non-pass — ignore
+        write_evidence_fixture(base, "NXT-999", "pass"); // unknown key
+
+        let report = reconcile_tranche_status_from_evidence_in(base, false).unwrap();
+        assert_eq!(report.flipped, vec!["NXT-101".to_string()]);
+        assert_eq!(report.already_complete, vec!["NXT-100".to_string()]);
+        assert_eq!(report.skipped_blocked, vec!["NXT-103".to_string()]);
+        assert_eq!(report.unknown_keys, vec!["NXT-999".to_string()]);
+
+        let tf = read_tranches_file_in(base).unwrap().unwrap();
+        let by_key = |k: &str| tf.tranches.iter().find(|t| t.key == k).unwrap().status;
+        assert_eq!(by_key("NXT-100"), TrancheStatus::Complete);
+        assert_eq!(
+            by_key("NXT-101"),
+            TrancheStatus::Complete,
+            "passing evidence should have flipped NXT-101"
+        );
+        assert_eq!(by_key("NXT-102"), TrancheStatus::Incomplete);
+        assert_eq!(
+            by_key("NXT-103"),
+            TrancheStatus::Blocked,
+            "blocked tranche must stay blocked"
+        );
+        assert_eq!(
+            by_key("NXT-104"),
+            TrancheStatus::Incomplete,
+            "partial evidence must not flip"
+        );
+    }
+
+    #[test]
+    fn reconcile_dry_run_does_not_mutate_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        write_tranches_fixture(base, RECONCILE_FIXTURE);
+        write_evidence_fixture(base, "NXT-101", "pass");
+
+        let before = fs::read_to_string(base.join(".yarli/tranches.toml")).unwrap();
+        let report = reconcile_tranche_status_from_evidence_in(base, true).unwrap();
+        assert_eq!(report.flipped, vec!["NXT-101".to_string()]);
+        let after = fs::read_to_string(base.join(".yarli/tranches.toml")).unwrap();
+        assert_eq!(before, after, "dry-run must not write the tranches file");
+    }
+
+    #[test]
+    fn reconcile_is_idempotent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        write_tranches_fixture(base, RECONCILE_FIXTURE);
+        write_evidence_fixture(base, "NXT-101", "pass");
+
+        let first = reconcile_tranche_status_from_evidence_in(base, false).unwrap();
+        assert_eq!(first.flipped.len(), 1);
+
+        let second = reconcile_tranche_status_from_evidence_in(base, false).unwrap();
+        assert!(
+            second.flipped.is_empty(),
+            "second pass must not re-flip anything"
+        );
+        assert_eq!(second.already_complete, vec!["NXT-101".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_is_noop_when_no_evidence_exists() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        write_tranches_fixture(base, RECONCILE_FIXTURE);
+
+        let report = reconcile_tranche_status_from_evidence_in(base, false).unwrap();
+        assert!(report.is_noop());
+    }
+
+    #[test]
+    fn reconcile_handles_missing_tranches_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path();
+        write_evidence_fixture(base, "NXT-101", "pass");
+
+        let report = reconcile_tranche_status_from_evidence_in(base, false).unwrap();
+        assert!(report.flipped.is_empty());
+        assert_eq!(report.unknown_keys, vec!["NXT-101".to_string()]);
     }
 }
