@@ -79,6 +79,42 @@ done_when = \"Optional copied completion criteria\"\n\
     )
 }
 
+/// Collect tranche keys from `.yarli/evidence` whose evidence file:
+///  - parses cleanly as a schema-valid evidence document, AND
+///  - declares `status = "pass"` in frontmatter.
+///
+/// Used by `yarli plan tranche reconcile-from-evidence` and the auto-reconcile
+/// pass invoked at the top of `yarli run` / `yarli run --fresh-from-tranches`
+/// to prevent re-dispatching tranches whose work is already landed on disk.
+pub(crate) fn collect_passing_tranche_keys(evidence_dir: &Path) -> Result<Vec<String>> {
+    if !evidence_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let files = collect_evidence_files(evidence_dir)?;
+    let mut keys = Vec::new();
+    for file in &files {
+        if let Ok((key, EvidenceStatus::Pass)) = read_tranche_key_and_status(file) {
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn read_tranche_key_and_status(path: &Path) -> Result<(String, EvidenceStatus)> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read evidence file {}", path.display()))?;
+    let document = parse_evidence_document(&content)
+        .with_context(|| format!("invalid evidence document {}", path.display()))?;
+    validate_frontmatter(path, &document.frontmatter)?;
+    validate_body(path, &document.frontmatter, &document.body)?;
+    Ok((
+        document.frontmatter.tranche.clone(),
+        document.frontmatter.status,
+    ))
+}
+
 pub(crate) fn cmd_evidence_validate(path: &Path) -> Result<()> {
     let files = collect_evidence_files(path)?;
     if files.is_empty() {

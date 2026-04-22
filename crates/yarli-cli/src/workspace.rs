@@ -1394,7 +1394,19 @@ pub(crate) fn auto_commit_state_files(
     for file in &state_files {
         let full = source_workdir.join(file);
         if full.exists() {
-            let output = run_git_capture(source_workdir, &["add", "-f", "--", file])?;
+            // Respect gitignore: do NOT pass `-f` here. If a project has
+            // `.yarli/` in `.gitignore` and these files are untracked, the
+            // add is a silent no-op and nothing downstream stages them.
+            // If a project deliberately tracks the files (no gitignore, or
+            // already tracked before the ignore landed), the add works
+            // normally and existing behavior is preserved.
+            //
+            // The historic `-f` forced tracking past gitignore and produced
+            // the "19 of 59 unpushed commits are pure yarli state" pattern
+            // that operators had no clean way to opt out of — removing it
+            // lets standard git hygiene (gitignore + `git rm --cached`)
+            // express operator intent.
+            let output = run_git_capture(source_workdir, &["add", "--", file])?;
             if output.status.success() {
                 any_staged = true;
             }
@@ -1614,9 +1626,11 @@ pub(crate) fn warn_on_new_file_content_divergence(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ParallelWorkspaceMergeFailureKind {
     MergeConflict,
+    AllowedPathsScopeViolation,
     RuntimeFailure,
 }
 
@@ -2389,7 +2403,7 @@ fn enforce_allowed_paths_for_task(
 
     let allowed = allowed_paths.join(", ");
     Err(ParallelWorkspaceMergeApplyError::new(
-        ParallelWorkspaceMergeFailureKind::RuntimeFailure,
+        ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation,
         false,
         format!(
             "task {task_key} modified paths outside allowed_paths during merge finalization: {} (allowed_paths: {})",
@@ -3476,9 +3490,9 @@ Operator recovery steps:\n\
             let restore_note =
                 restore_workspace_head_on_error("workspace scope enforcement failed")
                     .unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "parallel workspace merge failed while enforcing allowed_paths for task {task_key}{restore_note}: {err}"
-            ));
+            return Err(err.context(format!(
+                "parallel workspace merge failed while enforcing allowed_paths for task {task_key}{restore_note}"
+            )));
         }
         if scoped_paths.is_empty() {
             skipped_task_keys.push(task_key.to_string());
@@ -7054,6 +7068,54 @@ worktree_root = "{}"
     }
 
     #[test]
+    fn auto_commit_respects_gitignore_for_untracked_state_files() {
+        // Regression test: historically yarli used `git add -f` and
+        // force-tracked `.yarli/continuation.json` / `.yarli/tranches.toml`
+        // past `.gitignore`. Operators who put `.yarli/` in `.gitignore`
+        // expecting those files to stay untracked ended up with dozens of
+        // unavoidable `chore(state): checkpoint runtime state` commits.
+        // Dropping `-f` means the add respects gitignore — when the files
+        // are untracked AND gitignored, nothing stages, nothing commits.
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".yarli")).unwrap();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        std::fs::write(repo.join(".gitignore"), ".yarli/\n").unwrap();
+        run_git_expect_ok(&repo, &["add", "README.md", ".gitignore"]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        // State files are present on disk but not tracked and `.yarli/` is
+        // gitignored, so the auto-commit must be a no-op.
+        std::fs::write(repo.join(".yarli/continuation.json"), "{}").unwrap();
+        std::fs::write(repo.join(".yarli/tranches.toml"), "version = 1\n").unwrap();
+
+        let committed =
+            auto_commit_state_files(&repo, "tranche-001", "run-123", 1, 3, None).unwrap();
+        assert!(
+            !committed,
+            "gitignored untracked state files must not trigger an auto-commit"
+        );
+
+        // Confirm HEAD is still the init commit — no checkpoint commit was made.
+        let (ok, log, _) = run_git(&repo, &["log", "--oneline"]);
+        assert!(ok);
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "no new commits should have landed; got: {log}"
+        );
+
+        // And the files themselves remain untracked.
+        let (ok, ls, _) = run_git(&repo, &["ls-files", ".yarli/"]);
+        assert!(ok);
+        assert!(
+            ls.trim().is_empty(),
+            "no .yarli/* paths should be tracked; got: {ls:?}"
+        );
+    }
+
+    #[test]
     fn auto_commit_stages_state_files_only() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("repo");
@@ -7327,7 +7389,15 @@ worktree_root = "{}"
             )],
         )
         .unwrap_err();
-        let msg = err.to_string();
+        let scoped_err = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ParallelWorkspaceMergeApplyError>())
+            .expect("expected typed scope violation error");
+        assert_eq!(
+            scoped_err.kind,
+            ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation
+        );
+        let msg = format!("{err:#}");
         assert!(msg.contains("outside allowed_paths"), "error: {msg}");
         assert!(msg.contains("README.md"), "error: {msg}");
     }
@@ -7446,7 +7516,15 @@ worktree_root = "{}"
             &mut telemetry,
         )
         .unwrap_err();
-        let msg = err.to_string();
+        let scoped_err = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ParallelWorkspaceMergeApplyError>())
+            .expect("expected typed scope violation error");
+        assert_eq!(
+            scoped_err.kind,
+            ParallelWorkspaceMergeFailureKind::AllowedPathsScopeViolation
+        );
+        let msg = format!("{err:#}");
         assert!(msg.contains("outside allowed_paths"), "error: {msg}");
         assert!(msg.contains("README.md"), "error: {msg}");
     }

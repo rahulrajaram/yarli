@@ -993,6 +993,13 @@ pub(crate) fn load_run_projection(
             {
                 detail_lines.push(format!("task_key={task_key}"));
             }
+            if let Some(failure_kind) = event
+                .payload
+                .get("failure_kind")
+                .and_then(|value| value.as_str())
+            {
+                detail_lines.push(format!("failure_kind={failure_kind}"));
+            }
             if let Some(patch_path) = event
                 .payload
                 .get("patch_path")
@@ -1015,6 +1022,35 @@ pub(crate) fn load_run_projection(
                 detail_lines.push("repo_status:".to_string());
                 for line in repo_status.lines() {
                     detail_lines.push(format!("- {line}"));
+                }
+            }
+            let allowed_paths = event_string_list(Some(&event.payload), "allowed_paths");
+            if !allowed_paths.is_empty() {
+                detail_lines.push("allowed_paths:".to_string());
+                for path in allowed_paths {
+                    detail_lines.push(format!("- {path}"));
+                }
+            }
+            let changed_paths = event_string_list(Some(&event.payload), "changed_paths");
+            if !changed_paths.is_empty() {
+                detail_lines.push("changed_paths:".to_string());
+                for path in changed_paths {
+                    detail_lines.push(format!("- {path}"));
+                }
+            }
+            let out_of_scope_paths = event_string_list(Some(&event.payload), "out_of_scope_paths");
+            if !out_of_scope_paths.is_empty() {
+                detail_lines.push("out_of_scope_paths:".to_string());
+                for path in out_of_scope_paths {
+                    detail_lines.push(format!("- {path}"));
+                }
+            }
+            let suggested_allowed_paths =
+                event_string_list(Some(&event.payload), "suggested_allowed_paths");
+            if !suggested_allowed_paths.is_empty() {
+                detail_lines.push("suggested_allowed_paths:".to_string());
+                for path in suggested_allowed_paths {
+                    detail_lines.push(format!("- {path}"));
                 }
             }
             let conflicted_files = event_string_list(Some(&event.payload), "conflicted_files");
