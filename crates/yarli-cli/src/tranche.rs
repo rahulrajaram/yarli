@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write as IoWrite;
+use std::io::{BufRead, BufReader, Write as IoWrite};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -28,6 +30,7 @@ pub(crate) struct PlanGuardContext {
 // ---------------------------------------------------------------------------
 
 pub(crate) const TRANCHES_FILE: &str = ".yarli/tranches.toml";
+const VERIFY_OUTPUT_TAIL_LINES: usize = 40;
 
 pub(crate) fn tranches_file_path(base_dir: &Path) -> PathBuf {
     base_dir.join(TRANCHES_FILE)
@@ -389,13 +392,23 @@ pub(crate) fn run_tranche_verify_command(
         "running tranche verify command"
     );
 
-    let mut child = match process::Command::new("sh")
+    let mut command = process::Command::new("sh");
+    command
         .args(["-c", verify_cmd])
         .current_dir(workdir)
         .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
-        .spawn()
-    {
+        .stderr(process::Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(err) => {
             warn!(
@@ -406,29 +419,48 @@ pub(crate) fn run_tranche_verify_command(
             return Ok(false);
         }
     };
+    let process_group_id = Some(child.id() as i32);
+    let output_tail = VerifyOutputTail::default();
+    let mut stdout_drain = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_verify_output_drain("stdout", stdout, output_tail.clone()));
+    let mut stderr_drain = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_verify_output_drain("stderr", stderr, output_tail.clone()));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let passed = status.success();
+                join_verify_output_drains(stdout_drain.take(), stderr_drain.take());
                 info!(
                     tranche_key = %current_tranche.key,
                     exit_code = status.code(),
                     passed,
+                    tail_lines = output_tail.snapshot().len(),
                     "tranche verify command finished"
                 );
+                if !passed {
+                    log_verify_output_tail(&current_tranche.key, "failed", &output_tail);
+                }
                 return Ok(passed);
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
+                    let tail_lines = output_tail.snapshot().len();
                     warn!(
                         tranche_key = %current_tranche.key,
                         timeout_secs,
+                        tail_lines,
                         "tranche verify command timed out; killing"
                     );
-                    let _ = child.kill();
+                    terminate_tranche_verify_child(&mut child, process_group_id);
                     let _ = child.wait();
+                    join_verify_output_drains(stdout_drain.take(), stderr_drain.take());
+                    log_verify_output_tail(&current_tranche.key, "timed out", &output_tail);
                     return Ok(false);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -439,12 +471,96 @@ pub(crate) fn run_tranche_verify_command(
                     error = %err,
                     "error polling tranche verify command"
                 );
-                let _ = child.kill();
+                terminate_tranche_verify_child(&mut child, process_group_id);
                 let _ = child.wait();
+                join_verify_output_drains(stdout_drain.take(), stderr_drain.take());
+                log_verify_output_tail(&current_tranche.key, "polling error", &output_tail);
                 return Ok(false);
             }
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct VerifyOutputTail {
+    lines: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl VerifyOutputTail {
+    fn record(&self, stream: &str, line: String) {
+        let mut lines = self
+            .lines
+            .lock()
+            .expect("verify output tail mutex poisoned");
+        if lines.len() == VERIFY_OUTPUT_TAIL_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(format!("[{stream}] {line}"));
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .expect("verify output tail mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+fn spawn_verify_output_drain<R: std::io::Read + Send + 'static>(
+    stream: &'static str,
+    reader: R,
+    output_tail: VerifyOutputTail,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let buffered = BufReader::new(reader);
+        for line in buffered.lines() {
+            match line {
+                Ok(line) => output_tail.record(stream, line),
+                Err(err) => {
+                    output_tail.record(stream, format!("<read error: {err}>"));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn join_verify_output_drains(
+    stdout_drain: Option<std::thread::JoinHandle<()>>,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
+) {
+    for handle in [stdout_drain, stderr_drain].into_iter().flatten() {
+        let _ = handle.join();
+    }
+}
+
+fn log_verify_output_tail(tranche_key: &str, reason: &str, output_tail: &VerifyOutputTail) {
+    let snapshot = output_tail.snapshot();
+    if snapshot.is_empty() {
+        return;
+    }
+
+    warn!(
+        tranche_key,
+        reason,
+        tail_lines = snapshot.len(),
+        output_tail = %snapshot.join("\n"),
+        "tranche verify output tail"
+    );
+}
+
+fn terminate_tranche_verify_child(child: &mut process::Child, process_group_id: Option<i32>) {
+    #[cfg(unix)]
+    if let Some(group_id) = process_group_id {
+        unsafe {
+            libc::killpg(group_id, libc::SIGKILL);
+        }
+        return;
+    }
+
+    let _ = child.kill();
 }
 
 pub(crate) fn validate_tranche_definition(def: &TrancheDefinition) -> Result<()> {
@@ -2849,6 +2965,59 @@ verify = "false"
 
         let passed = run_tranche_verify_command(&plan, repo.path(), 10).unwrap();
         assert!(passed, "missing tranches file should default to pass");
+    }
+
+    #[test]
+    fn verify_command_drains_large_output_without_deadlock() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("PROMPT.md"), "# prompt\n").unwrap();
+        std::fs::write(
+            repo.path().join("IMPLEMENTATION_PLAN.md"),
+            "## Next Work Tranches\n1. VT-07 `Large output`: incomplete.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join(".yarli")).unwrap();
+        std::fs::write(
+            repo.path().join(".yarli/tranches.toml"),
+            r#"
+version = 1
+
+[[tranches]]
+key = "VT-07"
+summary = "Verify large output tranche"
+status = "incomplete"
+verify = "i=0; while [ $i -lt 5000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n'; i=$((i+1)); done"
+"#,
+        )
+        .unwrap();
+
+        let plan = RunPlan {
+            objective: "verify large output".to_string(),
+            tasks: Vec::new(),
+            task_catalog: Vec::new(),
+            workdir: repo.path().display().to_string(),
+            timeout_secs: 10,
+            pace: None,
+            prompt_snapshot: Some(prompt::PromptSnapshot {
+                entry_path: repo.path().join("PROMPT.md").display().to_string(),
+                expanded_sha256: "abc".to_string(),
+                included_files: Vec::new(),
+            }),
+            run_spec: None,
+            tranche_plan: vec![PlannedTranche {
+                key: "VT-07".to_string(),
+                objective: "verify large output".to_string(),
+                task_keys: vec!["task-001".to_string()],
+                tranche_group: None,
+            }],
+            current_tranche_index: Some(0),
+        };
+
+        let passed = run_tranche_verify_command(&plan, repo.path(), 10).unwrap();
+        assert!(
+            passed,
+            "large stdout should be drained instead of deadlocking"
+        );
     }
 
     fn write_tranches_fixture(base: &Path, body: &str) {
