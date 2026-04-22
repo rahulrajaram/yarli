@@ -382,9 +382,13 @@ yarli plan tranche add --key TP-05 --summary "Config loader hardening" --idempot
 yarli plan tranche add --key TP-06 --summary "Guard runner" --group runtime --allowed-paths crates/yarli-exec,crates/yarli-cli --verify "cargo test -p yarli" --done-when "guard diagnostics render in run status" --max-tokens 60000
 yarli plan tranche complete --key TP-05
 yarli plan tranche remove --key TP-05
+yarli plan tranche reconcile-from-evidence
+yarli plan tranche reconcile-from-evidence --dry-run
 ```
 
 `yarli plan tranche add` also supports tranche metadata fields used by plan-driven dispatch: `--group`, `--allowed-paths`, `--verify`, `--done-when`, and `--max-tokens`. Add `--idempotent` when an agent or script may enqueue the same tranche key repeatedly and you want matching definitions to no-op instead of failing. When `[run.tranche_contract]` is enabled, `yarli plan validate` and `yarli plan tranche add` enforce those stricter contract checks for open tranches without changing the default legacy behavior.
+
+`yarli plan tranche reconcile-from-evidence` flips matching tranches from `incomplete` to `complete` whenever `.yarli/evidence/I<KEY>.md` exists with `status = "pass"` frontmatter. `blocked` tranches and already-complete tranches are left alone. This reconciliation also runs automatically at the start of `yarli run` and `yarli run --fresh-from-tranches` so runs skip tranches whose work is already landed. Use `--dry-run` to preview the report without mutating `tranches.toml`.
 
 ### `yarli debug`
 
