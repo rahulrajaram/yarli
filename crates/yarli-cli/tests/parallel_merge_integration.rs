@@ -424,103 +424,17 @@ worktree_root = "{}"
     }
 }
 
-#[test]
-fn run_start_parallel_worktree_auto_commit_writes_checkpoint_message() {
-    let temp_dir = TempDir::new().expect("create temp workspace");
-    let repo_dir = temp_dir.path().join("repo");
-    std::fs::create_dir_all(&repo_dir).expect("create repo dir");
-    let worktree_root = repo_dir.join(".yarl/workspaces");
-    std::fs::create_dir_all(&worktree_root).expect("create worktree root dir");
-
-    run_git(&repo_dir, &["init"]);
-    run_git(&repo_dir, &["checkout", "-b", "main"]);
-    run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
-    run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
-    std::fs::write(repo_dir.join(".gitignore"), ".yarli/\n").expect("write gitignore");
-    std::fs::write(repo_dir.join("alpha.txt"), "alpha baseline\n").expect("write alpha baseline");
-    run_git(&repo_dir, &["add", "."]);
-    run_git(&repo_dir, &["commit", "-m", "initial"]);
-
-    let config = format!(
-        r#"[core]
-backend = "in-memory"
-allow_in_memory_writes = true
-
-[features]
-parallel = true
-parallel_worktree = true
-
-[run]
-auto_commit_interval = 1
-
-[execution]
-working_dir = "."
-worktree_root = "{}"
-"#,
-        worktree_root.display()
-    );
-    std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
-
-    let binary = run_output_path();
-    let task_cmd = "printf 'alpha merged\\n' > alpha.txt && mkdir -p .yarli && printf 'version = 1\\n[[tranches]]\\nkey = \"TR-01\"\\nsummary = \"checkpoint\"\\nstatus = \"complete\"\\n' > .yarli/tranches.toml && printf '{\"exit_state\":\"RunCompleted\"}\\n' > .yarli/continuation.json";
-    let run_output = run_yarli(
-        &binary,
-        &repo_dir,
-        &[
-            "run",
-            "start",
-            "parallel worktree checkpoint commit regression",
-            "--stream",
-            "--cmd",
-            task_cmd,
-        ],
-    );
-
-    assert!(
-        run_output.status.success(),
-        "run start command failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run_output.stdout),
-        String::from_utf8_lossy(&run_output.stderr),
-    );
-
-    let subjects = git_stdout(&repo_dir, &["log", "-2", "--pretty=%s"]);
-    let mut subject_lines = subjects.lines();
-    let latest_subject = subject_lines.next().expect("latest commit subject");
-    let previous_subject = subject_lines.next().expect("previous commit subject");
-
-    assert_eq!(latest_subject, "chore(state): checkpoint runtime state");
-    assert!(
-        is_change_centric_subject(previous_subject),
-        "expected change-centric worktree commit before checkpoint, saw: {previous_subject}"
-    );
-    assert!(
-        !previous_subject.contains("yarli:"),
-        "previous subject should not leak workflow metadata: {previous_subject}"
-    );
-    assert!(
-        !previous_subject.contains("tranche"),
-        "previous subject should not mention tranche bookkeeping: {previous_subject}"
-    );
-
-    let checkpoint_body = git_stdout(&repo_dir, &["log", "-1", "--pretty=%B"]);
-    assert!(
-        checkpoint_body.contains("yarli-run:"),
-        "checkpoint commit should contain yarli run attribution:\n{checkpoint_body}"
-    );
-    assert!(
-        checkpoint_body.contains("yarli-progress: 1/1"),
-        "checkpoint commit should record progress:\n{checkpoint_body}"
-    );
-    assert!(
-        checkpoint_body.contains("yarli-tranche: unknown"),
-        "ad-hoc run start should currently use the fallback tranche key in checkpoint metadata:\n{checkpoint_body}"
-    );
-
-    assert_eq!(
-        std::fs::read_to_string(repo_dir.join("alpha.txt")).unwrap(),
-        "alpha merged\n"
-    );
-}
+// NOTE: `run_start_parallel_worktree_auto_commit_writes_checkpoint_message`
+// was removed intentionally. It validated that a dedicated "chore(state):
+// checkpoint runtime state" commit is written for `.yarli/continuation.json`
+// and `.yarli/tranches.toml` after each tranche. That behavior only existed
+// because `auto_commit_state_files` used `git add -f` to force state files
+// past `.gitignore`. After the `fix(workspace): respect gitignore in
+// auto_commit_state_files` change, state files are auto-committed only when
+// the operator actually tracks them — in which case they land inside the
+// existing change-centric worktree-merge commit rather than a separate
+// checkpoint. The untracked/gitignored path is covered by
+// `auto_commit_respects_gitignore_for_untracked_state_files` in workspace.rs.
 
 #[test]
 fn run_start_parallel_merge_preserves_workspace_root_when_task_is_skipped() {
@@ -1058,6 +972,10 @@ fn run_plan_parallel_scope_violation_surfaces_allowed_paths_recovery_guidance() 
     run_git(&repo_dir, &["checkout", "-b", "main"]);
     run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
     run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
+    // Isolate from the host's global core.excludesFile so PROMPT.md,
+    // yarli.toml, etc. aren't filtered out of git-tracked state depending
+    // on whether the runner has a user-level gitignore for them.
+    run_git(&repo_dir, &["config", "core.excludesFile", "/dev/null"]);
 
     std::fs::write(repo_dir.join("src/lib.rs"), "pub fn hi() {}\n").expect("write src/lib.rs");
     std::fs::write(repo_dir.join("README.md"), "baseline\n").expect("write README.md");
@@ -1149,9 +1067,22 @@ prompt_mode = "arg"
         combined_output.contains("Exit state:  RunFailed"),
         "scope violation run should report RunFailed in summary\n{combined_output}"
     );
+    // The full set of suggested paths may also include incidentally-changed
+    // control files (PROMPT.md, yarli.toml, etc.) depending on what the
+    // host filesystem and global gitignore expose; we only require that the
+    // guidance surfaces AND names README.md, which the mock agent actually
+    // scope-violated.
+    let suggestions_line = combined_output
+        .lines()
+        .find(|line| line.starts_with("Suggested allowed_paths additions:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "scope violation run should surface allowed_paths recovery guidance\n{combined_output}"
+            )
+        });
     assert!(
-        combined_output.contains("Suggested allowed_paths additions: README.md"),
-        "scope violation run should surface allowed_paths recovery guidance\n{combined_output}"
+        suggestions_line.contains("README.md"),
+        "suggestions line must include README.md, saw: {suggestions_line}"
     );
 
     let continuation = read_continuation_payload(&repo_dir);
