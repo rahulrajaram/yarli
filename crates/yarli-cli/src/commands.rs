@@ -1330,6 +1330,14 @@ where
             task_workspace_by_id.insert(task.id, workspace_dir);
         }
     }
+    for (task, planned) in tasks.iter().zip(plan.tasks.iter()) {
+        if planned.allowed_paths.is_empty() {
+            continue;
+        }
+        scheduler
+            .bind_task_allowed_paths(task.id, planned.allowed_paths.clone())
+            .await;
+    }
 
     let task_names: Vec<(Uuid, String)> =
         tasks.iter().map(|t| (t.id, t.task_key.clone())).collect();

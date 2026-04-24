@@ -10,6 +10,7 @@
 //! 7. Heartbeat active leases and reclaim stale ones.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,9 @@ use crate::yarli_core::explain::GateType;
 use crate::yarli_core::fsm::command::CommandState;
 use crate::yarli_core::fsm::run::RunState;
 use crate::yarli_core::fsm::task::TaskState;
+use crate::yarli_exec::runner::{
+    encode_allowed_write_roots_env_value, INTERNAL_ALLOWED_WRITE_ROOTS_ENV,
+};
 use crate::yarli_exec::{
     CommandJournal, CommandRequest, CommandResult, CommandRunner, ExecError, ResourceLimits,
 };
@@ -205,6 +209,37 @@ fn build_resource_limits(budgets: &ResourceBudgetConfig) -> Option<ResourceLimit
     } else {
         None
     }
+}
+
+fn normalize_allowed_write_root(working_dir: &str, allowed_path: &str) -> Option<String> {
+    let trimmed = allowed_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let joined = Path::new(working_dir).join(trimmed);
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Some(normalized.to_string_lossy().to_string())
+}
+
+fn resolve_allowed_write_roots(working_dir: &str, allowed_paths: &[String]) -> Vec<String> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for allowed_path in allowed_paths {
+        let Some(root) = normalize_allowed_write_root(working_dir, allowed_path) else {
+            continue;
+        };
+        if seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 /// Errors from scheduler operations.
@@ -429,6 +464,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             runner,
             registry: Arc::new(RwLock::new(TaskRegistry::new())),
             task_working_dirs: Arc::new(RwLock::new(HashMap::new())),
+            task_allowed_paths: Arc::new(RwLock::new(HashMap::new())),
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             metrics: None,
@@ -453,6 +489,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             runner,
             registry: Arc::new(RwLock::new(registry)),
             task_working_dirs: Arc::new(RwLock::new(HashMap::new())),
+            task_allowed_paths: Arc::new(RwLock::new(HashMap::new())),
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             metrics: None,
@@ -512,6 +549,12 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
     pub async fn bind_task_working_dir(&self, task_id: TaskId, working_dir: impl Into<String>) {
         let mut dirs = self.task_working_dirs.write().await;
         dirs.insert(task_id, working_dir.into());
+    }
+
+    /// Bind tranche-scoped allowed paths for worker-level write enforcement.
+    pub async fn bind_task_allowed_paths(&self, task_id: TaskId, allowed_paths: Vec<String>) {
+        let mut paths = self.task_allowed_paths.write().await;
+        paths.insert(task_id, allowed_paths);
     }
 
     fn classify_merge_failure_reason(reason: &str, payload: &serde_json::Value) -> bool {
@@ -1019,6 +1062,13 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 .cloned()
                 .unwrap_or_else(|| self.config.working_dir.clone())
         };
+        let allowed_write_roots = {
+            let paths = self.task_allowed_paths.read().await;
+            paths
+                .get(&task_id)
+                .map(|allowed_paths| resolve_allowed_write_roots(&working_dir, allowed_paths))
+                .unwrap_or_default()
+        };
 
         if !self.config.allow_recursive_run && command_invokes_recursive_yarli_run(&command) {
             let decision = PolicyDecision {
@@ -1138,6 +1188,13 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             task_tx
         });
 
+        let mut env = Vec::new();
+        if !allowed_write_roots.is_empty() {
+            env.push((
+                INTERNAL_ALLOWED_WRITE_ROOTS_ENV.to_string(),
+                encode_allowed_write_roots_env_value(&allowed_write_roots),
+            ));
+        }
         let request = CommandRequest {
             task_id,
             run_id: entry.run_id,
@@ -1147,7 +1204,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             correlation_id,
             idempotency_key: Some(format!("{task_id}:cmd:{attempt_no}")),
             timeout: self.config.command_timeout,
-            env: vec![],
+            env,
             live_output_tx,
             resource_limits: build_resource_limits(&self.config.budgets),
             rehydration_tokens: entry.rehydration_tokens,
@@ -2720,11 +2777,52 @@ pub struct TickResult {
 mod tests {
     use super::*;
     use crate::yarli_core::domain::{CommandClass, SafeMode};
-    use crate::yarli_exec::LocalCommandRunner;
+    use crate::yarli_core::entities::command_execution::CommandExecution;
+    use crate::yarli_core::fsm::command::CommandState;
+    use crate::yarli_exec::{
+        CommandRequest, CommandResult, CommandRunner, ExecError, LocalCommandRunner,
+        INTERNAL_ALLOWED_WRITE_ROOTS_ENV,
+    };
     use crate::yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
     use crate::yarli_queue::InMemoryTaskQueue;
     use crate::yarli_store::InMemoryEventStore;
     use proptest::prelude::*;
+    use tempfile::TempDir;
+
+    #[derive(Clone, Default)]
+    struct CapturingRunner {
+        observed: Arc<tokio::sync::Mutex<Option<CommandRequest>>>,
+    }
+
+    impl CommandRunner for CapturingRunner {
+        async fn run(
+            &self,
+            request: CommandRequest,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<CommandResult, ExecError> {
+            *self.observed.lock().await = Some(request.clone());
+
+            let mut execution = CommandExecution::new(
+                request.task_id,
+                request.run_id,
+                request.command.clone(),
+                request.working_dir.clone(),
+                request.command_class,
+                request.correlation_id,
+            );
+            execution
+                .transition(CommandState::CmdStarted, "started", "test-runner", None)
+                .unwrap();
+            execution.exit(0, "test-runner", None).unwrap();
+
+            Ok(CommandResult {
+                execution,
+                chunks: Vec::new(),
+                runner_actor: "test-runner".to_string(),
+                backend_metadata: None,
+            })
+        }
+    }
 
     fn test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -2767,6 +2865,59 @@ mod tests {
 
     fn make_task(run_id: RunId, key: &str, command: &str, correlation_id: Uuid) -> Task {
         Task::new(run_id, key, command, CommandClass::Io, correlation_id)
+    }
+
+    #[tokio::test]
+    async fn tick_passes_allowed_paths_to_runner_as_internal_scope_env() {
+        let workspace = TempDir::new().unwrap();
+        let workspace_root = workspace.path().join("repo");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(CapturingRunner::default());
+        let mut config = test_config();
+        config.working_dir = workspace_root.display().to_string();
+        let sched = Scheduler::new(queue, store, runner.clone(), config);
+
+        let run = make_run("scoped");
+        let task = make_task(run.id, "scope-task", "echo ok", run.correlation_id);
+        let task_id = task.id;
+        sched
+            .bind_task_allowed_paths(
+                task_id,
+                vec![
+                    "crates/yarli-cli/src".to_string(),
+                    "docs/postmortem.md".to_string(),
+                ],
+            )
+            .await;
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.executed, 1);
+
+        let observed = runner.observed.lock().await.clone().unwrap();
+        let scope_env = observed
+            .env
+            .iter()
+            .find(|(key, _)| key == INTERNAL_ALLOWED_WRITE_ROOTS_ENV)
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        let scoped_roots: Vec<_> = scope_env.lines().collect();
+        assert_eq!(
+            scoped_roots,
+            vec![
+                workspace_root
+                    .join("crates/yarli-cli/src")
+                    .display()
+                    .to_string(),
+                workspace_root
+                    .join("docs/postmortem.md")
+                    .display()
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]

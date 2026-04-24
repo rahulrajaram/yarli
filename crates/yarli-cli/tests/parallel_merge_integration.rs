@@ -1128,6 +1128,102 @@ prompt_mode = "arg"
     assert_output_state_matches_continuation(&run_stdout, &continuation);
 }
 
+#[cfg(all(target_os = "linux", unix))]
+#[test]
+fn run_plan_worker_write_scope_blocks_out_of_scope_write_before_disk_mutation() {
+    let temp_dir = TempDir::new().expect("create temp workspace");
+    let repo_dir = temp_dir.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("src")).expect("create src dir");
+
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["checkout", "-b", "main"]);
+    run_git(&repo_dir, &["config", "user.email", "test@yarli.dev"]);
+    run_git(&repo_dir, &["config", "user.name", "Yarli Test"]);
+    run_git(&repo_dir, &["config", "core.excludesFile", "/dev/null"]);
+
+    std::fs::write(repo_dir.join("src/lib.rs"), "pub fn hi() {}\n").expect("write src/lib.rs");
+    std::fs::write(repo_dir.join("README.md"), "baseline\n").expect("write README.md");
+    std::fs::write(
+        repo_dir.join("mock-agent.sh"),
+        r#"#!/bin/sh
+set -eu
+prompt="${1:-}"
+case "$prompt" in
+  *YARLI_PREFLIGHT_OK*)
+    printf 'YARLI_PREFLIGHT_OK\n'
+    ;;
+  *)
+    printf 'scope leak\n' > README.md
+    printf 'task finished\n'
+    ;;
+esac
+"#,
+    )
+    .expect("write mock agent");
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "initial"]);
+
+    std::fs::write(
+        repo_dir.join("PROMPT.md"),
+        r#"
+```yarli-run
+version = 1
+objective = "exercise worker write scope"
+```
+"#,
+    )
+    .expect("write prompt file");
+    std::fs::write(
+        repo_dir.join("IMPLEMENTATION_PLAN.md"),
+        "- [ ] AP-01 worker-scope check allowed_paths=src/lib.rs\n",
+    )
+    .expect("write implementation plan");
+
+    let config = r#"[core]
+backend = "in-memory"
+allow_in_memory_writes = true
+
+[features]
+parallel = false
+
+[run]
+enforce_plan_tranche_allowed_paths = true
+
+[execution]
+working_dir = "."
+
+[cli]
+command = "sh"
+args = ["./mock-agent.sh"]
+prompt_mode = "arg"
+"#;
+    std::fs::write(repo_dir.join("yarli.toml"), config).expect("write yarli.toml config");
+
+    let binary = run_output_path();
+    let run_output = run_yarli(&binary, &repo_dir, &["run", "--stream"]);
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+
+    assert!(
+        !run_output.status.success(),
+        "run should fail when the worker attempts an out-of-scope write\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_output.stdout),
+        String::from_utf8_lossy(&run_output.stderr),
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("README.md")).expect("read README"),
+        "baseline\n",
+        "worker write scope should block README mutation before disk is touched",
+    );
+    assert!(
+        combined_output.contains("RunFailed"),
+        "worker-scope failure should surface RunFailed in summary\n{combined_output}"
+    );
+}
+
 #[test]
 fn run_start_parallel_merge_lineage_failure_preserves_workspace_and_escalates() {
     let temp_dir = TempDir::new().expect("create temp workspace");

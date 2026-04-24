@@ -10,10 +10,17 @@
 //! - Respects `CancellationToken` from shutdown infrastructure.
 //! - Supports configurable timeouts.
 
+use std::collections::BTreeSet;
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
+#[cfg(all(target_os = "linux", unix))]
+use std::{
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    path::{Path, PathBuf},
+};
 
 use crate::yarli_observability::YarliMetrics;
 use chrono::Utc;
@@ -31,6 +38,8 @@ use crate::yarli_core::fsm::command::CommandState;
 use crate::yarli_core::shutdown::ShutdownController;
 
 use crate::yarli_exec::error::ExecError;
+
+pub const INTERNAL_ALLOWED_WRITE_ROOTS_ENV: &str = "YARLI_INTERNAL_ALLOWED_WRITE_ROOTS";
 
 /// Derive a deterministic command ID from an idempotency key.
 ///
@@ -199,6 +208,251 @@ impl Default for LocalCommandRunner {
     }
 }
 
+pub fn encode_allowed_write_roots_env_value(roots: &[String]) -> String {
+    roots.join("\n")
+}
+
+fn split_internal_runner_env(env: &[(String, String)]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut child_env = Vec::with_capacity(env.len());
+    let mut allowed_write_roots = Vec::new();
+    for (key, value) in env {
+        if key == INTERNAL_ALLOWED_WRITE_ROOTS_ENV {
+            allowed_write_roots.extend(
+                value
+                    .lines()
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+            continue;
+        }
+        child_env.push((key.clone(), value.clone()));
+    }
+    (child_env, allowed_write_roots)
+}
+
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+#[cfg(all(target_os = "linux", unix))]
+const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+
+#[cfg(all(target_os = "linux", unix))]
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+}
+
+#[cfg(all(target_os = "linux", unix))]
+#[repr(C)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+#[cfg(all(target_os = "linux", unix))]
+#[derive(Debug)]
+struct PreparedWriteScope {
+    ruleset_fd: OwnedFd,
+}
+
+#[cfg(all(target_os = "linux", unix))]
+impl PreparedWriteScope {
+    fn apply(&self) -> io::Result<()> {
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let rc = libc::syscall(
+                libc::SYS_landlock_restrict_self,
+                self.ruleset_fd.as_raw_fd(),
+                0,
+            );
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn landlock_write_access_mask_for_abi(abi_version: i32) -> u64 {
+    let mut access = LANDLOCK_ACCESS_FS_WRITE_FILE
+        | LANDLOCK_ACCESS_FS_REMOVE_DIR
+        | LANDLOCK_ACCESS_FS_REMOVE_FILE
+        | LANDLOCK_ACCESS_FS_MAKE_CHAR
+        | LANDLOCK_ACCESS_FS_MAKE_DIR
+        | LANDLOCK_ACCESS_FS_MAKE_REG
+        | LANDLOCK_ACCESS_FS_MAKE_SOCK
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+        | LANDLOCK_ACCESS_FS_MAKE_SYM;
+    if abi_version >= 2 {
+        access |= LANDLOCK_ACCESS_FS_REFER;
+    }
+    if abi_version >= 3 {
+        access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+    access
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn detect_landlock_abi_version() -> io::Result<Option<i32>> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if rc >= 0 {
+        return Ok(Some(rc as i32));
+    }
+
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOSYS | libc::EOPNOTSUPP) => Ok(None),
+        _ => Err(err),
+    }
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn create_landlock_ruleset_fd(handled_access_fs: u64) -> io::Result<OwnedFd> {
+    let attr = LandlockRulesetAttr { handled_access_fs };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(rc as i32) })
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn open_landlock_root_fd(path: &Path) -> io::Result<OwnedFd> {
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    let c_path = CString::new(path_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("write-scope path contains NUL byte: {}", path.display()),
+        )
+    })?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn add_landlock_rule(ruleset_fd: &OwnedFd, path: &Path, allowed_access: u64) -> io::Result<()> {
+    let parent_fd = open_landlock_root_fd(path)?;
+    let attr = LandlockPathBeneathAttr {
+        allowed_access,
+        parent_fd: parent_fd.as_raw_fd(),
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset_fd.as_raw_fd(),
+            LANDLOCK_RULE_PATH_BENEATH,
+            &attr as *const LandlockPathBeneathAttr,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(metadata) = fs::metadata(&current) {
+            if metadata.is_dir() {
+                return Ok(current);
+            }
+            if let Some(parent) = current.parent() {
+                return Ok(parent.to_path_buf());
+            }
+        }
+        let Some(parent) = current.parent() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no existing ancestor for write-scope root {}",
+                    path.display()
+                ),
+            ));
+        };
+        current = parent.to_path_buf();
+    }
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn prepare_write_scope(allowed_write_roots: &[String]) -> io::Result<Option<PreparedWriteScope>> {
+    if allowed_write_roots.is_empty() {
+        return Ok(None);
+    }
+
+    let abi_version = detect_landlock_abi_version()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "worker write-scope enforcement requires Linux Landlock support",
+        )
+    })?;
+    let handled_access = landlock_write_access_mask_for_abi(abi_version);
+    let ruleset_fd = create_landlock_ruleset_fd(handled_access)?;
+
+    // Landlock rules must target existing filesystem objects. For file-scoped
+    // allowlists and not-yet-created outputs, widen to the nearest existing
+    // ancestor so common atomic-save patterns stay writable while out-of-scope
+    // paths remain blocked at the worker process boundary.
+    let mut rule_roots = BTreeSet::new();
+    for root in allowed_write_roots {
+        let existing_root = nearest_existing_ancestor(Path::new(root))?;
+        rule_roots.insert(existing_root);
+    }
+
+    for root in rule_roots {
+        add_landlock_rule(&ruleset_fd, &root, handled_access)?;
+    }
+
+    Ok(Some(PreparedWriteScope { ruleset_fd }))
+}
+
 impl CommandRunner for LocalCommandRunner {
     #[tracing::instrument(
         skip(self, request, cancel),
@@ -214,6 +468,16 @@ impl CommandRunner for LocalCommandRunner {
         request: CommandRequest,
         cancel: CancellationToken,
     ) -> Result<CommandResult, ExecError> {
+        let (child_env, allowed_write_roots) = split_internal_runner_env(&request.env);
+        #[cfg(all(target_os = "linux", unix))]
+        let write_scope = prepare_write_scope(&allowed_write_roots).map_err(ExecError::Io)?;
+        #[cfg(not(all(target_os = "linux", unix)))]
+        if !allowed_write_roots.is_empty() {
+            return Err(ExecError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "worker write-scope enforcement is only supported on Linux",
+            )));
+        }
         let timeout = request.timeout.or(self.default_timeout);
         let idle_kill_timeout = self.idle_kill_timeout;
         let live_tx = request.live_output_tx;
@@ -256,11 +520,13 @@ impl CommandRunner for LocalCommandRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .envs(request.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(child_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .kill_on_drop(true);
         #[cfg(unix)]
         {
             let rlimits = request.resource_limits.clone();
+            #[cfg(all(target_os = "linux", unix))]
+            let write_scope = write_scope;
             // Isolate each command in its own process group so cancellation tears
             // down descendants (shell + child toolchain processes) reliably.
             // Also apply rlimits if configured.
@@ -271,6 +537,10 @@ impl CommandRunner for LocalCommandRunner {
                     }
                     if let Some(ref limits) = rlimits {
                         apply_rlimits(limits)?;
+                    }
+                    #[cfg(all(target_os = "linux", unix))]
+                    if let Some(ref scope) = write_scope {
+                        scope.apply()?;
                     }
                     Ok(())
                 });
@@ -921,6 +1191,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::io;
+    use tempfile::TempDir;
 
     fn make_request(cmd: &str) -> CommandRequest {
         CommandRequest {
@@ -937,6 +1208,21 @@ mod tests {
             resource_limits: None,
             rehydration_tokens: None,
         }
+    }
+
+    #[cfg(all(target_os = "linux", unix))]
+    fn make_scoped_request(
+        cmd: &str,
+        working_dir: &Path,
+        allowed_write_roots: &[String],
+    ) -> CommandRequest {
+        let mut request = make_request(cmd);
+        request.working_dir = working_dir.display().to_string();
+        request.env.push((
+            INTERNAL_ALLOWED_WRITE_ROOTS_ENV.to_string(),
+            encode_allowed_write_roots_env_value(allowed_write_roots),
+        ));
+        request
     }
 
     #[tokio::test]
@@ -1025,6 +1311,58 @@ mod tests {
 
         assert_eq!(result.execution.state, CommandState::CmdTimedOut);
         assert!(result.execution.ended_at.is_some());
+    }
+
+    #[cfg(all(target_os = "linux", unix))]
+    #[tokio::test]
+    async fn test_write_scope_allows_in_scope_writes() {
+        let sandbox = TempDir::new().unwrap();
+        let workspace = sandbox.path().join("workspace");
+        let allowed_dir = workspace.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let req = make_scoped_request(
+            "printf scoped > in_scope.txt",
+            &allowed_dir,
+            &[allowed_dir.display().to_string()],
+        );
+        let result = runner.run(req, cancel).await.unwrap();
+
+        assert_eq!(result.execution.state, CommandState::CmdExited);
+        assert_eq!(result.execution.exit_code, Some(0));
+        assert_eq!(
+            fs::read_to_string(allowed_dir.join("in_scope.txt")).unwrap(),
+            "scoped"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", unix))]
+    #[tokio::test]
+    async fn test_write_scope_blocks_out_of_scope_writes_before_touching_disk() {
+        let sandbox = TempDir::new().unwrap();
+        let workspace = sandbox.path().join("workspace");
+        let allowed_dir = workspace.join("allowed");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        let blocked_path = workspace.join("blocked.txt");
+
+        let runner = LocalCommandRunner::new();
+        let cancel = CancellationToken::new();
+        let req = make_scoped_request(
+            "printf blocked > ../blocked.txt",
+            &allowed_dir,
+            &[allowed_dir.display().to_string()],
+        );
+        let result = runner.run(req, cancel).await.unwrap();
+
+        assert_eq!(result.execution.state, CommandState::CmdExited);
+        assert_ne!(result.execution.exit_code, Some(0));
+        assert!(
+            !blocked_path.exists(),
+            "out-of-scope path should remain untouched: {}",
+            blocked_path.display()
+        );
     }
 
     #[tokio::test]
