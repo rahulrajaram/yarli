@@ -446,6 +446,7 @@ pub struct Scheduler<Q: TaskQueue, S: EventStore, R: CommandRunner> {
     runner: Arc<R>,
     registry: Arc<RwLock<TaskRegistry>>,
     task_working_dirs: Arc<RwLock<HashMap<TaskId, String>>>,
+    task_allowed_paths: Arc<RwLock<HashMap<TaskId, Vec<String>>>>,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     metrics: Option<Arc<crate::yarli_observability::YarliMetrics>>,
