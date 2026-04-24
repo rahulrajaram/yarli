@@ -52,6 +52,15 @@ const CLAIM_CANDIDATES_SCOPED_SQL: &str = r#"
     LIMIT $2
 "#;
 
+/// Cancel pending/leased rows for an explicit set of run ids.
+const CANCEL_FOR_RUN_IDS_SQL: &str = r#"
+    UPDATE task_queue
+    SET status = 'cancelled',
+        updated_at = $1
+    WHERE status IN ('pending', 'leased')
+      AND run_id = ANY($2::uuid[])
+"#;
+
 /// Postgres-backed queue implementation.
 #[derive(Debug, Clone)]
 pub struct PostgresTaskQueue {
@@ -75,6 +84,26 @@ impl PostgresTaskQueue {
     /// Access the underlying pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Cancel all pending and leased entries for the provided run ids.
+    pub fn cancel_for_runs(&self, run_ids: &[RunId]) -> Result<usize, QueueError> {
+        if run_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let pool = self.pool.clone();
+        let run_ids = run_ids.to_vec();
+        self.run_async(async move {
+            let result = sqlx::query(CANCEL_FOR_RUN_IDS_SQL)
+                .bind(Utc::now())
+                .bind(&run_ids)
+                .execute(&pool)
+                .await
+                .map_err(|error| QueueError::Database(error.to_string()))?;
+
+            Ok(result.rows_affected() as usize)
+        })
     }
 
     fn run_async<T, Fut>(&self, fut: Fut) -> Result<T, QueueError>
@@ -749,25 +778,7 @@ impl TaskQueue for PostgresTaskQueue {
     }
 
     fn cancel_for_run(&self, run_id: RunId) -> Result<usize, QueueError> {
-        let pool = self.pool.clone();
-        self.run_async(async move {
-            let result = sqlx::query(
-                r#"
-                UPDATE task_queue
-                SET status = 'cancelled',
-                    updated_at = $1
-                WHERE run_id = $2
-                  AND status IN ('pending', 'leased')
-                "#,
-            )
-            .bind(Utc::now())
-            .bind(run_id)
-            .execute(&pool)
-            .await
-            .map_err(|error| QueueError::Database(error.to_string()))?;
-
-            Ok(result.rows_affected() as usize)
-        })
+        self.cancel_for_runs(&[run_id])
     }
 
     fn cancel_stale_runs(&self, active_run_ids: &[RunId]) -> Result<usize, QueueError> {
@@ -996,8 +1007,8 @@ mod tests {
 
     use super::{
         classify_unique_violation, command_class_from_db, command_class_to_db,
-        queue_status_from_db, queue_status_to_db, UniqueViolation, CLAIM_CANDIDATES_SCOPED_SQL,
-        CLAIM_CANDIDATES_SQL,
+        queue_status_from_db, queue_status_to_db, UniqueViolation, CANCEL_FOR_RUN_IDS_SQL,
+        CLAIM_CANDIDATES_SCOPED_SQL, CLAIM_CANDIDATES_SQL,
     };
     use crate::yarli_queue::queue::QueueStatus;
 
@@ -1058,5 +1069,11 @@ mod tests {
             UniqueViolation::Unknown
         );
         assert_eq!(classify_unique_violation(None), UniqueViolation::Unknown);
+    }
+
+    #[test]
+    fn cancel_for_run_ids_sql_targets_only_explicit_runs() {
+        assert!(CANCEL_FOR_RUN_IDS_SQL.contains("run_id = ANY($2::uuid[])"));
+        assert!(!CANCEL_FOR_RUN_IDS_SQL.contains("run_id != ALL"));
     }
 }

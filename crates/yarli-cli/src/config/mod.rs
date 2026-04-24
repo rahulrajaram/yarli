@@ -7,8 +7,11 @@ mod migrate;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{de::Deserializer, Deserialize, Serialize};
@@ -460,6 +463,7 @@ pub(crate) fn build_cli_command(invocation: &CliInvocationConfig, prompt_text: &
 }
 
 const PREFLIGHT_MARKER: &str = "YARLI_PREFLIGHT_OK";
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn has_claude_model_flag(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--model")
@@ -503,14 +507,82 @@ fn execute_preflight_command(
     invocation: &CliInvocationConfig,
     preflight_prompt: &str,
 ) -> Result<()> {
+    execute_preflight_command_with_timeout(invocation, preflight_prompt, PREFLIGHT_TIMEOUT)
+}
+
+fn execute_preflight_command_with_timeout(
+    invocation: &CliInvocationConfig,
+    preflight_prompt: &str,
+    timeout: Duration,
+) -> Result<()> {
     let cmd = build_cli_command(invocation, preflight_prompt);
-    let output = std::process::Command::new("sh")
+    let mut command = std::process::Command::new("sh");
+    command
         .arg("-c")
         .arg(&cmd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
         .with_context(|| format!("CLI backend preflight failed to execute: {cmd}"))?;
+    #[cfg(unix)]
+    let process_group_id = Some(child.id() as i32);
+    #[cfg(not(unix))]
+    let process_group_id = None;
+
+    let deadline = Instant::now() + timeout;
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                break child.wait_with_output().with_context(|| {
+                    format!("CLI backend preflight failed to collect output: {cmd}")
+                })?;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    terminate_preflight_child(&mut child, process_group_id);
+                    let output = child.wait_with_output().with_context(|| {
+                        format!(
+                            "CLI backend preflight timed out and failed to collect output: {cmd}"
+                        )
+                    })?;
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    bail!(
+                        "CLI backend preflight timed out after {}ms.\n\
+                         \n\
+                         Command: {cmd}\n\
+                         \n\
+                         Stdout (first 500 chars): {}\n\
+                         \n\
+                         Stderr (first 500 chars): {}\n\
+                         \n\
+                         Fix: the configured CLI backend is hanging before Yarli can register a run. Check auth, TTY requirements, blocking flags, or the backend command in yarli.toml.",
+                        timeout.as_millis(),
+                        &stdout[..stdout.len().min(500)],
+                        &stderr[..stderr.len().min(500)]
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => {
+                terminate_preflight_child(&mut child, process_group_id);
+                let _ = child.wait_with_output();
+                return Err(err).with_context(|| {
+                    format!("CLI backend preflight failed while polling child: {cmd}")
+                });
+            }
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -542,22 +614,83 @@ fn execute_preflight_command(
     Ok(())
 }
 
+fn terminate_preflight_child(child: &mut std::process::Child, process_group_id: Option<i32>) {
+    #[cfg(unix)]
+    if let Some(group_id) = process_group_id {
+        unsafe {
+            libc::killpg(group_id, libc::SIGKILL);
+        }
+        return;
+    }
+
+    let _ = child.kill();
+}
+
+fn format_preflight_failure_section(
+    label: &str,
+    invocation: &CliInvocationConfig,
+    preflight_prompt: &str,
+    error: &anyhow::Error,
+) -> String {
+    format!(
+        "{label}:\nCommand: {}\nError: {error}",
+        build_cli_command(invocation, preflight_prompt)
+    )
+}
+
+fn preflight_cli_backend_with_executor(
+    invocation: &CliInvocationConfig,
+    execute: impl Fn(&CliInvocationConfig, &str) -> Result<()>,
+) -> Result<()> {
+    let preflight_prompt = format!("Respond with exactly: {PREFLIGHT_MARKER}");
+    match execute(invocation, &preflight_prompt) {
+        Ok(()) => Ok(()),
+        Err(primary_error) => {
+            let Some(fallback) = fallback_preflight_invocation(invocation) else {
+                return Err(primary_error);
+            };
+
+            match execute(&fallback, &preflight_prompt) {
+                Ok(()) => Ok(()),
+                Err(fallback_error) => bail!(
+                    "CLI backend preflight failed for the configured invocation, and fallback without `--model` also failed.\n\
+                     \n\
+                     {}\n\
+                     \n\
+                     {}",
+                    format_preflight_failure_section(
+                        "Primary attempt",
+                        invocation,
+                        &preflight_prompt,
+                        &primary_error
+                    ),
+                    format_preflight_failure_section(
+                        "Fallback attempt",
+                        &fallback,
+                        &preflight_prompt,
+                        &fallback_error
+                    )
+                ),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn preflight_cli_backend_with_timeout(
+    invocation: &CliInvocationConfig,
+    timeout: Duration,
+) -> Result<()> {
+    preflight_cli_backend_with_executor(invocation, |attempt, prompt| {
+        execute_preflight_command_with_timeout(attempt, prompt, timeout)
+    })
+}
+
 /// Exercise the configured CLI backend with a trivial prompt to verify it works
 /// before dispatching real tasks. Catches missing binaries, bad flags, permission
 /// failures, and auth issues early.
 pub(crate) fn preflight_cli_backend(invocation: &CliInvocationConfig) -> Result<()> {
-    let preflight_prompt = format!("Respond with exactly: {PREFLIGHT_MARKER}");
-    match execute_preflight_command(invocation, &preflight_prompt) {
-        Ok(()) => Ok(()),
-        Err(primary_error) => {
-            if let Some(fallback) = fallback_preflight_invocation(invocation) {
-                if let Ok(()) = execute_preflight_command(&fallback, &preflight_prompt) {
-                    return Ok(());
-                }
-            }
-            Err(primary_error)
-        }
-    }
+    preflight_cli_backend_with_executor(invocation, execute_preflight_command)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1845,6 +1978,8 @@ mod tests {
     use crate::cli::Cli;
     use clap::CommandFactory;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
@@ -1869,6 +2004,16 @@ mod tests {
     fn write_test_config_at(path: &Path, contents: &str) -> LoadedConfig {
         std::fs::write(path, contents).unwrap();
         LoadedConfig::load(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_test_cli_script(temp_dir: &TempDir, name: &str, body: &str) -> String {
+        let path = temp_dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path.display().to_string()
     }
 
     #[test]
@@ -2901,6 +3046,134 @@ allow_in_memory_writes = true
         let msg = err.to_string();
         assert!(
             msg.contains("did not contain expected marker"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_cli_backend_times_out_when_command_hangs() {
+        let invocation = CliInvocationConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 1".to_string()],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+        let err = execute_preflight_command_with_timeout(
+            &invocation,
+            &format!("Respond with exactly: {PREFLIGHT_MARKER}"),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("before Yarli can register a run"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_cli_backend_succeeds_after_model_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let command = write_test_cli_script(
+            &temp_dir,
+            "claude",
+            r#"
+if [ "${1:-}" = "--model" ]; then
+  echo "primary-model-unsupported" >&2
+  exit 12
+fi
+printf '%s\n' "${1:-}"
+"#,
+        );
+        let invocation = CliInvocationConfig {
+            command,
+            args: vec!["--model".to_string(), "claude-sonnet-4-6".to_string()],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+
+        preflight_cli_backend(&invocation).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_cli_backend_reports_primary_and_fallback_failures() {
+        let temp_dir = TempDir::new().unwrap();
+        let command = write_test_cli_script(
+            &temp_dir,
+            "claude",
+            r#"
+if [ "${1:-}" = "--model" ]; then
+  echo "primary-model-unsupported" >&2
+  exit 12
+fi
+echo "fallback-still-broken" >&2
+exit 23
+"#,
+        );
+        let invocation = CliInvocationConfig {
+            command,
+            args: vec!["--model".to_string(), "claude-sonnet-4-6".to_string()],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+
+        let err = preflight_cli_backend(&invocation).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fallback without `--model` also failed"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("Primary attempt"), "unexpected error: {msg}");
+        assert!(msg.contains("Fallback attempt"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("primary-model-unsupported"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("fallback-still-broken"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_cli_backend_applies_timeout_to_fallback_attempt() {
+        let temp_dir = TempDir::new().unwrap();
+        let command = write_test_cli_script(
+            &temp_dir,
+            "claude",
+            r#"
+if [ "${1:-}" = "--model" ]; then
+  echo "primary-model-unsupported" >&2
+  exit 12
+fi
+sleep 1
+"#,
+        );
+        let invocation = CliInvocationConfig {
+            command,
+            args: vec!["--model".to_string(), "claude-sonnet-4-6".to_string()],
+            prompt_mode: PromptMode::Arg,
+            env_unset: vec![],
+        };
+
+        let err =
+            preflight_cli_backend_with_timeout(&invocation, Duration::from_millis(10)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("primary-model-unsupported"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("Fallback attempt"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("timed out after 10ms"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("before Yarli can register a run"),
             "unexpected error: {msg}"
         );
     }

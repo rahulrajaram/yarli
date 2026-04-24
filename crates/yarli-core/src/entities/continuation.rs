@@ -58,6 +58,7 @@ mod run_state_pascal_case {
             RunState::RunBlocked => "RunBlocked",
             RunState::RunFailed => "RunFailed",
             RunState::RunCompleted => "RunCompleted",
+            RunState::RunCompletedWithMergeFailure => "RunCompletedWithMergeFailure",
             RunState::RunCancelled => "RunCancelled",
             RunState::RunDrained => "RunDrained",
         })
@@ -75,6 +76,9 @@ mod run_state_pascal_case {
             "RunBlocked" | "RUN_BLOCKED" => RunState::RunBlocked,
             "RunFailed" | "RUN_FAILED" => RunState::RunFailed,
             "RunCompleted" | "RUN_COMPLETED" => RunState::RunCompleted,
+            "RunCompletedWithMergeFailure" | "RUN_COMPLETED_WITH_MERGE_FAILURE" => {
+                RunState::RunCompletedWithMergeFailure
+            }
             "RunCancelled" | "RUN_CANCELLED" => RunState::RunCancelled,
             "RunDrained" | "RUN_DRAINED" => RunState::RunDrained,
             other => {
@@ -87,6 +91,7 @@ mod run_state_pascal_case {
                         "RunBlocked",
                         "RunFailed",
                         "RunCompleted",
+                        "RunCompletedWithMergeFailure",
                         "RunCancelled",
                         "RunDrained",
                         "RUN_OPEN",
@@ -95,6 +100,7 @@ mod run_state_pascal_case {
                         "RUN_BLOCKED",
                         "RUN_FAILED",
                         "RUN_COMPLETED",
+                        "RUN_COMPLETED_WITH_MERGE_FAILURE",
                         "RUN_CANCELLED",
                         "RUN_DRAINED",
                     ],
@@ -844,6 +850,82 @@ mod tests {
         assert_eq!(
             collect_allowed_paths_scope_suggestions(&tasks),
             vec!["README.md".to_string(), "docs/CLI.md".to_string()]
+        );
+    }
+
+    // NXT-381: RunCompletedWithMergeFailure is distinct from RunFailed and round-trips correctly.
+    #[test]
+    fn run_completed_with_merge_failure_is_distinct_from_run_failed() {
+        // A run that completed all tasks (RunCompleted) but whose post-completion
+        // parallel-merge teardown failed should surface as RunCompletedWithMergeFailure,
+        // not RunFailed. This lets tooling (yarli-loop-inspect.sh, dashboards) distinguish
+        // "work undone" from "work done but teardown failed".
+        let mut run = make_run();
+        // Simulate: yarli commands.rs overrides the exit state after merge failure.
+        run.state = RunState::RunCompletedWithMergeFailure;
+        run.exit_reason = Some(ExitReason::CompletedMergeTeardownFailed);
+        let mut t1 = make_task(&run, "build");
+        t1.state = TaskState::TaskComplete;
+        let mut t2 = make_task(&run, "test");
+        t2.state = TaskState::TaskComplete;
+
+        let payload = ContinuationPayload::build(&run, &[&t1, &t2]);
+
+        // The exit state must be the new variant — not RunFailed.
+        assert_eq!(
+            payload.exit_state,
+            RunState::RunCompletedWithMergeFailure,
+            "post-completion merge failure must not be reported as RunFailed"
+        );
+        assert_ne!(
+            payload.exit_state,
+            RunState::RunFailed,
+            "RunCompletedWithMergeFailure must be distinct from RunFailed"
+        );
+        assert_eq!(
+            payload.exit_reason,
+            Some(ExitReason::CompletedMergeTeardownFailed)
+        );
+        // All tasks completed — summary must reflect that.
+        assert_eq!(payload.summary.completed, 2);
+        assert_eq!(payload.summary.failed, 0);
+
+        // Round-trip through JSON so continuation.json consumers see the new string.
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(
+            json.contains("RunCompletedWithMergeFailure"),
+            "continuation.json must contain 'RunCompletedWithMergeFailure', got: {json}"
+        );
+        assert!(
+            !json.contains("\"RunFailed\""),
+            "continuation.json must NOT contain 'RunFailed' for this case"
+        );
+        let roundtrip: ContinuationPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.exit_state, RunState::RunCompletedWithMergeFailure);
+        assert_eq!(
+            roundtrip.exit_reason,
+            Some(ExitReason::CompletedMergeTeardownFailed)
+        );
+    }
+
+    // NXT-381: is_work_done() returns true for both RunCompleted and RunCompletedWithMergeFailure.
+    #[test]
+    fn run_state_is_work_done_covers_both_completed_variants() {
+        assert!(
+            RunState::RunCompleted.is_work_done(),
+            "RunCompleted must be considered work-done"
+        );
+        assert!(
+            RunState::RunCompletedWithMergeFailure.is_work_done(),
+            "RunCompletedWithMergeFailure must be considered work-done"
+        );
+        assert!(
+            !RunState::RunFailed.is_work_done(),
+            "RunFailed must NOT be considered work-done"
+        );
+        assert!(
+            !RunState::RunCancelled.is_work_done(),
+            "RunCancelled must NOT be considered work-done"
         );
     }
 }

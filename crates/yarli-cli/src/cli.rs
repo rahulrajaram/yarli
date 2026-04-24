@@ -38,6 +38,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) tui: bool,
 
+    /// Disable current-repo run scoping for repo-scoped run discovery/control commands.
+    #[arg(long, global = true)]
+    pub(crate) all_repos: bool,
+
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -823,7 +827,7 @@ pub(crate) enum RunAction {
     },
     #[command(
         about = "List all known runs",
-        long_about = "List all runs found in the event store.\n\nShows each run's ID (short), state, objective, task counts, and last update time.\nUseful for discovering active runs so you can query status or explain.\n\nExamples:\n  yarli run list"
+        long_about = "List runs found in the event store.\n\nBy default this is scoped to the current repo (or current working directory when not inside a Git repo). Use `--all-repos` to inspect runs across every repo sharing the configured store.\n\nShows each run's ID (short), state, objective, task counts, and last update time.\nUseful for discovering active runs so you can query status or explain.\n\nExamples:\n  yarli run list\n  yarli run list --all-repos"
     )]
     List,
     #[command(
@@ -837,7 +841,7 @@ pub(crate) enum RunAction {
     },
     #[command(
         about = "Pause active runs (operator control)",
-        long_about = "Pause active runs (operator control).\n\nTransitions the selected run(s) to RUN_BLOCKED with operator reason metadata.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to pause all active/verifying runs.\n\nExamples:\n  yarli run pause 019577a2-...\n  yarli run pause --all-active --reason \"maintenance window\""
+        long_about = "Pause active runs (operator control).\n\nTransitions the selected run(s) to RUN_BLOCKED with operator reason metadata.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection defaults to the current repo scope. Use `--all-repos` to target runs across every repo sharing the configured store.\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to pause all active/verifying runs in scope.\n\nExamples:\n  yarli run pause 019577a2-...\n  yarli run pause --all-active --reason \"maintenance window\"\n  yarli run pause --all-active --all-repos --reason \"global maintenance window\""
     )]
     Pause {
         /// Run ID to pause (UUID or unique run-list prefix).
@@ -851,7 +855,7 @@ pub(crate) enum RunAction {
     },
     #[command(
         about = "Resume paused runs (operator control)",
-        long_about = "Resume paused runs (operator control).\n\nTransitions selected RUN_BLOCKED runs back to RUN_ACTIVE.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-paused` to resume all paused runs.\n\nExamples:\n  yarli run resume 019577a2-...\n  yarli run resume --all-paused --reason \"maintenance complete\""
+        long_about = "Resume paused runs (operator control).\n\nTransitions selected RUN_BLOCKED runs back to RUN_ACTIVE.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection defaults to the current repo scope. Use `--all-repos` to target runs across every repo sharing the configured store.\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-paused` to resume all paused runs in scope.\n\nExamples:\n  yarli run resume 019577a2-...\n  yarli run resume --all-paused --reason \"maintenance complete\"\n  yarli run resume --all-paused --all-repos --reason \"global maintenance complete\""
     )]
     Resume {
         /// Run ID to resume (UUID or unique run-list prefix).
@@ -865,7 +869,7 @@ pub(crate) enum RunAction {
     },
     #[command(
         about = "Drain active runs after current work finishes (operator control)",
-        long_about = "Drain active runs after current work finishes (operator control).\n\nRequests that selected run(s) stop claiming any new work while allowing the current active task set to finish normally. Once the active set reaches zero, yarli persists continuation state and exits the run as RUN_DRAINED.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to drain all active/verifying runs.\n\nExamples:\n  yarli run drain 019577a2-...\n  yarli run drain --all-active --reason \"stop after current\""
+        long_about = "Drain active runs after current work finishes (operator control).\n\nRequests that selected run(s) stop claiming any new work while allowing the current active task set to finish normally. Once the active set reaches zero, yarli persists continuation state and exits the run as RUN_DRAINED.\n\nSelection defaults to the current repo scope. Use `--all-repos` to target runs across every repo sharing the configured store.\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to drain all active/verifying runs in scope.\n\nExamples:\n  yarli run drain 019577a2-...\n  yarli run drain --all-active --reason \"stop after current\"\n  yarli run drain --all-active --all-repos --reason \"global stop after current\""
     )]
     Drain {
         /// Run ID to drain (UUID or unique run-list prefix).
@@ -879,7 +883,7 @@ pub(crate) enum RunAction {
     },
     #[command(
         about = "Cancel active runs (operator control)",
-        long_about = "Cancel active runs (operator control).\n\nTransitions selected run(s) to RUN_CANCELLED, cancels non-terminal tasks,\nand drains queued entries for those runs.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection:\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to cancel all active/verifying runs.\n\nExamples:\n  yarli run cancel 019577a2-...\n  yarli run cancel --all-active --reason \"operator stop\""
+        long_about = "Cancel active runs (operator control).\n\nTransitions selected run(s) to RUN_CANCELLED, cancels non-terminal tasks,\nand drains queued entries for those runs.\nThis is an explicit control-plane action and does not rely on external observers.\n\nSelection defaults to the current repo scope. Use `--all-repos` to target runs across every repo sharing the configured store.\n- Provide `<run-id>` (UUID or unique run-list prefix), or\n- use `--all-active` to cancel all active/verifying runs in scope.\n\nExamples:\n  yarli run cancel 019577a2-...\n  yarli run cancel --all-active --reason \"operator stop\"\n  yarli run cancel --all-active --all-repos --reason \"global operator stop\""
     )]
     Cancel {
         /// Run ID to cancel (UUID or unique run-list prefix).
@@ -1347,6 +1351,37 @@ mod tests {
                 assert!(action.is_none());
             }
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_all_repos_global_flag_for_repo_scoped_run_commands() {
+        let cli = Cli::parse_from(["yarli", "run", "list", "--all-repos"]);
+        assert!(cli.all_repos);
+        match cli.command {
+            Commands::Run { action, .. } => {
+                assert!(matches!(action, Some(RunAction::List)));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_all_repos_global_flag_for_run_resume() {
+        let cli = Cli::parse_from(["yarli", "run", "resume", "--all-paused", "--all-repos"]);
+        assert!(cli.all_repos);
+        match cli.command {
+            Commands::Run {
+                action:
+                    Some(RunAction::Resume {
+                        run_id, all_paused, ..
+                    }),
+                ..
+            } => {
+                assert!(run_id.is_none());
+                assert!(all_paused);
+            }
+            _ => panic!("expected run resume command"),
         }
     }
 

@@ -93,6 +93,9 @@ pub enum ExitReason {
     MergeConflict,
     FailedPolicyDenial,
     FailedRuntimeError,
+    /// All tasks succeeded and gates passed; post-completion parallel-merge teardown failed.
+    /// The tranche work is committed and usable — only workspace finalization could not complete.
+    CompletedMergeTeardownFailed,
     CancelledByOperator,
     DrainedByOperator,
     TimedOut,
@@ -108,6 +111,7 @@ impl std::fmt::Display for ExitReason {
             Self::MergeConflict => write!(f, "merge_conflict"),
             Self::FailedPolicyDenial => write!(f, "failed_policy_denial"),
             Self::FailedRuntimeError => write!(f, "failed_runtime_error"),
+            Self::CompletedMergeTeardownFailed => write!(f, "completed_merge_teardown_failed"),
             Self::CancelledByOperator => write!(f, "cancelled_by_operator"),
             Self::DrainedByOperator => write!(f, "drained_by_operator"),
             Self::TimedOut => write!(f, "timed_out"),

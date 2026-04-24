@@ -22,8 +22,9 @@ use uuid::Uuid;
 use crate::yarli_core::domain::{
     CommandClass, EntityType, Event, ExitReason, PolicyDecision, PolicyOutcome, RunId, TaskId,
 };
-use crate::yarli_core::entities::command_execution::StreamChunk;
-use crate::yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
+use crate::yarli_core::entities::command_execution::{
+    CommandResourceUsage, StreamChunk, StreamType, TokenUsage,
+};
 use crate::yarli_core::entities::continuation::format_allowed_paths_scope_mismatch;
 use crate::yarli_core::entities::run::Run;
 use crate::yarli_core::entities::task::{BlockerCode, Task};
@@ -43,7 +44,7 @@ use crate::yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use crate::yarli_store::event_store::EventQuery;
 use crate::yarli_store::EventStore;
 
-use crate::yarli_queue::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry};
+use crate::yarli_queue::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry, QueueStatus};
 use crate::yarli_queue::TaskQueue;
 
 /// A live output chunk from a running command, for real-time streaming.
@@ -1911,14 +1912,15 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             };
             let runtime_scope_violation =
                 infer_runtime_scope_violation(&result.chunks, &allowed_paths);
+            let detail = nonzero_exit_detail(exit_code, &result.chunks);
             let last_error = runtime_scope_violation
                 .as_ref()
-                .map(|(_, detail)| detail.clone())
-                .unwrap_or_else(|| format!("command exited with code {exit_code}"));
+                .map(|(_, msg)| msg.clone())
+                .unwrap_or_else(|| detail.clone());
             task.set_last_error(&last_error);
             let transition = task.transition(
                 TaskState::TaskFailed,
-                format!("command exited with code {exit_code}"),
+                &detail,
                 &self.config.worker_id,
                 None,
             )?;
@@ -2382,20 +2384,74 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
         self.queue.stats()
     }
 
-    /// Cancel all stale queue rows not belonging to any run in the registry.
+    fn stale_queue_run_ids(&self, active_run_ids: &HashSet<RunId>) -> Vec<RunId> {
+        let mut stale_run_ids = Vec::new();
+        let mut seen = HashSet::new();
+
+        for entry in self.queue.entries() {
+            if !matches!(entry.status, QueueStatus::Pending | QueueStatus::Leased) {
+                continue;
+            }
+
+            if active_run_ids.contains(&entry.run_id) || !seen.insert(entry.run_id) {
+                continue;
+            }
+
+            stale_run_ids.push(entry.run_id);
+        }
+
+        stale_run_ids
+    }
+
+    /// Cancel pending/leased queue entries for the provided stale run ids.
+    ///
+    /// This scoped path lets callers limit cleanup to the current repo or run set
+    /// instead of cancelling every queue row absent from the local registry.
+    pub fn cleanup_stale_queue_for_runs(
+        &self,
+        stale_run_ids: &[RunId],
+    ) -> Result<usize, SchedulerError> {
+        let mut cancelled = 0usize;
+        let mut seen = HashSet::new();
+
+        for run_id in stale_run_ids.iter().copied() {
+            if !seen.insert(run_id) {
+                continue;
+            }
+
+            let run_cancelled = self.queue.cancel_for_run(run_id)?;
+            if run_cancelled > 0 {
+                info!(
+                    run_id = %run_id,
+                    cancelled = run_cancelled,
+                    "cleaned up stale queue entries for run"
+                );
+            }
+            cancelled += run_cancelled;
+        }
+
+        if cancelled > 0 {
+            info!(
+                cancelled,
+                stale_runs = seen.len(),
+                "cleaned up scoped stale queue entries"
+            );
+        }
+
+        Ok(cancelled)
+    }
+
+    /// Cancel stale queue rows discovered from the current registry snapshot.
     ///
     /// Should be called once at scheduler startup before the first tick to
     /// drain pending/leased residue from prior crashed or cancelled runs.
     pub async fn cleanup_stale_queue(&self) -> Result<usize, SchedulerError> {
-        let active_ids = {
+        let active_ids: HashSet<_> = {
             let reg = self.registry.read().await;
-            reg.run_ids()
+            reg.run_ids().into_iter().collect()
         };
-        let cancelled = self.queue.cancel_stale_runs(&active_ids)?;
-        if cancelled > 0 {
-            info!(cancelled, "cleaned up stale queue entries from prior runs");
-        }
-        Ok(cancelled)
+        let stale_run_ids = self.stale_queue_run_ids(&active_ids);
+        self.cleanup_stale_queue_for_runs(&stale_run_ids)
     }
 
     /// Cancel all pending/leased queue entries for a run.
@@ -2711,6 +2767,7 @@ fn run_state_label(state: RunState) -> &'static str {
         RunState::RunBlocked => "RUN_BLOCKED",
         RunState::RunVerifying => "RUN_VERIFYING",
         RunState::RunCompleted => "RUN_COMPLETED",
+        RunState::RunCompletedWithMergeFailure => "RUN_COMPLETED_WITH_MERGE_FAILURE",
         RunState::RunFailed => "RUN_FAILED",
         RunState::RunCancelled => "RUN_CANCELLED",
         RunState::RunDrained => "RUN_DRAINED",
@@ -2759,6 +2816,29 @@ fn command_exit_reason_label(
         CommandState::CmdQueued | CommandState::CmdStarted | CommandState::CmdStreaming => {
             "unknown"
         }
+    }
+}
+
+fn nonzero_exit_detail(exit_code: i32, chunks: &[StreamChunk]) -> String {
+    let stderr_data = chunks
+        .iter()
+        .filter(|chunk| chunk.stream == StreamType::Stderr)
+        .map(|chunk| chunk.data.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    let stderr_excerpt = stderr_data
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if stderr_excerpt.is_empty() {
+        format!("command exited with code {exit_code}")
+    } else {
+        format!(
+            "command exited with code {exit_code}; stderr: {}",
+            stderr_excerpt.join(" | ")
+        )
     }
 }
 
@@ -2832,6 +2912,7 @@ mod tests {
         INTERNAL_ALLOWED_WRITE_ROOTS_ENV,
     };
     use crate::yarli_observability::{AuditCategory, AuditSink, InMemoryAuditSink};
+    use crate::yarli_queue::queue::QueueStatus;
     use crate::yarli_queue::InMemoryTaskQueue;
     use crate::yarli_store::InMemoryEventStore;
     use proptest::prelude::*;
@@ -4470,6 +4551,52 @@ mod tests {
         drop(reg);
     }
 
+    #[tokio::test]
+    async fn test_nonzero_exit_failure_persists_stderr_excerpt() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = test_config();
+        let sched = Scheduler::new(queue, store.clone(), runner, config);
+
+        let run = make_run("stderr failure detail");
+        let task = make_task(
+            run.id,
+            "bootstrap-failure",
+            "sh -lc 'echo Error: thread/start: thread/start failed >&2; exit 1'",
+            run.correlation_id,
+        );
+        let task_id = task.id;
+
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.failed, 1);
+
+        let failed_event = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.event_type == "task.failed" && event.entity_id == task_id.to_string()
+            })
+            .expect("expected task.failed event");
+        let detail = failed_event
+            .payload
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .expect("task.failed detail must be present");
+
+        assert!(
+            detail.contains("command exited with code 1"),
+            "detail must keep the exit code: {detail}"
+        );
+        assert!(
+            detail.contains("thread/start failed"),
+            "detail must preserve stderr excerpt: {detail}"
+        );
+    }
+
     /// Headless integration test: drives the scheduler tick-by-tick without any
     /// TTY or renderer, verifying that 3 independent tasks all reach terminal
     /// state purely through the scheduler loop.
@@ -4644,6 +4771,46 @@ mod tests {
         let stats = sched.queue_stats();
         assert_eq!(stats.pending, 0);
         assert_eq!(stats.leased, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_queue_for_runs_scopes_to_requested_runs() {
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(LocalCommandRunner::new());
+        let config = test_config();
+        let sched = Scheduler::new(queue.clone(), store, runner, config);
+
+        let stale_run_a = Uuid::now_v7();
+        let stale_run_b = Uuid::now_v7();
+        for _ in 0..3 {
+            queue
+                .enqueue(Uuid::now_v7(), stale_run_a, 1, CommandClass::Io, None)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            queue
+                .enqueue(Uuid::now_v7(), stale_run_b, 1, CommandClass::Io, None)
+                .unwrap();
+        }
+
+        let cancelled = sched
+            .cleanup_stale_queue_for_runs(&[stale_run_a, stale_run_a])
+            .unwrap();
+        assert_eq!(cancelled, 3);
+
+        let entries = queue.entries();
+        let cancelled_a = entries
+            .iter()
+            .filter(|entry| entry.run_id == stale_run_a && entry.status == QueueStatus::Cancelled)
+            .count();
+        let pending_b = entries
+            .iter()
+            .filter(|entry| entry.run_id == stale_run_b && entry.status == QueueStatus::Pending)
+            .count();
+
+        assert_eq!(cancelled_a, 3);
+        assert_eq!(pending_b, 2);
     }
 
     #[tokio::test]
