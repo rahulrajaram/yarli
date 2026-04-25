@@ -2103,6 +2103,7 @@ mode = "implement"
             key: "TP-10".to_string(),
             summary: "Legacy tranche that predates strict contract".to_string(),
             is_complete: true,
+            is_blocked: false,
             tranche_group: None,
             allowed_paths: Vec::new(),
             verify: None,

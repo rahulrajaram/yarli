@@ -20,4 +20,5 @@ pub use journal::CommandJournal;
 pub use overwatch::{OverwatchCommandRunner, OverwatchRunnerConfig};
 pub use runner::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, ResourceLimits,
+    INTERNAL_ALLOWED_WRITE_ROOTS_ENV,
 };

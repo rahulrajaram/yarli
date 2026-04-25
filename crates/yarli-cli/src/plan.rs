@@ -19,7 +19,9 @@ use crate::evidence::evidence_file_format_instructions;
 
 use yarli_cli::mode::RenderMode;
 use yarli_cli::yarli_core::domain::CommandClass;
-use yarli_cli::yarli_core::entities::continuation::ContinuationInterventionKind;
+use yarli_cli::yarli_core::entities::continuation::{
+    collect_allowed_paths_scope_suggestions, ContinuationInterventionKind,
+};
 use yarli_cli::yarli_core::fsm::run::RunState;
 use yarli_cli::yarli_core::fsm::task::TaskState;
 use yarli_cli::yarli_observability::{Registry, YarliMetrics};
@@ -111,6 +113,12 @@ pub(crate) struct ImplementationPlanEntry {
     pub(crate) key: String,
     pub(crate) summary: String,
     pub(crate) is_complete: bool,
+    /// True if the tranche is `status = "blocked"` (gated behind an
+    /// explicit unblock). Blocked tranches are NOT eligible for
+    /// scheduling and must be filtered out alongside completed ones at
+    /// every dispatch site. See docs/postmortem_2026_04_18.md in
+    /// downstream projects that rely on `blocked` as a safety gate.
+    pub(crate) is_blocked: bool,
     pub(crate) tranche_group: Option<String>,
     pub(crate) allowed_paths: Vec<String>,
     pub(crate) verify: Option<String>,
@@ -165,6 +173,7 @@ impl TranchesFile {
                 key: def.key.clone(),
                 summary: def.summary.clone(),
                 is_complete: def.status == TrancheStatus::Complete,
+                is_blocked: def.status == TrancheStatus::Blocked,
                 tranche_group: def.group.clone(),
                 allowed_paths: def.allowed_paths.clone(),
                 verify: def.verify.clone(),
@@ -522,7 +531,7 @@ pub(crate) fn build_plan_driven_run_sequence(
     let open_tranches = filter_plan_dispatch_entries_for_run_spec(
         all_tranches
             .iter()
-            .filter(|entry| !entry.is_complete)
+            .filter(|entry| !entry.is_complete && !entry.is_blocked)
             .cloned()
             .collect(),
         &all_tranches,
@@ -1114,7 +1123,7 @@ pub(crate) fn detect_continuation_tranche_drift(
     let current_open_keys = tf
         .to_entries()
         .into_iter()
-        .filter(|entry| !entry.is_complete)
+        .filter(|entry| !entry.is_complete && !entry.is_blocked)
         .map(|entry| entry.key)
         .collect::<Vec<_>>();
     if current_open_keys.is_empty() {
@@ -1358,6 +1367,13 @@ pub(crate) fn print_run_summary(outcome: &RunExecutionOutcome) {
                     .unwrap_or_else(|| "unknown".to_string());
                 println!("  Failed:      {} ({})", task.task_key, detail);
             }
+        }
+        let suggested_allowed_paths = collect_allowed_paths_scope_suggestions(&payload.tasks);
+        if !suggested_allowed_paths.is_empty() {
+            println!(
+                "Suggested allowed_paths additions: {}",
+                suggested_allowed_paths.join(", ")
+            );
         }
     }
 
@@ -2188,6 +2204,8 @@ pub(crate) fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntr
             key,
             summary: normalized_summary,
             is_complete,
+            // Markdown checkbox form carries no blocked state.
+            is_blocked: false,
             tranche_group: parse_plan_tranche_group(entry),
             allowed_paths: parse_plan_allowed_paths(entry),
             verify: parse_plan_verify(entry),
@@ -2217,6 +2235,10 @@ pub(crate) fn parse_plan_entry_line(line: &str) -> Option<ImplementationPlanEntr
         key,
         summary: normalized_summary,
         is_complete,
+        // parse_plan_status_keywords does not surface "blocked" as a
+        // distinct state; blocked text falls through to None earlier
+        // so a constructed entry here is never blocked.
+        is_blocked: false,
         tranche_group: parse_plan_tranche_group(candidate),
         allowed_paths: parse_plan_allowed_paths(candidate),
         verify: parse_plan_verify(candidate),
@@ -2308,9 +2330,10 @@ pub(crate) fn parse_plan_tranche_header_line(line: &str) -> Option<Implementatio
             })
             .to_ascii_lowercase()
     })?;
-    let is_complete = match status_word.as_str() {
-        "complete" => true,
-        "incomplete" | "blocked" => false,
+    let (is_complete, is_blocked) = match status_word.as_str() {
+        "complete" => (true, false),
+        "incomplete" => (false, false),
+        "blocked" => (false, true),
         _ => return None,
     };
 
@@ -2328,6 +2351,7 @@ pub(crate) fn parse_plan_tranche_header_line(line: &str) -> Option<Implementatio
         key: key_token.to_string(),
         summary: normalized_summary,
         is_complete,
+        is_blocked,
         tranche_group: parse_plan_tranche_group(candidate),
         allowed_paths: parse_plan_allowed_paths(candidate),
         verify: parse_plan_verify(candidate),
@@ -2777,6 +2801,87 @@ mod tests {
     use yarli_cli::yarli_core::explain::{DeteriorationReport, DeteriorationTrend};
     use yarli_cli::yarli_core::fsm::run::RunState;
     use yarli_cli::yarli_core::fsm::task::TaskState;
+
+    #[test]
+    fn to_entries_marks_blocked_tranches_as_blocked() {
+        // Regression: status="blocked" tranches must surface `is_blocked`
+        // so the dispatch filter can exclude them alongside completed
+        // ones. Prior to the fix they were indistinguishable from
+        // incomplete-but-eligible entries.
+        let tf = TranchesFile {
+            version: 1,
+            tranches: vec![
+                TrancheDefinition {
+                    key: "T-OPEN".to_string(),
+                    summary: "eligible".to_string(),
+                    status: TrancheStatus::Incomplete,
+                    group: None,
+                    allowed_paths: Vec::new(),
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
+                },
+                TrancheDefinition {
+                    key: "T-GATED".to_string(),
+                    summary: "gated behind explicit unblock".to_string(),
+                    status: TrancheStatus::Blocked,
+                    group: None,
+                    allowed_paths: Vec::new(),
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
+                },
+                TrancheDefinition {
+                    key: "T-DONE".to_string(),
+                    summary: "already complete".to_string(),
+                    status: TrancheStatus::Complete,
+                    group: None,
+                    allowed_paths: Vec::new(),
+                    verify: None,
+                    done_when: None,
+                    max_tokens: None,
+                },
+            ],
+        };
+        let entries = tf.to_entries();
+        let eligible: Vec<&str> = entries
+            .iter()
+            .filter(|e| !e.is_complete && !e.is_blocked)
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(eligible, vec!["T-OPEN"]);
+
+        let gated = entries.iter().find(|e| e.key == "T-GATED").unwrap();
+        assert!(gated.is_blocked);
+        assert!(!gated.is_complete);
+
+        let done = entries.iter().find(|e| e.key == "T-DONE").unwrap();
+        assert!(done.is_complete);
+        assert!(!done.is_blocked);
+    }
+
+    #[test]
+    fn parse_plan_tranche_header_line_distinguishes_blocked_from_incomplete() {
+        let blocked = parse_plan_tranche_header_line(
+            "1. NXT-010 summary text: blocked [tranche_group=discovery]",
+        )
+        .expect("parse");
+        assert_eq!(blocked.key, "NXT-010");
+        assert!(!blocked.is_complete);
+        assert!(blocked.is_blocked);
+
+        let incomplete = parse_plan_tranche_header_line(
+            "2. NXT-011 summary text: incomplete [tranche_group=ops]",
+        )
+        .expect("parse");
+        assert!(!incomplete.is_complete);
+        assert!(!incomplete.is_blocked);
+
+        let done =
+            parse_plan_tranche_header_line("3. NXT-012 summary text: complete").expect("parse");
+        assert!(done.is_complete);
+        assert!(!done.is_blocked);
+    }
 
     #[test]
     fn run_config_has_run_spec_data_detects_configured_sections() {
@@ -3815,6 +3920,7 @@ enforce_plan_tranche_allowed_paths = true
             key: "R9-06".to_string(),
             summary: "Implement checkpoint contract metadata in prompts".to_string(),
             is_complete: false,
+            is_blocked: false,
             tranche_group: Some("runtime-contract".to_string()),
             allowed_paths: vec!["crates/yarli-cli/src".to_string()],
             verify: Some("cargo test --workspace".to_string()),
