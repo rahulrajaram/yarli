@@ -126,7 +126,8 @@ async fn run() -> Result<()> {
         return config::cmd_init(path.clone(), *force, *print, *backend);
     }
 
-    let loaded_config = LoadedConfig::load_default().context("failed to load runtime config")?;
+    let mut loaded_config =
+        LoadedConfig::load_default().context("failed to load runtime config")?;
     info!(
         config_path = %loaded_config.path().display(),
         config_source = loaded_config.source().label(),
@@ -137,197 +138,235 @@ async fn run() -> Result<()> {
     // Detect terminal capabilities once; only commands that need a renderer
     // should fail render-mode selection.
     let term_info = TerminalInfo::detect();
-    let select_render_mode = || {
-        commands::resolve_render_mode(
-            &term_info,
-            cli.stream,
-            cli.tui,
-            loaded_config.config().ui.mode,
-        )
-    };
+    // Extract the UI mode before any CLI flag overrides so we can capture it
+    // in the closure without holding a borrow on loaded_config.
+    let ui_mode = loaded_config.config().ui.mode;
+    let select_render_mode =
+        || commands::resolve_render_mode(&term_info, cli.stream, cli.tui, ui_mode);
 
     match cli.command {
         Commands::Run {
             prompt_file,
             fresh_from_tranches,
             allow_recursive_run,
+            no_submodule_auto_commit,
+            allow_dirty_submodules,
             action,
-        } => match action {
-            None => {
-                let render_mode = select_render_mode()?;
-                cmd_run_default(
-                    render_mode,
-                    &loaded_config,
-                    prompt_file,
-                    fresh_from_tranches,
-                    allow_recursive_run,
-                )
-                .await
+        } => {
+            // NXT-382: --no-submodule-auto-commit overrides [run].auto_commit_submodule_edits.
+            if no_submodule_auto_commit {
+                loaded_config.config_mut().run.auto_commit_submodule_edits = false;
             }
-            Some(RunAction::Start {
-                objective,
-                cmd,
-                pace,
-                workdir,
-                timeout,
-            }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
-                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
-                    );
-                }
-                let plan =
-                    resolve_run_plan(&loaded_config, objective, cmd, pace, workdir, timeout, None)?;
-                let render_mode = select_render_mode()?;
-                cmd_run_start(plan, render_mode, &loaded_config, allow_recursive_run).await
+            // NXT-383: --allow-dirty-submodules overrides the pre-flight dirty check.
+            if allow_dirty_submodules {
+                loaded_config.config_mut().run.allow_dirty_submodules = true;
             }
-            Some(RunAction::Batch {
-                objective,
-                pace,
-                workdir,
-                timeout,
-            }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
+            match action {
+                None => {
+                    let render_mode = select_render_mode()?;
+                    cmd_run_default(
+                        render_mode,
+                        &loaded_config,
+                        prompt_file,
+                        fresh_from_tranches,
+                        allow_recursive_run,
+                    )
+                    .await
                 }
-                if fresh_from_tranches {
-                    bail!(
-                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
-                    );
-                }
-                let plan = resolve_run_plan(
-                    &loaded_config,
-                    objective.unwrap_or_else(|| "batch".to_string()),
-                    Vec::new(),
+                Some(RunAction::Start {
+                    objective,
+                    cmd,
                     pace,
                     workdir,
                     timeout,
-                    Some("batch"),
-                )?;
-                let render_mode = select_render_mode()?;
-                cmd_run_start(plan, render_mode, &loaded_config, allow_recursive_run).await
-            }
-            Some(RunAction::Status { run_id }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    let plan = resolve_run_plan(
+                        &loaded_config,
+                        objective,
+                        cmd,
+                        pace,
+                        workdir,
+                        timeout,
+                        None,
+                    )?;
+                    let render_mode = select_render_mode()?;
+                    cmd_run_start(plan, render_mode, &loaded_config, allow_recursive_run).await
                 }
-                cmd_run_status(&run_id)
-            }
-            Some(RunAction::ExplainExit { run_id }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::Batch {
+                    objective,
+                    pace,
+                    workdir,
+                    timeout,
+                }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    let plan = resolve_run_plan(
+                        &loaded_config,
+                        objective.unwrap_or_else(|| "batch".to_string()),
+                        Vec::new(),
+                        pace,
+                        workdir,
+                        timeout,
+                        Some("batch"),
+                    )?;
+                    let render_mode = select_render_mode()?;
+                    cmd_run_start(plan, render_mode, &loaded_config, allow_recursive_run).await
                 }
-                cmd_run_explain(&run_id)
-            }
-            Some(RunAction::List) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::Status { run_id }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    cmd_run_status(&run_id)
                 }
-                cmd_run_list()
-            }
-            Some(RunAction::Continue { file }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::ExplainExit { run_id }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    cmd_run_explain(&run_id)
                 }
-                let render_mode = select_render_mode()?;
-                cmd_run_continue(file, render_mode, &loaded_config, allow_recursive_run).await
-            }
-            Some(RunAction::Pause {
-                run_id,
-                all_active,
-                reason,
-            }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::List) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    cmd_run_list()
                 }
-                cmd_run_pause(run_id.as_deref(), all_active, &reason)
-            }
-            Some(RunAction::Resume {
-                run_id,
-                all_paused,
-                reason,
-            }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::Continue { file }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    let render_mode = select_render_mode()?;
+                    cmd_run_continue(file, render_mode, &loaded_config, allow_recursive_run).await
                 }
-                cmd_run_resume(run_id.as_deref(), all_paused, &reason)
-            }
-            Some(RunAction::Drain {
-                run_id,
-                all_active,
-                reason,
-            }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::Pause {
+                    run_id,
+                    all_active,
+                    reason,
+                }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    cmd_run_pause(run_id.as_deref(), all_active, &reason)
                 }
-                cmd_run_drain(run_id.as_deref(), all_active, &reason)
-            }
-            Some(RunAction::Cancel {
-                run_id,
-                all_active,
-                reason,
-            }) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::Resume {
+                    run_id,
+                    all_paused,
+                    reason,
+                }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    cmd_run_resume(run_id.as_deref(), all_paused, &reason)
                 }
-                cmd_run_cancel(run_id.as_deref(), all_active, &reason)
-            }
-            #[cfg(feature = "sw4rm")]
-            Some(RunAction::Sw4rm) => {
-                if prompt_file.is_some() {
-                    bail!("--prompt-file is only valid for default `yarli run` (no subcommand)");
-                }
-                if fresh_from_tranches {
-                    bail!(
+                Some(RunAction::Drain {
+                    run_id,
+                    all_active,
+                    reason,
+                }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
                         "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
                     );
+                    }
+                    cmd_run_drain(run_id.as_deref(), all_active, &reason)
                 }
-                cmd_run_sw4rm(&loaded_config).await
+                Some(RunAction::Cancel {
+                    run_id,
+                    all_active,
+                    reason,
+                }) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                    }
+                    cmd_run_cancel(run_id.as_deref(), all_active, &reason)
+                }
+                #[cfg(feature = "sw4rm")]
+                Some(RunAction::Sw4rm) => {
+                    if prompt_file.is_some() {
+                        bail!(
+                            "--prompt-file is only valid for default `yarli run` (no subcommand)"
+                        );
+                    }
+                    if fresh_from_tranches {
+                        bail!(
+                        "--fresh-from-tranches is only valid for default `yarli run` (no subcommand)"
+                    );
+                    }
+                    cmd_run_sw4rm(&loaded_config).await
+                }
             }
-        },
+        }
         Commands::Task { action } => match action {
             TaskAction::List { run_id } => cmd_task_list(&run_id),
             TaskAction::Explain { task_id } => cmd_task_explain(&task_id),

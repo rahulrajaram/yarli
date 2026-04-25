@@ -87,6 +87,9 @@ pub struct TaskSnapshot {
     /// Token usage from the last command execution (if available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
+    /// First preserved execution error detail for the task (if available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     /// If the task failed due to budget breach, the failure reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_breach_reason: Option<String>,
@@ -132,6 +135,9 @@ pub struct BlockerInfo {
     pub state: TaskState,
     /// Why this task is a blocker (human-readable).
     pub reason: String,
+    /// Preserved task failure detail when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// A failed gate with details.
@@ -321,6 +327,8 @@ pub fn explain_task(task: &TaskSnapshot) -> ExplainResult {
 fn compute_run_status(snapshot: &RunSnapshot) -> RunStatus {
     match snapshot.state {
         RunState::RunCompleted => RunStatus::Done,
+        // Work is done and committed; only post-completion merge teardown failed.
+        RunState::RunCompletedWithMergeFailure => RunStatus::Done,
         RunState::RunCancelled => RunStatus::Cancelled,
         RunState::RunDrained => RunStatus::Cancelled,
         RunState::RunFailed => RunStatus::Failed,
@@ -345,7 +353,7 @@ fn find_blocking_tasks(tasks: &[TaskSnapshot]) -> Vec<BlockerInfo> {
         .iter()
         .filter_map(|t| {
             let reason = match t.state {
-                TaskState::TaskFailed => Some(format!("task/{} FAILED", t.name)),
+                TaskState::TaskFailed => Some(format_failed_task_reason(t)),
                 TaskState::TaskBlocked => {
                     let blockers: Vec<&str> = tasks
                         .iter()
@@ -377,9 +385,38 @@ fn find_blocking_tasks(tasks: &[TaskSnapshot]) -> Vec<BlockerInfo> {
                 task_name: t.name.clone(),
                 state: t.state,
                 reason: r,
+                last_error: t.last_error.clone(),
             })
         })
         .collect()
+}
+
+fn format_failed_task_reason(task: &TaskSnapshot) -> String {
+    match task.last_error.as_deref() {
+        Some(last_error) if is_backend_start_failure(last_error) => format!(
+            "task/{} FAILED - backend bootstrap failure: {}",
+            task.name,
+            inline_error_detail(last_error)
+        ),
+        Some(last_error) => format!(
+            "task/{} FAILED - {}",
+            task.name,
+            inline_error_detail(last_error)
+        ),
+        None => format!("task/{} FAILED", task.name),
+    }
+}
+
+fn is_backend_start_failure(last_error: &str) -> bool {
+    last_error.contains("thread/start failed")
+}
+
+fn inline_error_detail(detail: &str) -> String {
+    detail
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn find_failed_gates(snapshot: &RunSnapshot) -> Vec<GateFailure> {
@@ -506,6 +543,19 @@ fn suggest_actions(
 
     for blocker in blocking_tasks {
         if blocker.state == TaskState::TaskFailed {
+            if let Some(last_error) = blocker.last_error.as_deref() {
+                if is_backend_start_failure(last_error) {
+                    actions.push(SuggestedAction {
+                        description: format!(
+                            "Backend worker failed during startup for {}: inspect thread/process pressure, then retry ({})",
+                            blocker.task_name,
+                            inline_error_detail(last_error)
+                        ),
+                        command: None,
+                    });
+                    continue;
+                }
+            }
             actions.push(SuggestedAction {
                 description: format!("Fix failures and re-run: {}", blocker.task_name),
                 command: Some(format!("yarli task retry {}", blocker.task_name)),
@@ -554,6 +604,7 @@ mod tests {
             last_transition_at: None,
             resource_usage: None,
             token_usage: None,
+            last_error: None,
             budget_breach_reason: None,
         }
     }
@@ -602,6 +653,34 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("retry"));
+    }
+
+    #[test]
+    fn backend_start_failure_surfaces_specialized_reason_and_action() {
+        let mut task = make_task("nxt-424", TaskState::TaskFailed);
+        task.last_error = Some(
+            "command exited with code 1; stderr: Error: thread/start: thread/start failed"
+                .to_string(),
+        );
+
+        let snapshot = RunSnapshot {
+            run_id: Uuid::new_v4(),
+            state: RunState::RunFailed,
+            tasks: vec![task],
+            gates: vec![],
+        };
+
+        let result = explain_run(&snapshot);
+        assert!(result.blocking_tasks[0]
+            .reason
+            .contains("backend bootstrap failure"));
+        assert!(result.blocking_tasks[0]
+            .reason
+            .contains("thread/start failed"));
+        assert!(result.suggested_actions[0]
+            .description
+            .contains("Backend worker failed during startup"));
+        assert!(result.suggested_actions[0].command.is_none());
     }
 
     #[test]

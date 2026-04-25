@@ -78,7 +78,7 @@ pub fn analyze_run(
     gate_failures: &[String],
 ) -> RunAnalysis {
     // Clean completion — no patterns, no lesson
-    if exit_state == RunState::RunCompleted && gate_failures.is_empty() {
+    if exit_state.is_work_done() && gate_failures.is_empty() {
         let all_ok = tasks
             .iter()
             .all(|t| t.state == TaskState::TaskComplete || t.state == TaskState::TaskCancelled);
@@ -165,7 +165,7 @@ pub fn analyze_run(
     // Detect AllTasksSucceededRunFailed (non-gate)
     if all_tasks_ok
         && gate_failures.is_empty()
-        && exit_state != RunState::RunCompleted
+        && !exit_state.is_work_done()
         && !matches!(exit_reason, Some(ExitReason::BlockedGateFailure))
         && !matches!(
             exit_reason,
@@ -398,6 +398,23 @@ mod tests {
         assert!(result.run_lesson.is_none());
         assert_eq!(result.retry_recommendation, RetryScope::None);
         assert!((result.confidence - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn analyze_completed_with_merge_failure_as_work_done() {
+        let tasks = vec![
+            make_task("build", TaskState::TaskComplete),
+            make_task("test", TaskState::TaskComplete),
+        ];
+        let result = analyze_run(
+            RunState::RunCompletedWithMergeFailure,
+            Some(ExitReason::CompletedMergeTeardownFailed),
+            &tasks,
+            &[],
+        );
+        assert!(result.patterns.is_empty());
+        assert!(result.run_lesson.is_none());
+        assert_eq!(result.retry_recommendation, RetryScope::None);
     }
 
     #[test]

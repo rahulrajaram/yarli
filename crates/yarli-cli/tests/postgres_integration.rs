@@ -1840,6 +1840,7 @@ fn map_run_state_to_db(state: &str) -> Option<&'static str> {
         "RunBlocked" => Some("RUN_BLOCKED"),
         "RunFailed" => Some("RUN_FAILED"),
         "RunCompleted" => Some("RUN_COMPLETED"),
+        "RunCompletedWithMergeFailure" => Some("RUN_COMPLETED_WITH_MERGE_FAILURE"),
         "RunCancelled" => Some("RUN_CANCELLED"),
         "RunDrained" => Some("RUN_DRAINED"),
         _ => None,
@@ -1880,11 +1881,27 @@ fn derive_run_state_from_event(event_type: &str, to_state: Option<&str>) -> Opti
         "run.blocked" => Some("RUN_BLOCKED"),
         "run.verifying" => Some("RUN_VERIFYING"),
         "run.completed" => Some("RUN_COMPLETED"),
+        "run.parallel_merge_failed" => Some("RUN_COMPLETED_WITH_MERGE_FAILURE"),
         "run.failed" | "run.gate_failed" => Some("RUN_FAILED"),
         "run.cancelled" => Some("RUN_CANCELLED"),
         "run.drained" => Some("RUN_DRAINED"),
         _ => None,
     }
+}
+
+#[test]
+fn derive_run_state_from_parallel_merge_failure_event_maps_to_completed_with_merge_failure() {
+    assert_eq!(
+        derive_run_state_from_event("run.parallel_merge_failed", None),
+        Some("RUN_COMPLETED_WITH_MERGE_FAILURE")
+    );
+    assert_eq!(
+        derive_run_state_from_event(
+            "run.parallel_merge_failed",
+            Some("RunCompletedWithMergeFailure")
+        ),
+        Some("RUN_COMPLETED_WITH_MERGE_FAILURE")
+    );
 }
 
 fn derive_task_state_from_event(event_type: &str, to_state: Option<&str>) -> Option<&'static str> {

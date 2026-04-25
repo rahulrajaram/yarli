@@ -17,7 +17,9 @@ use yarli_cli::yarli_gates::all_passed;
 use yarli_cli::yarli_store::event_store::EventQuery;
 use yarli_cli::yarli_store::EventStore;
 
-use crate::commands::format_cancel_provenance_summary;
+use crate::commands::{
+    format_cancel_provenance_summary, run_matches_scope_from_payload, RunDiscoveryScope,
+};
 use crate::events::task_id_from_command_event;
 use crate::persistence::query_events;
 use crate::projection::*;
@@ -339,6 +341,7 @@ pub(crate) fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result
                 last_transition_at: Some(task.updated_at),
                 resource_usage: task.resource_usage.clone(),
                 token_usage: task.token_usage.clone(),
+                last_error: task.last_error.clone(),
                 budget_breach_reason: task.budget_breach_reason.clone(),
             })
             .collect(),
@@ -411,6 +414,9 @@ pub(crate) fn render_run_explain(store: &dyn EventStore, run_id: Uuid) -> Result
                 "  {} ({:?}) - {}",
                 blocker.task_name, blocker.state, blocker.reason
             )?;
+            if let Some(last_error) = blocker.last_error.as_deref() {
+                writeln!(&mut out, "    last_error: {last_error}")?;
+            }
         }
     }
 
@@ -545,6 +551,7 @@ pub(crate) fn render_task_explain(store: &dyn EventStore, task_id: Uuid) -> Resu
         last_transition_at: Some(task.updated_at),
         resource_usage: task.resource_usage.clone(),
         token_usage: task.token_usage.clone(),
+        last_error: task.last_error.clone(),
         budget_breach_reason: task.budget_breach_reason.clone(),
     };
     let explain = explain_task(&snapshot);
@@ -741,7 +748,7 @@ pub(crate) fn render_merge_status(store: &dyn EventStore, merge_id: Uuid) -> Res
         None => {
             return Ok(format!(
                 "Merge intent {merge_id} not found in persisted event log."
-            ))
+            ));
         }
     };
 
@@ -773,19 +780,28 @@ pub(crate) fn render_merge_status(store: &dyn EventStore, merge_id: Uuid) -> Res
     Ok(out.trim_end().to_string())
 }
 
+#[allow(dead_code)]
 pub(crate) fn render_run_list(store: &dyn EventStore) -> Result<String> {
+    render_run_list_scoped(store, &RunDiscoveryScope::AllRepos)
+}
+
+pub(crate) fn render_run_list_scoped(
+    store: &dyn EventStore,
+    scope: &RunDiscoveryScope,
+) -> Result<String> {
     let run_events = query_events(
         store,
         &EventQuery::by_entity_type(yarli_cli::yarli_core::domain::EntityType::Run),
     )?;
 
     if run_events.is_empty() {
-        return Ok("No runs found in event store.".to_string());
+        return Ok(scope.list_empty_message());
     }
 
     // Group events by run entity_id to discover unique runs.
     let mut runs: BTreeMap<String, (RunState, Option<String>, chrono::DateTime<chrono::Utc>, u32)> =
         BTreeMap::new();
+    let mut scoped_run_ids = std::collections::HashSet::new();
     for event in &run_events {
         let entry = runs.entry(event.entity_id.clone()).or_insert((
             RunState::RunOpen,
@@ -805,7 +821,20 @@ pub(crate) fn render_run_list(store: &dyn EventStore) -> Result<String> {
                 .get("objective")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            if run_matches_scope_from_payload(scope, &event.payload) {
+                scoped_run_ids.insert(event.entity_id.clone());
+            }
+        } else if matches!(scope, RunDiscoveryScope::AllRepos) {
+            scoped_run_ids.insert(event.entity_id.clone());
         }
+    }
+
+    if !matches!(scope, RunDiscoveryScope::AllRepos) {
+        runs.retain(|run_id, _| scoped_run_ids.contains(run_id));
+    }
+
+    if runs.is_empty() {
+        return Ok(scope.list_empty_message());
     }
 
     // Count tasks per run.
@@ -854,6 +883,7 @@ pub(crate) fn render_run_list(store: &dyn EventStore) -> Result<String> {
     let run_id_prefixes = unique_run_id_prefixes(runs.keys().cloned().collect::<Vec<_>>(), 10);
 
     let mut out = String::new();
+    writeln!(&mut out, "Scope: {}", scope.description())?;
     out.push_str(&format!(
         "{:<14} {:<14} {:<30} {:<16} {}\n",
         "RUN ID", "STATE", "OBJECTIVE", "TASKS (C/F/T)", "UPDATED"
@@ -1033,6 +1063,7 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use std::process::Command;
+    use tempfile::TempDir;
     use tokio::sync::mpsc;
     use uuid::Uuid;
     use yarli_cli::stream::StreamEvent;
@@ -1822,6 +1853,77 @@ mod tests {
     }
 
     #[test]
+    fn render_run_list_scoped_limits_results_to_current_scope() {
+        let store = InMemoryEventStore::new();
+        let run_a = Uuid::now_v7();
+        let run_b = Uuid::now_v7();
+        let corr_a = Uuid::now_v7();
+        let corr_b = Uuid::now_v7();
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+
+        for (run_id, corr, root, objective) in [
+            (run_a, corr_a, repo_a.path(), "local"),
+            (run_b, corr_b, repo_b.path(), "remote"),
+        ] {
+            store
+                .append(make_event(
+                    EntityType::Run,
+                    run_id.to_string(),
+                    "run.config_snapshot",
+                    corr,
+                    serde_json::json!({
+                        "objective": objective,
+                        "config_snapshot": {
+                            "runtime": {
+                                "working_dir": root.display().to_string(),
+                                "scope_root": root.display().to_string(),
+                            }
+                        }
+                    }),
+                ))
+                .unwrap();
+            store
+                .append(make_event(
+                    EntityType::Run,
+                    run_id.to_string(),
+                    "run.activated",
+                    corr,
+                    serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+                ))
+                .unwrap();
+        }
+
+        let output = render_run_list_scoped(
+            &store,
+            &RunDiscoveryScope::CurrentScope {
+                scope_root: repo_a.path().to_path_buf(),
+            },
+        )
+        .unwrap();
+
+        assert!(output.contains("Scope: current repo scope"));
+        assert!(output.contains("local"));
+        assert!(!output.contains("remote"));
+    }
+
+    #[test]
+    fn render_run_list_scoped_empty_scope_surfaces_all_repos_hint() {
+        let store = InMemoryEventStore::new();
+        let repo = TempDir::new().unwrap();
+
+        let output = render_run_list_scoped(
+            &store,
+            &RunDiscoveryScope::CurrentScope {
+                scope_root: repo.path().to_path_buf(),
+            },
+        )
+        .unwrap();
+
+        assert!(output.contains("Pass --all-repos"));
+    }
+
+    #[test]
     fn resolve_run_id_input_accepts_unique_prefix() {
         let store = InMemoryEventStore::new();
         let run_id = Uuid::parse_str("019c5056-d8a7-7133-9ad0-77652b8be1e8").unwrap();
@@ -2013,6 +2115,52 @@ mod tests {
         assert!(
             output.contains("budget_exceeded") || output.contains("max_task_total_tokens"),
             "explain output must reference budget breach detail: {output}"
+        );
+    }
+
+    #[test]
+    fn render_run_explain_surfaces_backend_start_failure_detail() {
+        let store = InMemoryEventStore::new();
+        let run_id = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+        let corr = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.activated",
+                corr,
+                serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Task,
+                task_id.to_string(),
+                "task.failed",
+                corr,
+                serde_json::json!({
+                    "from": "TaskExecuting",
+                    "to": "TaskFailed",
+                    "reason": "nonzero_exit",
+                    "detail": "command exited with code 1; stderr: Error: thread/start: thread/start failed"
+                }),
+            ))
+            .unwrap();
+
+        let output = render_run_explain(&store, run_id).unwrap();
+        assert!(
+            output.contains("backend bootstrap failure"),
+            "run explain must classify backend startup failures: {output}"
+        );
+        assert!(
+            output.contains("last_error: command exited with code 1; stderr: Error: thread/start: thread/start failed"),
+            "run explain must surface preserved failure detail: {output}"
+        );
+        assert!(
+            output.contains("Backend worker failed during startup"),
+            "run explain must offer a targeted remediation hint: {output}"
         );
     }
 

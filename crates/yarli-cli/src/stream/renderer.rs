@@ -906,7 +906,7 @@ fn tier_for_run_state(state: crate::yarli_core::fsm::run::RunState) -> Tier {
     match state {
         RunState::RunFailed | RunState::RunBlocked => Tier::Urgent,
         RunState::RunActive | RunState::RunVerifying => Tier::Active,
-        RunState::RunCompleted => Tier::Contextual,
+        RunState::RunCompleted | RunState::RunCompletedWithMergeFailure => Tier::Contextual,
         RunState::RunDrained => Tier::Contextual,
         _ => Tier::Contextual,
     }

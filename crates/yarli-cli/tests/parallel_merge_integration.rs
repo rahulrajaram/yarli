@@ -166,6 +166,10 @@ fn assert_output_state_matches_continuation(run_output: &str, continuation: &Val
         "RunCompleted" => {
             run_output.contains("RunCompleted") || run_output.contains("RUN_COMPLETED")
         }
+        "RunCompletedWithMergeFailure" => {
+            run_output.contains("RunCompletedWithMergeFailure")
+                || run_output.contains("RUN_COMPLETED_WITH_MERGE_FAILURE")
+        }
         "RunFailed" => run_output.contains("RunFailed") || run_output.contains("RUN_FAILED"),
         "RunCancelled" => {
             run_output.contains("RunCancelled") || run_output.contains("RUN_CANCELLED")
@@ -651,10 +655,11 @@ worktree_root = "{}"
 
     let run_stdout = String::from_utf8_lossy(&run_output.stdout);
     // The run state machine transiently reaches RunCompleted before merge finalization
-    // overrides the continuation to RunFailed. Check the summary exit state instead.
+    // overrides the continuation to RunCompletedWithMergeFailure. Check the summary exit
+    // state instead.
     assert!(
-        run_stdout.contains("Exit state:  RunFailed"),
-        "conflict run should report RunFailed in summary\nstdout:\n{}",
+        run_stdout.contains("Exit state:  RunCompletedWithMergeFailure"),
+        "conflict run should report RunCompletedWithMergeFailure in summary\nstdout:\n{}",
         run_stdout
     );
 
@@ -716,8 +721,8 @@ worktree_root = "{}"
     let continuation = read_continuation_payload(&repo_dir);
     assert_eq!(
         continuation.get("exit_state").and_then(Value::as_str),
-        Some("RunFailed"),
-        "expected continuation exit_state to be RunFailed after merge conflict"
+        Some("RunCompletedWithMergeFailure"),
+        "expected continuation exit_state to be RunCompletedWithMergeFailure after merge conflict"
     );
     assert_eq!(
         continuation.get("exit_reason").and_then(Value::as_str),
@@ -904,10 +909,11 @@ worktree_root = "{}"
 
     let run_stdout = String::from_utf8_lossy(&run_output.stdout);
     // The run state machine transiently reaches RunCompleted before merge finalization
-    // overrides the continuation to RunFailed. Check the summary exit state instead.
+    // overrides the continuation to RunCompletedWithMergeFailure. Check the summary exit
+    // state instead.
     assert!(
-        run_stdout.contains("Exit state:  RunFailed"),
-        "auto-repair failure run should report RunFailed in summary\nstdout:\n{run_stdout}"
+        run_stdout.contains("Exit state:  RunCompletedWithMergeFailure"),
+        "auto-repair failure run should report RunCompletedWithMergeFailure in summary\nstdout:\n{run_stdout}"
     );
 
     let run_roots = list_run_workspace_roots(&worktree_root);
@@ -935,15 +941,15 @@ worktree_root = "{}"
     let continuation = read_continuation_payload(&repo_dir);
     assert_eq!(
         continuation.get("exit_state").and_then(Value::as_str),
-        Some("RunFailed"),
-        "expected continuation exit_state to be RunFailed after auto-repair merge conflict failure"
+        Some("RunCompletedWithMergeFailure"),
+        "expected continuation exit_state to be RunCompletedWithMergeFailure after auto-repair merge conflict failure"
     );
     assert_eq!(
         continuation
             .get("exit_reason")
             .and_then(Value::as_str),
-        Some("failed_runtime_error"),
-        "expected continuation exit_reason to be failed_runtime_error after auto-repair failure on delete conflict"
+        Some("completed_merge_teardown_failed"),
+        "expected continuation exit_reason to be completed_merge_teardown_failed after auto-repair failure on delete conflict"
     );
     let next_tranche = continuation
         .get("next_tranche")

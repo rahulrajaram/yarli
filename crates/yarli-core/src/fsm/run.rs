@@ -17,6 +17,12 @@ pub enum RunState {
     RunBlocked,
     RunFailed,
     RunCompleted,
+    /// All tasks completed and gates passed, but post-completion parallel-merge teardown
+    /// failed (e.g. dirty submodule content or merge conflict during finalization).
+    /// The tranche work itself landed via direct git commits; only the workspace merge
+    /// could not be finalized. Distinct from `RunFailed` so tooling can recognize that
+    /// the underlying work is done — not undone.
+    RunCompletedWithMergeFailure,
     RunCancelled,
     RunDrained,
 }
@@ -27,9 +33,19 @@ impl RunState {
         matches!(
             self,
             RunState::RunCompleted
+                | RunState::RunCompletedWithMergeFailure
                 | RunState::RunFailed
                 | RunState::RunCancelled
                 | RunState::RunDrained
+        )
+    }
+
+    /// Returns true when the run's underlying task work is considered done,
+    /// regardless of whether teardown (merge finalization) succeeded.
+    pub fn is_work_done(self) -> bool {
+        matches!(
+            self,
+            RunState::RunCompleted | RunState::RunCompletedWithMergeFailure
         )
     }
 
@@ -47,6 +63,7 @@ impl RunState {
             ],
             RunVerifying => &[
                 RunCompleted,
+                RunCompletedWithMergeFailure,
                 RunActive,
                 RunBlocked,
                 RunFailed,
@@ -55,7 +72,8 @@ impl RunState {
             ],
             RunBlocked => &[RunActive, RunFailed, RunCancelled],
             RunFailed => &[],
-            RunCompleted => &[],
+            RunCompleted => &[RunCompletedWithMergeFailure],
+            RunCompletedWithMergeFailure => &[],
             RunCancelled => &[],
             RunDrained => &[],
         }

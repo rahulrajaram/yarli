@@ -650,7 +650,7 @@ pub fn build_title_line<'a>(state: &PanelManager) -> Line<'a> {
         .map(|s| match s {
             RunState::RunFailed | RunState::RunBlocked => Tier::Urgent,
             RunState::RunActive | RunState::RunVerifying => Tier::Active,
-            RunState::RunCompleted => Tier::Contextual,
+            RunState::RunCompleted | RunState::RunCompletedWithMergeFailure => Tier::Contextual,
             RunState::RunDrained => Tier::Contextual,
             _ => Tier::Contextual,
         })

@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS runs (
             'RUN_BLOCKED',
             'RUN_FAILED',
             'RUN_COMPLETED',
+            'RUN_COMPLETED_WITH_MERGE_FAILURE',
             'RUN_CANCELLED',
             'RUN_DRAINED'
         )
@@ -25,8 +26,10 @@ CREATE TABLE IF NOT EXISTS runs (
             'completed_all_gates',
             'blocked_open_tasks',
             'blocked_gate_failure',
+            'merge_conflict',
             'failed_policy_denial',
             'failed_runtime_error',
+            'completed_merge_teardown_failed',
             'cancelled_by_operator',
             'drained_by_operator',
             'timed_out',

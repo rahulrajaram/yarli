@@ -74,6 +74,7 @@ ALTER TABLE runs
             'RUN_BLOCKED',
             'RUN_FAILED',
             'RUN_COMPLETED',
+            'RUN_COMPLETED_WITH_MERGE_FAILURE',
             'RUN_CANCELLED'
         )
     );
@@ -89,8 +90,10 @@ ALTER TABLE runs
             'completed_all_gates',
             'blocked_open_tasks',
             'blocked_gate_failure',
+            'merge_conflict',
             'failed_policy_denial',
             'failed_runtime_error',
+            'completed_merge_teardown_failed',
             'cancelled_by_operator',
             'timed_out',
             'stalled_no_progress'
@@ -153,12 +156,28 @@ mod migration_tests {
             "expected fresh schema to allow RUN_DRAINED"
         );
         assert!(
+            MIGRATION_0001_INIT.contains("'RUN_COMPLETED_WITH_MERGE_FAILURE'"),
+            "expected fresh schema to allow RUN_COMPLETED_WITH_MERGE_FAILURE"
+        );
+        assert!(
             MIGRATION_0001_INIT.contains("'drained_by_operator'"),
             "expected fresh schema to allow drained_by_operator"
         );
         assert!(
+            MIGRATION_0001_INIT.contains("'merge_conflict'"),
+            "expected fresh schema to allow merge_conflict"
+        );
+        assert!(
+            MIGRATION_0001_INIT.contains("'completed_merge_teardown_failed'"),
+            "expected fresh schema to allow completed_merge_teardown_failed"
+        );
+        assert!(
             MIGRATION_0003_RUN_DRAINED_STATE.contains("RUN_DRAINED"),
             "expected follow-up migration to add RUN_DRAINED support"
+        );
+        assert!(
+            MIGRATION_0003_RUN_DRAINED_STATE.contains("RUN_COMPLETED_WITH_MERGE_FAILURE"),
+            "expected follow-up migration to add RUN_COMPLETED_WITH_MERGE_FAILURE support"
         );
     }
 
