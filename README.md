@@ -522,7 +522,7 @@ Key sections:
 | `[cli]` | LLM CLI backend (`codex`/`claude`/`gemini`/`kiro-cli`/custom), prompt mode, command, args |
 | `[features]` | Parallel execution, git worktree mode |
 | `[queue]` | Claim batch size, lease TTL, per-class caps |
-| `[execution]` | Runner (`native`/`overwatch`), working dir, worktree root, timeouts |
+| `[execution]` | Runner (`native`/`overwatch`), working dir, worktree root, backend write roots, timeouts |
 | `[run]` | Prompt file, auto-advance policy, task health, merge conflict resolution, plan guard |
 | `[budgets]` | Per-task and per-run resource limits (RSS, CPU, IO, tokens) |
 | `[git]` | Default target branch, destructive operation deny |

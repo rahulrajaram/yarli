@@ -9,6 +9,7 @@ pub mod memory;
 pub mod postgres;
 pub mod queue;
 pub mod scheduler;
+mod task_bindings;
 
 pub use error::QueueError;
 pub use memory::InMemoryTaskQueue;

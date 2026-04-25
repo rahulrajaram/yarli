@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
@@ -64,6 +64,7 @@ mod persistence;
 mod plan;
 mod projection;
 mod render;
+mod run_scope;
 #[cfg(test)]
 mod test_helpers;
 mod tranche;

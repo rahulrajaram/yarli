@@ -228,6 +228,7 @@ Execution behavior:
 - Optional per-tranche file-scope policy: annotate plan lines with `allowed_paths=path/a,path/b` and set `[run].enforce_plan_tranche_allowed_paths = true` to inject explicit scope constraints into tranche prompts.
 - Optional tranche hardening: configure `[run.tranche_contract]` to require `verify`, require `done_when`, and fail merge finalization on out-of-scope edits. These checks are opt-in and preserve legacy behavior when unset.
 - Optional run-spec defaults can live in `yarli.toml` (`[run]`, `[[run.tasks]]`, `[[run.tranches]]`, `[run.plan_guard]`), with `PROMPT.md` `yarli-run` blocks used only for per-prompt overrides/backward compatibility.
+- Optional backend startup write roots can be configured with `[execution].trusted_backend_write_roots`; these are added only to native runner enforcement and do not expand tranche merge scope.
 - Parallel mode defaults to enabled (`[features].parallel = true`) and requires `[execution].worktree_root`.
 - In parallel mode, YARLI prepares one workspace copy per task under `execution.worktree_root` before execution.
 - After `RunCompleted`, YARLI auto-merges task workspace changes into the source repo using `git apply --3way`.

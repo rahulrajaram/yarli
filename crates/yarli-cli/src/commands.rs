@@ -15,6 +15,7 @@ use crate::cli::AuditOutputFormat;
 use crate::events::*;
 use crate::persistence::RUN_CONTINUATION_EVENT_TYPE;
 use crate::render::*;
+use crate::run_scope::*;
 use crate::tranche::reconcile_tranche_status_from_evidence_in;
 use crate::workspace::{
     cleanup_parallel_workspace, merge_parallel_workspace_results_with_resolution_with_events,
@@ -183,126 +184,6 @@ fn format_budget_value(current: u64, limit: Option<u64>) -> String {
         }
         None => current.to_string(),
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RunDiscoveryScope {
-    AllRepos,
-    CurrentScope { scope_root: PathBuf },
-}
-
-impl RunDiscoveryScope {
-    pub(crate) fn description(&self) -> String {
-        match self {
-            Self::AllRepos => "all repos".to_string(),
-            Self::CurrentScope { scope_root } => {
-                format!("current repo scope {}", scope_root.display())
-            }
-        }
-    }
-
-    pub(crate) fn list_empty_message(&self) -> String {
-        match self {
-            Self::AllRepos => "No runs found in event store.".to_string(),
-            Self::CurrentScope { scope_root } => format!(
-                "No runs found in {}. Pass --all-repos to inspect runs across every repo.",
-                scope_root.display()
-            ),
-        }
-    }
-
-    fn selection_hint(&self) -> Option<String> {
-        match self {
-            Self::AllRepos => None,
-            Self::CurrentScope { scope_root } => Some(format!(
-                "searched {}; pass --all-repos to search across every repo",
-                scope_root.display()
-            )),
-        }
-    }
-}
-
-pub(crate) fn cli_flag_requested_from_args<I, S>(args: I, flag: &str) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    args.into_iter().any(|arg| {
-        let raw = arg.as_ref().to_string_lossy();
-        raw == flag
-            || raw
-                .strip_prefix(flag)
-                .and_then(|suffix| suffix.strip_prefix('='))
-                .map(|value| matches!(value, "1" | "true" | "yes" | "on"))
-                .unwrap_or(false)
-    })
-}
-
-pub(crate) fn cli_all_repos_requested() -> bool {
-    cli_flag_requested_from_args(std::env::args_os(), "--all-repos")
-}
-
-pub(crate) fn resolve_run_discovery_scope(all_repos: bool) -> Result<RunDiscoveryScope> {
-    if all_repos {
-        return Ok(RunDiscoveryScope::AllRepos);
-    }
-
-    let cwd = std::env::current_dir().context("failed to read current working directory")?;
-    let scope_root = crate::plan::find_repo_root(&cwd).unwrap_or(cwd);
-    let scope_root = scope_root.canonicalize().unwrap_or(scope_root);
-    Ok(RunDiscoveryScope::CurrentScope { scope_root })
-}
-
-fn scope_root_from_snapshot_payload(payload: &serde_json::Value) -> Option<PathBuf> {
-    payload
-        .get("config_snapshot")
-        .and_then(|snapshot| snapshot.get("runtime"))
-        .and_then(|runtime| runtime.get("scope_root"))
-        .and_then(|value| value.as_str())
-        .map(PathBuf::from)
-}
-
-fn working_dir_from_snapshot_payload(payload: &serde_json::Value) -> Option<PathBuf> {
-    payload
-        .get("config_snapshot")
-        .and_then(|snapshot| snapshot.get("runtime"))
-        .and_then(|runtime| runtime.get("working_dir"))
-        .and_then(|value| value.as_str())
-        .map(PathBuf::from)
-}
-
-pub(crate) fn run_matches_scope_from_payload(
-    scope: &RunDiscoveryScope,
-    payload: &serde_json::Value,
-) -> bool {
-    match scope {
-        RunDiscoveryScope::AllRepos => true,
-        RunDiscoveryScope::CurrentScope { scope_root } => {
-            if let Some(run_scope_root) = scope_root_from_snapshot_payload(payload) {
-                return run_scope_root == *scope_root;
-            }
-
-            working_dir_from_snapshot_payload(payload)
-                .map(|working_dir| working_dir.starts_with(scope_root))
-                .unwrap_or(false)
-        }
-    }
-}
-
-fn run_scope_for_run(store: &dyn EventStore, run_id: Uuid) -> Result<Option<RunDiscoveryScope>> {
-    let run_events = query_events(
-        store,
-        &EventQuery::by_entity(EntityType::Run, run_id.to_string()),
-    )?;
-    for event in run_events.iter().rev() {
-        if event.event_type != "run.config_snapshot" {
-            continue;
-        }
-        if let Some(scope_root) = scope_root_from_snapshot_payload(&event.payload) {
-            return Ok(Some(RunDiscoveryScope::CurrentScope { scope_root }));
-        }
-    }
-    Ok(None)
 }
 
 #[derive(Debug, Default)]
@@ -1292,8 +1173,16 @@ where
             crate::plan::find_repo_root(&scheduler_workdir)
                 .unwrap_or_else(|| scheduler_workdir.clone())
         });
+    let trusted_backend_write_roots = config::resolve_execution_paths_from_cwd(
+        &loaded_config.config().execution.trusted_backend_write_roots,
+        "execution.trusted_backend_write_roots",
+    )
+    .context(
+        "run startup failed before registration (phase=resolve_trusted_backend_write_roots)",
+    )?;
     let mut config = SchedulerConfig {
         working_dir: scheduler_workdir_display.clone(),
+        trusted_backend_write_roots,
         command_timeout,
         ..SchedulerConfig::default()
     };
@@ -7100,127 +6989,6 @@ pub(crate) fn cmd_run_list() -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub(crate) fn list_runs_by_latest_state(
-    store: &dyn EventStore,
-) -> Result<BTreeMap<Uuid, RunState>> {
-    list_runs_by_latest_state_scoped(store, &RunDiscoveryScope::AllRepos)
-}
-
-pub(crate) fn list_runs_by_latest_state_scoped(
-    store: &dyn EventStore,
-    scope: &RunDiscoveryScope,
-) -> Result<BTreeMap<Uuid, RunState>> {
-    let run_events = query_events(store, &EventQuery::by_entity_type(EntityType::Run))?;
-    let mut runs: BTreeMap<Uuid, RunState> = BTreeMap::new();
-    let mut scoped_run_ids: HashSet<Uuid> = HashSet::new();
-    for event in run_events {
-        let Ok(run_id) = Uuid::parse_str(&event.entity_id) else {
-            continue;
-        };
-        let entry = runs.entry(run_id).or_insert(RunState::RunOpen);
-        if let Some(state) = run_state_from_event(&event) {
-            *entry = state;
-        }
-        if matches!(scope, RunDiscoveryScope::AllRepos)
-            || (event.event_type == "run.config_snapshot"
-                && run_matches_scope_from_payload(scope, &event.payload))
-        {
-            scoped_run_ids.insert(run_id);
-        }
-    }
-
-    if matches!(scope, RunDiscoveryScope::AllRepos) {
-        return Ok(runs);
-    }
-
-    Ok(runs
-        .into_iter()
-        .filter(|(run_id, _)| scoped_run_ids.contains(run_id))
-        .collect())
-}
-
-pub(crate) fn render_run_candidates(run_ids: &[Uuid]) -> String {
-    let strings = run_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let prefixes = unique_run_id_prefixes(strings.clone(), 10);
-    strings
-        .iter()
-        .map(|id| {
-            prefixes
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| compact_run_id(id))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-pub(crate) fn select_run_targets_for_control(
-    store: &dyn EventStore,
-    run_id_input: Option<&str>,
-    all_selected: bool,
-    eligible_states: &[RunState],
-    all_flag_name: &str,
-    action_name: &str,
-    scope: &RunDiscoveryScope,
-) -> Result<Vec<Uuid>> {
-    let runs = list_runs_by_latest_state_scoped(store, scope)?;
-    if let Some(raw_run_id) = run_id_input {
-        let run_id = resolve_run_id_input_scoped(store, raw_run_id, scope)?;
-        let state = runs
-            .get(&run_id)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("Run {run_id} not found in persisted event log."))?;
-        if !eligible_states.contains(&state) {
-            bail!(
-                "run {run_id} is {:?}; cannot {action_name}. Eligible states: {}",
-                state,
-                eligible_states
-                    .iter()
-                    .map(|s| format!("{s:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        return Ok(vec![run_id]);
-    }
-
-    let eligible = runs
-        .iter()
-        .filter_map(|(run_id, state)| eligible_states.contains(state).then_some(*run_id))
-        .collect::<Vec<_>>();
-
-    if all_selected {
-        if eligible.is_empty() {
-            if let Some(hint) = scope.selection_hint() {
-                bail!("no eligible runs found for `{action_name}` ({hint})");
-            }
-            bail!("no eligible runs found for `{action_name}`");
-        }
-        return Ok(eligible);
-    }
-
-    match eligible.len() {
-        0 => {
-            if let Some(hint) = scope.selection_hint() {
-                bail!("no eligible runs found for `{action_name}` ({hint})");
-            }
-            bail!("no eligible runs found for `{action_name}`");
-        }
-        1 => Ok(eligible),
-        _ => {
-            let base = format!(
-                "multiple eligible runs found for `{action_name}`; pass <run-id> or --{all_flag_name}. Candidates: {}",
-                render_run_candidates(&eligible)
-            );
-            if let Some(hint) = scope.selection_hint() {
-                bail!("{base} ({hint})");
-            }
-            bail!("{base}");
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append_run_transition_event(
     store: &dyn EventStore,
@@ -7716,89 +7484,6 @@ pub(crate) fn cmd_run_cancel(run_id: Option<&str>, all_active: bool, reason: &st
     })?;
     println!("{output}");
     Ok(())
-}
-
-fn resolve_run_id_input_from_candidates(run_id_input: &str, run_ids: &[Uuid]) -> Result<Uuid> {
-    let trimmed = run_id_input.trim();
-    if trimmed.is_empty() {
-        bail!("invalid run ID (expected UUID or unique run-list prefix)");
-    }
-
-    if let Ok(parsed) = Uuid::parse_str(trimmed) {
-        if run_ids.contains(&parsed) {
-            return Ok(parsed);
-        }
-        bail!("run {parsed} not found in persisted event log");
-    }
-
-    let compact_input = trimmed
-        .chars()
-        .filter(|c| *c != '-')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if compact_input.is_empty() {
-        bail!("invalid run ID (expected UUID or unique run-list prefix)");
-    }
-
-    let matches: Vec<Uuid> = run_ids
-        .iter()
-        .copied()
-        .filter(|run_id| run_id.simple().to_string().starts_with(&compact_input))
-        .collect();
-
-    match matches.len() {
-        1 => Ok(matches[0]),
-        0 => bail!(
-            "invalid run ID {:?} (expected UUID or unique run-list prefix)",
-            run_id_input
-        ),
-        _ => {
-            let sample = matches
-                .iter()
-                .take(5)
-                .map(|run_id| run_id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "ambiguous run ID prefix {:?}; matches multiple runs: {}",
-                run_id_input,
-                sample
-            );
-        }
-    }
-}
-
-pub(crate) fn resolve_run_id_input(store: &dyn EventStore, run_id_input: &str) -> Result<Uuid> {
-    let run_events = query_events(store, &EventQuery::by_entity_type(EntityType::Run))?;
-    let mut unique = HashSet::new();
-    let mut run_ids = Vec::new();
-    for event in &run_events {
-        let Ok(run_id) = Uuid::parse_str(&event.entity_id) else {
-            continue;
-        };
-        if unique.insert(run_id) {
-            run_ids.push(run_id);
-        }
-    }
-    resolve_run_id_input_from_candidates(run_id_input, &run_ids)
-}
-
-pub(crate) fn resolve_run_id_input_scoped(
-    store: &dyn EventStore,
-    run_id_input: &str,
-    scope: &RunDiscoveryScope,
-) -> Result<Uuid> {
-    let run_ids = list_runs_by_latest_state_scoped(store, scope)?
-        .keys()
-        .copied()
-        .collect::<Vec<_>>();
-    resolve_run_id_input_from_candidates(run_id_input, &run_ids).map_err(|err| {
-        if let Some(hint) = scope.selection_hint() {
-            err.context(hint)
-        } else {
-            err
-        }
-    })
 }
 
 /// `yarli run explain-exit` — run the Why Not Done? engine.
@@ -8812,26 +8497,6 @@ mod tests {
             drop(guard);
             result
         })
-    }
-
-    fn with_current_dir_unlocked<T>(dir: &Path, operation: impl FnOnce() -> T) -> T {
-        struct CurrentDirGuard {
-            previous_dir: PathBuf,
-        }
-
-        impl Drop for CurrentDirGuard {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.previous_dir)
-                    .or_else(|_| std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")));
-            }
-        }
-
-        let _guard = CurrentDirGuard {
-            previous_dir: std::env::current_dir()
-                .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()),
-        };
-        std::env::set_current_dir(dir).expect("switch to isolated test dir");
-        operation()
     }
 
     #[tokio::test]
@@ -10703,22 +10368,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_flag_requested_from_args_detects_all_repos_flag() {
-        assert!(cli_flag_requested_from_args(
-            ["yarli", "run", "list", "--all-repos"],
-            "--all-repos"
-        ));
-        assert!(cli_flag_requested_from_args(
-            ["yarli", "run", "list", "--all-repos=true"],
-            "--all-repos"
-        ));
-        assert!(!cli_flag_requested_from_args(
-            ["yarli", "run", "list"],
-            "--all-repos"
-        ));
-    }
-
-    #[test]
     fn build_run_config_snapshot_persists_resolved_working_dir_and_scope_root() {
         with_isolated_runtime_env(|| {
             let loaded = LoadedConfig::load_default().expect("default config should load");
@@ -10747,184 +10396,6 @@ mod tests {
                 snapshot["runtime"]["scope_root"].as_str(),
                 Some(scope_root.display().to_string().as_str())
             );
-        });
-    }
-
-    #[test]
-    fn select_run_targets_for_control_limits_default_scope_to_current_repo() {
-        with_isolated_runtime_env(|| {
-            let repo_a = TempDir::new().expect("repo a");
-            let repo_b = TempDir::new().expect("repo b");
-            run_git_expect_ok(repo_a.path(), &["init"]);
-            run_git_expect_ok(repo_b.path(), &["init"]);
-
-            let store = InMemoryEventStore::new();
-            let run_a = Uuid::now_v7();
-            let run_b = Uuid::now_v7();
-            let corr_a = Uuid::now_v7();
-            let corr_b = Uuid::now_v7();
-
-            for (run_id, corr, root, objective) in [
-                (run_a, corr_a, repo_a.path(), "local"),
-                (run_b, corr_b, repo_b.path(), "remote"),
-            ] {
-                store
-                    .append(make_event(
-                        EntityType::Run,
-                        run_id.to_string(),
-                        "run.config_snapshot",
-                        corr,
-                        serde_json::json!({
-                            "objective": objective,
-                            "config_snapshot": {
-                                "runtime": {
-                                    "working_dir": root.display().to_string(),
-                                    "scope_root": root.display().to_string(),
-                                }
-                            }
-                        }),
-                    ))
-                    .unwrap();
-                store
-                    .append(make_event(
-                        EntityType::Run,
-                        run_id.to_string(),
-                        "run.activated",
-                        corr,
-                        serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
-                    ))
-                    .unwrap();
-            }
-
-            let targets = with_current_dir_unlocked(repo_a.path(), || {
-                let scope = resolve_run_discovery_scope(false).unwrap();
-                select_run_targets_for_control(
-                    &store,
-                    None,
-                    false,
-                    &[RunState::RunActive, RunState::RunVerifying],
-                    "all-active",
-                    "pause",
-                    &scope,
-                )
-                .unwrap()
-            });
-
-            assert_eq!(targets, vec![run_a]);
-        });
-    }
-
-    #[test]
-    fn select_run_targets_for_resume_limits_default_scope_to_current_repo() {
-        with_isolated_runtime_env(|| {
-            let repo_a = TempDir::new().expect("repo a");
-            let repo_b = TempDir::new().expect("repo b");
-            run_git_expect_ok(repo_a.path(), &["init"]);
-            run_git_expect_ok(repo_b.path(), &["init"]);
-
-            let store = InMemoryEventStore::new();
-            let run_a = Uuid::now_v7();
-            let run_b = Uuid::now_v7();
-            let corr_a = Uuid::now_v7();
-            let corr_b = Uuid::now_v7();
-
-            for (run_id, corr, root, objective) in [
-                (run_a, corr_a, repo_a.path(), "local paused"),
-                (run_b, corr_b, repo_b.path(), "remote paused"),
-            ] {
-                store
-                    .append(make_event(
-                        EntityType::Run,
-                        run_id.to_string(),
-                        "run.config_snapshot",
-                        corr,
-                        serde_json::json!({
-                            "objective": objective,
-                            "config_snapshot": {
-                                "runtime": {
-                                    "working_dir": root.display().to_string(),
-                                    "scope_root": root.display().to_string(),
-                                }
-                            }
-                        }),
-                    ))
-                    .unwrap();
-                store
-                    .append(make_event(
-                        EntityType::Run,
-                        run_id.to_string(),
-                        "run.blocked",
-                        corr,
-                        serde_json::json!({ "from": "RunActive", "to": "RunBlocked" }),
-                    ))
-                    .unwrap();
-            }
-
-            let targets = with_current_dir_unlocked(repo_a.path(), || {
-                let scope = resolve_run_discovery_scope(false).unwrap();
-                select_run_targets_for_control(
-                    &store,
-                    None,
-                    true,
-                    &[RunState::RunBlocked],
-                    "all-paused",
-                    "resume",
-                    &scope,
-                )
-                .unwrap()
-            });
-
-            assert_eq!(targets, vec![run_a]);
-        });
-    }
-
-    #[test]
-    fn resolve_run_id_input_scoped_reports_scope_hint_when_run_is_out_of_scope() {
-        with_isolated_runtime_env(|| {
-            let repo_a = TempDir::new().expect("repo a");
-            let repo_b = TempDir::new().expect("repo b");
-            run_git_expect_ok(repo_a.path(), &["init"]);
-            run_git_expect_ok(repo_b.path(), &["init"]);
-
-            let store = InMemoryEventStore::new();
-            let run_a = Uuid::now_v7();
-            let corr_a = Uuid::now_v7();
-
-            store
-                .append(make_event(
-                    EntityType::Run,
-                    run_a.to_string(),
-                    "run.config_snapshot",
-                    corr_a,
-                    serde_json::json!({
-                        "objective": "remote",
-                        "config_snapshot": {
-                            "runtime": {
-                                "working_dir": repo_a.path().display().to_string(),
-                                "scope_root": repo_a.path().display().to_string(),
-                            }
-                        }
-                    }),
-                ))
-                .unwrap();
-            store
-                .append(make_event(
-                    EntityType::Run,
-                    run_a.to_string(),
-                    "run.activated",
-                    corr_a,
-                    serde_json::json!({ "from": "RunOpen", "to": "RunActive" }),
-                ))
-                .unwrap();
-
-            let err = with_current_dir_unlocked(repo_b.path(), || {
-                let scope = resolve_run_discovery_scope(false).unwrap();
-                resolve_run_id_input_scoped(&store, &run_a.simple().to_string()[..12], &scope)
-                    .unwrap_err()
-            });
-            let message = err.to_string();
-            assert!(message.contains("pass --all-repos"));
-            assert!(message.contains("searched"));
         });
     }
 

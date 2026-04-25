@@ -107,6 +107,7 @@ commands unless `core.allow_in_memory_writes = true`.
 - execution.working_dir (default: "."; expands `~` and `$ENV_VAR`)
 - execution.worktree_root (default: unset; required when features.parallel = true; expands `~` and `$ENV_VAR`)
 - execution.worktree_exclude_paths (default: [".yarl/workspaces",".yarli","target","node_modules",".venv","venv","__pycache__"]; names/paths excluded from workspace copies)
+- execution.trusted_backend_write_roots (default: []; backend-only write roots for CLI startup state; expands `~` and `$ENV_VAR`)
 - execution.command_timeout_seconds (default: 300; 0 disables timeout)
 - execution.tick_interval_ms (default: 100)
 - execution.overwatch.service_url (required when runner = "overwatch")
@@ -316,6 +317,9 @@ working_dir = "."
 # worktree_root = ".yarl/workspaces"
 # Directory names or paths to exclude from per-task workspace copies.
 worktree_exclude_paths = [".yarl/workspaces", ".yarli", "target", "node_modules", ".venv", "venv", "__pycache__"]
+# Backend-only write roots added to native runner enforcement, without expanding tranche merge scope.
+# Prefer narrow directories such as "~/.codex/tmp" and "~/.codex/sessions".
+trusted_backend_write_roots = []
 # Default command timeout in seconds (0 disables timeout).
 command_timeout_seconds = 300
 # Scheduler tick cadence.
