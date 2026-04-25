@@ -7709,8 +7709,17 @@ worktree_root = "{}"
         );
         run_git_expect_ok(&umbrella, &["commit", "-m", "add submodule"]);
 
-        // Simulate worker edit: modify a file inside the submodule WITHOUT committing.
+        // The cloned submodule in umbrella/sub doesn't inherit user identity from
+        // the source clone. Set it explicitly so autocommit_dirty_submodules can
+        // create a commit on hardened CI runners that have no global git identity.
         let sub_in_umbrella = umbrella.join("sub");
+        run_git_expect_ok(
+            &sub_in_umbrella,
+            &["config", "user.email", "test@yarli.dev"],
+        );
+        run_git_expect_ok(&sub_in_umbrella, &["config", "user.name", "Yarli Test"]);
+
+        // Simulate worker edit: modify a file inside the submodule WITHOUT committing.
         std::fs::write(sub_in_umbrella.join("lib.py"), "x = 42\n").expect("write lib.py edit");
 
         // Verify the submodule is dirty before auto-commit.
