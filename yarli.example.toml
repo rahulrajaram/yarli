@@ -50,6 +50,9 @@ working_dir = "."
 # Directory names or paths to exclude from per-task workspace copies.
 # Helps avoid copying large/generated trees in parallel mode.
 worktree_exclude_paths = [".yarl/workspaces", ".yarli", "target", "node_modules", ".venv", "venv", "__pycache__"]
+# Backend-only write roots added to native runner enforcement, without expanding tranche merge scope.
+# Prefer narrow directories such as "~/.codex/tmp" and "~/.codex/sessions".
+trusted_backend_write_roots = []
 command_timeout_seconds = 900
 tick_interval_ms = 200
 

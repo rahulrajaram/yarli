@@ -10,7 +10,6 @@
 //! 7. Heartbeat active leases and reclaim stale ones.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +43,7 @@ use crate::yarli_policy::{ActionType, PolicyEngine, PolicyRequest};
 use crate::yarli_store::event_store::EventQuery;
 use crate::yarli_store::EventStore;
 
+use super::task_bindings::TaskBindings;
 use crate::yarli_queue::queue::{ClaimRequest, ConcurrencyConfig, QueueEntry, QueueStatus};
 use crate::yarli_queue::TaskQueue;
 
@@ -77,6 +77,11 @@ pub struct SchedulerConfig {
     pub command_timeout: Option<Duration>,
     /// Default working directory for commands.
     pub working_dir: String,
+    /// Trusted backend-only write roots added to runner enforcement.
+    ///
+    /// These roots support backend/tool startup state and intentionally do not
+    /// expand tranche `allowed_paths` or merge scope.
+    pub trusted_backend_write_roots: Vec<String>,
     /// Gates to evaluate for task-level verification.
     /// If empty, tasks auto-complete after successful execution.
     pub task_gates: Vec<GateType>,
@@ -141,6 +146,7 @@ impl Default for SchedulerConfig {
             concurrency: ConcurrencyConfig::default(),
             command_timeout: None,
             working_dir: "/tmp".to_string(),
+            trusted_backend_write_roots: Vec::new(),
             task_gates: crate::yarli_gates::default_task_gates(),
             // Run-level gates: structural invariants only.
             // Evidence-level gates (RequiredEvidencePresent) are evaluated
@@ -213,43 +219,33 @@ fn build_resource_limits(budgets: &ResourceBudgetConfig) -> Option<ResourceLimit
     }
 }
 
-fn normalize_allowed_write_root(working_dir: &str, allowed_path: &str) -> Option<String> {
-    let trimmed = allowed_path.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let joined = Path::new(working_dir).join(trimmed);
-    let mut normalized = PathBuf::new();
-    for component in joined.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    Some(normalized.to_string_lossy().to_string())
-}
-
-fn resolve_allowed_write_roots(working_dir: &str, allowed_paths: &[String]) -> Vec<String> {
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
-    for allowed_path in allowed_paths {
-        let Some(root) = normalize_allowed_write_root(working_dir, allowed_path) else {
-            continue;
-        };
-        if seen.insert(root.clone()) {
-            roots.push(root);
-        }
-    }
-    roots
-}
-
 fn parse_permission_denied_write_target(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let (_, remainder) = trimmed.split_once("cannot create ")?;
     let (path, _) = remainder.split_once(": Permission denied")?;
     let candidate = path.trim().trim_matches('\'').trim_matches('"');
     (!candidate.is_empty()).then(|| candidate.to_string())
+}
+
+fn merge_runner_write_roots(
+    task_allowed_write_roots: Vec<String>,
+    trusted_backend_write_roots: &[String],
+) -> Vec<String> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for root in task_allowed_write_roots
+        .into_iter()
+        .chain(trusted_backend_write_roots.iter().cloned())
+    {
+        let root = root.trim();
+        if root.is_empty() {
+            continue;
+        }
+        if seen.insert(root.to_string()) {
+            roots.push(root.to_string());
+        }
+    }
+    roots
 }
 
 fn infer_runtime_scope_violation(
@@ -478,8 +474,7 @@ pub struct Scheduler<Q: TaskQueue, S: EventStore, R: CommandRunner> {
     store: Arc<S>,
     runner: Arc<R>,
     registry: Arc<RwLock<TaskRegistry>>,
-    task_working_dirs: Arc<RwLock<HashMap<TaskId, String>>>,
-    task_allowed_paths: Arc<RwLock<HashMap<TaskId, Vec<String>>>>,
+    task_bindings: TaskBindings,
     policy_engine: Arc<Mutex<PolicyEngine>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     metrics: Option<Arc<crate::yarli_observability::YarliMetrics>>,
@@ -497,8 +492,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             store,
             runner,
             registry: Arc::new(RwLock::new(TaskRegistry::new())),
-            task_working_dirs: Arc::new(RwLock::new(HashMap::new())),
-            task_allowed_paths: Arc::new(RwLock::new(HashMap::new())),
+            task_bindings: TaskBindings::new(),
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             metrics: None,
@@ -522,8 +516,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             store,
             runner,
             registry: Arc::new(RwLock::new(registry)),
-            task_working_dirs: Arc::new(RwLock::new(HashMap::new())),
-            task_allowed_paths: Arc::new(RwLock::new(HashMap::new())),
+            task_bindings: TaskBindings::new(),
             policy_engine: Arc::new(Mutex::new(PolicyEngine::with_defaults())),
             audit_sink: None,
             metrics: None,
@@ -581,14 +574,16 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
 
     /// Bind a task ID to an explicit working directory for command execution.
     pub async fn bind_task_working_dir(&self, task_id: TaskId, working_dir: impl Into<String>) {
-        let mut dirs = self.task_working_dirs.write().await;
-        dirs.insert(task_id, working_dir.into());
+        self.task_bindings
+            .bind_working_dir(task_id, working_dir)
+            .await;
     }
 
     /// Bind tranche-scoped allowed paths for worker-level write enforcement.
     pub async fn bind_task_allowed_paths(&self, task_id: TaskId, allowed_paths: Vec<String>) {
-        let mut paths = self.task_allowed_paths.write().await;
-        paths.insert(task_id, allowed_paths);
+        self.task_bindings
+            .bind_allowed_paths(task_id, allowed_paths)
+            .await;
     }
 
     fn classify_merge_failure_reason(reason: &str, payload: &serde_json::Value) -> bool {
@@ -1090,19 +1085,18 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 run.safe_mode,
             )
         };
-        let working_dir = {
-            let dirs = self.task_working_dirs.read().await;
-            dirs.get(&task_id)
-                .cloned()
-                .unwrap_or_else(|| self.config.working_dir.clone())
-        };
-        let allowed_write_roots = {
-            let paths = self.task_allowed_paths.read().await;
-            paths
-                .get(&task_id)
-                .map(|allowed_paths| resolve_allowed_write_roots(&working_dir, allowed_paths))
-                .unwrap_or_default()
-        };
+        let working_dir = self
+            .task_bindings
+            .working_dir(task_id, &self.config.working_dir)
+            .await;
+        let task_allowed_write_roots = self
+            .task_bindings
+            .allowed_write_roots(task_id, &working_dir)
+            .await;
+        let allowed_write_roots = merge_runner_write_roots(
+            task_allowed_write_roots,
+            &self.config.trusted_backend_write_roots,
+        );
 
         if !self.config.allow_recursive_run && command_invokes_recursive_yarli_run(&command) {
             let decision = PolicyDecision {
@@ -1906,10 +1900,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             TaskOutcome::Killed
         } else {
             // Nonzero exit code: Executing → Failed
-            let allowed_paths = {
-                let paths = self.task_allowed_paths.read().await;
-                paths.get(&task_id).cloned().unwrap_or_default()
-            };
+            let allowed_paths = self.task_bindings.allowed_paths(task_id).await;
             let runtime_scope_violation =
                 infer_runtime_scope_violation(&result.chunks, &allowed_paths);
             let detail = nonzero_exit_detail(exit_code, &result.chunks);
@@ -2961,6 +2952,7 @@ mod tests {
             concurrency: ConcurrencyConfig::default(),
             command_timeout: Some(Duration::from_secs(5)),
             working_dir: "/tmp".to_string(),
+            trusted_backend_write_roots: Vec::new(),
             // Empty gates: auto-complete (backward compat with M1 tests)
             task_gates: vec![],
             run_gates: vec![],
@@ -3003,6 +2995,14 @@ mod tests {
         let runner = Arc::new(CapturingRunner::default());
         let mut config = test_config();
         config.working_dir = workspace_root.display().to_string();
+        config.trusted_backend_write_roots = vec![
+            workspace.path().join("codex-tmp").display().to_string(),
+            " ".to_string(),
+            workspace_root
+                .join("crates/yarli-cli/src")
+                .display()
+                .to_string(),
+        ];
         let sched = Scheduler::new(queue, store, runner.clone(), config);
 
         let run = make_run("scoped");
@@ -3041,6 +3041,7 @@ mod tests {
                     .join("docs/postmortem.md")
                     .display()
                     .to_string(),
+                workspace.path().join("codex-tmp").display().to_string(),
             ]
         );
     }
@@ -4967,6 +4968,27 @@ mod tests {
                 "./mock-agent.sh: 9: cannot create README.md: Permission denied"
             ),
             Some("README.md".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_runner_write_roots_deduplicates_task_and_trusted_roots() {
+        let roots = merge_runner_write_roots(
+            vec!["/repo/src".to_string(), "/repo/docs".to_string()],
+            &[
+                "/repo/src".to_string(),
+                " ".to_string(),
+                "/home/user/.codex/sessions".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            roots,
+            vec![
+                "/repo/src".to_string(),
+                "/repo/docs".to_string(),
+                "/home/user/.codex/sessions".to_string()
+            ]
         );
     }
 

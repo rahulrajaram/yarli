@@ -17,12 +17,13 @@ use yarli_cli::yarli_gates::all_passed;
 use yarli_cli::yarli_store::event_store::EventQuery;
 use yarli_cli::yarli_store::EventStore;
 
-use crate::commands::{
-    format_cancel_provenance_summary, run_matches_scope_from_payload, RunDiscoveryScope,
-};
+use crate::commands::format_cancel_provenance_summary;
 use crate::events::task_id_from_command_event;
 use crate::persistence::query_events;
 use crate::projection::*;
+use crate::run_scope::{
+    compact_run_id, run_matches_scope_from_payload, unique_run_id_prefixes, RunDiscoveryScope,
+};
 
 fn write_blocker_lines(out: &mut String, blocker: &str) -> Result<(), std::fmt::Error> {
     for line in blocker.lines() {
@@ -926,47 +927,6 @@ pub(crate) fn render_run_list_scoped(
     Ok(out.trim_end().to_string())
 }
 
-pub(crate) fn compact_run_id(run_id: &str) -> String {
-    if let Ok(parsed) = Uuid::parse_str(run_id) {
-        parsed.simple().to_string()
-    } else {
-        run_id.chars().filter(|c| *c != '-').collect()
-    }
-}
-
-pub(crate) fn unique_run_id_prefixes(
-    run_ids: Vec<String>,
-    min_len: usize,
-) -> HashMap<String, String> {
-    let compact: Vec<(String, String)> = run_ids
-        .into_iter()
-        .map(|run_id| {
-            let compact = compact_run_id(&run_id);
-            (run_id, compact)
-        })
-        .collect();
-    let mut prefixes = HashMap::new();
-
-    for (run_id, compact_id) in &compact {
-        let mut chosen = compact_id.clone();
-        let start = min_len.min(compact_id.len()).max(1);
-        for len in start..=compact_id.len() {
-            let prefix = &compact_id[..len];
-            let is_unique = compact
-                .iter()
-                .filter(|(other_id, _)| other_id != run_id)
-                .all(|(_, other_compact)| !other_compact.starts_with(prefix));
-            if is_unique {
-                chosen = prefix.to_string();
-                break;
-            }
-        }
-        prefixes.insert(run_id.clone(), chosen);
-    }
-
-    prefixes
-}
-
 pub(crate) fn render_task_output(store: &dyn EventStore, task_id: Uuid) -> Result<String> {
     if let Some(artifact_lines) = read_task_output_artifact(task_id)? {
         if !artifact_lines.is_empty() {
@@ -1055,8 +1015,9 @@ fn read_task_output_artifact(task_id: Uuid) -> Result<Option<Vec<String>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{execute_task_annotate, list_runs_by_latest_state, resolve_run_id_input};
+    use crate::commands::execute_task_annotate;
     use crate::events::*;
+    use crate::run_scope::{list_runs_by_latest_state, resolve_run_id_input};
     use crate::test_helpers::{make_event, with_current_dir};
     use chrono::Utc;
     use std::fs::{self, File};
@@ -1853,7 +1814,7 @@ mod tests {
     }
 
     #[test]
-    fn render_run_list_scoped_limits_results_to_current_scope() {
+    fn render_run_list_scoped_filters_two_repos_with_and_without_all_repos() {
         let store = InMemoryEventStore::new();
         let run_a = Uuid::now_v7();
         let run_b = Uuid::now_v7();
@@ -1905,6 +1866,12 @@ mod tests {
         assert!(output.contains("Scope: current repo scope"));
         assert!(output.contains("local"));
         assert!(!output.contains("remote"));
+
+        let all_repos_output =
+            render_run_list_scoped(&store, &RunDiscoveryScope::AllRepos).unwrap();
+        assert!(all_repos_output.contains("Scope: all repos"));
+        assert!(all_repos_output.contains("local"));
+        assert!(all_repos_output.contains("remote"));
     }
 
     #[test]

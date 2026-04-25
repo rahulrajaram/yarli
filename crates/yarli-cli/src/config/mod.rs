@@ -4,7 +4,7 @@
 
 mod migrate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 #[cfg(unix)]
@@ -346,6 +346,23 @@ pub(crate) fn resolve_execution_path_from_cwd(
             raw_path
         )
     })
+}
+
+pub(crate) fn resolve_execution_paths_from_cwd(
+    raw_paths: &[String],
+    setting_name: &str,
+) -> Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, raw_path) in raw_paths.iter().enumerate() {
+        let resolved_path =
+            resolve_execution_path_from_cwd(raw_path, &format!("{setting_name}[{index}]"))?;
+        let rendered = resolved_path.display().to_string();
+        if seen.insert(rendered.clone()) {
+            resolved.push(rendered);
+        }
+    }
+    Ok(resolved)
 }
 
 pub(crate) fn ensure_parallel_workspace_contract(loaded_config: &LoadedConfig) -> Result<()> {
@@ -1139,6 +1156,12 @@ pub struct ExecutionConfig {
     /// Examples: `target`, `node_modules`, `.venv`, `venv`, `sdks/rust_sdk/target`.
     #[serde(default = "default_worktree_exclude_paths")]
     pub worktree_exclude_paths: Vec<String>,
+    /// Extra trusted write roots granted only to the backend runner.
+    ///
+    /// These roots support CLI/backend startup state such as Codex session
+    /// files. They do not expand tranche `allowed_paths` or merge scope.
+    #[serde(default)]
+    pub trusted_backend_write_roots: Vec<String>,
     #[serde(default = "default_command_timeout_seconds")]
     pub command_timeout_seconds: u64,
     #[serde(default = "default_tick_interval_ms")]
@@ -1154,6 +1177,7 @@ impl Default for ExecutionConfig {
             working_dir: default_working_dir(),
             worktree_root: None,
             worktree_exclude_paths: default_worktree_exclude_paths(),
+            trusted_backend_write_roots: Vec::new(),
             command_timeout_seconds: default_command_timeout_seconds(),
             tick_interval_ms: default_tick_interval_ms(),
             overwatch: OverwatchConfig::default(),
@@ -2009,18 +2033,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
     use uuid::Uuid;
-
-    static DATABASE_URL_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn with_database_url_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        DATABASE_URL_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("database URL env lock should be obtainable")
-    }
 
     fn write_test_config(contents: &str) -> LoadedConfig {
         let temp_dir = TempDir::new().unwrap();
@@ -2129,6 +2143,7 @@ mod tests {
             "execution.working_dir",
             "execution.worktree_root",
             "execution.worktree_exclude_paths",
+            "execution.trusted_backend_write_roots",
             "execution.command_timeout_seconds",
             "execution.tick_interval_ms",
             "execution.runner",
@@ -2268,6 +2283,31 @@ parallel = false
         let resolved = resolve_execution_path_from_cwd("~/yarli-tmp", "execution.working_dir")
             .expect("tilde expansion should succeed when HOME/USERPROFILE is set");
         assert_eq!(resolved, home.join("yarli-tmp"));
+    }
+
+    #[test]
+    fn resolve_execution_paths_from_cwd_expands_and_deduplicates() {
+        let temp_dir = TempDir::new().unwrap();
+        let env_key = format!("YARLI_TEST_ROOTS_{}", Uuid::now_v7().simple());
+        std::env::set_var(&env_key, temp_dir.path());
+        let paths = vec![
+            format!("${{{env_key}}}/sessions"),
+            format!("${{{env_key}}}/sessions"),
+            format!("${{{env_key}}}/tmp"),
+        ];
+
+        let resolved =
+            resolve_execution_paths_from_cwd(&paths, "execution.trusted_backend_write_roots")
+                .unwrap();
+        std::env::remove_var(&env_key);
+
+        assert_eq!(
+            resolved,
+            vec![
+                temp_dir.path().join("sessions").display().to_string(),
+                temp_dir.path().join("tmp").display().to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2435,6 +2475,11 @@ env_unset = ["BAD-NAME"]
             .worktree_exclude_paths
             .iter()
             .any(|path| path == ".venv"));
+        assert!(loaded
+            .config()
+            .execution
+            .trusted_backend_write_roots
+            .is_empty());
         assert_eq!(loaded.config().run.prompt_file, None);
         assert_eq!(loaded.config().run.objective, None);
         assert_eq!(loaded.config().run.continue_wait_timeout_seconds, 0);
@@ -2507,6 +2552,7 @@ runner = "overwatch"
 working_dir = "/work"
 worktree_root = "/worktrees"
 worktree_exclude_paths = ["target", "node_modules", ".venv", "venv"]
+trusted_backend_write_roots = ["/home/test/.codex/tmp", "/home/test/.codex/sessions"]
 command_timeout_seconds = 600
 [execution.overwatch]
 service_url = "http://127.0.0.1:9999"
@@ -2621,6 +2667,13 @@ mode = "stream"
                 "node_modules".to_string(),
                 ".venv".to_string(),
                 "venv".to_string()
+            ]
+        );
+        assert_eq!(
+            loaded.config().execution.trusted_backend_write_roots,
+            vec![
+                "/home/test/.codex/tmp".to_string(),
+                "/home/test/.codex/sessions".to_string()
             ]
         );
         assert_eq!(
@@ -2826,95 +2879,100 @@ provider = "missing"
 
     #[test]
     fn postgres_backend_requires_database_url() {
-        let mut config = YarliConfig::default();
-        config.core.backend = BackendKind::Postgres;
-        let _guard = with_database_url_env_lock();
-        std::env::remove_var(DATABASE_URL_ENV);
-        let loaded = LoadedConfig {
-            path: PathBuf::from("yarli.toml"),
-            source: ConfigSource::Defaults,
-            config,
-        };
-        let err = loaded.backend_selection().unwrap_err();
-        assert!(err.to_string().contains("DATABASE_URL"));
+        crate::test_helpers::with_process_env_lock(|| {
+            let mut config = YarliConfig::default();
+            config.core.backend = BackendKind::Postgres;
+            std::env::remove_var(DATABASE_URL_ENV);
+            let loaded = LoadedConfig {
+                path: PathBuf::from("yarli.toml"),
+                source: ConfigSource::Defaults,
+                config,
+            };
+            let err = loaded.backend_selection().unwrap_err();
+            assert!(err.to_string().contains("DATABASE_URL"));
+        });
     }
 
     #[test]
     fn postgres_backend_prefers_environment_database_url() {
-        let mut config = YarliConfig::default();
-        config.core.backend = BackendKind::Postgres;
-        let _guard = with_database_url_env_lock();
-        std::env::set_var(
-            DATABASE_URL_ENV,
-            "postgres://postgres:postgres@localhost:5432/env-var",
-        );
-        let loaded = LoadedConfig {
-            path: PathBuf::from("yarli.toml"),
-            source: ConfigSource::Defaults,
-            config,
-        };
+        crate::test_helpers::with_process_env_lock(|| {
+            let mut config = YarliConfig::default();
+            config.core.backend = BackendKind::Postgres;
+            std::env::set_var(
+                DATABASE_URL_ENV,
+                "postgres://postgres:postgres@localhost:5432/env-var",
+            );
+            let loaded = LoadedConfig {
+                path: PathBuf::from("yarli.toml"),
+                source: ConfigSource::Defaults,
+                config,
+            };
 
-        let selection = loaded.backend_selection().unwrap();
-        assert_eq!(
-            selection,
-            BackendSelection::Postgres {
-                database_url: "postgres://postgres:postgres@localhost:5432/env-var".to_string()
-            }
-        );
-        std::env::remove_var(DATABASE_URL_ENV);
+            let selection = loaded.backend_selection().unwrap();
+            assert_eq!(
+                selection,
+                BackendSelection::Postgres {
+                    database_url: "postgres://postgres:postgres@localhost:5432/env-var".to_string()
+                }
+            );
+            std::env::remove_var(DATABASE_URL_ENV);
+        });
     }
 
     #[test]
     fn postgres_backend_prefers_configured_database_url_file() {
-        let _guard = with_database_url_env_lock();
-        let previous_env = std::env::var(DATABASE_URL_ENV).ok();
-        std::env::remove_var(DATABASE_URL_ENV);
-        let temp_dir = TempDir::new().unwrap();
-        let secret_path = temp_dir.path().join("database-url");
-        std::fs::write(
-            &secret_path,
-            "postgres://postgres:postgres@localhost:5432/file-backed",
-        )
-        .unwrap();
-        let loaded = write_test_config(&format!(
-            r#"
+        crate::test_helpers::with_process_env_lock(|| {
+            let previous_env = std::env::var(DATABASE_URL_ENV).ok();
+            std::env::remove_var(DATABASE_URL_ENV);
+            let temp_dir = TempDir::new().unwrap();
+            let secret_path = temp_dir.path().join("database-url");
+            std::fs::write(
+                &secret_path,
+                "postgres://postgres:postgres@localhost:5432/file-backed",
+            )
+            .unwrap();
+            let loaded = write_test_config(&format!(
+                r#"
 [core]
 backend = "postgres"
 
 [postgres]
 database_url_file = "{}"
 "#,
-            secret_path.display()
-        ));
+                secret_path.display()
+            ));
 
-        let selection = loaded.backend_selection().unwrap();
-        assert_eq!(
-            selection,
-            BackendSelection::Postgres {
-                database_url: "postgres://postgres:postgres@localhost:5432/file-backed".to_string()
+            let selection = loaded.backend_selection().unwrap();
+            assert_eq!(
+                selection,
+                BackendSelection::Postgres {
+                    database_url: "postgres://postgres:postgres@localhost:5432/file-backed"
+                        .to_string()
+                }
+            );
+
+            match previous_env {
+                Some(value) => std::env::set_var(DATABASE_URL_ENV, value),
+                None => std::env::remove_var(DATABASE_URL_ENV),
             }
-        );
-
-        match previous_env {
-            Some(value) => std::env::set_var(DATABASE_URL_ENV, value),
-            None => std::env::remove_var(DATABASE_URL_ENV),
-        }
+        });
     }
 
     #[test]
     fn postgres_backend_rejects_invalid_database_url() {
-        let _guard = with_database_url_env_lock();
-        std::env::remove_var(DATABASE_URL_ENV);
-        let mut config = YarliConfig::default();
-        config.core.backend = BackendKind::Postgres;
-        config.postgres.database_url = Some("not-a-valid-url".to_string());
-        let loaded = LoadedConfig {
-            path: PathBuf::from("yarli.toml"),
-            source: ConfigSource::Defaults,
-            config,
-        };
-        let err = loaded.backend_selection().unwrap_err();
-        assert!(err.to_string().contains("invalid postgres database url"));
+        crate::test_helpers::with_process_env_lock(|| {
+            std::env::remove_var(DATABASE_URL_ENV);
+            let mut config = YarliConfig::default();
+            config.core.backend = BackendKind::Postgres;
+            config.postgres.database_url = Some("not-a-valid-url".to_string());
+            let loaded = LoadedConfig {
+                path: PathBuf::from("yarli.toml"),
+                source: ConfigSource::Defaults,
+                config,
+            };
+            let err = loaded.backend_selection().unwrap_err();
+            assert!(err.to_string().contains("invalid postgres database url"));
+        });
     }
 
     #[test]

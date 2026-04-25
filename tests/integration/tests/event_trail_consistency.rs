@@ -34,6 +34,7 @@ fn test_config() -> SchedulerConfig {
         concurrency: ConcurrencyConfig::default(),
         command_timeout: Some(Duration::from_secs(5)),
         working_dir: "/tmp".to_string(),
+        trusted_backend_write_roots: Vec::new(),
         task_gates: vec![],
         run_gates: vec![],
         enforce_policies: true,

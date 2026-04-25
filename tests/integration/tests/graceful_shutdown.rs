@@ -41,6 +41,7 @@ async fn graceful_shutdown_cancels_running_tasks() {
         // Short timeout so test doesn't hang
         command_timeout: Some(Duration::from_secs(10)),
         working_dir: "/tmp".to_string(),
+        trusted_backend_write_roots: Vec::new(),
         task_gates: vec![],
         run_gates: vec![],
         enforce_policies: true,
@@ -128,6 +129,7 @@ async fn scheduler_loop_with_cancellation_completes_fast_task() {
         concurrency: ConcurrencyConfig::default(),
         command_timeout: Some(Duration::from_secs(5)),
         working_dir: "/tmp".to_string(),
+        trusted_backend_write_roots: Vec::new(),
         task_gates: vec![],
         run_gates: vec![],
         enforce_policies: true,
