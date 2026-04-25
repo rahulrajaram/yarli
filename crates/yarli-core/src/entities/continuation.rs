@@ -173,6 +173,53 @@ pub struct TaskOutcome {
     pub blocker: Option<BlockerCode>,
 }
 
+const ALLOWED_PATHS_SCOPE_MISMATCH_PREFIX: &str = "allowed_paths scope mismatch:";
+
+pub fn parse_allowed_paths_scope_mismatch(last_error: &str) -> Option<Vec<String>> {
+    let remainder = last_error
+        .strip_prefix(ALLOWED_PATHS_SCOPE_MISMATCH_PREFIX)?
+        .trim();
+    let paths_segment = remainder
+        .split_once(" (allowed_paths:")
+        .map(|(paths, _)| paths)
+        .unwrap_or(remainder);
+    let paths: Vec<String> = paths_segment
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
+pub fn format_allowed_paths_scope_mismatch(
+    suggested_allowed_paths: &[String],
+    allowed_paths: &[String],
+) -> String {
+    let suggested = suggested_allowed_paths.join(", ");
+    if allowed_paths.is_empty() {
+        format!("{ALLOWED_PATHS_SCOPE_MISMATCH_PREFIX} {suggested}")
+    } else {
+        format!(
+            "{ALLOWED_PATHS_SCOPE_MISMATCH_PREFIX} {suggested} (allowed_paths: {})",
+            allowed_paths.join(", ")
+        )
+    }
+}
+
+pub fn collect_allowed_paths_scope_suggestions(tasks: &[TaskOutcome]) -> Vec<String> {
+    let mut suggestions: Vec<String> = tasks
+        .iter()
+        .filter(|task| task.state == TaskState::TaskFailed)
+        .filter_map(|task| task.last_error.as_deref())
+        .filter_map(parse_allowed_paths_scope_mismatch)
+        .flatten()
+        .collect();
+    suggestions.sort();
+    suggestions.dedup();
+    suggestions
+}
+
 /// Aggregate counts across all tasks in the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {
@@ -311,8 +358,34 @@ impl ContinuationPayload {
             .map(|o| o.task_key.clone())
             .collect();
 
+        let scope_violation_task_keys: Vec<String> = task_outcomes
+            .iter()
+            .filter(|o| o.state == TaskState::TaskFailed)
+            .filter(|o| {
+                o.last_error
+                    .as_deref()
+                    .and_then(parse_allowed_paths_scope_mismatch)
+                    .is_some()
+            })
+            .map(|o| o.task_key.clone())
+            .collect();
+        let scope_violation_suggestions = collect_allowed_paths_scope_suggestions(&task_outcomes);
+
         let next_tranche = if !retry_task_keys.is_empty() || !unfinished_task_keys.is_empty() {
-            let suggested_objective = if !retry_task_keys.is_empty() {
+            let suggested_objective = if !scope_violation_task_keys.is_empty() {
+                if scope_violation_suggestions.is_empty() {
+                    format!(
+                        "Recover verified allowed_paths scope mismatch for tasks: {}",
+                        scope_violation_task_keys.join(", ")
+                    )
+                } else {
+                    format!(
+                        "Recover verified allowed_paths scope mismatch for tasks: {}. Reconcile allowed_paths with: {}",
+                        scope_violation_task_keys.join(", "),
+                        scope_violation_suggestions.join(", ")
+                    )
+                }
+            } else if !retry_task_keys.is_empty() {
                 format!("Retry failed tasks: {}", retry_task_keys.join(", "))
             } else {
                 format!(
@@ -712,5 +785,65 @@ mod tests {
 
         let tranche = roundtrip.next_tranche.as_ref().unwrap();
         assert_eq!(tranche.kind, TrancheKind::GateRetry);
+    }
+
+    #[test]
+    fn allowed_paths_scope_mismatch_round_trips_into_recovery_objective() {
+        let run = make_run();
+        let mut t1 = make_task(&run, "task-scope");
+        t1.state = TaskState::TaskFailed;
+        t1.last_error = Some(format_allowed_paths_scope_mismatch(
+            &["README.md".to_string()],
+            &["src/lib.rs".to_string()],
+        ));
+
+        let payload = ContinuationPayload::build(&run, &[&t1]);
+        let tranche = payload.next_tranche.expect("retry tranche expected");
+
+        assert!(
+            tranche
+                .suggested_objective
+                .contains("allowed_paths scope mismatch"),
+            "objective should call out scope mismatch: {}",
+            tranche.suggested_objective
+        );
+        assert!(
+            tranche.suggested_objective.contains("README.md"),
+            "objective should include suggested path: {}",
+            tranche.suggested_objective
+        );
+    }
+
+    #[test]
+    fn collect_allowed_paths_scope_suggestions_deduplicates_paths() {
+        let tasks = vec![
+            TaskOutcome {
+                task_id: TaskId::nil(),
+                task_key: "task-a".to_string(),
+                state: TaskState::TaskFailed,
+                attempt_no: 1,
+                last_error: Some(format_allowed_paths_scope_mismatch(
+                    &["README.md".to_string(), "docs/CLI.md".to_string()],
+                    &["src/lib.rs".to_string()],
+                )),
+                blocker: None,
+            },
+            TaskOutcome {
+                task_id: TaskId::nil(),
+                task_key: "task-b".to_string(),
+                state: TaskState::TaskFailed,
+                attempt_no: 1,
+                last_error: Some(format_allowed_paths_scope_mismatch(
+                    &["README.md".to_string()],
+                    &["src/lib.rs".to_string()],
+                )),
+                blocker: None,
+            },
+        ];
+
+        assert_eq!(
+            collect_allowed_paths_scope_suggestions(&tasks),
+            vec!["README.md".to_string(), "docs/CLI.md".to_string()]
+        );
     }
 }

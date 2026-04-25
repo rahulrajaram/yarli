@@ -19,7 +19,9 @@ use crate::evidence::evidence_file_format_instructions;
 
 use yarli_cli::mode::RenderMode;
 use yarli_cli::yarli_core::domain::CommandClass;
-use yarli_cli::yarli_core::entities::continuation::ContinuationInterventionKind;
+use yarli_cli::yarli_core::entities::continuation::{
+    collect_allowed_paths_scope_suggestions, ContinuationInterventionKind,
+};
 use yarli_cli::yarli_core::fsm::run::RunState;
 use yarli_cli::yarli_core::fsm::task::TaskState;
 use yarli_cli::yarli_observability::{Registry, YarliMetrics};
@@ -1365,6 +1367,13 @@ pub(crate) fn print_run_summary(outcome: &RunExecutionOutcome) {
                     .unwrap_or_else(|| "unknown".to_string());
                 println!("  Failed:      {} ({})", task.task_key, detail);
             }
+        }
+        let suggested_allowed_paths = collect_allowed_paths_scope_suggestions(&payload.tasks);
+        if !suggested_allowed_paths.is_empty() {
+            println!(
+                "Suggested allowed_paths additions: {}",
+                suggested_allowed_paths.join(", ")
+            );
         }
     }
 

@@ -24,6 +24,7 @@ use crate::yarli_core::domain::{
 };
 use crate::yarli_core::entities::command_execution::StreamChunk;
 use crate::yarli_core::entities::command_execution::{CommandResourceUsage, TokenUsage};
+use crate::yarli_core::entities::continuation::format_allowed_paths_scope_mismatch;
 use crate::yarli_core::entities::run::Run;
 use crate::yarli_core::entities::task::{BlockerCode, Task};
 use crate::yarli_core::explain::GateType;
@@ -240,6 +241,37 @@ fn resolve_allowed_write_roots(working_dir: &str, allowed_paths: &[String]) -> V
         }
     }
     roots
+}
+
+fn parse_permission_denied_write_target(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let (_, remainder) = trimmed.split_once("cannot create ")?;
+    let (path, _) = remainder.split_once(": Permission denied")?;
+    let candidate = path.trim().trim_matches('\'').trim_matches('"');
+    (!candidate.is_empty()).then(|| candidate.to_string())
+}
+
+fn infer_runtime_scope_violation(
+    chunks: &[StreamChunk],
+    allowed_paths: &[String],
+) -> Option<(Vec<String>, String)> {
+    if allowed_paths.is_empty() {
+        return None;
+    }
+    let mut suggested_allowed_paths: Vec<String> = chunks
+        .iter()
+        .filter(|chunk| {
+            chunk.stream == crate::yarli_core::entities::command_execution::StreamType::Stderr
+        })
+        .filter_map(|chunk| parse_permission_denied_write_target(&chunk.data))
+        .collect();
+    suggested_allowed_paths.sort();
+    suggested_allowed_paths.dedup();
+    if suggested_allowed_paths.is_empty() {
+        return None;
+    }
+    let detail = format_allowed_paths_scope_mismatch(&suggested_allowed_paths, allowed_paths);
+    Some((suggested_allowed_paths, detail))
 }
 
 /// Errors from scheduler operations.
@@ -1873,7 +1905,17 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
             TaskOutcome::Killed
         } else {
             // Nonzero exit code: Executing → Failed
-            task.set_last_error(format!("command exited with code {exit_code}"));
+            let allowed_paths = {
+                let paths = self.task_allowed_paths.read().await;
+                paths.get(&task_id).cloned().unwrap_or_default()
+            };
+            let runtime_scope_violation =
+                infer_runtime_scope_violation(&result.chunks, &allowed_paths);
+            let last_error = runtime_scope_violation
+                .as_ref()
+                .map(|(_, detail)| detail.clone())
+                .unwrap_or_else(|| format!("command exited with code {exit_code}"));
+            task.set_last_error(&last_error);
             let transition = task.transition(
                 TaskState::TaskFailed,
                 format!("command exited with code {exit_code}"),
@@ -1893,6 +1935,11 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                     "exit_code": exit_code,
                     "reason": "nonzero_exit",
                     "detail": transition.reason,
+                    "allowed_paths": allowed_paths,
+                    "suggested_allowed_paths": runtime_scope_violation
+                        .as_ref()
+                        .map(|(paths, _)| paths.clone())
+                        .unwrap_or_default(),
                     "resource_usage": result.execution.resource_usage,
                     "token_usage": result.execution.token_usage,
                 }),
@@ -4748,5 +4795,36 @@ mod tests {
             "run should be terminal after idle timeout"
         );
         assert_eq!(run.exit_reason, Some(ExitReason::StalledNoProgress));
+    }
+
+    #[test]
+    fn parse_permission_denied_write_target_extracts_blocked_path() {
+        assert_eq!(
+            parse_permission_denied_write_target(
+                "./mock-agent.sh: 9: cannot create README.md: Permission denied"
+            ),
+            Some("README.md".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_runtime_scope_violation_promotes_suggested_allowed_paths() {
+        let chunk = StreamChunk {
+            command_id: Uuid::nil(),
+            sequence: 1,
+            stream: crate::yarli_core::entities::command_execution::StreamType::Stderr,
+            data: "./mock-agent.sh: 9: cannot create README.md: Permission denied".to_string(),
+            captured_at: chrono::Utc::now(),
+        };
+
+        let violation = infer_runtime_scope_violation(&[chunk], &["src/lib.rs".to_string()])
+            .expect("expected runtime scope violation");
+
+        assert_eq!(violation.0, vec!["README.md".to_string()]);
+        assert!(
+            violation.1.contains("allowed_paths scope mismatch"),
+            "expected structured detail: {}",
+            violation.1
+        );
     }
 }
