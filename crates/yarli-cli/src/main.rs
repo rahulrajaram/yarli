@@ -150,11 +150,16 @@ async fn run() -> Result<()> {
             fresh_from_tranches,
             allow_recursive_run,
             no_submodule_auto_commit,
+            allow_dirty_submodules,
             action,
         } => {
             // NXT-382: --no-submodule-auto-commit overrides [run].auto_commit_submodule_edits.
             if no_submodule_auto_commit {
                 loaded_config.config_mut().run.auto_commit_submodule_edits = false;
+            }
+            // NXT-383: --allow-dirty-submodules overrides the pre-flight dirty check.
+            if allow_dirty_submodules {
+                loaded_config.config_mut().run.allow_dirty_submodules = true;
             }
             match action {
                 None => {

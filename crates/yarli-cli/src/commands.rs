@@ -1024,6 +1024,13 @@ pub(crate) async fn cmd_run_default(
     )?;
     info!("CLI backend preflight passed");
 
+    // NXT-383: refuse to start when the umbrella has dirty submodule content.
+    if !loaded_config.config().run.allow_dirty_submodules {
+        let umbrella = std::env::current_dir()
+            .context("failed to read current working directory for dirty-submodule preflight")?;
+        preflight_check_dirty_submodules(&umbrella)?;
+    }
+
     let objective = run_spec
         .objective
         .clone()
@@ -8632,6 +8639,89 @@ pub(crate) fn parse_merge_strategy(name: &str) -> Option<&'static str> {
     }
 }
 
+/// NXT-383: pre-flight check that refuses `yarli run` when the umbrella repo
+/// has dirty submodule content (` M` lines in `git status --porcelain`).
+///
+/// Worker patches applied to a dirty submodule cannot be cleanly merged back
+/// because the stash step has nothing stable to anchor to. This guard catches
+/// the problematic state before any tokens are spent.
+///
+/// Returns `Ok(())` if the umbrella is clean (no dirty submodule lines).
+/// Returns an error listing all dirty submodule paths if any are found.
+/// Pass `--allow-dirty-submodules` (or set `[run].allow_dirty_submodules = true`
+/// in yarli.toml) to bypass.
+fn preflight_check_dirty_submodules(umbrella: &std::path::Path) -> Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args(["-C", &umbrella.to_string_lossy(), "status", "--porcelain"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            // git itself returned non-zero — probably not in a git repo.
+            // Don't block the run; just warn.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            warn!(
+                exit_code = %o.status,
+                stderr = %stderr.trim(),
+                "NXT-383: git status failed during dirty-submodule preflight; skipping check"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "NXT-383: could not invoke git for dirty-submodule preflight; skipping check"
+            );
+            return Ok(());
+        }
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut dirty_submodule_paths: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let mut chars = line.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        let path = line[3..]
+            .trim()
+            .trim_start_matches('"')
+            .trim_end_matches('"');
+        // A submodule directory shows as ' M <path>' when the submodule has
+        // uncommitted working-tree content (Y column = 'M'/'m') but an
+        // unchanged pointer, or 'M  <path>' / 'MM <path>' when the pointer
+        // is staged.  We treat any non-'?' modification touching a path that
+        // is a git repo directory as a dirty submodule.
+        let is_modified = matches!(y, 'M' | 'm' | 'A' | 'D' | 'R' | 'C' | 'U')
+            || matches!(x, 'M' | 'm' | 'A' | 'D' | 'R' | 'C');
+        if is_modified {
+            let candidate = umbrella.join(path);
+            if candidate.join(".git").exists() || candidate.join(".git").is_file() {
+                dirty_submodule_paths.push(path.to_string());
+            }
+        }
+    }
+
+    if dirty_submodule_paths.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "NXT-383: yarli run refused — umbrella has dirty submodule content.\n\
+         Dirty submodules:\n  {paths}\n\n\
+         Worker patches cannot be cleanly merged back onto a dirty baseline.\n\
+         Fix: commit or stash the dirty content in each submodule, then retry.\n\
+         Bypass (inspection only): pass --allow-dirty-submodules.",
+        paths = dirty_submodule_paths.join("\n  ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11404,5 +11494,123 @@ mod tests {
             objective.contains("tests/new_scope.rs"),
             "expected suggested path in objective: {objective}"
         );
+    }
+
+    // NXT-383 pre-flight tests.
+    mod nxt383_preflight {
+        use super::super::preflight_check_dirty_submodules;
+        use std::fs;
+        use std::process::Command;
+
+        fn run_git(dir: &std::path::Path, args: &[&str]) {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("git failed");
+            assert!(status.success(), "git {:?} failed in {:?}", args, dir);
+        }
+
+        /// Build a minimal umbrella + submodule layout where the submodule has
+        /// uncommitted working-tree content (the ` M` case).
+        fn setup_dirty_submodule_umbrella() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path();
+
+            // Init submodule repo.
+            let sub_dir = root.join("sub_repo");
+            fs::create_dir_all(&sub_dir).unwrap();
+            run_git(&sub_dir, &["init", "-b", "main"]);
+            run_git(&sub_dir, &["config", "user.email", "t@t.com"]);
+            run_git(&sub_dir, &["config", "user.name", "Test"]);
+            fs::write(sub_dir.join("init.py"), "x = 1\n").unwrap();
+            run_git(&sub_dir, &["add", "."]);
+            run_git(&sub_dir, &["commit", "--no-verify", "-m", "init"]);
+
+            // Init umbrella.
+            let umbrella = root.join("umbrella");
+            fs::create_dir_all(&umbrella).unwrap();
+            run_git(&umbrella, &["init", "-b", "main"]);
+            run_git(&umbrella, &["config", "user.email", "t@t.com"]);
+            run_git(&umbrella, &["config", "user.name", "Test"]);
+            fs::write(umbrella.join("README"), "umbrella\n").unwrap();
+            run_git(&umbrella, &["add", "."]);
+            run_git(&umbrella, &["commit", "--no-verify", "-m", "init"]);
+
+            // Add submodule.
+            let sub_abs = sub_dir.to_string_lossy();
+            Command::new("git")
+                .args(["submodule", "add", &sub_abs, "sub"])
+                .current_dir(&umbrella)
+                .status()
+                .expect("git submodule add");
+            run_git(&umbrella, &["commit", "--no-verify", "-m", "add sub"]);
+
+            // Make the submodule dirty (modify a file inside it without committing).
+            let sub_in_umbrella = umbrella.join("sub");
+            fs::write(sub_in_umbrella.join("init.py"), "x = 42\n").unwrap();
+
+            tmp
+        }
+
+        #[test]
+        fn preflight_refuses_when_submodule_is_dirty() {
+            let tmp = setup_dirty_submodule_umbrella();
+            let umbrella = tmp.path().join("umbrella");
+            let result = preflight_check_dirty_submodules(&umbrella);
+            assert!(
+                result.is_err(),
+                "expected pre-flight to refuse dirty submodule; got Ok"
+            );
+            let msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                msg.contains("NXT-383"),
+                "expected NXT-383 in error message: {msg}"
+            );
+            assert!(
+                msg.contains("sub"),
+                "expected dirty submodule path in error message: {msg}"
+            );
+        }
+
+        #[test]
+        fn preflight_passes_when_submodule_is_clean() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path();
+
+            // Init a clean umbrella with one committed submodule.
+            let sub_dir = root.join("sub_repo");
+            fs::create_dir_all(&sub_dir).unwrap();
+            run_git(&sub_dir, &["init", "-b", "main"]);
+            run_git(&sub_dir, &["config", "user.email", "t@t.com"]);
+            run_git(&sub_dir, &["config", "user.name", "Test"]);
+            fs::write(sub_dir.join("lib.py"), "x = 1\n").unwrap();
+            run_git(&sub_dir, &["add", "."]);
+            run_git(&sub_dir, &["commit", "--no-verify", "-m", "init"]);
+
+            let umbrella = root.join("umbrella");
+            fs::create_dir_all(&umbrella).unwrap();
+            run_git(&umbrella, &["init", "-b", "main"]);
+            run_git(&umbrella, &["config", "user.email", "t@t.com"]);
+            run_git(&umbrella, &["config", "user.name", "Test"]);
+            fs::write(umbrella.join("README"), "umbrella\n").unwrap();
+            run_git(&umbrella, &["add", "."]);
+            run_git(&umbrella, &["commit", "--no-verify", "-m", "init"]);
+
+            let sub_abs = sub_dir.to_string_lossy();
+            Command::new("git")
+                .args(["submodule", "add", &sub_abs, "sub"])
+                .current_dir(&umbrella)
+                .status()
+                .expect("git submodule add");
+            run_git(&umbrella, &["commit", "--no-verify", "-m", "add sub"]);
+
+            // Everything committed — should pass.
+            let result = preflight_check_dirty_submodules(&umbrella);
+            assert!(
+                result.is_ok(),
+                "expected pre-flight to pass on clean umbrella; got {result:?}"
+            );
+        }
     }
 }

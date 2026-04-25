@@ -1388,6 +1388,12 @@ pub struct RunConfig {
     /// state instead of auto-committing (useful for inspection or manual cleanup).
     #[serde(default = "default_auto_commit_submodule_edits")]
     pub auto_commit_submodule_edits: bool,
+    /// NXT-383: allow `yarli run` to proceed even when the umbrella has dirty
+    /// submodule content (` M` lines in `git status --porcelain`). Defaults to
+    /// false so that the pre-flight check refuses ambiguous starts. Set to true
+    /// or pass `--allow-dirty-submodules` to bypass (useful for inspection).
+    #[serde(default = "default_allow_dirty_submodules")]
+    pub allow_dirty_submodules: bool,
     /// The default named pace used by shorthand commands like `yarli run batch`.
     #[serde(default)]
     pub default_pace: Option<String>,
@@ -1504,6 +1510,7 @@ impl Default for RunConfig {
             auto_commit_interval: default_auto_commit_interval(),
             auto_commit_message: None,
             auto_commit_submodule_edits: default_auto_commit_submodule_edits(),
+            allow_dirty_submodules: default_allow_dirty_submodules(),
             plan_guard: None,
             default_pace: None,
             paces: std::collections::BTreeMap::new(),
@@ -1596,6 +1603,10 @@ fn default_auto_commit_interval() -> u32 {
 
 fn default_auto_commit_submodule_edits() -> bool {
     true
+}
+
+fn default_allow_dirty_submodules() -> bool {
+    false
 }
 
 fn deserialize_merge_conflict_resolution<'de, D>(

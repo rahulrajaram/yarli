@@ -639,6 +639,13 @@ pub(crate) enum Commands {
         /// Pass this flag to preserve dirty submodule content instead (useful for inspection).
         #[arg(long, default_value_t = false)]
         no_submodule_auto_commit: bool,
+        /// Allow `yarli run` to proceed even when the umbrella repo has submodules with
+        /// uncommitted working-tree content (` M` lines in `git status --porcelain`).
+        /// By default yarli refuses to start if dirty submodule content is detected, because
+        /// worker patches applied to a dirty submodule cannot be cleanly merged back.
+        /// Use this flag to bypass the check (e.g. for inspection or manual recovery).
+        #[arg(long, default_value_t = false)]
+        allow_dirty_submodules: bool,
         #[command(subcommand)]
         action: Option<RunAction>,
     },
