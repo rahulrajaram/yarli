@@ -1070,8 +1070,8 @@ prompt_mode = "arg"
         String::from_utf8_lossy(&run_output.stderr)
     );
     assert!(
-        combined_output.contains("Exit state:  RunCompletedWithMergeFailure"),
-        "scope violation run should report RunCompletedWithMergeFailure in summary\n{combined_output}"
+        combined_output.contains("Exit state:  RunFailed"),
+        "scope violation run should report RunFailed in summary\n{combined_output}"
     );
     // The full set of suggested paths may also include incidentally-changed
     // control files (PROMPT.md, yarli.toml, etc.) depending on what the
@@ -1094,13 +1094,13 @@ prompt_mode = "arg"
     let continuation = read_continuation_payload(&repo_dir);
     assert_eq!(
         continuation.get("exit_state").and_then(Value::as_str),
-        Some("RunCompletedWithMergeFailure"),
-        "expected continuation exit_state to be RunCompletedWithMergeFailure after scope violation"
+        Some("RunFailed"),
+        "expected continuation exit_state to be RunFailed after scope violation"
     );
     assert_eq!(
         continuation.get("exit_reason").and_then(Value::as_str),
-        Some("completed_merge_teardown_failed"),
-        "expected continuation exit_reason to be completed_merge_teardown_failed after scope violation"
+        Some("failed_runtime_error"),
+        "expected continuation exit_reason to be failed_runtime_error after scope violation"
     );
     let next_tranche = continuation
         .get("next_tranche")

@@ -974,7 +974,8 @@ pub(crate) fn load_run_projection(
                 | "run.cancelled"
         ) {
             failed_gates.clear();
-        } else if event.event_type == "run.parallel_merge_failed" {
+        }
+        if event.event_type == "run.parallel_merge_failed" {
             let reason = event
                 .payload
                 .get("reason")

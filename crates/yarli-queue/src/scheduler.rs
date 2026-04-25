@@ -1918,12 +1918,8 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 .map(|(_, msg)| msg.clone())
                 .unwrap_or_else(|| detail.clone());
             task.set_last_error(&last_error);
-            let transition = task.transition(
-                TaskState::TaskFailed,
-                &detail,
-                &self.config.worker_id,
-                None,
-            )?;
+            let transition =
+                task.transition(TaskState::TaskFailed, &detail, &self.config.worker_id, None)?;
 
             self.store.append(Event {
                 event_id: transition.event_id,
