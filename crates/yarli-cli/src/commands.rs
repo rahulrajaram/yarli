@@ -1,6 +1,7 @@
 //! Command handlers extracted from `main.rs`.
 
 use anyhow::{anyhow, Context};
+use sqlx::Connection;
 use yarli_cli::yarli_exec::{
     CommandRequest, CommandResult, CommandRunner, LocalCommandRunner, OverwatchCommandRunner,
     OverwatchRunnerConfig,
@@ -1680,6 +1681,31 @@ where
             let resolution_config =
                 MergeResolutionConfig::from_run_config(&loaded_config.config().run);
             let mut merge_apply_telemetry = Vec::new();
+
+            // NXT-382: auto-commit dirty submodule edits before the merge stash step.
+            // Task workers edit files inside submodule directories; yarli stashes
+            // pre-existing dirty state before merging workspace patches. If submodules
+            // have uncommitted content, git stash cannot cleanly handle them, causing
+            // the next run's merge to fail even though the work landed. We commit
+            // submodule edits here so the stash operates on a clean state.
+            let do_autocommit_submodule_edits =
+                loaded_config.config().run.auto_commit_submodule_edits;
+            if do_autocommit_submodule_edits {
+                let tranche_key = plan
+                    .tasks
+                    .first()
+                    .map(|t| t.task_key.as_str())
+                    .unwrap_or("autocommit");
+                let committed =
+                    crate::workspace::autocommit_dirty_submodules(&source_workdir, tranche_key);
+                if !committed.is_empty() {
+                    info!(
+                        submodules = ?committed,
+                        "NXT-382: auto-committed dirty submodule edits before parallel-merge"
+                    );
+                }
+            }
+
             let task_workspaces = plan
                 .tasks
                 .iter()
@@ -2323,18 +2349,16 @@ pub(crate) async fn seed_postgres_run_state_if_needed(
         return Ok(());
     };
 
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&database_url)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to connect to postgres for run/task seeding at {}",
-                loaded_config.path().display()
-            )
-        })?;
+    let mut connection = connect_postgres_for_runtime_write(
+        &database_url,
+        &format!(
+            "failed to connect to postgres for run/task seeding at {}",
+            loaded_config.path().display()
+        ),
+    )
+    .await?;
 
-    let mut tx = pool
+    let mut tx = connection
         .begin()
         .await
         .context("failed to begin run/task seed transaction")?;
@@ -2394,6 +2418,15 @@ pub(crate) async fn seed_postgres_run_state_if_needed(
         .await
         .context("failed to commit run/task seed transaction")?;
     Ok(())
+}
+
+async fn connect_postgres_for_runtime_write(
+    database_url: &str,
+    context: &str,
+) -> Result<sqlx::postgres::PgConnection> {
+    sqlx::postgres::PgConnection::connect(database_url)
+        .await
+        .with_context(|| format!("{context}: {database_url}"))
 }
 
 pub(crate) fn run_state_db(state: RunState) -> &'static str {
@@ -8709,6 +8742,26 @@ mod tests {
         };
         std::env::set_current_dir(dir).expect("switch to isolated test dir");
         operation()
+    }
+
+    #[tokio::test]
+    async fn runtime_postgres_connect_surfaces_direct_connect_error() {
+        let err = connect_postgres_for_runtime_write(
+            "postgres://postgres:postgres@127.0.0.1:1/yarli_runtime",
+            "runtime write connect failed",
+        )
+        .await
+        .expect_err("closed port should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("runtime write connect failed"),
+            "connection errors should preserve context: {message}"
+        );
+        assert!(
+            !message.contains("pool timed out while waiting for an open connection"),
+            "direct connect path should not surface pool wait errors: {message}"
+        );
     }
 
     fn seed_worktree_event_payload(

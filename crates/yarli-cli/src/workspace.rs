@@ -2750,6 +2750,149 @@ Operator recovery steps:\n\
     Ok(note_path)
 }
 
+/// Auto-commit uncommitted edits inside dirty submodules of `repo_dir`.
+///
+/// Task workers often edit files inside submodule directories (e.g.,
+/// `striation_customer_platform/build/agents/foo.py`). If those edits are
+/// committed at the submodule level but not reflected as a pointer change in
+/// the umbrella, the umbrella shows `m <path>` (dirty submodule content) in
+/// `git status --porcelain`. `git stash` cannot cleanly stash dirty submodule
+/// content, which causes the next run's parallel-merge to fail even though the
+/// task work itself landed.
+///
+/// This function detects such dirty submodules, enters each one, and creates a
+/// commit with message `yarli: <tranche_key> — autocommit (worker edits)` so
+/// the umbrella can stash/merge cleanly. This is the NXT-382 auto-commit fix.
+///
+/// Returns the list of submodule paths where an auto-commit was attempted.
+/// Errors from individual auto-commits are logged as warnings but do not
+/// propagate — we want the merge to proceed even if a single submodule
+/// commit fails.
+pub(crate) fn autocommit_dirty_submodules(repo_dir: &Path, tranche_key: &str) -> Vec<String> {
+    // Run `git submodule status` in the umbrella to find dirty submodules.
+    // Dirty = lines starting with '+' (modified pointer) or any line where the
+    // submodule itself has uncommitted content. We also check `git status --porcelain`
+    // for lines like ` m <path>` which indicate dirty submodule working-tree content.
+    let status_result = run_git_capture(repo_dir, &["status", "--porcelain"]);
+    let status_text = match status_result {
+        Ok(ref output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => return Vec::new(),
+    };
+
+    // Detect submodule dirty entries: porcelain shows them as lines where
+    // XY starts with space + 'm' (untracked submodule modifications) or
+    // uppercase 'M' in either column for the submodule path itself.
+    // We use `git submodule status` for definitive dirty detection.
+    let submodule_status_result = run_git_capture(repo_dir, &["submodule", "status"]);
+    let submodule_text = match submodule_status_result {
+        Ok(ref output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => return Vec::new(),
+    };
+
+    // Collect candidate dirty submodule paths from both sources.
+    let mut dirty_submodule_paths: Vec<String> = Vec::new();
+
+    // From `git status --porcelain`: lines like " M path" where the path is a
+    // submodule directory.  Porcelain v1 uses uppercase 'M' in the X or Y
+    // column to indicate modifications; a submodule with uncommitted
+    // working-tree content (but unchanged pointer) appears as " M <path>".
+    for line in status_text.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let mut chars = line.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        let path = line[3..]
+            .trim()
+            .trim_start_matches('"')
+            .trim_end_matches('"');
+        // Dirty submodule: Y column is 'M' (modified working-tree content that
+        // hasn't been staged into the submodule index), or X is 'M'/'A'/'D'
+        // (submodule pointer staged but not yet committed in umbrella).
+        let is_dirty = matches!(y, 'M' | 'm' | 'A' | 'D' | 'R' | 'C' | 'U')
+            || matches!(x, 'M' | 'm' | 'A' | 'D' | 'R' | 'C');
+        if is_dirty {
+            let candidate = repo_dir.join(path);
+            if candidate.join(".git").exists() || candidate.join(".git").is_file() {
+                dirty_submodule_paths.push(path.to_string());
+            }
+        }
+    }
+
+    // Also check via `git submodule status` for the '+' prefix (pointer changed).
+    use yarli_cli::yarli_git::submodule::{parse_submodule_status, SubmoduleStatus};
+    let sub_entries = parse_submodule_status(&submodule_text);
+    for entry in &sub_entries {
+        if entry.status == SubmoduleStatus::Modified {
+            // Check if the submodule has uncommitted working-tree changes.
+            let sub_path = repo_dir.join(&entry.path);
+            if let Ok(ws_status) = run_git_capture(&sub_path, &["status", "--porcelain"]) {
+                let ws_text = String::from_utf8_lossy(&ws_status.stdout);
+                if !ws_text.trim().is_empty() && !dirty_submodule_paths.contains(&entry.path) {
+                    dirty_submodule_paths.push(entry.path.clone());
+                }
+            }
+        }
+    }
+
+    let mut committed = Vec::new();
+    let commit_message = format!("yarli: {tranche_key} — autocommit (worker edits)");
+
+    for sub_rel_path in &dirty_submodule_paths {
+        let sub_abs_path = repo_dir.join(sub_rel_path);
+        if !sub_abs_path.is_dir() {
+            continue;
+        }
+        // Stage all changes inside the submodule.
+        let add_result = run_git_capture(&sub_abs_path, &["add", "-A"]);
+        if add_result.is_err() {
+            warn!(
+                submodule = %sub_rel_path,
+                "NXT-382: failed to stage changes inside dirty submodule; skipping auto-commit"
+            );
+            continue;
+        }
+        // Check if there is anything staged.
+        let diff_result = run_git_capture(&sub_abs_path, &["diff", "--cached", "--quiet"]);
+        let has_staged = diff_result.map(|o| !o.status.success()).unwrap_or(false);
+        if !has_staged {
+            continue;
+        }
+        // Commit inside the submodule.
+        let commit_result = run_git_capture(
+            &sub_abs_path,
+            &["commit", "--no-verify", "-m", &commit_message],
+        );
+        match commit_result {
+            Ok(ref output) if output.status.success() => {
+                info!(
+                    submodule = %sub_rel_path,
+                    "NXT-382: auto-committed dirty submodule edits"
+                );
+                committed.push(sub_rel_path.clone());
+                // Now stage the updated submodule pointer in the umbrella.
+                let _ = run_git_capture(repo_dir, &["add", sub_rel_path.as_str()]);
+            }
+            Ok(ref output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    submodule = %sub_rel_path,
+                    "NXT-382: submodule auto-commit failed: {stderr}"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    submodule = %sub_rel_path,
+                    "NXT-382: submodule auto-commit error: {err}"
+                );
+            }
+        }
+    }
+
+    committed
+}
+
 #[cfg(test)]
 pub(crate) fn merge_parallel_workspace_results<T: WorkspaceBindingLike>(
     source_workdir: &Path,
@@ -7527,5 +7670,90 @@ worktree_root = "{}"
         let msg = format!("{err:#}");
         assert!(msg.contains("outside allowed_paths"), "error: {msg}");
         assert!(msg.contains("README.md"), "error: {msg}");
+    }
+
+    // NXT-382: autocommit_dirty_submodules should detect and commit dirty submodule
+    // content so the umbrella's parallel-merge stash can operate on a clean state.
+    #[test]
+    fn autocommit_dirty_submodules_commits_uncommitted_edits_in_submodule() {
+        let temp = TempDir::new().expect("create temp dir");
+        let umbrella = temp.path().join("umbrella");
+        let sub_path = temp.path().join("sub_repo");
+
+        // Create a bare sub-repo.
+        std::fs::create_dir_all(&sub_path).expect("create sub_repo dir");
+        run_git_expect_ok(&sub_path, &["init"]);
+        run_git_expect_ok(&sub_path, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&sub_path, &["config", "user.name", "Yarli Test"]);
+        run_git_expect_ok(&sub_path, &["checkout", "-b", "main"]);
+        std::fs::write(sub_path.join("lib.py"), "x = 1\n").expect("write lib.py");
+        run_git_expect_ok(&sub_path, &["add", "."]);
+        run_git_expect_ok(&sub_path, &["commit", "-m", "init sub"]);
+
+        // Create umbrella repo and add the sub-repo as a submodule.
+        std::fs::create_dir_all(&umbrella).expect("create umbrella dir");
+        run_git_expect_ok(&umbrella, &["init"]);
+        run_git_expect_ok(&umbrella, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&umbrella, &["config", "user.name", "Yarli Test"]);
+        run_git_expect_ok(&umbrella, &["checkout", "-b", "main"]);
+        run_git_expect_ok(
+            &umbrella,
+            &["submodule", "add", sub_path.to_str().unwrap(), "sub"],
+        );
+        run_git_expect_ok(&umbrella, &["commit", "-m", "add submodule"]);
+
+        // Simulate worker edit: modify a file inside the submodule WITHOUT committing.
+        let sub_in_umbrella = umbrella.join("sub");
+        std::fs::write(sub_in_umbrella.join("lib.py"), "x = 42\n").expect("write lib.py edit");
+
+        // Verify the submodule is dirty before auto-commit.
+        let (_, status_before, _) = run_git(&sub_in_umbrella, &["status", "--porcelain"]);
+        assert!(
+            !status_before.trim().is_empty(),
+            "submodule should be dirty before auto-commit: {status_before}"
+        );
+
+        // Run the NXT-382 auto-commit.
+        let committed = autocommit_dirty_submodules(&umbrella, "NXT-TST");
+
+        // The submodule should now have a clean working tree.
+        let (_, status_after, _) = run_git(&sub_in_umbrella, &["status", "--porcelain"]);
+        assert!(
+            status_after.trim().is_empty(),
+            "submodule should be clean after auto-commit; status: {status_after}"
+        );
+
+        // The auto-commit should be reflected in the commit log.
+        let (_, log, _) = run_git(&sub_in_umbrella, &["log", "--oneline", "-1"]);
+        assert!(
+            log.contains("autocommit"),
+            "submodule commit message should contain 'autocommit': {log}"
+        );
+
+        // The committed list should include the submodule path.
+        assert!(
+            !committed.is_empty(),
+            "autocommit_dirty_submodules should report committed paths; got empty"
+        );
+    }
+
+    // NXT-382: autocommit_dirty_submodules should be a no-op when submodules are clean.
+    #[test]
+    fn autocommit_dirty_submodules_noop_when_clean() {
+        let temp = TempDir::new().expect("create temp dir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        run_git_expect_ok(&repo, &["init"]);
+        run_git_expect_ok(&repo, &["config", "user.email", "test@yarli.dev"]);
+        run_git_expect_ok(&repo, &["config", "user.name", "Yarli Test"]);
+        std::fs::write(repo.join("README.md"), "base\n").expect("write README");
+        run_git_expect_ok(&repo, &["add", "."]);
+        run_git_expect_ok(&repo, &["commit", "-m", "init"]);
+
+        let committed = autocommit_dirty_submodules(&repo, "NXT-TST");
+        assert!(
+            committed.is_empty(),
+            "no submodules to commit in clean repo: {committed:?}"
+        );
     }
 }

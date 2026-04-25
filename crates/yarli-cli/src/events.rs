@@ -123,16 +123,24 @@ pub(crate) fn event_to_stream_events(
                 at: event.occurred_at,
             }]
         }
-        "run.activated" | "run.verifying" | "run.blocked" | "run.completed" | "run.failed"
+        "run.activated"
+        | "run.verifying"
+        | "run.blocked"
+        | "run.completed"
+        | "run.parallel_merge_failed"
+        | "run.failed"
         | "run.cancelled" => {
             let from_str = event.payload.get("from").and_then(|v| v.as_str());
             let to_str = event.payload.get("to").and_then(|v| v.as_str());
+            let fallback = default_run_transition_states(event.event_type.as_str());
 
             let from = from_str
                 .and_then(parse_run_state)
+                .or_else(|| fallback.map(|(from, _)| from))
                 .unwrap_or(RunState::RunOpen);
             let to = to_str
                 .and_then(parse_run_state)
+                .or_else(|| fallback.map(|(_, to)| to))
                 .unwrap_or(RunState::RunOpen);
 
             let reason = event
@@ -243,9 +251,76 @@ pub(crate) fn parse_run_state(s: &str) -> Option<RunState> {
         "RunBlocked" => Some(RunState::RunBlocked),
         "RunVerifying" => Some(RunState::RunVerifying),
         "RunCompleted" => Some(RunState::RunCompleted),
+        "RunCompletedWithMergeFailure" | "RUN_COMPLETED_WITH_MERGE_FAILURE" => {
+            Some(RunState::RunCompletedWithMergeFailure)
+        }
         "RunFailed" => Some(RunState::RunFailed),
         "RunCancelled" => Some(RunState::RunCancelled),
         "RunDrained" => Some(RunState::RunDrained),
         _ => None,
+    }
+}
+
+fn default_run_transition_states(event_type: &str) -> Option<(RunState, RunState)> {
+    match event_type {
+        "run.activated" => Some((RunState::RunOpen, RunState::RunActive)),
+        "run.blocked" => Some((RunState::RunActive, RunState::RunBlocked)),
+        "run.verifying" => Some((RunState::RunActive, RunState::RunVerifying)),
+        "run.completed" => Some((RunState::RunVerifying, RunState::RunCompleted)),
+        "run.parallel_merge_failed" => Some((
+            RunState::RunCompleted,
+            RunState::RunCompletedWithMergeFailure,
+        )),
+        "run.failed" | "run.gate_failed" => Some((RunState::RunVerifying, RunState::RunFailed)),
+        "run.cancelled" => Some((RunState::RunActive, RunState::RunCancelled)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+    use yarli_cli::yarli_core::domain::{EntityType, Event};
+
+    #[test]
+    fn parse_run_state_accepts_completed_with_merge_failure() {
+        assert_eq!(
+            parse_run_state("RunCompletedWithMergeFailure"),
+            Some(RunState::RunCompletedWithMergeFailure)
+        );
+        assert_eq!(
+            parse_run_state("RUN_COMPLETED_WITH_MERGE_FAILURE"),
+            Some(RunState::RunCompletedWithMergeFailure)
+        );
+    }
+
+    #[test]
+    fn parallel_merge_failure_event_streams_distinct_terminal_state() {
+        let event = Event {
+            event_id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            entity_type: EntityType::Run,
+            entity_id: Uuid::new_v4().to_string(),
+            event_type: "run.parallel_merge_failed".to_string(),
+            payload: json!({
+                "reason": "parallel merge did not finalize",
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: "test".to_string(),
+            idempotency_key: None,
+        };
+
+        let events = event_to_stream_events(&event, &[], false, false);
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::RunTransition {
+                from: RunState::RunCompleted,
+                to: RunState::RunCompletedWithMergeFailure,
+                ..
+            }]
+        ));
     }
 }

@@ -1170,6 +1170,9 @@ fn parse_run_state_filter(value: Option<&str>) -> Result<Option<RunState>, ApiEr
         "blocked" => Ok(Some(RunState::RunBlocked)),
         "verifying" => Ok(Some(RunState::RunVerifying)),
         "completed" => Ok(Some(RunState::RunCompleted)),
+        "completed-with-merge-failure"
+        | "completed_with_merge_failure"
+        | "completedwithmergefailure" => Ok(Some(RunState::RunCompletedWithMergeFailure)),
         "failed" => Ok(Some(RunState::RunFailed)),
         "cancelled" => Ok(Some(RunState::RunCancelled)),
         other => Err(ApiError::InvalidStateFilter {
@@ -2467,6 +2470,7 @@ fn run_state_from_event(event: &Event) -> Option<RunState> {
             "run.activated" => Some(RunState::RunActive),
             "run.verifying" => Some(RunState::RunVerifying),
             "run.completed" => Some(RunState::RunCompleted),
+            "run.parallel_merge_failed" => Some(RunState::RunCompletedWithMergeFailure),
             "run.failed" | "run.gate_failed" => Some(RunState::RunFailed),
             "run.cancelled" => Some(RunState::RunCancelled),
             _ => None,
@@ -2498,6 +2502,9 @@ fn parse_run_state(value: &str) -> Option<RunState> {
         "RunBlocked" => Some(RunState::RunBlocked),
         "RunVerifying" => Some(RunState::RunVerifying),
         "RunCompleted" => Some(RunState::RunCompleted),
+        "RunCompletedWithMergeFailure" | "RUN_COMPLETED_WITH_MERGE_FAILURE" => {
+            Some(RunState::RunCompletedWithMergeFailure)
+        }
         "RunFailed" => Some(RunState::RunFailed),
         "RunCancelled" => Some(RunState::RunCancelled),
         _ => None,
@@ -3396,6 +3403,65 @@ mod tests {
         assert_eq!(payload["limit"], json!(1));
         assert_eq!(payload["offset"], json!(1));
         assert_eq!(payload["has_more"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn list_runs_endpoint_filters_completed_with_merge_failure_state() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let now = Utc::now();
+        let run_id = Uuid::now_v7();
+        let correlation_id = Uuid::now_v7();
+
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.config_snapshot",
+                correlation_id,
+                now,
+                json!({"objective": "merge failure completion"}),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.completed",
+                correlation_id,
+                now + Duration::seconds(1),
+                json!({"to":"RunCompleted"}),
+            ))
+            .unwrap();
+        store
+            .append(make_event(
+                EntityType::Run,
+                run_id.to_string(),
+                "run.parallel_merge_failed",
+                correlation_id,
+                now + Duration::seconds(2),
+                json!({"reason": "parallel merge did not finalize"}),
+            ))
+            .unwrap();
+
+        let response = router(store)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/runs?state=completed-with-merge-failure")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let runs = payload["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["run_id"], json!(run_id));
+        assert_eq!(runs[0]["state"], json!("RunCompletedWithMergeFailure"));
+        assert_eq!(payload["total"], json!(1));
     }
 
     #[tokio::test]

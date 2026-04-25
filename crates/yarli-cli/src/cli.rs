@@ -633,6 +633,12 @@ pub(crate) enum Commands {
         /// Allow recursive `yarli run` from task commands for this invocation.
         #[arg(long, default_value_t = false)]
         allow_recursive_run: bool,
+        /// Disable the NXT-382 auto-commit of dirty submodule edits during parallel-merge
+        /// finalization. By default yarli commits uncommitted edits inside touched submodules
+        /// before merging workspace patches, so that stash can operate on a clean state.
+        /// Pass this flag to preserve dirty submodule content instead (useful for inspection).
+        #[arg(long, default_value_t = false)]
+        no_submodule_auto_commit: bool,
         #[command(subcommand)]
         action: Option<RunAction>,
     },

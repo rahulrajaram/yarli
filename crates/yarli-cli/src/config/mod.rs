@@ -781,6 +781,11 @@ impl LoadedConfig {
         &self.config
     }
 
+    /// Mutable access to the config — used by CLI flag overrides before dispatch.
+    pub fn config_mut(&mut self) -> &mut YarliConfig {
+        &mut self.config
+    }
+
     pub fn backend_selection(&self) -> Result<BackendSelection> {
         match self.config.core.backend {
             BackendKind::InMemory => Ok(BackendSelection::InMemory),
@@ -1376,6 +1381,13 @@ pub struct RunConfig {
     /// `{run_id}`, `{tranches_completed}`, `{tranches_total}`.
     #[serde(default)]
     pub auto_commit_message: Option<String>,
+    /// When true (default), yarli automatically commits uncommitted edits inside
+    /// touched submodules during parallel-merge finalization. This prevents dirty
+    /// submodule state from causing the next run's merge to fail. Set to false
+    /// (or pass `--no-submodule-auto-commit` at the CLI) to preserve the dirty
+    /// state instead of auto-committing (useful for inspection or manual cleanup).
+    #[serde(default = "default_auto_commit_submodule_edits")]
+    pub auto_commit_submodule_edits: bool,
     /// The default named pace used by shorthand commands like `yarli run batch`.
     #[serde(default)]
     pub default_pace: Option<String>,
@@ -1491,6 +1503,7 @@ impl Default for RunConfig {
             tranches: Vec::new(),
             auto_commit_interval: default_auto_commit_interval(),
             auto_commit_message: None,
+            auto_commit_submodule_edits: default_auto_commit_submodule_edits(),
             plan_guard: None,
             default_pace: None,
             paces: std::collections::BTreeMap::new(),
@@ -1579,6 +1592,10 @@ fn default_merge_repair_timeout_seconds() -> u64 {
 
 fn default_auto_commit_interval() -> u32 {
     1
+}
+
+fn default_auto_commit_submodule_edits() -> bool {
+    true
 }
 
 fn deserialize_merge_conflict_resolution<'de, D>(

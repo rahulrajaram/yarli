@@ -1268,6 +1268,17 @@ pub(crate) fn finalize_run_outcome(outcome: &RunExecutionOutcome) -> Result<()> 
             println!("Run {} completed successfully.", outcome.run_id);
             Ok(())
         }
+        RunState::RunCompletedWithMergeFailure => {
+            eprintln!(
+                "Run {} completed task work, but parallel merge finalization failed. \
+                 Inspect `yarli run explain-exit {}` and the preserved workspace before cleanup.",
+                outcome.run_id, outcome.run_id
+            );
+            bail!(
+                "Run {} completed task work, but merge finalization failed.",
+                outcome.run_id
+            )
+        }
         RunState::RunFailed => {
             if outcome
                 .continuation_payload

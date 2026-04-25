@@ -216,20 +216,7 @@ impl HeadlessRenderer {
 
     fn print_summary(&self) {
         let s = &self.summary;
-        let status = match s.run_state {
-            Some(RunState::RunCompleted) => "OK",
-            Some(RunState::RunFailed | RunState::RunBlocked) => "FAILED",
-            Some(RunState::RunCancelled) => "CANCELLED",
-            Some(RunState::RunDrained) => "DRAINED",
-            Some(_) => "DONE",
-            None => {
-                if s.tasks_failed > 0 {
-                    "FAILED"
-                } else {
-                    "OK"
-                }
-            }
-        };
+        let status = summary_status_label(s.run_state, s.tasks_failed);
         let run_label = s
             .run_id
             .map(|id| format!(" [{}]", display_run_id(id)))
@@ -240,6 +227,24 @@ impl HeadlessRenderer {
         );
         info!("{}", line);
         let _ = writeln!(io::stderr(), "{line}");
+    }
+}
+
+fn summary_status_label(run_state: Option<RunState>, tasks_failed: u32) -> &'static str {
+    match run_state {
+        Some(RunState::RunCompleted) => "OK",
+        Some(RunState::RunCompletedWithMergeFailure) => "COMPLETED_WITH_MERGE_FAILURE",
+        Some(RunState::RunFailed | RunState::RunBlocked) => "FAILED",
+        Some(RunState::RunCancelled) => "CANCELLED",
+        Some(RunState::RunDrained) => "DRAINED",
+        Some(_) => "DONE",
+        None => {
+            if tasks_failed > 0 {
+                "FAILED"
+            } else {
+                "OK"
+            }
+        }
     }
 }
 
@@ -510,5 +515,13 @@ mod tests {
 
         assert_eq!(renderer.summary.run_state, Some(RunState::RunCompleted));
         assert_eq!(renderer.summary.tasks_failed, 0);
+    }
+
+    #[test]
+    fn summary_status_label_distinguishes_completed_with_merge_failure() {
+        assert_eq!(
+            summary_status_label(Some(RunState::RunCompletedWithMergeFailure), 0),
+            "COMPLETED_WITH_MERGE_FAILURE"
+        );
     }
 }

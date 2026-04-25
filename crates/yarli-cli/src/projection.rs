@@ -404,7 +404,7 @@ pub(crate) fn run_state_from_event(event: &Event) -> Option<RunState> {
             "run.blocked" => Some(RunState::RunBlocked),
             "run.verifying" => Some(RunState::RunVerifying),
             "run.completed" => Some(RunState::RunCompleted),
-            "run.parallel_merge_failed" => Some(RunState::RunFailed),
+            "run.parallel_merge_failed" => Some(RunState::RunCompletedWithMergeFailure),
             "run.failed" | "run.gate_failed" => Some(RunState::RunFailed),
             "run.cancelled" => Some(RunState::RunCancelled),
             "run.drained" => Some(RunState::RunDrained),
@@ -931,7 +931,12 @@ pub(crate) fn load_run_projection(
             drain_reason = event_reason(event);
         } else if matches!(
             event.event_type.as_str(),
-            "run.completed" | "run.failed" | "run.gate_failed" | "run.cancelled" | "run.drained"
+            "run.completed"
+                | "run.parallel_merge_failed"
+                | "run.failed"
+                | "run.gate_failed"
+                | "run.cancelled"
+                | "run.drained"
         ) {
             drain_requested = false;
         }
@@ -962,7 +967,11 @@ pub(crate) fn load_run_projection(
             failed_gates = gate_failures_from_event(event);
         } else if matches!(
             event.event_type.as_str(),
-            "run.activated" | "run.verifying" | "run.completed" | "run.cancelled"
+            "run.activated"
+                | "run.verifying"
+                | "run.completed"
+                | "run.parallel_merge_failed"
+                | "run.cancelled"
         ) {
             failed_gates.clear();
         } else if event.event_type == "run.parallel_merge_failed" {
