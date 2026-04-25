@@ -7698,7 +7698,14 @@ worktree_root = "{}"
         run_git_expect_ok(&umbrella, &["checkout", "-b", "main"]);
         run_git_expect_ok(
             &umbrella,
-            &["submodule", "add", sub_path.to_str().unwrap(), "sub"],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_path.to_str().unwrap(),
+                "sub",
+            ],
         );
         run_git_expect_ok(&umbrella, &["commit", "-m", "add submodule"]);
 
