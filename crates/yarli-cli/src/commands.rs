@@ -11537,13 +11537,20 @@ mod tests {
             run_git(&umbrella, &["add", "."]);
             run_git(&umbrella, &["commit", "--no-verify", "-m", "init"]);
 
-            // Add submodule.
+            // Add submodule. Pass protocol.file.allow=always so file-protocol
+            // submodule clones work on hardened CI runners (CVE-2022-39253).
             let sub_abs = sub_dir.to_string_lossy();
-            Command::new("git")
-                .args(["submodule", "add", &sub_abs, "sub"])
-                .current_dir(&umbrella)
-                .status()
-                .expect("git submodule add");
+            run_git(
+                &umbrella,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    &sub_abs,
+                    "sub",
+                ],
+            );
             run_git(&umbrella, &["commit", "--no-verify", "-m", "add sub"]);
 
             // Make the submodule dirty (modify a file inside it without committing).
@@ -11598,11 +11605,17 @@ mod tests {
             run_git(&umbrella, &["commit", "--no-verify", "-m", "init"]);
 
             let sub_abs = sub_dir.to_string_lossy();
-            Command::new("git")
-                .args(["submodule", "add", &sub_abs, "sub"])
-                .current_dir(&umbrella)
-                .status()
-                .expect("git submodule add");
+            run_git(
+                &umbrella,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    &sub_abs,
+                    "sub",
+                ],
+            );
             run_git(&umbrella, &["commit", "--no-verify", "-m", "add sub"]);
 
             // Everything committed — should pass.
