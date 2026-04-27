@@ -1391,13 +1391,27 @@ where
             task_workspace_by_id.insert(task.id, workspace_dir);
         }
     }
-    for (task, planned) in tasks.iter().zip(plan.tasks.iter()) {
-        if planned.allowed_paths.is_empty() {
-            continue;
+    // Only bind plan-tranche allowed_paths to the scheduler when the user has
+    // opted into either the legacy `enforce_plan_tranche_allowed_paths` flag
+    // or the new `[run.tranche_contract] enforce_allowed_paths_on_merge` flag.
+    // Without this gate, the bindings activate Linux Landlock on the worker
+    // process via INTERNAL_ALLOWED_WRITE_ROOTS_ENV even when both flags are
+    // off, breaking workers that need to write outside the declared scope —
+    // e.g. codex sessions live at ~/.codex/sessions/ and any tranche with
+    // narrow allowed_paths would otherwise deny codex writes there.
+    if loaded_config
+        .config()
+        .run
+        .should_surface_allowed_paths_in_prompts()
+    {
+        for (task, planned) in tasks.iter().zip(plan.tasks.iter()) {
+            if planned.allowed_paths.is_empty() {
+                continue;
+            }
+            scheduler
+                .bind_task_allowed_paths(task.id, planned.allowed_paths.clone())
+                .await;
         }
-        scheduler
-            .bind_task_allowed_paths(task.id, planned.allowed_paths.clone())
-            .await;
     }
 
     let task_names: Vec<(Uuid, String)> =
