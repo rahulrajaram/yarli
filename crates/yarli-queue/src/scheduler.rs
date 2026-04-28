@@ -10,6 +10,7 @@
 //! 7. Heartbeat active leases and reclaim stale ones.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -246,6 +247,59 @@ fn merge_runner_write_roots(
         }
     }
     roots
+}
+
+fn request_or_parent_env_has(env: &[(String, String)], key: &str) -> bool {
+    env.iter().any(|(candidate, _)| candidate == key) || std::env::var_os(key).is_some()
+}
+
+fn first_command_word(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("backend")
+        .trim_matches('"')
+        .trim_matches('\'')
+}
+
+fn command_agent_name(command: &str) -> String {
+    let executable = first_command_word(command);
+    let basename = Path::new(executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("backend");
+    format!("yarli-{basename}")
+}
+
+fn project_slug_from_working_dir(working_dir: &str) -> Option<String> {
+    Path::new(working_dir)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn add_agent_attribution_env(
+    env: &mut Vec<(String, String)>,
+    command: &str,
+    working_dir: &str,
+    run_id: RunId,
+) {
+    if !request_or_parent_env_has(env, "AGENT_ATTRIBUTION_CALLER") {
+        env.push((
+            "AGENT_ATTRIBUTION_CALLER".to_string(),
+            command_agent_name(command),
+        ));
+    }
+    if !request_or_parent_env_has(env, "AGENT_ATTRIBUTION_PROJECT") {
+        if let Some(slug) = project_slug_from_working_dir(working_dir) {
+            env.push(("AGENT_ATTRIBUTION_PROJECT".to_string(), slug));
+        }
+    }
+    if !request_or_parent_env_has(env, "AGENT_ATTRIBUTION_SESSION") {
+        env.push(("AGENT_ATTRIBUTION_SESSION".to_string(), run_id.to_string()));
+    }
 }
 
 fn infer_runtime_scope_violation(
@@ -1223,6 +1277,7 @@ impl<Q: TaskQueue, S: EventStore, R: CommandRunner + Clone> Scheduler<Q, S, R> {
                 encode_allowed_write_roots_env_value(&allowed_write_roots),
             ));
         }
+        add_agent_attribution_env(&mut env, &command, &working_dir, entry.run_id);
         let request = CommandRequest {
             task_id,
             run_id: entry.run_id,
@@ -3043,6 +3098,49 @@ mod tests {
                     .to_string(),
                 workspace.path().join("codex-tmp").display().to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_passes_agent_attribution_context_to_runner() {
+        let workspace = TempDir::new().unwrap();
+        let workspace_root = workspace.path().join("demo-project");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+
+        let queue = Arc::new(InMemoryTaskQueue::new());
+        let store = Arc::new(InMemoryEventStore::new());
+        let runner = Arc::new(CapturingRunner::default());
+        let mut config = test_config();
+        config.working_dir = workspace_root.display().to_string();
+        let sched = Scheduler::new(queue, store, runner.clone(), config);
+
+        let run = make_run("agent attribution context");
+        let run_id = run.id;
+        let task = make_task(
+            run.id,
+            "context-task",
+            "codex exec check",
+            run.correlation_id,
+        );
+        sched.submit_run(run, vec![task]).await.unwrap();
+
+        let result = sched.tick().await.unwrap();
+        assert_eq!(result.executed, 1);
+
+        let observed = runner.observed.lock().await.clone().unwrap();
+        let find_env = |key: &str| {
+            observed
+                .env
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(find_env("AGENT_ATTRIBUTION_CALLER"), Some("yarli-codex"));
+        assert_eq!(find_env("AGENT_ATTRIBUTION_PROJECT"), Some("demo-project"));
+        let run_id_string = run_id.to_string();
+        assert_eq!(
+            find_env("AGENT_ATTRIBUTION_SESSION"),
+            Some(run_id_string.as_str())
         );
     }
 

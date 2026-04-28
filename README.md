@@ -563,6 +563,9 @@ Bootstrap per repo: `memory-backend init -y`
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP tracing exporter endpoint |
 | `YARLI_TEST_DATABASE_URL` | Postgres URL for integration tests |
 | `YARLI_REQUIRE_POSTGRES_TESTS` | Enable Postgres integration tests |
+| `AGENT_ATTRIBUTION_CALLER` | Optional attribution for child agent invocations; Yarli sets a default when unset |
+| `AGENT_ATTRIBUTION_PROJECT` | Optional project attribution for child agent invocations; Yarli sets a default from the working directory when unset |
+| `AGENT_ATTRIBUTION_SESSION` | Optional session/run attribution for child agent invocations; Yarli sets a default from the run id when unset |
 
 ## Architecture
 
